@@ -1,0 +1,20 @@
+benchmarks/rpc_client.py
+  s_451b7943cccad2::t_8c4773a9cc71cd 288-292
+  s_451b7943cccad2::t_46b48f0e3acea2 32,137-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1c7646596dfc0591df520adb66402b2374203908",
+  "prompts": {},
+  "sessions": {
+    "s_451b7943cccad2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "33765903-78a3-4c0a-9ccc-394a448800a9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Stan Miroshnikov <1870571+mirstan@users.noreply.github.com>"
+    }
+  }
+}
