@@ -161,11 +161,21 @@ def _run_exercise(
         with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                    session_id=f"poly-{lang}-{ex_name}",
                    env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
+            timed_out = False
             r1 = rpc.prompt_and_collect(prompt, timeout=900)
             passed, out = desc["run_tests"](work, desc["timeout_s"])
             attempt = "pass_1" if passed else None
 
-            if not passed and retry:
+            if not passed and retry and not r1.agent_ended:
+                # prompt_and_collect() returns partial events *silently* when
+                # agent_end never arrives within its timeout, so a capped
+                # attempt is indistinguishable from a completed one. pi is
+                # still generating at this point: sending the retry prompt gets
+                # "Agent is already processing" and takes the whole run down.
+                # PromptResult.agent_ended already records this; consult it.
+                attempt = None
+                timed_out = True
+            elif not passed and retry:
                 retry_prompt = (
                     "The tests failed. Output:\n\n```\n"
                     + out[-4000:]
@@ -182,7 +192,7 @@ def _run_exercise(
             print(f"[{lang}/{ex_name}] {'PASS' if passed else 'FAIL'} in {elapsed:.1f}s on {attempt or 'fail'}")
 
         return {
-            "status": attempt or "fail",
+            "status": attempt or ("fail_timeout" if timed_out else "fail"),
             "elapsed_s": round(elapsed, 2),
             "turn_count": (r1.turn_count + (r2.turn_count if not attempt == "pass_1" and retry else 0)) if attempt else r1.turn_count,
         }
@@ -221,11 +231,18 @@ def main():
         key = f"{args.language}/{name}"
         if args.resume and results["exercises"].get(key, {}).get("status") in ("pass_1", "pass_2"):
             continue
-        r = _run_exercise(
-            args.language, name, args.model,
-            verbose=args.verbose,
-            retry=not args.no_retry,
-        )
+        # Results are already checkpointed atomically per exercise, but an
+        # exception anywhere in _run_exercise still discarded every remaining
+        # exercise. Record the failure and continue.
+        try:
+            r = _run_exercise(
+                args.language, name, args.model,
+                verbose=args.verbose,
+                retry=not args.no_retry,
+            )
+        except Exception as exc:
+            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
+            print(f"[{args.language}/{name}] ERROR {r['reason']}")
         results["exercises"][key] = r
         _save_results(results)
 
