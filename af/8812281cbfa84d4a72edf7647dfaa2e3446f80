@@ -1,0 +1,23 @@
+benchmarks/aider_polyglot.py
+  s_451b7943cccad2::t_6e3c885101d4b0 356,376
+  s_451b7943cccad2::t_87b91206544e7e 25,38-42,160-178,236,238-251,302,323-327,329,342,344
+benchmarks/test_polyglot_artifacts.py
+  s_451b7943cccad2::t_6e3c885101d4b0 1-69,136-137
+  s_451b7943cccad2::t_620a98db844e24 70-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "af8812281cbfa84d4a72edf7647dfaa2e3446f80",
+  "prompts": {},
+  "sessions": {
+    "s_451b7943cccad2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "33765903-78a3-4c0a-9ccc-394a448800a9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Stan Miroshnikov <1870571+mirstan@users.noreply.github.com>"
+    }
+  }
+}
