@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -28,6 +29,13 @@ from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).parent.parent
 PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
+
+# Retry budget for the "Agent is already processing" startup race (see
+# prompt_and_collect). 12 x 6s ~= 72s, comfortably longer than session
+# auto-naming even on a loaded local inference server.
+PROMPT_BUSY_RETRIES = 12
+PROMPT_BUSY_BACKOFF_S = 6
+STDERR_TAIL_LINES = 200
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
 
@@ -130,6 +138,26 @@ class PiRpc:
             text=True,
             bufsize=1,  # line-buffered
         )
+
+        # pi's stderr is piped but never consumed by the reader loop below.
+        # Once the OS pipe buffer (~64KB) fills, pi blocks on write and the run
+        # wedges with no diagnostic. Drain it continuously and keep a short tail
+        # for error reporting.
+        self._stderr_tail: list[str] = []
+
+        def _drain_stderr(pipe, sink):
+            try:
+                for line in pipe:
+                    sink.append(line.rstrip())
+                    del sink[:-STDERR_TAIL_LINES]
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_drain_stderr,
+            args=(self._proc.stderr, self._stderr_tail),
+            daemon=True,
+        ).start()
 
         # Demultiplexer state
         self._responses: dict[str, dict] = {}
@@ -262,11 +290,33 @@ class PiRpc:
     # ── Public API ───────────────────────────────────────────────────────
     def prompt_and_collect(self, message: str, timeout: float = 900) -> PromptResult:
         """Send a prompt, drain events until agent_end, return summary."""
-        rid = str(uuid.uuid4())
-        self._send({"id": rid, "type": "prompt", "message": message})
-        resp = self._await_response(rid, timeout=30)
-        if not resp.get("success"):
-            raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
+        # There is no readiness handshake: the prompt goes out immediately after
+        # Popen, while little-coder's branding extension may still be running its
+        # startup session-auto-naming model call. When the inference server is
+        # under load that call is slow, pi answers "Agent is already processing",
+        # and the resulting RuntimeError aborts the entire benchmark run.
+        # Retry instead of dying; the agent frees up once startup work completes.
+        resp = None
+        for attempt in range(PROMPT_BUSY_RETRIES):
+            rid = str(uuid.uuid4())
+            self._send({"id": rid, "type": "prompt", "message": message})
+            resp = self._await_response(rid, timeout=30)
+            if resp.get("success"):
+                break
+            err = str(resp.get("error") or "")
+            if "already processing" not in err:
+                raise RuntimeError(f"pi rejected prompt: {err}")
+            print(
+                f"[rpc] pi busy, retrying prompt "
+                f"({attempt + 1}/{PROMPT_BUSY_RETRIES})",
+                file=sys.stderr, flush=True,
+            )
+            time.sleep(PROMPT_BUSY_BACKOFF_S)
+        if resp is None or not resp.get("success"):
+            raise RuntimeError(
+                f"pi rejected prompt after {PROMPT_BUSY_RETRIES} retries: "
+                f"{resp and resp.get('error')}"
+            )
 
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",
