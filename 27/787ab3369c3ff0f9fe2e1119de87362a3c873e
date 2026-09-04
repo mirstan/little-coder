@@ -1,0 +1,23 @@
+benchmarks/harbor_adapter/little_coder_agent.py
+  s_451b7943cccad2::t_7d8884f093add9 231,233-235,252
+benchmarks/gaia.py
+  s_451b7943cccad2::t_bc1266c0e15be7 183,202-206,240
+benchmarks/tb_adapter/little_coder_agent.py
+  s_451b7943cccad2::t_bc1266c0e15be7 268-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "27787ab3369c3ff0f9fe2e1119de87362a3c873e",
+  "prompts": {},
+  "sessions": {
+    "s_451b7943cccad2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "33765903-78a3-4c0a-9ccc-394a448800a9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Stan Miroshnikov <1870571+mirstan@users.noreply.github.com>"
+    }
+  }
+}
