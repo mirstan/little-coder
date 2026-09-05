@@ -97,9 +97,34 @@ def test_real_run_happy_path_reaches_compile_and_writes_output(tmp_path, monkeyp
 def test_real_run_happy_path_configures_dummy_lm_not_a_real_one(tmp_path, monkeypatch):
     """Confirms the forward-pass LM is the free DummyLM, not something that
     would make a real network call -- the actual safety property this whole
-    design depends on."""
+    design depends on.
+
+    Reads what _real_run() actually PASSED to dspy.settings.configure(),
+    rather than reading dspy.settings.lm back afterward: the latter is
+    global, un-reset state shared across the whole test session, so it could
+    stay green from a previous test's configure() call even if this run's
+    own configure() call were removed or broken -- a real gap, confirmed by
+    review.
+
+    Patches Settings.configure on the CLASS, not the dspy.settings instance:
+    Settings overrides __setattr__ to route any instance-attribute set
+    through self.configure(**{name: value}) itself, so
+    monkeypatch.setattr(dspy.settings, "configure", ...) silently never
+    takes effect -- normal attribute lookup still finds the real class
+    method first. Patching the class is the only way to actually intercept
+    the call."""
     monkeypatch.setenv("REFLECTION_LM_API_KEY", "sk-fake-not-real-never-used")
     monkeypatch.setattr(dspy, "GEPA", _StubGEPA)
+
+    settings_cls = type(dspy.settings)
+    configure_calls = []
+    original_configure = settings_cls.configure
+
+    def recording_configure(self, **kwargs):
+        configure_calls.append(kwargs)
+        return original_configure(self, **kwargs)
+
+    monkeypatch.setattr(settings_cls, "configure", recording_configure)
 
     trajectories = [_traj("t1")]
     components = {"agents_md": "Body."}
@@ -107,7 +132,8 @@ def test_real_run_happy_path_configures_dummy_lm_not_a_real_one(tmp_path, monkey
     _real_run(trajectories, components, _args(tmp_path))
 
     from dspy.utils.dummies import DummyLM
-    assert isinstance(dspy.settings.lm, DummyLM)
+    assert len(configure_calls) == 1
+    assert isinstance(configure_calls[0]["lm"], DummyLM)
 
 
 def test_real_run_happy_path_passes_reflection_model_through(tmp_path, monkeypatch):

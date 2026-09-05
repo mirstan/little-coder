@@ -4,6 +4,24 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolated_git_config(tmp_path_factory, monkeypatch):
+    """Autouse for every test in this directory: test_apply_results.py's
+    scratch repos run real `git init`/`commit` subprocesses, which by
+    default still read the DEVELOPER's real ~/.gitconfig (and any
+    /etc/gitconfig) -- a global commit.gpgsign=true or core.hooksPath there
+    could make `git commit` fail (or hang on a passphrase prompt) in a way
+    that has nothing to do with what the test is checking. GIT_CONFIG_GLOBAL
+    (git >= 2.32) fully replaces the global config path for these
+    subprocesses without touching the developer's real file; GIT_CONFIG_
+    SYSTEM/NOSYSTEM similarly neutralize any machine-wide config."""
+    fake_global = tmp_path_factory.mktemp("git-config") / "gitconfig"
+    fake_global.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_global))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(fake_global.parent / "does-not-exist"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture
 def gaia_run(tmp_path) -> Path:
     """A minimal gaia benchmark run directory: two task dirs, matching the
