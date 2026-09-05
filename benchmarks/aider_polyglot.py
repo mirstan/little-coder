@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rpc_client import PiRpc, PromptResult  # noqa: E402
+from rpc_client import PiRpc, PromptResult, capture_environment_snapshot  # noqa: E402
 
 BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
 REPO_ROOT = Path(__file__).parent.parent
@@ -658,12 +658,22 @@ def _run_exercise(
         turn_total = 0
         current_prompt = prompt
         codex_session_id = None
+        confirmed_thinking_level = None
         for i in range(1, effective_attempts + 1):
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                            session_id=f"poly-{lang}-{ex_name}-attempt{i}",
                            env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
                            thinking=thinking) as rpc:
+                    if i == 1:
+                        # Best-effort: confirms the thinking level pi actually
+                        # resolved to (vs. our own static-file guess in
+                        # capture_environment_snapshot), straight from pi's
+                        # own get_state. Never worth failing the exercise over.
+                        try:
+                            confirmed_thinking_level = rpc.get_state().get("thinkingLevel")
+                        except Exception:
+                            pass
                     # prompt_and_collect() returns partial events *silently*
                     # when agent_end never arrives (_drain_events_until
                     # returns `collected`, it does not raise), so a
@@ -749,13 +759,19 @@ def _run_exercise(
         if verbose:
             print(f"[{lang}/{ex_name}] {'PASS' if passed else 'FAIL'} in {elapsed:.1f}s on {attempt or 'fail'}")
 
-        return {
+        record = {
             "run_id": RUN_ID,
             "status": _classify_status(passed, attempt, outcomes),
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
         }
+        if confirmed_thinking_level is not None:
+            # Transient -- popped by the caller into meta.environment_snapshot,
+            # not meant to sit on every individual exercise record (it's a
+            # run-invariant fact, not something that varies per exercise).
+            record["_confirmed_thinking_level"] = confirmed_thinking_level
+        return record
 
 
 def main():
@@ -809,6 +825,10 @@ def main():
     params = _scoring_params(model, args.language, not args.no_retry, desc,
                              max_attempts=args.max_attempts, thinking=args.thinking,
                              agent=args.agent)
+    # Diagnostic only -- deliberately NOT part of _scoring_params/_param_mismatches,
+    # same reasoning as config_label: this doesn't affect how an attempt runs,
+    # so a --resume under a different sampling temperature isn't a mismatch.
+    env_snapshot = capture_environment_snapshot(model, cli_thinking=args.thinking)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -829,8 +849,10 @@ def main():
         "run_id": RUN_ID,
         "started_at": datetime.datetime.now().isoformat(),
         "scoring_params": params,
+        "environment_snapshot": env_snapshot,
     })
     results["meta"]["scoring_params"] = params
+    results["meta"]["environment_snapshot"] = env_snapshot
     results["meta"]["run_id"] = RUN_ID
 
     practice = desc["practice_dir"]
@@ -865,6 +887,14 @@ def main():
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
+
+        confirmed_level = r.pop("_confirmed_thinking_level", None)
+        if confirmed_level is not None and env_snapshot["thinking"]["confirmed_live"] is None:
+            # Only the first exercise to report one sets it -- config doesn't
+            # change mid-run, and this keeps meta.environment_snapshot a
+            # single run-invariant fact rather than the last exercise's value.
+            env_snapshot["thinking"]["confirmed_live"] = confirmed_level
+            results["meta"]["environment_snapshot"] = env_snapshot
 
         r["scoring_params"] = params
         results["exercises"][key] = r

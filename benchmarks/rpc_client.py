@@ -30,6 +30,20 @@ REPO_ROOT = Path(__file__).parent.parent
 PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
+# capture_environment_snapshot()'s config sources -- module-level constants
+# (not inlined) so tests can monkeypatch each one independently, matching how
+# REPO_ROOT/PI_BIN are already overridden in tests.
+_PI_SETTINGS_PATH = Path.home() / ".pi" / "agent" / "settings.json"
+_LC_MODELS_SHIPPED_DEFAULT = REPO_ROOT / "models.json"
+_OMLX_SETTINGS = Path.home() / ".omlx" / "settings.json"
+_OMLX_MODEL_SETTINGS = Path.home() / ".omlx" / "model_settings.json"
+_VENDOR_PATCH_TARGET = (
+    REPO_ROOT / "node_modules" / "@earendil-works" / "pi-coding-agent" / "node_modules"
+    / "@earendil-works" / "pi-ai" / "dist" / "api" / "openai-completions.js"
+)
+_VENDOR_PATCH_MARKER = "PI_REASONING_MAX_TOKENS"
+_OMLX_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "repetition_penalty")
+
 
 def _extension_paths() -> list[str]:
     """Enumerate absolute paths to every extension in the repo.
@@ -403,6 +417,20 @@ class PiRpc:
         self._send({"id": rid, "type": "new_session"})
         self._await_response(rid)
 
+    def get_state(self, timeout: float = 20) -> dict:
+        """Query pi's own resolved session state (e.g. thinkingLevel).
+
+        More authoritative than reading pi's settings files ourselves for
+        anything -- pi computes this value through its own full resolution
+        chain (CLI flag, scoped-model overrides, machine-local defaults),
+        so this can't drift from what pi actually does the way re-deriving
+        the same logic in Python could.
+        """
+        rid = str(uuid.uuid4())
+        self._send({"id": rid, "type": "get_state"})
+        resp = self._await_response(rid, timeout=timeout)
+        return resp.get("data", {})
+
     def _settle_stderr(self, timeout: float = 1.0):
         """Let the existing stderr reader finish once pi is gone.
 
@@ -450,3 +478,157 @@ class PiRpc:
 
     def __exit__(self, *a):
         self.close()
+
+
+# ── Environment snapshot ────────────────────────────────────────────────────
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    """Best-effort JSON read. None (not a raise) on any failure, including a
+    missing file -- callers distinguish "file missing/unreadable" (None) from
+    "file present but empty of the field we wanted" ({})."""
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _resolve_little_coder_models_file() -> tuple[Path, str]:
+    """Mirror .pi/extensions/llama-cpp-provider/config.ts::resolveOverridePath()'s
+    precedence exactly -- kept in sync by hand, there is no shared source of
+    truth between this Python harness and that TS extension."""
+    env_override = os.environ.get("LITTLE_CODER_MODELS_FILE")
+    if env_override:
+        return Path(env_override), "env:LITTLE_CODER_MODELS_FILE"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "little-coder" / "models.json", "env:XDG_CONFIG_HOME"
+    return Path.home() / ".config" / "little-coder" / "models.json", "home_default"
+
+
+def _find_model_max_tokens(provider: str, model_id: str) -> dict:
+    """maxTokens resolution: the user-override file wins if it defines this
+    model; otherwise fall back to the shipped default at REPO_ROOT/models.json
+    (the same file llama-cpp-provider's own pkgRoot points at)."""
+    out = {"value": None, "source_file": None, "resolution": None}
+    override_path, resolution = _resolve_little_coder_models_file()
+    for path, res in ((override_path, resolution), (_LC_MODELS_SHIPPED_DEFAULT, "shipped_default")):
+        data = _read_json(path)
+        if not data:
+            continue
+        for entry in data.get("providers", {}).get(provider, {}).get("models", []):
+            if entry.get("id") == model_id:
+                out.update(value=entry.get("maxTokens"), source_file=str(path), resolution=res)
+                return out
+    return out
+
+
+def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
+    settings = _read_json(_PI_SETTINGS_PATH)
+    pi_default = settings.get("defaultThinkingLevel") if settings else None
+    if cli_thinking:
+        resolved, source = cli_thinking, "cli"
+    elif pi_default:
+        resolved, source = pi_default, "pi_default_settings"
+    else:
+        resolved, source = None, "unresolved"
+    return {
+        "cli_value": cli_thinking,
+        "pi_default_setting": pi_default,
+        "resolved": resolved,
+        "source": source,
+        # Filled in later by the caller once a live PiRpc session exists and
+        # can be asked via get_state() -- see PiRpc.get_state() above. This
+        # static resolution has no session to query, so it starts unset.
+        "confirmed_live": None,
+    }
+
+
+def _capture_omlx_sampling(model_id: str, errors: list[dict]) -> dict:
+    out = {
+        "provider": "omlx",
+        "global_default": None,
+        "per_model_override": None,
+        "effective": None,
+        "source_files": [str(_OMLX_SETTINGS), str(_OMLX_MODEL_SETTINGS)],
+    }
+    global_settings = _read_json(_OMLX_SETTINGS)
+    if global_settings is None:
+        errors.append({"source": "server_sampling", "error": f"unreadable or missing: {_OMLX_SETTINGS}"})
+    else:
+        raw = global_settings.get("sampling", {})
+        out["global_default"] = {k: raw[k] for k in _OMLX_SAMPLING_KEYS if k in raw}
+
+    model_settings = _read_json(_OMLX_MODEL_SETTINGS)
+    if model_settings is None:
+        errors.append({"source": "server_sampling", "error": f"unreadable or missing: {_OMLX_MODEL_SETTINGS}"})
+    elif model_id in model_settings.get("models", {}):
+        raw = model_settings["models"][model_id]
+        out["per_model_override"] = {k: raw[k] for k in _OMLX_SAMPLING_KEYS if k in raw}
+
+    if out["global_default"] is not None or out["per_model_override"] is not None:
+        out["effective"] = {**(out["global_default"] or {}), **(out["per_model_override"] or {})}
+    return out
+
+
+def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None) -> dict:
+    """Best-effort snapshot of config that affects generation but isn't visible
+    to the harness's own CLI args: the machine-local default thinking level
+    pi falls back to when --thinking is unset, the model's maxTokens, the
+    model server's sampling params (temperature/top_p/top_k/repetition_penalty
+    -- omlx only for now; rapid-mlx's sampling flags are CLI-launch-time only
+    with no queryable file, so that provider degrades to a note rather than a
+    guess), and whether the PI_REASONING_MAX_TOKENS vendor patch to pi's own
+    vendored openai-completions.js is present in THIS install (it does not
+    survive `npm ci`, so a fresh worktree can silently lose it with no other
+    indication).
+
+    Reflects on-disk config, not necessarily a currently-running server's
+    already-loaded state -- a hand-edited settings file the server hasn't
+    picked up yet (no restart) would still read as the new value here.
+
+    Never raises. A missing or unreadable source is recorded as absent (None)
+    with a breadcrumb in "errors", not a crashed run -- this must not be the
+    reason a benchmark exercise fails.
+    """
+    provider, sep, model_id = model.partition("/")
+    errors: list[dict] = []
+    if not sep:
+        errors.append({"source": "model", "error": f"no provider prefix in {model!r}"})
+
+    snapshot = {
+        "model": model,
+        "provider": provider,
+        "thinking": _resolve_thinking(cli_thinking),
+        "max_tokens": _find_model_max_tokens(provider, model_id),
+    }
+
+    if provider == "omlx":
+        try:
+            snapshot["server_sampling"] = _capture_omlx_sampling(model_id, errors)
+        except Exception as exc:
+            errors.append({"source": "server_sampling", "error": f"{type(exc).__name__}: {exc}"})
+            snapshot["server_sampling"] = {"note": "error while reading omlx config", "provider": provider}
+    else:
+        snapshot["server_sampling"] = {"note": "not introspectable for this provider", "provider": provider}
+
+    try:
+        patch_exists = _VENDOR_PATCH_TARGET.is_file()
+        patch_applied = patch_exists and _VENDOR_PATCH_MARKER in _VENDOR_PATCH_TARGET.read_text(errors="replace")
+    except Exception as exc:
+        patch_exists = patch_applied = False
+        errors.append({"source": "vendor_patch", "error": f"{type(exc).__name__}: {exc}"})
+    try:
+        target_file = str(_VENDOR_PATCH_TARGET.relative_to(REPO_ROOT))
+    except ValueError:
+        # Not under REPO_ROOT -- e.g. a test monkeypatched this constant to a
+        # tmp_path fixture. Fall back to the absolute path rather than raise.
+        target_file = str(_VENDOR_PATCH_TARGET)
+    snapshot["vendor_patch"] = {
+        "target_file": target_file,
+        "exists": patch_exists,
+        "applied": patch_applied,
+    }
+
+    snapshot["errors"] = errors
+    return snapshot
