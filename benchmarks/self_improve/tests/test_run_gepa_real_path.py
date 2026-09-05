@@ -56,6 +56,21 @@ def test_split_train_val_handles_singleton_group():
     assert len(val) == 1
 
 
+def test_split_train_val_always_holds_out_at_least_one_for_groups_larger_than_one():
+    """Real bug, confirmed by review: round(n * train_frac) can equal n
+    itself for n > 1 (e.g. n=3, train_frac=0.9 -> round(2.7)=3), which used
+    to fall through to the singleton-group fallback and duplicate the ENTIRE
+    group into val -- silently measuring training performance instead of
+    held-out validation performance for that stratum."""
+    trajs = [_traj(f"t{i}") for i in range(3)]
+    train, val = split_train_val(trajs, train_frac=0.9, seed=1)
+    assert len(train) == 2
+    assert len(val) == 1
+    val_ids = {t.task_id for t in val}
+    train_ids = {t.task_id for t in train}
+    assert val_ids.isdisjoint(train_ids)  # genuinely held out, not a duplicate
+
+
 def _args(**overrides):
     defaults = dict(
         reflection_model=None, confirm_real_run=False,

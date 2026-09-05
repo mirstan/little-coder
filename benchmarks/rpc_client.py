@@ -85,9 +85,22 @@ def _build_system_prompt() -> Path:
         return agents_md
 
     generated = REPO_ROOT / ".pi" / ".system-prompt.generated.md"
-    generated.parent.mkdir(parents=True, exist_ok=True)
     content = agents_md.read_text() + "\n\n# Principles\n\n" + principles_md.read_text()
-    generated.write_text(content)
+    try:
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write via tmp-file + rename: a plain write_text() truncates
+        # the shared file in place first, so a PiRpc constructed
+        # concurrently with another (parallel benchmark attempts, or a
+        # before/after comparison run) could read a corrupted, half-written
+        # system prompt -- real gap, confirmed by review. Falls back to
+        # AGENTS.md alone, same as the no-PRINCIPLES.md path above, if the
+        # write itself fails (e.g. a read-only .pi/) rather than raising an
+        # uncaught OSError out of PiRpc.__init__.
+        tmp = generated.with_name(f"{generated.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp.write_text(content)
+        tmp.replace(generated)
+    except OSError:
+        return agents_md
     return generated
 
 

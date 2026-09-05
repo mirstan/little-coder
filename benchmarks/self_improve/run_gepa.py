@@ -55,8 +55,12 @@ class _Example:
         self.trajectory = trajectory
 
 
-def _ingest_all(log_roots: dict[str, str]) -> tuple[list[NormalizedTrajectory], list[str]]:
+def _ingest_all(
+    log_roots: dict[str, str], repo_root: Path | None = None
+) -> tuple[list[NormalizedTrajectory], list[str]]:
     """log_roots keys: 'aider' (value: 'log_root,results_json'), 'gaia', 'harbor', 'tb'.
+    repo_root resolves knowledge-inject component usage for aider/gaia (see
+    ingest.common.build_knowledge_topic_index()).
 
     Returns (trajectories, empty_sources) -- empty_sources lists every
     REQUESTED key that yielded zero trajectories, whether because ingest
@@ -69,20 +73,34 @@ def _ingest_all(log_roots: dict[str, str]) -> tuple[list[NormalizedTrajectory], 
 
     if "aider" in log_roots:
         raw = log_roots["aider"]
-        log_root_str, _, results_json_str = raw.partition(",")
-        try:
-            trajs = aider_polyglot_ingest.load(Path(log_root_str), Path(results_json_str))
-            trajectories.extend(trajs)
-            logger.info("ingested %d aider_polyglot trajectories", len(trajs))
-            if not trajs:
-                empty_sources.append("aider")
-        except Exception as e:
-            logger.warning("aider_polyglot ingest failed: %s", e, exc_info=True)
+        log_root_str, sep, results_json_str = raw.partition(",")
+        if not sep:
+            # Real gap, confirmed by review: Path("") normalizes to Path("."),
+            # whose .exists() is True, so a missing ",<results.json>" suffix
+            # previously bypassed aider_polyglot_ingest.load()'s own
+            # FileNotFoundError guard and surfaced as an opaque
+            # IsADirectoryError instead of a clear misconfiguration message.
+            logger.warning(
+                "aider_polyglot ingest failed: --log-roots aider=%r is missing the "
+                "required ',<results.json path>' suffix", raw,
+            )
             empty_sources.append("aider")
+        else:
+            try:
+                trajs = aider_polyglot_ingest.load(
+                    Path(log_root_str), Path(results_json_str), repo_root=repo_root,
+                )
+                trajectories.extend(trajs)
+                logger.info("ingested %d aider_polyglot trajectories", len(trajs))
+                if not trajs:
+                    empty_sources.append("aider")
+            except Exception as e:
+                logger.warning("aider_polyglot ingest failed: %s", e, exc_info=True)
+                empty_sources.append("aider")
 
     if "gaia" in log_roots:
         try:
-            trajs = gaia_ingest.load(Path(log_roots["gaia"]))
+            trajs = gaia_ingest.load(Path(log_roots["gaia"]), repo_root=repo_root)
             trajectories.extend(trajs)
             logger.info("ingested %d gaia trajectories", len(trajs))
             if not trajs:
@@ -204,9 +222,20 @@ def split_train_val(trajectories: list[NormalizedTrajectory], train_frac: float,
     for group in groups.values():
         shuffled = group[:]
         rng.shuffle(shuffled)
-        cut = max(1, round(len(shuffled) * train_frac)) if len(shuffled) > 1 else len(shuffled)
+        n = len(shuffled)
+        if n <= 1:
+            cut = n
+        else:
+            # Real bug, confirmed by review: round(n * train_frac) can equal
+            # n itself for n > 1 (e.g. n=3, train_frac=0.9 -> round(2.7)=3),
+            # which used to fall through to the "tiny groups" `or` fallback
+            # below and silently duplicate the ENTIRE group into val instead
+            # of holding out just the size-1 groups it was meant for. Clamp
+            # to n-1 so any group with more than one item always keeps at
+            # least one genuinely held-out example.
+            cut = min(max(1, round(n * train_frac)), n - 1)
         train.extend(shuffled[:cut])
-        val.extend(shuffled[cut:] or shuffled[:cut])  # tiny groups: reuse for val rather than empty
+        val.extend(shuffled[cut:] or shuffled[:cut])  # only n<=1 hits this fallback now
     return train, val
 
 
@@ -321,7 +350,7 @@ def main():
         key, _, value = kv.partition("=")
         log_roots[key] = value
 
-    trajectories, empty_sources = _ingest_all(log_roots)
+    trajectories, empty_sources = _ingest_all(log_roots, repo_root=Path(args.repo_root))
     components = load_components(Path(args.components_config), repo_root=Path(args.repo_root))
 
     weights_path = Path(args.components_config).parent / "benchmark_weights.yaml"

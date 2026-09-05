@@ -131,3 +131,16 @@ reviewed the local commit.
 4. Full-scope expansion (all ~32 components at once) should only happen after
    the single-component case (e.g. just `skills/tools/bash.md`) clears
    Layers 4 and 5, per `VALIDATION_PLAN.md`'s closing summary table.
+5. `ComponentUsage.was_error_context` (`ingest/common.py`'s `follows_error`
+   param to `merge_component_usage()`) is never set `True` by any real
+   caller today -- both `gaia_ingest.py` and `aider_polyglot_ingest.py` pass
+   the default `False`. The metric's `_component_feedback()` is written to
+   cite "(including right after a tool error)" when this flag is set, but
+   since no ingest module currently correlates a notification line's
+   position with an adjacent tool-call error in `tool_calls.jsonl`, that
+   refinement never actually fires against real data -- only in unit tests
+   that set it directly. Confirmed by review; not fixed here because doing
+   it correctly needs a real ordering/timestamp correlation across two
+   separate log files per benchmark, which is more than a "safe, well-defined"
+   fix -- it needs its own design pass on what "right after" should mean
+   (same turn? N lines apart? within a time window?).

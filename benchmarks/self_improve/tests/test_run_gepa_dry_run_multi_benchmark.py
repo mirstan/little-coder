@@ -64,6 +64,19 @@ def test_ingest_all_records_empty_source_when_a_requested_root_yields_nothing(tm
     assert empty_sources == ["gaia"]
 
 
+def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_path):
+    """Real gap, confirmed by review: `--log-roots aider=<dir>` with no
+    ',<results.json>' suffix used to make Path("") -> Path(".") -- whose
+    .exists() is True -- silently bypass aider_polyglot_ingest.load()'s own
+    FileNotFoundError guard and surface as an opaque IsADirectoryError deep
+    inside json.loads(). Must be caught before ever calling load()."""
+    log_root, _results_json = _make_aider_fixture(tmp_path)
+    log_roots = {"aider": str(log_root)}  # no comma, no results.json path
+    trajectories, empty_sources = _ingest_all(log_roots)
+    assert trajectories == []
+    assert empty_sources == ["aider"]
+
+
 def test_ingest_all_records_empty_source_when_ingest_raises(tmp_path):
     """Same guarantee on the exception path: a malformed results.json for
     aider_polyglot raises inside ingest today (confirmed: aider_polyglot_ingest

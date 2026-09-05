@@ -52,6 +52,34 @@ def test_build_system_prompt_falls_back_to_agents_md_path_when_agents_md_missing
     assert not path.exists()  # caller's existence check correctly sees this as absent
 
 
+def test_build_system_prompt_falls_back_to_agents_md_when_write_fails(tmp_path, monkeypatch):
+    """Real gap, confirmed by review: an unguarded write_text()/mkdir() gave
+    PiRpc.__init__ a new unguarded OSError surface once PRINCIPLES.md exists
+    (e.g. a read-only .pi/ directory) -- must degrade the same way the
+    no-PRINCIPLES.md path already does, not crash the whole benchmark run."""
+    (tmp_path / "AGENTS.md").write_text("# little-coder\n\nBody.\n")
+    (tmp_path / "PRINCIPLES.md").write_text("Be concise.\n")
+    monkeypatch.setattr(rpc_client, "REPO_ROOT", tmp_path)
+    # .pi exists as a FILE, not a directory -- mkdir(parents=True, exist_ok=True)
+    # on generated.parent raises FileExistsError (an OSError subclass).
+    (tmp_path / ".pi").write_text("not a directory")
+    path = rpc_client._build_system_prompt()
+    assert path == tmp_path / "AGENTS.md"
+
+
+def test_build_system_prompt_leaves_no_partial_file_visible_mid_write(tmp_path, monkeypatch):
+    """The generated file is produced via tmp-file + rename, not an in-place
+    write_text() truncation -- confirms no stray .tmp-* file is left behind
+    on a normal successful call (rename cleans it up as part of replacing
+    the target)."""
+    (tmp_path / "AGENTS.md").write_text("# little-coder\n\nBody.\n")
+    (tmp_path / "PRINCIPLES.md").write_text("Be concise.\n")
+    monkeypatch.setattr(rpc_client, "REPO_ROOT", tmp_path)
+    path = rpc_client._build_system_prompt()
+    leftover_tmp_files = [p for p in path.parent.iterdir() if ".tmp-" in p.name]
+    assert leftover_tmp_files == []
+
+
 def test_build_system_prompt_refreshes_on_each_call(tmp_path, monkeypatch):
     """Edits to PRINCIPLES.md between two PiRpc constructions must be picked
     up -- the generated file is rewritten every call, not cached."""
