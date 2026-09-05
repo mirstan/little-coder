@@ -13,11 +13,19 @@ class FakeExample:
         self.trajectory = trajectory
 
 
-def test_metric_episode_level_returns_base_score_for_pass():
+def test_metric_episode_level_returns_bare_float_not_score_with_feedback():
+    """pred_name=None (dspy's plain Evaluate path, used by GEPA for
+    valset/trainset Pareto tracking) must get a bare float back -- NOT
+    ScoreWithFeedback, confirmed via a real GEPA run: TypeError:
+    unsupported operand type(s) for +: 'int' and 'ScoreWithFeedback' inside
+    dspy's own sum(vals) progress-reporting code. The real
+    dspy.teleprompt.gepa.gepa_utils.ScoreWithFeedback extends
+    dspy.Prediction (dict-like), genuinely incompatible with sum()."""
     traj = NormalizedTrajectory(benchmark="aider_polyglot", task_id="t", success=True,
                                  stop_reason="agent_end", turn_count=3, partial_score=1.0)
     result = metric(FakeExample(traj), pred=None, trace=None, pred_name=None, pred_trace=None)
-    assert result.score == 1.0
+    assert result == 1.0
+    assert isinstance(result, float)
 
 
 def test_metric_works_with_standard_3_arg_dspy_evaluate_call_signature():
@@ -31,7 +39,7 @@ def test_metric_works_with_standard_3_arg_dspy_evaluate_call_signature():
     traj = NormalizedTrajectory(benchmark="aider_polyglot", task_id="t", success=True,
                                  stop_reason="agent_end", turn_count=1, partial_score=1.0)
     result = metric(FakeExample(traj), None, None)  # exactly 3 positional args, no keywords
-    assert result.score == 1.0
+    assert result == 1.0
 
 
 def test_metric_works_with_2_arg_call_signature():
@@ -39,21 +47,21 @@ def test_metric_works_with_2_arg_call_signature():
     traj = NormalizedTrajectory(benchmark="gaia", task_id="t", success=False,
                                  stop_reason="deadline", turn_count=1, partial_score=0.0)
     result = metric(FakeExample(traj), None)
-    assert result.score == 0.0
+    assert result == 0.0
 
 
 def test_metric_episode_level_returns_base_score_for_fail():
     traj = NormalizedTrajectory(benchmark="gaia", task_id="t", success=False,
                                  stop_reason="deadline", turn_count=3, partial_score=0.0)
     result = metric(FakeExample(traj), pred=None, trace=None, pred_name=None, pred_trace=None)
-    assert result.score == 0.0
+    assert result == 0.0
 
 
 def test_metric_pass_2_scores_partial_credit():
     traj = NormalizedTrajectory(benchmark="aider_polyglot", task_id="t", success=True,
                                  stop_reason="agent_end", turn_count=5, partial_score=0.7)
     result = metric(FakeExample(traj), pred=None, trace=None, pred_name=None, pred_trace=None)
-    assert result.score == 0.7
+    assert result == 0.7
 
 
 def test_metric_component_not_used_returns_score_no_feedback():

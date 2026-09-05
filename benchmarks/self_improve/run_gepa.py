@@ -96,18 +96,22 @@ def _dry_run(trajectories: list[NormalizedTrajectory], components: dict[str, str
     for traj in trajectories:
         example = _Example(traj)
         try:
-            episode_result = metric(example, pred=None, trace=None, pred_name=None, pred_trace=None)
+            # pred_name=None returns a bare float (matches dspy's own plain-
+            # Evaluate calling convention) -- NOT a ScoreWithFeedback object;
+            # see metric.py's docstring for why the two calling conventions
+            # need different return types.
+            episode_score = metric(example, pred=None, trace=None, pred_name=None, pred_trace=None)
         except Exception as e:
             logger.warning("metric() failed for %s/%s (episode-level): %s", traj.benchmark, traj.task_id, e)
             errors += 1
             continue
 
-        if episode_result.score is None:
+        if episode_score is None:
             logger.warning("metric() returned None score for %s/%s", traj.benchmark, traj.task_id)
             errors += 1
             continue
 
-        per_benchmark_scores.setdefault(traj.benchmark, []).append(episode_result.score)
+        per_benchmark_scores.setdefault(traj.benchmark, []).append(episode_score)
 
         for usage in traj.components_used:
             if usage.pred_name not in components:

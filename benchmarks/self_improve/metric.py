@@ -47,22 +47,32 @@ def _component_feedback(traj: NormalizedTrajectory, usage: ComponentUsage, pred_
     return " ".join(parts)
 
 
-def metric(gold, pred, trace=None, pred_name=None, pred_trace=None, program_trace=None) -> ScoreWithFeedback:
-    """trace/pred_name/pred_trace/program_trace all default to None: dspy
-    calls metrics under multiple conventions depending on context -- plain
-    Evaluate (full valset/trainset scoring, used by GEPA's own Pareto
-    tracking) calls metric(gold, pred, trace) with only 3 positional args,
-    while GEPA's reflective credit-assignment step calls the full 6-arg
-    form. Confirmed via a real GEPA run: without these defaults, EVERY
-    Evaluate-driven call crashed with 'missing 2 required positional
-    arguments', silently scoring every trajectory as an exception (dspy's
-    parallelizer swallows the traceback into a 0.0), producing a fully
-    broken optimization pass with no real signal at all."""
+def metric(gold, pred, trace=None, pred_name=None, pred_trace=None, program_trace=None):
+    """Return type depends on the caller, confirmed via two real GEPA runs:
+
+    1. trace/pred_name/pred_trace/program_trace all default to None: dspy's
+       plain Evaluate utility (used by GEPA for full valset/trainset Pareto
+       tracking, NOT just its own reflective credit-assignment step) calls
+       metric(gold, pred, trace) with only 3 positional args. Without these
+       defaults, every such call crashed with "missing 2 required positional
+       arguments" -- silently swallowed by dspy's parallelizer into a 0.0,
+       producing a fully broken optimization pass with no real signal.
+
+    2. When pred_name is None (i.e. that same plain-Evaluate path), the
+       return value must be a bare float/bool, not a ScoreWithFeedback --
+       confirmed via TypeError: unsupported operand type(s) for +: 'int' and
+       'ScoreWithFeedback' inside dspy's progress-reporting sum(vals). The
+       real dspy.teleprompt.gepa.gepa_utils.ScoreWithFeedback extends
+       dspy.Prediction (dict-like), not float -- genuinely incompatible with
+       sum(). ScoreWithFeedback is only valid on the OTHER calling
+       convention: GEPA's reflective credit-assignment step, which always
+       supplies a real pred_name.
+    """
     traj: NormalizedTrajectory = gold.trajectory
     base_score = _score_for_benchmark(traj)
 
     if pred_name is None:
-        return ScoreWithFeedback(score=base_score, feedback=None)
+        return base_score
 
     usage = _find_usage(traj, pred_name)
     if usage is None:
