@@ -127,7 +127,7 @@ def test_attempt1_snapshot_predates_the_retry_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=True)
+    AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
 
     log_dir = tmp_path / "logs" / "pi" / "faker" / "ex"
     one = (log_dir / "workdir_1" / "solution.py").read_text()
@@ -159,13 +159,15 @@ def test_log_dir_namespaced_by_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
     monkeypatch.setattr(
         AP, "_run_codex_turn",
-        lambda model, work, prompt, resume: AP.PromptResult(
-            turn_count=1, agent_ended=True, stop_reason="agent_end",
-            assistant_text="codex did it"))
+        lambda model, work, prompt, session_id, log_dir, attempt_name: (
+            AP.PromptResult(turn_count=1, agent_ended=True, stop_reason="agent_end",
+                             assistant_text="codex did it"),
+            "fake-session-id",
+        ))
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=False)
-    AP._run_exercise("faker", "ex", "codex", "fake/model", verbose=False, retry=False)
+    AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=False)
+    AP._run_exercise("faker", "ex", "fake/model", agent="codex", verbose=False, retry=False)
 
     pi_traj = tmp_path / "logs" / "pi" / "faker" / "ex" / "trajectory_1.txt"
     codex_traj = tmp_path / "logs" / "codex" / "faker" / "ex" / "trajectory_1.txt"
