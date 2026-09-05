@@ -40,10 +40,42 @@ def test_ingest_all_combines_both_benchmarks(tmp_path):
         "aider": f"{log_root},{results_json}",
         "tb": str(REAL_TB_FIXTURE),
     }
-    trajectories = _ingest_all(log_roots)
+    trajectories, empty_sources = _ingest_all(log_roots)
     benchmarks_seen = {t.benchmark for t in trajectories}
     assert benchmarks_seen == {"aider_polyglot", "tb"}
     assert len(trajectories) == 2
+    assert empty_sources == []
+
+
+def test_ingest_all_records_empty_source_when_a_requested_root_yields_nothing(tmp_path):
+    """Real gap, confirmed by review: a requested source that ingests
+    successfully but finds zero trajectories (e.g. a log_root that exists
+    but is empty) must be distinguishable from one that was never requested,
+    so _real_run() can refuse rather than silently training on a subset."""
+    log_root, results_json = _make_aider_fixture(tmp_path)
+    empty_gaia_root = tmp_path / "empty_gaia_logs"
+    empty_gaia_root.mkdir()
+    log_roots = {
+        "aider": f"{log_root},{results_json}",
+        "gaia": str(empty_gaia_root),
+    }
+    trajectories, empty_sources = _ingest_all(log_roots)
+    assert len(trajectories) == 1  # aider's one trajectory
+    assert empty_sources == ["gaia"]
+
+
+def test_ingest_all_records_empty_source_when_ingest_raises(tmp_path):
+    """Same guarantee on the exception path: a malformed results.json for
+    aider_polyglot raises inside ingest today (confirmed: aider_polyglot_ingest
+    reads it eagerly) -- this must still be reported as an empty source, not
+    just logged and forgotten."""
+    log_root, _results_json = _make_aider_fixture(tmp_path)
+    malformed_results_json = tmp_path / "not_json.json"
+    malformed_results_json.write_text("not valid json{{{")
+    log_roots = {"aider": f"{log_root},{malformed_results_json}"}
+    trajectories, empty_sources = _ingest_all(log_roots)
+    assert trajectories == []
+    assert empty_sources == ["aider"]
 
 
 def test_dry_run_produces_a_plausible_weighted_aggregate_across_benchmarks(tmp_path, capsys):
@@ -56,7 +88,7 @@ def test_dry_run_produces_a_plausible_weighted_aggregate_across_benchmarks(tmp_p
         "aider": f"{log_root},{results_json}",
         "tb": str(REAL_TB_FIXTURE),
     }
-    trajectories = _ingest_all(log_roots)
+    trajectories, _empty_sources = _ingest_all(log_roots)
 
     real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
     components = load_components(

@@ -55,9 +55,17 @@ class _Example:
         self.trajectory = trajectory
 
 
-def _ingest_all(log_roots: dict[str, str]) -> list[NormalizedTrajectory]:
-    """log_roots keys: 'aider' (value: 'log_root,results_json'), 'gaia', 'harbor', 'tb'."""
+def _ingest_all(log_roots: dict[str, str]) -> tuple[list[NormalizedTrajectory], list[str]]:
+    """log_roots keys: 'aider' (value: 'log_root,results_json'), 'gaia', 'harbor', 'tb'.
+
+    Returns (trajectories, empty_sources) -- empty_sources lists every
+    REQUESTED key that yielded zero trajectories, whether because ingest
+    raised or because it legitimately found nothing. Distinguishing "some
+    sources silently produced nothing" from "combined result is empty" lets
+    _real_run() refuse a paid run before it trains on a partial, likely
+    misconfigured dataset instead of the one the caller actually asked for."""
     trajectories: list[NormalizedTrajectory] = []
+    empty_sources: list[str] = []
 
     if "aider" in log_roots:
         raw = log_roots["aider"]
@@ -66,16 +74,22 @@ def _ingest_all(log_roots: dict[str, str]) -> list[NormalizedTrajectory]:
             trajs = aider_polyglot_ingest.load(Path(log_root_str), Path(results_json_str))
             trajectories.extend(trajs)
             logger.info("ingested %d aider_polyglot trajectories", len(trajs))
+            if not trajs:
+                empty_sources.append("aider")
         except Exception as e:
-            logger.warning("aider_polyglot ingest failed: %s", e)
+            logger.warning("aider_polyglot ingest failed: %s", e, exc_info=True)
+            empty_sources.append("aider")
 
     if "gaia" in log_roots:
         try:
             trajs = gaia_ingest.load(Path(log_roots["gaia"]))
             trajectories.extend(trajs)
             logger.info("ingested %d gaia trajectories", len(trajs))
+            if not trajs:
+                empty_sources.append("gaia")
         except Exception as e:
-            logger.warning("gaia ingest failed: %s", e)
+            logger.warning("gaia ingest failed: %s", e, exc_info=True)
+            empty_sources.append("gaia")
 
     for key in ("harbor", "tb"):
         if key in log_roots:
@@ -83,10 +97,13 @@ def _ingest_all(log_roots: dict[str, str]) -> list[NormalizedTrajectory]:
                 trajs = harbor_tb_ingest.load(Path(log_roots[key]), benchmark=key)
                 trajectories.extend(trajs)
                 logger.info("ingested %d %s trajectories", len(trajs), key)
+                if not trajs:
+                    empty_sources.append(key)
             except Exception as e:
-                logger.warning("%s ingest failed: %s", key, e)
+                logger.warning("%s ingest failed: %s", key, e, exc_info=True)
+                empty_sources.append(key)
 
-    return trajectories
+    return trajectories, empty_sources
 
 
 def _dry_run(trajectories: list[NormalizedTrajectory], components: dict[str, str], weights: dict[str, float]):
@@ -197,6 +214,7 @@ def _real_run(
     trajectories: list[NormalizedTrajectory],
     components: dict[str, str],
     args,
+    empty_sources: list[str] = (),
 ) -> int:
     """Wires the real (non-dry-run) GEPA path. Requires explicit, redundant
     confirmation before GEPA.compile() -- which spends real reflection_lm
@@ -223,6 +241,19 @@ def _real_run(
 
     if not trajectories:
         print("No trajectories ingested -- nothing to optimize against.", file=sys.stderr)
+        return 1
+
+    if empty_sources and not getattr(args, "allow_partial_ingest", False):
+        print(
+            "Refusing to run GEPA for real: the following requested log-root(s) "
+            f"yielded zero trajectories: {', '.join(empty_sources)}. This usually "
+            "means a bad path or an ingest failure (see the warning log above), "
+            "not an intentionally empty benchmark -- training on the remaining "
+            "sources alone would silently spend budget on a dataset different "
+            "from the one requested.\n"
+            "Pass --allow-partial-ingest if this is expected.",
+            file=sys.stderr,
+        )
         return 1
 
     train_trajs, val_trajs = split_train_val(trajectories, args.train_frac, args.seed)
@@ -275,6 +306,9 @@ def main():
     ap.add_argument("--confirm-real-run", action="store_true",
                      help="Required in addition to --reflection-model and "
                           f"${REFLECTION_LM_API_KEY_ENV} to actually spend API budget.")
+    ap.add_argument("--allow-partial-ingest", action="store_true",
+                     help="Allow a real run even when one or more requested "
+                          "--log-roots sources yielded zero trajectories.")
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out-dir", default="benchmarks/self_improve/runs/latest")
@@ -287,7 +321,7 @@ def main():
         key, _, value = kv.partition("=")
         log_roots[key] = value
 
-    trajectories = _ingest_all(log_roots)
+    trajectories, empty_sources = _ingest_all(log_roots)
     components = load_components(Path(args.components_config), repo_root=Path(args.repo_root))
 
     weights_path = Path(args.components_config).parent / "benchmark_weights.yaml"
@@ -299,7 +333,7 @@ def main():
         _dry_run(trajectories, components, weights)
         return 0
 
-    return _real_run(trajectories, components, args)
+    return _real_run(trajectories, components, args, empty_sources=empty_sources)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ def _args(**overrides):
     defaults = dict(
         reflection_model=None, confirm_real_run=False,
         train_frac=0.7, seed=42, out_dir="/tmp/unused",
+        allow_partial_ingest=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -98,3 +99,40 @@ def test_real_run_refuses_with_no_trajectories_even_if_fully_authorized(monkeypa
         _args(reflection_model="some/model", confirm_real_run=True),
     )
     assert code == 1
+
+
+def test_real_run_refuses_when_a_requested_source_yielded_zero_trajectories(monkeypatch):
+    """Real gap, confirmed by review: _ingest_all can silently swallow a
+    per-source failure (bad path, malformed logs) and still return a
+    non-empty combined list from the OTHER sources -- which would otherwise
+    sail past the 'no trajectories' check and train on a dataset the caller
+    never actually asked for."""
+    monkeypatch.setenv("REFLECTION_LM_API_KEY", "fake-key-not-real")
+    code = _real_run(
+        [_traj("t1")], {"agents_md": "body"},
+        _args(reflection_model="some/model", confirm_real_run=True),
+        empty_sources=["gaia"],
+    )
+    assert code == 1
+
+
+def test_real_run_allows_partial_ingest_when_explicitly_overridden(monkeypatch, tmp_path):
+    """--allow-partial-ingest is the documented, explicit escape hatch --
+    with it set, an empty source must not block an otherwise-authorized run."""
+    monkeypatch.setenv("REFLECTION_LM_API_KEY", "fake-key-not-real")
+
+    class _StubGEPA:
+        def __init__(self, **kw):
+            pass
+
+        def compile(self, student, **kw):
+            return student
+
+    monkeypatch.setattr("dspy.GEPA", _StubGEPA)
+    code = _real_run(
+        [_traj("t1")], {"agents_md": "body"},
+        _args(reflection_model="some/model", confirm_real_run=True, allow_partial_ingest=True,
+              out_dir=str(tmp_path / "out")),
+        empty_sources=["gaia"],
+    )
+    assert code == 0
