@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from benchmarks.self_improve.ingest.common import (
+    build_knowledge_topic_index,
     merge_component_usage,
     parse_notification_line,
     summarize_for_reflection,
@@ -20,12 +23,67 @@ def test_parse_skill_inject_notification_research_directive_only():
     assert usages == []
 
 
-def test_parse_knowledge_inject_notification():
-    usages = parse_notification_line("[info] knowledge-inject: +2 [binary_search,two_pointer]")
+def test_parse_knowledge_inject_notification_resolves_via_topic_index():
+    """Real notification format, confirmed by review: knowledge-inject's
+    bracketed names are each entry's `topic` FRONTMATTER FIELD (e.g. "Binary
+    Search"), an arbitrary human string independent of the file's name/stem
+    -- never a slug. pred_name can only be resolved via a topic index built
+    from the real skill files (build_knowledge_topic_index()), never by
+    string transformation of the topic itself."""
+    index = {
+        "Binary Search": "skills_knowledge_binary_search",
+        "Two Pointers": "skills_knowledge_two_pointers",
+    }
+    usages = parse_notification_line(
+        "[info] knowledge-inject: +2 [Binary Search,Two Pointers]", knowledge_topic_index=index,
+    )
     assert usages == [
         ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
-        ComponentUsage(pred_name="skills_knowledge_two_pointer", invocation_count=1),
+        ComponentUsage(pred_name="skills_knowledge_two_pointers", invocation_count=1),
     ]
+
+
+def test_parse_knowledge_inject_notification_drops_unresolved_topic():
+    """Without a topic index (or a topic missing from it -- e.g. a renamed
+    skill file), the usage record is dropped rather than guessed at."""
+    assert parse_notification_line("[info] knowledge-inject: +1 [Some Unknown Topic]") == []
+
+
+def _write_skill_file(path, name, topic=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fm = f"name: {name}\n" + (f"topic: {topic}\n" if topic else "")
+    path.write_text(f"---\n{fm}---\nBody text.\n")
+
+
+def test_build_knowledge_topic_index_maps_topic_field_to_pred_name(tmp_path):
+    _write_skill_file(tmp_path / "skills" / "knowledge" / "binary_search.md",
+                       "binary-search", topic="Binary Search")
+    index = build_knowledge_topic_index(tmp_path)
+    assert index == {"Binary Search": "skills_knowledge_binary_search"}
+
+
+def test_build_knowledge_topic_index_falls_back_to_name_field_when_no_topic(tmp_path):
+    """skills/protocols/*.md files have no `topic:` field at all (confirmed
+    against real files) -- topic falls back to `name`, exactly matching
+    .pi/extensions/knowledge-inject/index.ts:49-50."""
+    _write_skill_file(tmp_path / "skills" / "protocols" / "cite_before_answer.md",
+                       "cite-before-answer")
+    index = build_knowledge_topic_index(tmp_path)
+    assert index == {"cite-before-answer": "skills_protocols_cite_before_answer"}
+
+
+def test_build_knowledge_topic_index_handles_missing_directories(tmp_path):
+    assert build_knowledge_topic_index(tmp_path) == {}
+
+
+def test_build_knowledge_topic_index_against_real_repo_files():
+    """End-to-end against the REAL skills/knowledge and skills/protocols
+    files, not fixtures -- confirms the index actually resolves the same
+    topic strings real notification lines carry."""
+    real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
+    index = build_knowledge_topic_index(real_repo_root)
+    assert index["Binary Search"] == "skills_knowledge_binary_search"
+    assert index["cite-before-answer"] == "skills_protocols_cite_before_answer"
 
 
 def test_parse_notification_line_ignores_unrelated_lines():

@@ -130,3 +130,21 @@ def test_write_components_back_rejects_path_that_escapes_repo_root(tmp_path, rel
     components_yaml = _make_repo_with_escaping_entry(tmp_path, rel_path)
     with pytest.raises(ValueError, match="escapes repo_root"):
         write_components_back(components_yaml, repo_root=tmp_path, optimized={"escaping": "pwned"})
+
+
+def test_write_components_back_warns_on_pred_name_missing_from_components_yaml(tmp_path, caplog):
+    """Real gap, confirmed by review: applying an `optimized` dict against a
+    components.yaml with a smaller/different scope (e.g. a full-scope run's
+    output applied against a scoped-down pilot yaml, per README.md's
+    documented pilot-then-full-run workflow) used to silently drop every
+    unmatched pred_name with zero signal -- `changed` just came back shorter
+    than expected, with no way to tell "nothing changed" from "scope
+    mismatch" apart."""
+    components_yaml = _make_repo(tmp_path)
+    with caplog.at_level("WARNING"):
+        changed = write_components_back(
+            components_yaml, repo_root=tmp_path,
+            optimized={"not_a_real_pred_name": "some optimized text"},
+        )
+    assert changed == []
+    assert "not_a_real_pred_name" in caplog.text

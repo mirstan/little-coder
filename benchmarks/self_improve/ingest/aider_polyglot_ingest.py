@@ -25,7 +25,12 @@ import logging
 import re
 from pathlib import Path
 
-from benchmarks.self_improve.ingest.common import merge_component_usage, summarize_for_reflection
+from benchmarks.self_improve.ingest.common import (
+    build_knowledge_topic_index,
+    merge_component_usage,
+    summarize_for_reflection,
+)
+from benchmarks.self_improve.path_safety import resolve_contained_path
 from benchmarks.self_improve.schema import NormalizedTrajectory
 
 logger = logging.getLogger(__name__)
@@ -50,7 +55,13 @@ def _pass_n_score(status: str) -> tuple[bool, float] | None:
     return True, score
 
 
-def load(log_root: Path, results_json_path: Path) -> list[NormalizedTrajectory]:
+def load(
+    log_root: Path, results_json_path: Path, repo_root: Path | None = None
+) -> list[NormalizedTrajectory]:
+    """repo_root, if given, resolves knowledge-inject component usage against
+    the real skills/knowledge and skills/protocols files (see
+    ingest.common.build_knowledge_topic_index()). Without it, knowledge-inject
+    usage is dropped (skill-inject usage is unaffected either way)."""
     results_json_path = Path(results_json_path)
     if not results_json_path.exists():
         raise FileNotFoundError(f"results_full_polyglot.json not found: {results_json_path}")
@@ -58,23 +69,29 @@ def load(log_root: Path, results_json_path: Path) -> list[NormalizedTrajectory]:
     log_root = Path(log_root)
     results = json.loads(results_json_path.read_text())
     exercises = results.get("exercises", {})
+    knowledge_topic_index = build_knowledge_topic_index(repo_root) if repo_root else {}
 
     trajectories = []
     for key, record in exercises.items():
         lang, _, exercise = key.partition("/")
         # results_full_polyglot.json is repo-controlled data today, but a
         # corrupted or malicious "lang/exercise" key (e.g. containing "..")
-        # would otherwise let ex_dir below escape log_root entirely -- cheap
-        # to validate, so validate it.
-        ex_dir = (log_root / lang / exercise).resolve()
-        if not ex_dir.is_relative_to(log_root.resolve()):
+        # would otherwise let ex_dir escape log_root entirely -- cheap to
+        # validate, so validate it (shared with components.py's identical
+        # check -- see path_safety.py).
+        try:
+            resolve_contained_path(log_root, f"{lang}/{exercise}")
+        except ValueError:
             logger.warning("aider_polyglot_ingest: skipping %r, escapes log_root", key)
             continue
-        trajectories.append(_build_trajectory(log_root, lang, exercise, key, record))
+        trajectories.append(_build_trajectory(log_root, lang, exercise, key, record, knowledge_topic_index))
     return trajectories
 
 
-def _build_trajectory(log_root: Path, lang: str, exercise: str, key: str, record: dict) -> NormalizedTrajectory:
+def _build_trajectory(
+    log_root: Path, lang: str, exercise: str, key: str, record: dict,
+    knowledge_topic_index: dict[str, str] | None = None,
+) -> NormalizedTrajectory:
     status = record.get("status", "fail")
     success, partial_score = _pass_n_score(status) or (False, 0.0)
 
@@ -89,8 +106,8 @@ def _build_trajectory(log_root: Path, lang: str, exercise: str, key: str, record
     ex_dir = log_root / lang / exercise
     assistant_text = ""
     tool_calls: list[dict] = []
-    components_used = []
     raw_paths: dict[str, str] = {}
+    all_notif_lines: list[str] = []
 
     if ex_dir.is_dir():
         # Sort by the parsed attempt NUMBER, not the filename string --
@@ -102,23 +119,32 @@ def _build_trajectory(log_root: Path, lang: str, exercise: str, key: str, record
             return int(m.group(1)) if m else -1
 
         attempt_files = sorted(ex_dir.glob("trajectory_*.json"), key=_attempt_num)
-        if attempt_files:
-            latest = attempt_files[-1]
+        for attempt_file in attempt_files:
             try:
-                data = json.loads(latest.read_text())
-                assistant_text = data.get("assistant_text", "")
-                tool_calls = data.get("tool_calls", [])
-                raw_paths["trajectory"] = str(latest)
-                # Present only for trajectories dumped after
-                # aider_polyglot.py's notifications= addition to
-                # _dump_trajectory -- absent for older data, degrades to [].
-                notif_lines = [
-                    f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
-                    for n in data.get("notifications", [])
-                ]
-                components_used = merge_component_usage(notif_lines)
+                data = json.loads(attempt_file.read_text())
             except (json.JSONDecodeError, OSError) as e:
-                logger.warning("aider_polyglot_ingest: failed to read %s: %s", latest, e)
+                logger.warning("aider_polyglot_ingest: failed to read %s: %s", attempt_file, e)
+                continue
+            # components_used is a UNION across every successfully-parsed
+            # attempt: a skill injected on an earlier, failed attempt but not
+            # re-triggered on the attempt that ultimately passed still
+            # genuinely influenced the outcome -- real gap, confirmed by
+            # review, in previously reading only the latest attempt's
+            # notifications. Present only for trajectories dumped after
+            # aider_polyglot.py's notifications= addition to
+            # _dump_trajectory -- absent for older data, degrades to [].
+            all_notif_lines.extend(
+                f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
+                for n in data.get("notifications", [])
+            )
+            # summarized_transcript/raw_paths reflect the LATEST
+            # successfully-parsed attempt only -- that conversation is the
+            # one actually relevant to reflection_lm.
+            assistant_text = data.get("assistant_text", "")
+            tool_calls = data.get("tool_calls", [])
+            raw_paths["trajectory"] = str(attempt_file)
+
+    components_used = merge_component_usage(all_notif_lines, knowledge_topic_index=knowledge_topic_index)
 
     return NormalizedTrajectory(
         benchmark="aider_polyglot",

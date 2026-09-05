@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -227,6 +228,55 @@ def test_load_picks_latest_attempt_by_numeric_not_lexicographic_order(tmp_path):
     traj = aider_polyglot_ingest.load(log_root, results_json)[0]
     assert "attempt 10" in traj.summarized_transcript
     assert traj.raw_paths["trajectory"].endswith("trajectory_10.json")
+
+
+def test_load_components_used_is_union_across_all_attempts_not_just_latest(tmp_path):
+    """Real gap, confirmed by review: a skill injected on an earlier, failed
+    attempt but not re-triggered on the attempt that ultimately passed still
+    genuinely influenced the outcome -- reading only the latest attempt's
+    notifications silently lost that signal."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "two-attempts"
+    ex.mkdir(parents=True)
+    _write_trajectory(
+        ex / "trajectory_1.json",
+        notifications=[{"message": "skill-inject: +1 [bash]", "notifyType": "info"}],
+    )
+    _write_trajectory(
+        ex / "trajectory_2.json",
+        notifications=[{"message": "skill-inject: +1 [read]", "notifyType": "info"}],
+    )
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/two-attempts": {"status": "pass_2", "stop_reasons": ["deadline", "agent_end"],
+                                 "turn_count": 2},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    names = {u.pred_name for u in traj.components_used}
+    assert names == {"skills_tools_bash", "skills_tools_read"}
+    # raw_paths/summarized_transcript still reflect only the latest attempt
+    assert traj.raw_paths["trajectory"].endswith("trajectory_2.json")
+
+
+def test_load_resolves_knowledge_inject_usage_when_repo_root_given(tmp_path):
+    """Real bug, confirmed by review: knowledge-inject notification names are
+    the topic FRONTMATTER FIELD (e.g. "Binary Search"), not a slug -- must
+    resolve against the REAL skills/knowledge files via repo_root."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "ex"
+    ex.mkdir(parents=True)
+    _write_trajectory(
+        ex / "trajectory_1.json",
+        notifications=[{"message": "knowledge-inject: +1 [Binary Search]", "notifyType": "info"}],
+    )
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/ex": {"status": "pass_1", "stop_reasons": ["agent_end"], "turn_count": 1},
+    }}))
+    real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
+    traj = aider_polyglot_ingest.load(log_root, results_json, repo_root=real_repo_root)[0]
+    names = {u.pred_name for u in traj.components_used}
+    assert names == {"skills_knowledge_binary_search"}
 
 
 def test_load_skips_exercise_key_that_would_escape_log_root(tmp_path):

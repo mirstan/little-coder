@@ -7,10 +7,13 @@ exactly (TDD_SPEC.md §7.2).
 config/components.yaml is the single source of truth mapping pred_name ->
 repo-relative file path.
 """
+import logging
 from pathlib import Path
 
 import dspy
 import yaml
+
+from benchmarks.self_improve.path_safety import resolve_contained_path
 
 _FRONTMATTER_DELIM = "---\n"
 
@@ -44,19 +47,16 @@ def _load_components_yaml(components_yaml_path: Path) -> dict[str, str]:
 def _resolve_component_path(repo_root: Path, rel_path: str) -> Path:
     """Join rel_path onto repo_root and verify the result stays inside it.
 
-    components.yaml is repo-controlled data today, but `Path(repo_root) /
-    rel_path` alone provides no containment: an ABSOLUTE rel_path discards
-    repo_root entirely (pathlib's `/` operator replaces the left side when
-    the right is absolute), and a relative one can still escape via `../`
-    segments. Cheap to validate regardless of current trust level
-    (confirmed hardening gap by review) -- this is the only thing standing
-    between a components.yaml edit and an arbitrary file read/overwrite.
+    components.yaml is repo-controlled data today, but that alone provides no
+    containment (confirmed hardening gap by review) -- this is the only thing
+    standing between a components.yaml edit and an arbitrary file
+    read/overwrite. See path_safety.resolve_contained_path for the shared
+    resolve+validate logic (also used by aider_polyglot_ingest.py).
     """
-    repo_root = Path(repo_root).resolve()
-    resolved = (repo_root / rel_path).resolve()
-    if not resolved.is_relative_to(repo_root):
-        raise ValueError(f"component path {rel_path!r} escapes repo_root {repo_root}")
-    return resolved
+    try:
+        return resolve_contained_path(repo_root, rel_path)
+    except ValueError as e:
+        raise ValueError(f"component path {rel_path!r} escapes repo_root {Path(repo_root).resolve()}") from e
 
 
 def load_components(components_yaml_path: Path, repo_root: Path) -> dict[str, str]:
@@ -128,6 +128,16 @@ def write_components_back(
     for pred_name, new_body in optimized.items():
         rel_path = mapping.get(pred_name)
         if rel_path is None:
+            # Real gap, confirmed by review: silently dropping this with no
+            # signal is how a mismatched components.yaml (e.g. applying a
+            # full-scope optimized set against a scoped-down pilot yaml)
+            # loses most of a run's results with zero error -- `changed`
+            # just comes back shorter than the caller expects.
+            logging.getLogger(__name__).warning(
+                "write_components_back: %r is not in %s -- skipping (optimized "
+                "and components.yaml were likely generated from different scopes)",
+                pred_name, components_yaml_path,
+            )
             continue
         file_path = _resolve_component_path(repo_root, rel_path)
         current_text = file_path.read_text()

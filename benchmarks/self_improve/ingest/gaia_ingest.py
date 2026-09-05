@@ -13,17 +13,27 @@ import json
 import logging
 from pathlib import Path
 
-from benchmarks.self_improve.ingest.common import merge_component_usage, summarize_for_reflection
+from benchmarks.self_improve.ingest.common import (
+    build_knowledge_topic_index,
+    merge_component_usage,
+    summarize_for_reflection,
+)
 from benchmarks.self_improve.schema import NormalizedTrajectory
 
 logger = logging.getLogger(__name__)
 
 
-def load(log_root: Path) -> list[NormalizedTrajectory]:
+def load(log_root: Path, repo_root: Path | None = None) -> list[NormalizedTrajectory]:
+    """repo_root, if given, resolves knowledge-inject component usage against
+    the real skills/knowledge and skills/protocols files (see
+    build_knowledge_topic_index()). Without it, knowledge-inject usage is
+    dropped (skill-inject usage is unaffected either way)."""
     log_root = Path(log_root)
     if not log_root.is_dir():
         logger.warning("gaia_ingest: log_root does not exist or is not a directory: %s", log_root)
         return []
+
+    knowledge_topic_index = build_knowledge_topic_index(repo_root) if repo_root else {}
 
     trajectories: list[NormalizedTrajectory] = []
     for entry in sorted(log_root.iterdir()):
@@ -33,13 +43,23 @@ def load(log_root: Path) -> list[NormalizedTrajectory]:
         # after this same is_dir() filter, so it could never match).
         if not entry.is_dir():
             continue
-        traj = _load_task(entry)
+        try:
+            traj = _load_task(entry, knowledge_topic_index)
+        except (OSError, UnicodeDecodeError) as e:
+            # Real gap, confirmed by review: an unguarded read_text() on
+            # stderr.log/notifications.txt/transcript.txt (e.g. non-UTF-8
+            # content from a crashed run) previously propagated all the way
+            # out of load(), where run_gepa.py's _ingest_all's broad
+            # except-Exception would discard EVERY task from this log_root,
+            # not just the one bad one.
+            logger.warning("gaia_ingest: skipping %s, failed to read task files: %s", entry, e)
+            continue
         if traj is not None:
             trajectories.append(traj)
     return trajectories
 
 
-def _load_task(task_dir: Path) -> NormalizedTrajectory | None:
+def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = None) -> NormalizedTrajectory | None:
     result_path = task_dir / "result.json"
     if not result_path.exists():
         logger.warning("gaia_ingest: skipping %s, no result.json", task_dir)
@@ -59,7 +79,7 @@ def _load_task(task_dir: Path) -> NormalizedTrajectory | None:
 
     notif_path = task_dir / "notifications.txt"
     notif_lines = notif_path.read_text().splitlines() if notif_path.exists() else []
-    components_used = merge_component_usage(notif_lines)
+    components_used = merge_component_usage(notif_lines, knowledge_topic_index=knowledge_topic_index)
 
     tool_calls_path = task_dir / "tool_calls.jsonl"
     tool_calls = []

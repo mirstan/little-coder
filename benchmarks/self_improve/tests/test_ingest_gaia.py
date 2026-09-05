@@ -101,3 +101,51 @@ def test_load_handles_missing_log_root_gracefully(tmp_path):
     """load() must never raise on a missing/non-directory log_root --
     matches the module's own graceful-degradation contract."""
     assert gaia_ingest.load(tmp_path / "does-not-exist") == []
+
+
+def test_load_resolves_knowledge_inject_usage_when_repo_root_given(tmp_path):
+    """Real bug, confirmed by review: knowledge-inject notification names are
+    the topic FRONTMATTER FIELD (e.g. "Binary Search"), not a slug -- must
+    resolve against the REAL skills/knowledge files via repo_root, not the
+    naive skills_knowledge_+name prefixing this used to do (which never
+    matched any real components.yaml key)."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text('{"correct": true}')
+    (task / "notifications.txt").write_text("[info] knowledge-inject: +1 [Binary Search]\n")
+
+    real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
+    trajs = gaia_ingest.load(tmp_path, repo_root=real_repo_root)
+    names = {u.pred_name for u in trajs[0].components_used}
+    assert names == {"skills_knowledge_binary_search"}
+
+
+def test_load_drops_knowledge_inject_usage_without_repo_root(tmp_path):
+    """Without repo_root, there's no way to resolve a topic to a pred_name --
+    must degrade to dropping the record (with a warning), not raise or guess."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text('{"correct": true}')
+    (task / "notifications.txt").write_text("[info] knowledge-inject: +1 [Binary Search]\n")
+
+    trajs = gaia_ingest.load(tmp_path)
+    assert trajs[0].components_used == []
+
+
+def test_load_skips_task_with_non_utf8_file_instead_of_crashing_whole_run(tmp_path):
+    """Real gap, confirmed by review: an unguarded read_text() on
+    stderr.log/notifications.txt/transcript.txt (e.g. non-UTF-8 content from
+    a crashed run) previously propagated out of load() entirely, where
+    run_gepa.py's _ingest_all broad except-Exception would discard EVERY
+    task from this log_root, not just the one with bad bytes."""
+    good = tmp_path / "task-good"
+    good.mkdir()
+    (good / "result.json").write_text('{"correct": true}')
+
+    bad = tmp_path / "task-bad"
+    bad.mkdir()
+    (bad / "result.json").write_text('{"correct": false}')
+    (bad / "stderr.log").write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+
+    trajs = gaia_ingest.load(tmp_path)
+    assert {t.task_id for t in trajs} == {"task-good"}
