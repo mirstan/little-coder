@@ -282,7 +282,8 @@ _ENV_KNOBS = (
 )
 
 
-def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_attempts: int = 2) -> dict:
+def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
+                    max_attempts: int = 2, thinking: str | None = None) -> dict:
     """Everything that affects whether an exercise passes.
 
     Absent from results until now, so `--resume` could silently blend runs made
@@ -297,6 +298,7 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_a
         "test_timeout_s": desc.get("timeout_s"),
         "retry": retry,
         "max_attempts": max_attempts if retry else 1,
+        "thinking": thinking,
         "score_in_copy": bool(desc.get("score_in_copy")),
         "allowed_tools": sorted(set(ALLOWED_TOOLS)),
         "env": {k: os.environ[k] for k in _ENV_KNOBS if k in os.environ},
@@ -415,6 +417,7 @@ def _run_exercise(
     verbose: bool,
     retry: bool,
     max_attempts: int = 2,
+    thinking: str | None = None,
 ):
     desc = LANG_DESCRIPTORS.get(lang)
     if desc is None:
@@ -463,7 +466,8 @@ def _run_exercise(
         for i in range(1, effective_attempts + 1):
             with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                        session_id=f"poly-{lang}-{ex_name}-attempt{i}",
-                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
+                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
+                       thinking=thinking) as rpc:
                 # prompt_and_collect() returns partial events *silently* when
                 # agent_end never arrives (_drain_events_until returns
                 # `collected`, it does not raise), so a budget-capped attempt
@@ -538,6 +542,10 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=2,
                      help="Total attempts including the first; default 2 matches "
                           "the original hardcoded one-retry behavior")
+    ap.add_argument("--thinking", default=None,
+                     help="--thinking level passed to the pi CLI "
+                          "(off/minimal/low/medium/high/xhigh/max). Unset = pi's "
+                          "own default (medium).")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -550,7 +558,8 @@ def main():
     if desc is None:
         sys.exit(f"No descriptor for language '{args.language}'. Supported: {list(LANG_DESCRIPTORS)}")
 
-    params = _scoring_params(args.model, args.language, not args.no_retry, desc, max_attempts=args.max_attempts)
+    params = _scoring_params(args.model, args.language, not args.no_retry, desc,
+                             max_attempts=args.max_attempts, thinking=args.thinking)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -601,6 +610,7 @@ def main():
                 verbose=args.verbose,
                 retry=not args.no_retry,
                 max_attempts=args.max_attempts,
+                thinking=args.thinking,
             )
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}

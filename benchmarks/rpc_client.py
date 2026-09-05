@@ -86,6 +86,7 @@ class PiRpc:
         tb_mode: bool = False,
         env: Optional[dict] = None,
         max_turns: Optional[int] = None,
+        thinking: Optional[str] = None,
         tb_shell_handler: Optional[Callable[[dict], str]] = None,
     ):
         if not PI_BIN.exists():
@@ -111,6 +112,8 @@ class PiRpc:
             full_env["LITTLE_CODER_MAX_TURNS"] = str(max_turns)
 
         cmd = [str(PI_BIN), "--mode", "rpc", "--no-session", "--model", model]
+        if thinking:
+            cmd.extend(["--thinking", thinking])
         for ext in _extension_paths():
             cmd.extend(["-e", ext])
         # Pi's --tools flag filters the tool SCHEMAS presented to the model

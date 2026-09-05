@@ -69,6 +69,26 @@ def test_rpc_allowed_tools_env_propagates(tmp_path):
         rpc.close(timeout=3)
 
 
+def test_rpc_thinking_flag_reaches_pi(tmp_path):
+    """thinking= should reach pi's own --thinking CLI flag, not just be
+    accepted and silently dropped. get_state reports the level pi actually
+    resolved, so this checks the real effect, not just that no error was
+    raised."""
+    rpc = PiRpc(
+        model="llamacpp/qwen3.6-35b-a3b",
+        cwd=str(tmp_path),
+        thinking="high",
+    )
+    try:
+        rid = str(uuid.uuid4())
+        rpc._send({"id": rid, "type": "get_state"})
+        resp = rpc._await_response(rid, timeout=20)
+        assert resp["success"] is True
+        assert resp["data"]["thinkingLevel"] == "high"
+    finally:
+        rpc.close(timeout=3)
+
+
 def test_rpc_tb_mode_env_propagates(tmp_path):
     """tb_mode=True sets LITTLE_CODER_TB_MODE=1 for the subprocess."""
     rpc = PiRpc(
