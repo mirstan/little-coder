@@ -467,12 +467,22 @@ def _run_exercise(
         attempt = "pass_1" if passed else None
 
         if not passed and retry and outcome_1 == "completed":
+            # Repeats the original prompt in full, not just the failure --
+            # each attempt is now a fresh session (see above), so a retry
+            # prompt built from the failure alone drops the exercise name,
+            # the stub/test file paths, the "tests are for reference only --
+            # DO NOT edit" constraint, and the syntax hint. Without those, an
+            # agent scoring itself against a copy of the tree (_score()) has
+            # nothing stopping it from "fixing" the failure by editing the
+            # test file instead of the implementation and recording a
+            # fabricated pass.
             retry_prompt = (
-                "The tests failed. Output:\n\n```\n"
+                prompt
+                + "\n\n---\n\nThis is a retry: the file(s) already contain "
+                  "your previous attempt's code (read the current state "
+                  "before editing). The tests failed with this output:\n\n```\n"
                 + out[-4000:]
-                + "\n```\n\nThe file(s) still contain your previous attempt's "
-                  "code -- read the current state, then fix the "
-                  "implementation and try again."
+                + "\n```\n\nFix the implementation and try again."
             )
             with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                        session_id=f"poly-{lang}-{ex_name}-attempt2",
