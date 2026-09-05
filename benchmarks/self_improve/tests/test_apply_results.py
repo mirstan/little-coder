@@ -12,6 +12,7 @@ from benchmarks.self_improve.apply_results import (
     apply_and_open_pr,
     build_commit_message,
     create_branch_and_commit,
+    create_pull_request,
 )
 
 
@@ -195,3 +196,46 @@ def test_apply_and_open_pr_returns_none_and_touches_nothing_when_unchanged(tmp_p
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert branch == original_branch  # never switched branches -- nothing to commit
+
+
+# ── create_pull_request: STRUCTURAL check only, subprocess.run fully mocked.
+# This never spawns a real process -- no git push, no gh pr create, no
+# network. It only confirms the exact command shape (flags, order, args) is
+# correct, since a typo here would otherwise only be caught by a human
+# actually running it for real.
+
+def test_create_pull_request_command_shape(monkeypatch, tmp_path):
+    calls = []
+
+    class _FakeCompletedProcess:
+        stdout = "https://github.com/example/repo/pull/123\n"
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    url = create_pull_request(
+        repo_root=tmp_path,
+        branch_name="self-improve/gepa-test",
+        title="self-improve: GEPA-proposed rewrite (1 component)",
+        body="commit body text",
+    )
+
+    assert url == "https://github.com/example/repo/pull/123"
+    assert len(calls) == 2
+
+    push_cmd, push_kwargs = calls[0]
+    assert push_cmd == ["git", "push", "-u", "origin", "self-improve/gepa-test"]
+    assert push_kwargs.get("cwd") == tmp_path
+    assert push_kwargs.get("check") is True
+
+    pr_cmd, pr_kwargs = calls[1]
+    assert pr_cmd == [
+        "gh", "pr", "create",
+        "--title", "self-improve: GEPA-proposed rewrite (1 component)",
+        "--body", "commit body text",
+    ]
+    assert pr_kwargs.get("cwd") == tmp_path
+    assert pr_kwargs.get("check") is True
