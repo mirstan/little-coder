@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Aider Polyglot runner for little-coder.
 
-Drives `pi --mode rpc` per exercise via benchmarks/rpc_client.py::PiRpc.
-Per-language transforms (xit-strip, @Disabled-strip, cpp CMakeLists
+Drives `pi --mode rpc` per exercise via benchmarks/rpc_client.py::PiRpc, or
+`codex exec` per exercise via a plain subprocess call -- --agent selects
+which. Per-language transforms (xit-strip, @Disabled-strip, cpp CMakeLists
 named dirs, cargo --include-ignored, EXERCISM_RUN_ALL_TESTS) are copied
 verbatim from little-coder's original aider_polyglot.py — the only real
 change is that the agent call site uses PiRpc instead of agent.run().
@@ -12,6 +13,7 @@ Usage:
     python benchmarks/aider_polyglot.py --language python
     python benchmarks/aider_polyglot.py --exercise hello-world --language python
     python benchmarks/aider_polyglot.py --model llamacpp/qwen3.5-9b
+    python benchmarks/aider_polyglot.py --agent codex --model gpt-5.6-luna
 """
 from __future__ import annotations
 
@@ -70,6 +72,8 @@ def _positive_int_env(name: str, default: int) -> int:
 #: model with a large thinking budget needs more, or every hard exercise is
 #: clock-limited rather than capability-limited.
 ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 900)
+#: Per-attempt budget for `codex exec`, seconds.
+CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
 
 # Allowed tools for Polyglot — the core filesystem + bash toolbox. Ports
@@ -282,7 +286,8 @@ _ENV_KNOBS = (
 )
 
 
-def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_attempts: int = 2) -> dict:
+def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
+                    max_attempts: int = 2, agent: str = "pi") -> dict:
     """Everything that affects whether an exercise passes.
 
     Absent from results until now, so `--resume` could silently blend runs made
@@ -291,6 +296,7 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_a
     not an argparse field, so it is captured here rather than from `args`.
     """
     return {
+        "agent": agent,
         "model": model,
         "language": language,
         "attempt_timeout_s": ATTEMPT_TIMEOUT_S,
@@ -408,9 +414,82 @@ def _score(desc, work: Path, timeout: int):
         return desc["run_tests"](target, timeout)
 
 
+def _run_codex_turn(model: str, work: Path, prompt: str, resume: bool) -> PromptResult:
+    """Drive one codex exec turn.
+
+    Sandbox: workspace-write + --approve-for-me -- auto-approves within the
+    workspace, blocks writes outside it and (per Codex's OS-level sandbox)
+    outbound network by default. This is a categorically different
+    restriction from little-coder's shell-command whitelist -- document,
+    don't conflate, when comparing failures against the pi agent.
+
+    Returns a PromptResult (not a codex-specific type) so the rest of
+    _run_exercise's loop -- _attempt_outcome, _stop_reason, _dump_trajectory
+    -- works unchanged for both agents. codex has no equivalent of pi's
+    per-tool-call introspection, so tool_calls is always empty; turn_count
+    is a coarser unit than pi's (see below), and stop_reason/agent_ended
+    only distinguish "ran to completion" from "timed out" -- codex has no
+    analog of pi's mid-turn process_exit or its "still processing" race.
+    """
+    out_file = work / ".codex_last_message.txt"
+    args = ["codex", "exec"]
+    if resume:
+        args += ["resume", "--last"]
+    args += [
+        "--approve-for-me",  # auto-approves within workspace-write sandbox (mutually
+                              # exclusive with --sandbox; --approve-for-me already implies it)
+        "--skip-git-repo-check",
+        "--json",
+        "--model", model,
+        "--cd", str(work),
+        "-o", str(out_file),
+        "--",
+        prompt,
+    ]
+    try:
+        # stdin MUST be closed/redirected: codex exec reads an appended <stdin> block
+        # whenever stdin isn't already closed, even when a prompt is given as an
+        # argument (per its own --help) -- inherited-but-open stdin from a parent
+        # shell hangs forever waiting for EOF. Confirmed by direct testing: a run
+        # with inherited stdin sat at 0% CPU / zero network connections for 17+
+        # minutes on a trivial task, blocked in a stdin read, not "thinking."
+        r = subprocess.run(args, capture_output=True, text=True, timeout=CODEX_TIMEOUT_S,
+                            stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return PromptResult(turn_count=0, agent_ended=False, stop_reason="deadline")
+
+    # NOTE on turn_count comparability: a `turn.completed` event fires once per
+    # `codex exec` invocation regardless of how many tool calls happened inside
+    # it (confirmed empirically: a 3-tool-call edit task produced exactly one
+    # turn.completed) -- this is a coarser unit than pi's turn_count, which
+    # increments per tool-call round. Counting actionable item.completed events
+    # instead (command_execution / file_change / mcp_tool_call) is a much closer
+    # analog to what pi's turn_count actually measures: distinct steps taken.
+    action_types = {"command_execution", "file_change", "mcp_tool_call"}
+    action_count = 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "item.completed" and ev.get("item", {}).get("type") in action_types:
+            action_count += 1
+    assistant_text = out_file.read_text(errors="replace") if out_file.exists() else ""
+    return PromptResult(
+        turn_count=max(action_count, 1),
+        agent_ended=True,
+        stop_reason="agent_end",
+        assistant_text=assistant_text,
+    )
+
+
 def _run_exercise(
     lang: str,
     ex_name: str,
+    agent: str,
     model: str,
     verbose: bool,
     retry: bool,
@@ -424,7 +503,12 @@ def _run_exercise(
     if not src.exists():
         return {"status": "error", "reason": f"exercise not found at {src}"}
 
-    log_dir = LOG_ROOT / lang / ex_name
+    # Namespaced by agent: two agents run against the same exercise names,
+    # and an un-namespaced log_dir let a later agent's run silently
+    # overwrite an earlier agent's raw diagnostic text (trajectory/workdir/
+    # final_output artifacts) even though the scored JSON results are kept
+    # separate per (language, exercise) key regardless of agent.
+    log_dir = LOG_ROOT / agent / lang / ex_name
     log_dir.mkdir(parents=True, exist_ok=True)
     _purge_log_dir(log_dir)
 
@@ -461,14 +545,27 @@ def _run_exercise(
         turn_total = 0
         current_prompt = prompt
         for i in range(1, effective_attempts + 1):
-            with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
-                       session_id=f"poly-{lang}-{ex_name}-attempt{i}",
-                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
-                # prompt_and_collect() returns partial events *silently* when
-                # agent_end never arrives (_drain_events_until returns
-                # `collected`, it does not raise), so a budget-capped attempt
-                # is otherwise indistinguishable from a completed one.
-                r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
+            if agent == "pi":
+                with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
+                           session_id=f"poly-{lang}-{ex_name}-attempt{i}",
+                           env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
+                    # prompt_and_collect() returns partial events *silently*
+                    # when agent_end never arrives (_drain_events_until
+                    # returns `collected`, it does not raise), so a
+                    # budget-capped attempt is otherwise indistinguishable
+                    # from a completed one.
+                    r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
+            elif agent == "codex":
+                # Unlike pi's fresh-session-per-attempt (see above), codex
+                # resumes its own prior session from attempt 2 onward --
+                # a different tool with a different retry convention, kept
+                # as-is rather than forced into pi's shape. Because it
+                # remembers its own conversation, its retry prompt (below)
+                # doesn't need to restate the original instructions the way
+                # pi's does.
+                r = _run_codex_turn(model, work, current_prompt, resume=(i > 1))
+            else:
+                return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
@@ -495,23 +592,34 @@ def _run_exercise(
                 # a failure mode that didn't actually consume an attempt's
                 # worth of the model's effort.
                 break
-            # Repeats the original prompt in full, not just the failure --
-            # each attempt is a fresh session (see above) with no memory of
-            # this one, so a retry prompt built from the failure alone drops
-            # the exercise name, the stub/test file paths, the "tests are
-            # for reference only -- DO NOT edit" constraint, and the syntax
-            # hint. Without those, an agent scoring itself against a copy of
-            # the tree (_score()) has nothing stopping it from "fixing" the
-            # failure by editing the test file instead of the
-            # implementation and recording a fabricated pass.
-            current_prompt = (
-                prompt
-                + "\n\n---\n\nThis is a retry: the file(s) already contain "
-                  "your previous attempt's code (read the current state "
-                  "before editing). The tests failed with this output:\n\n```\n"
-                + out[-4000:]
-                + "\n```\n\nFix the implementation and try again."
-            )
+            if agent == "pi":
+                # Repeats the original prompt in full, not just the failure
+                # -- each attempt is a fresh session (see above) with no
+                # memory of this one, so a retry prompt built from the
+                # failure alone drops the exercise name, the stub/test file
+                # paths, the "tests are for reference only -- DO NOT edit"
+                # constraint, and the syntax hint. Without those, an agent
+                # scoring itself against a copy of the tree (_score()) has
+                # nothing stopping it from "fixing" the failure by editing
+                # the test file instead of the implementation and recording
+                # a fabricated pass.
+                current_prompt = (
+                    prompt
+                    + "\n\n---\n\nThis is a retry: the file(s) already contain "
+                      "your previous attempt's code (read the current state "
+                      "before editing). The tests failed with this output:\n\n```\n"
+                    + out[-4000:]
+                    + "\n```\n\nFix the implementation and try again."
+                )
+            else:
+                # codex resumes its own session (see above), so it already
+                # has the original instructions in context -- only the new
+                # failure needs restating.
+                current_prompt = (
+                    "The tests failed. Output:\n\n```\n"
+                    + out[-4000:]
+                    + "\n```\n\nFix the implementation and try again."
+                )
 
         elapsed = time.time() - t0
         (log_dir / "final_output.txt").write_text(out)
@@ -529,7 +637,8 @@ def _run_exercise(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--agent", choices=["pi", "codex"], default="pi")
+    ap.add_argument("--model", default=None)
     ap.add_argument("--language", default="python")
     ap.add_argument("--exercise", default=None, help="Run a single exercise")
     ap.add_argument("--exercises", type=int, default=0, help="Run first N exercises (0 = all)")
@@ -544,13 +653,21 @@ def main():
     if args.max_attempts < 1:
         sys.exit(f"--max-attempts must be >= 1, got {args.max_attempts}")
 
+    # DEFAULT_MODEL is a pi/llamacpp id; using it as a silent fallback for
+    # codex would point at a model that doesn't exist for that agent, so
+    # codex requires an explicit --model instead of inheriting pi's default.
+    model = args.model or (DEFAULT_MODEL if args.agent == "pi" else None)
+    if model is None:
+        sys.exit("--model is required for --agent codex (e.g. --model gpt-5.1-codex-max)")
+
     results = _load_results() if args.resume else {"exercises": {}, "meta": {}}
 
     desc = LANG_DESCRIPTORS.get(args.language)
     if desc is None:
         sys.exit(f"No descriptor for language '{args.language}'. Supported: {list(LANG_DESCRIPTORS)}")
 
-    params = _scoring_params(args.model, args.language, not args.no_retry, desc, max_attempts=args.max_attempts)
+    params = _scoring_params(model, args.language, not args.no_retry, desc,
+                             max_attempts=args.max_attempts, agent=args.agent)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -597,7 +714,7 @@ def main():
         # that reads like a finished 0% run.
         try:
             r = _run_exercise(
-                args.language, name, args.model,
+                args.language, name, args.agent, model,
                 verbose=args.verbose,
                 retry=not args.no_retry,
                 max_attempts=args.max_attempts,

@@ -127,15 +127,51 @@ def test_attempt1_snapshot_predates_the_retry_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    AP._run_exercise("faker", "ex", "fake/model", verbose=False, retry=True)
+    AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=True)
 
-    log_dir = tmp_path / "logs" / "faker" / "ex"
+    log_dir = tmp_path / "logs" / "pi" / "faker" / "ex"
     one = (log_dir / "workdir_1" / "solution.py").read_text()
     two = (log_dir / "workdir_2" / "solution.py").read_text()
     assert one == "written by attempt 1", f"attempt 1 snapshot is stale: {one!r}"
     assert two == "written by attempt 2"
     assert (log_dir / "final_output_1.txt").exists()
     assert (log_dir / "final_output_2.txt").exists()
+
+
+def test_log_dir_namespaced_by_agent(tmp_path, monkeypatch):
+    """Two agents run against the same exercise name -- pi and codex must
+    not clobber each other's raw diagnostic artifacts. Regression cover for
+    an un-namespaced log_dir: introducing --agent codex without this would
+    have silently overwritten whichever agent ran the same exercise name
+    first, the same class of bug test_snapshots_of_two_attempts_differ
+    guards for within one agent's own attempts."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": lambda s, w: (AP._copy_exercise(s, w), ([w / "ex.py"], []))[1],
+        "run_tests": lambda where, timeout: (True, "ok"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
+    monkeypatch.setattr(
+        AP, "_run_codex_turn",
+        lambda model, work, prompt, resume: AP.PromptResult(
+            turn_count=1, agent_ended=True, stop_reason="agent_end",
+            assistant_text="codex did it"))
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=False)
+    AP._run_exercise("faker", "ex", "codex", "fake/model", verbose=False, retry=False)
+
+    pi_traj = tmp_path / "logs" / "pi" / "faker" / "ex" / "trajectory_1.txt"
+    codex_traj = tmp_path / "logs" / "codex" / "faker" / "ex" / "trajectory_1.txt"
+    assert pi_traj.exists() and codex_traj.exists()
+    assert "codex did it" not in pi_traj.read_text()
+    assert "codex did it" in codex_traj.read_text()
 
 
 def test_run_id_is_stable_within_a_process():

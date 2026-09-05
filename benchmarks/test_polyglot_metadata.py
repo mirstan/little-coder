@@ -122,7 +122,7 @@ def test_turn_count_sums_both_attempts_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(AP, "PiRpc", _CountingRpc)
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    rec = AP._run_exercise("faker", "ex", "fake/model", verbose=False, retry=True)
+    rec = AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=True)
     assert rec["status"] == "fail"
     assert rec["turn_count"] == 7, f"expected 3+4, got {rec['turn_count']}"
 
@@ -185,7 +185,7 @@ def test_empty_response_does_not_abort_remaining_attempts(tmp_path, monkeypatch)
     monkeypatch.setattr(AP, "PiRpc", _EmptyThenRealRpc)
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    rec = AP._run_exercise("faker", "ex", "fake/model", verbose=False, retry=True, max_attempts=2)
+    rec = AP._run_exercise("faker", "ex", "pi", "fake/model", verbose=False, retry=True, max_attempts=2)
     assert calls["n"] == 2, "attempt 2 never ran -- empty_response aborted the loop"
     assert rec["status"] == "pass_2"
     assert rec["stop_reasons"] == ["agent_end", "agent_end"]
