@@ -141,3 +141,69 @@ def test_load_missing_results_json_raises_clear_error(tmp_path):
     'exercise not yet scored' (expected, silent skip)."""
     with pytest.raises(FileNotFoundError):
         aider_polyglot_ingest.load(tmp_path, tmp_path / "does_not_exist.json")
+
+
+# ── New result-record schema (post dev merge): stop_reasons is a list,
+# generalized from the old fixed stop_reason_1/stop_reason_2 fields, and
+# status can now be pass_N for any N (--max-attempts is no longer capped at
+# 2). Old-format fixtures above (stop_reason_1/2, pass_1/pass_2 only) are
+# kept as explicit backward-compat regression tests, not replaced -- real,
+# already-captured data still uses that shape.
+
+def test_load_uses_last_stop_reasons_list_entry_when_present(tmp_path):
+    """New schema: aider_polyglot.py now records stop_reasons as a list
+    (one entry per attempt that ran), not fixed stop_reason_1/2 fields."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "ex"
+    ex.mkdir(parents=True)
+    _write_trajectory(ex / "trajectory_1.json")
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/ex": {"status": "fail", "stop_reasons": ["deadline", "agent_end"],
+                       "turn_count": 2},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    assert traj.stop_reason == "agent_end"  # last entry, matching old stop_reason_2 semantics
+
+
+def test_load_falls_back_to_old_stop_reason_fields_when_stop_reasons_absent(tmp_path):
+    """Backward compat: real, already-captured data predates the
+    stop_reasons list and only has stop_reason_1/stop_reason_2."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "ex"
+    ex.mkdir(parents=True)
+    _write_trajectory(ex / "trajectory_1.json")
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/ex": {"status": "fail", "stop_reason_1": "deadline",
+                       "stop_reason_2": "process_exit", "turn_count": 2},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    assert traj.stop_reason == "process_exit"
+
+
+@pytest.mark.parametrize("status,expected_score", [
+    ("pass_1", 1.0),
+    ("pass_2", 0.7),
+    ("pass_3", 0.4),
+    ("pass_4", 0.4),   # floors rather than going negative/zero for a genuine pass
+    ("pass_10", 0.4),
+])
+def test_load_generalizes_pass_n_scoring_beyond_pass_2(tmp_path, status, expected_score):
+    """Real bug, confirmed against dev's generalized --max-attempts: attempt
+    can now be pass_3, pass_4, ... for higher --max-attempts, not just
+    pass_1/pass_2. A hardcoded 2-entry lookup silently treated any pass_3+
+    as a FAILURE (score 0.0, success=False) -- scoring a genuine pass as a
+    loss. Must generalize to any pass_N while still exactly preserving the
+    documented pass_1=1.0/pass_2=0.7 values."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "ex"
+    ex.mkdir(parents=True)
+    _write_trajectory(ex / "trajectory_1.json")
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/ex": {"status": status, "stop_reasons": ["agent_end"], "turn_count": 1},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    assert traj.success is True, f"{status} must be a genuine pass, not scored as a failure"
+    assert traj.partial_score == expected_score

@@ -108,12 +108,14 @@ class PiRpc:
         self,
         model: str,
         cwd: Optional[str] = None,
+        *,
         benchmark: Optional[str] = None,
         allowed_tools: Optional[list[str]] = None,
         session_id: Optional[str] = None,
         tb_mode: bool = False,
         env: Optional[dict] = None,
         max_turns: Optional[int] = None,
+        thinking: Optional[str] = None,
         tb_shell_handler: Optional[Callable[[dict], str]] = None,
     ):
         if not PI_BIN.exists():
@@ -139,6 +141,8 @@ class PiRpc:
             full_env["LITTLE_CODER_MAX_TURNS"] = str(max_turns)
 
         cmd = [str(PI_BIN), "--mode", "rpc", "--no-session", "--model", model]
+        if thinking:
+            cmd.extend(["--thinking", thinking])
         for ext in _extension_paths():
             cmd.extend(["-e", ext])
         # Pi's --tools flag filters the tool SCHEMAS presented to the model
@@ -222,6 +226,12 @@ class PiRpc:
                 continue
             with self._cv:
                 if msg.get("type") == "response" and msg.get("id"):
+                    # Stamped here, under the same lock and in the same
+                    # message-stream position the response itself arrived in,
+                    # so a caller can later tell exactly which queued events
+                    # existed strictly before this response -- see
+                    # prompt_and_collect()'s readiness-retry handling.
+                    msg["_event_q_watermark"] = len(self._event_q)
                     self._responses[msg["id"]] = msg
                 else:
                     self._event_q.append(msg)
@@ -321,14 +331,56 @@ class PiRpc:
 
     # ── Public API ───────────────────────────────────────────────────────
     def prompt_and_collect(self, message: str, timeout: float = 900) -> PromptResult:
-        """Send a prompt, drain events until agent_end, return summary."""
+        """Send a prompt, drain events until agent_end, return summary.
+
+        Retries the SEND (not the whole turn) a few times on "Agent is already
+        processing" -- a real, reproducible race under higher --thinking
+        effort: pi's agent_end event can fire before pi's internal state has
+        actually settled back to idle, so a prompt sent immediately after a
+        previous prompt_and_collect() returns can be rejected even though the
+        caller correctly waited for agent_end. Not observed at pi's default
+        thinking level; higher effort apparently widens whatever internal
+        window this races on.
+        """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
-        rid = str(uuid.uuid4())
-        self._send({"id": rid, "type": "prompt", "message": message})
-        resp = self._await_response(rid, timeout=30)
-        if not resp.get("success"):
+        resp = None
+        for readiness_attempt in range(5):
+            rid = str(uuid.uuid4())
+            self._send({"id": rid, "type": "prompt", "message": message})
+            resp = self._await_response(rid, timeout=30)
+            if resp.get("success"):
+                break
+            err = str(resp.get("error", ""))
+            if "already processing" in err.lower() and readiness_attempt < 4:
+                time.sleep(2 * (readiness_attempt + 1))
+                continue
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
+
+        # Trim any event still queued from before THIS response was recorded
+        # -- not gated on readiness_attempt > 0, because the same corruption
+        # doesn't require a rejection at all: PiRpc is documented as "reused
+        # across prompts within a session", and pi emitting a stray/duplicate
+        # agent_end after a turn's real one leaves it queued regardless of
+        # whether the *next* send happened to be accepted outright or needed
+        # a retry first. On a clean session this is a no-op: the watermark is
+        # 0 when nothing stale is queued.
+        #
+        # Neither "clear before resending" nor "clear right after the ack"
+        # is race-free: the former leaves a gap for pi to enqueue a stale
+        # event between the clear and the ack (reproduced: pi can write a
+        # turn's agent_end right up until the moment it frees itself to
+        # accept the next one), and the latter can instead discard the real
+        # turn's own events if the reader thread queues them before this
+        # thread wakes from _await_response(). Trimming to the watermark
+        # recorded at the exact moment THIS response was stored is race-free
+        # in both directions: anything queued before that point in the
+        # message stream cannot belong to a turn pi had not yet accepted
+        # when it wrote the response, and anything queued at or after it is
+        # preserved regardless of scheduling.
+        watermark = resp.get("_event_q_watermark", 0)
+        with self._cv:
+            del self._event_q[:watermark]
 
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",

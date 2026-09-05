@@ -65,30 +65,30 @@ def test_attempt_outcome(res, expected):
 
 
 # ── precedence table ─────────────────────────────────────────────────────
-@pytest.mark.parametrize("passed,attempt,o1,o2,expected", [
+@pytest.mark.parametrize("passed,attempt,outcomes,expected", [
     # passing beats everything, including a process that then died
-    (True,  "pass_1", "completed",      None,            "pass_1"),
-    (True,  "pass_1", "process_exit",   None,            "pass_1"),
-    (True,  "pass_2", "completed",      "process_exit",  "pass_2"),
+    (True,  "pass_1", ["completed"],                  "pass_1"),
+    (True,  "pass_1", ["process_exit"],                "pass_1"),
+    (True,  "pass_2", ["completed", "process_exit"],   "pass_2"),
     # single attempt
-    (False, None,     "process_exit",   None,            "error"),
-    (False, None,     "deadline",       None,            "fail_timeout"),
-    (False, None,     "empty_response", None,            "empty_response"),
-    (False, None,     "completed",      None,            "fail"),
+    (False, None,     ["process_exit"],                "error"),
+    (False, None,     ["deadline"],                    "fail_timeout"),
+    (False, None,     ["empty_response"],               "empty_response"),
+    (False, None,     ["completed"],                   "fail"),
     # retry ran: attempt 1 was scored, so a dead pi is a failed exercise
-    (False, None,     "completed",      "process_exit",  "fail"),
-    (False, None,     "completed",      "deadline",      "fail_timeout"),
-    (False, None,     "completed",      "empty_response","empty_response"),
-    (False, None,     "completed",      "completed",     "fail"),
+    (False, None,     ["completed", "process_exit"],   "fail"),
+    (False, None,     ["completed", "deadline"],       "fail_timeout"),
+    (False, None,     ["completed", "empty_response"], "empty_response"),
+    (False, None,     ["completed", "completed"],      "fail"),
 ])
-def test_classify_status(passed, attempt, o1, o2, expected):
-    assert AP._classify_status(passed, attempt, o1, o2) == expected
+def test_classify_status(passed, attempt, outcomes, expected):
+    assert AP._classify_status(passed, attempt, outcomes) == expected
 
 
 def test_a_pass_is_never_downgraded_to_error():
     """Regression guard: applying process_exit before checking `passed` would
     turn a pi that exited right after writing a correct solution into an error."""
-    assert AP._classify_status(True, "pass_1", "process_exit", None) == "pass_1"
+    assert AP._classify_status(True, "pass_1", ["process_exit"]) == "pass_1"
 
 
 # ── score in a copy ──────────────────────────────────────────────────────

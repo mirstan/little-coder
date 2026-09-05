@@ -12,9 +12,17 @@ always empty here. Closed upstream (benchmarks/aider_polyglot.py's
 _dump_trajectory now takes a notifications= kwarg) -- components_used
 populates from the latest attempt's "notifications" field when present, and
 degrades to [] gracefully for older-format data that predates this field.
+
+Result-record schema evolved twice, both handled here with fallback:
+- stop_reason_1/stop_reason_2 (fixed two-attempt fields) -> stop_reasons
+  (a list, one entry per attempt, since --max-attempts generalized beyond 2).
+- status "pass_1"/"pass_2" only -> "pass_N" for any N (same reason). A
+  hardcoded 2-entry score lookup would silently score any pass_3+ as a
+  failure -- confirmed real bug, fixed via _pass_n_score() below.
 """
 import json
 import logging
+import re
 from pathlib import Path
 
 from benchmarks.self_improve.ingest.common import merge_component_usage, summarize_for_reflection
@@ -22,10 +30,24 @@ from benchmarks.self_improve.schema import NormalizedTrajectory
 
 logger = logging.getLogger(__name__)
 
-_STATUS_TO_SCORE = {
-    "pass_1": (True, 1.0),
-    "pass_2": (True, 0.7),
-}
+_PASS_N_RE = re.compile(r"^pass_(\d+)$")
+#: Score decays 0.3 per attempt past the first, floored so a genuine pass
+#: (however many attempts it took) is never scored as low as an outright
+#: failure. pass_1=1.0, pass_2=0.7 (exact values from the original design,
+#: preserved for backward compat), pass_3+=0.4.
+_PASS_N_FLOOR = 0.4
+_PASS_N_DECAY = 0.3
+
+
+def _pass_n_score(status: str) -> tuple[bool, float] | None:
+    """Return (success, partial_score) for any "pass_N" status, or None if
+    status doesn't match that pattern at all (a real failure/error status)."""
+    m = _PASS_N_RE.match(status)
+    if not m:
+        return None
+    n = int(m.group(1))
+    score = max(_PASS_N_FLOOR, 1.0 - _PASS_N_DECAY * (n - 1))
+    return True, score
 
 
 def load(log_root: Path, results_json_path: Path) -> list[NormalizedTrajectory]:
@@ -45,9 +67,15 @@ def load(log_root: Path, results_json_path: Path) -> list[NormalizedTrajectory]:
 
 def _build_trajectory(log_root: Path, lang: str, exercise: str, key: str, record: dict) -> NormalizedTrajectory:
     status = record.get("status", "fail")
-    success, partial_score = _STATUS_TO_SCORE.get(status, (False, 0.0))
+    success, partial_score = _pass_n_score(status) or (False, 0.0)
 
-    stop_reason = record.get("stop_reason_2") or record.get("stop_reason_1") or "unknown"
+    stop_reasons = record.get("stop_reasons")
+    if stop_reasons:
+        stop_reason = stop_reasons[-1] or "unknown"
+    else:
+        # Backward compat: real, already-captured data predates the
+        # stop_reasons list and only has these two fixed fields.
+        stop_reason = record.get("stop_reason_2") or record.get("stop_reason_1") or "unknown"
 
     ex_dir = log_root / lang / exercise
     assistant_text = ""

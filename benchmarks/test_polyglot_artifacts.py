@@ -74,7 +74,13 @@ class _FakeRpc:
 
     def __init__(self, *a, **kw):
         self.cwd = Path(kw["cwd"])
-        self.n = 0
+        # Session ids are now "poly-<lang>-<ex>-attempt<i>" -- one fresh PiRpc
+        # per attempt -- rather than one id shared across the whole retry, so
+        # derive which attempt this instance represents from that id instead
+        # of a per-instance call counter (each attempt gets its own fresh
+        # instance now, not a shared one whose call count tracked the
+        # attempt number).
+        self.n = int(kw["session_id"].rsplit("attempt", 1)[-1])
         self._notifications = []
 
     def __enter__(self):
@@ -84,7 +90,6 @@ class _FakeRpc:
         return False
 
     def prompt_and_collect(self, message, timeout=900):
-        self.n += 1
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
         self._notifications.append(
             {"message": f"skill-inject: +1 [bash]  # attempt {self.n}", "notifyType": "info"}
@@ -130,15 +135,53 @@ def test_attempt1_snapshot_predates_the_retry_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
     monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
 
-    AP._run_exercise("faker", "ex", "fake/model", verbose=False, retry=True)
+    AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
 
-    log_dir = tmp_path / "logs" / "faker" / "ex"
+    log_dir = tmp_path / "logs" / "pi" / "faker" / "ex"
     one = (log_dir / "workdir_1" / "solution.py").read_text()
     two = (log_dir / "workdir_2" / "solution.py").read_text()
     assert one == "written by attempt 1", f"attempt 1 snapshot is stale: {one!r}"
     assert two == "written by attempt 2"
     assert (log_dir / "final_output_1.txt").exists()
     assert (log_dir / "final_output_2.txt").exists()
+
+
+def test_log_dir_namespaced_by_agent(tmp_path, monkeypatch):
+    """Two agents run against the same exercise name -- pi and codex must
+    not clobber each other's raw diagnostic artifacts. Regression cover for
+    an un-namespaced log_dir: introducing --agent codex without this would
+    have silently overwritten whichever agent ran the same exercise name
+    first, the same class of bug test_snapshots_of_two_attempts_differ
+    guards for within one agent's own attempts."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": lambda s, w: (AP._copy_exercise(s, w), ([w / "ex.py"], []))[1],
+        "run_tests": lambda where, timeout: (True, "ok"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
+    monkeypatch.setattr(
+        AP, "_run_codex_turn",
+        lambda model, work, prompt, session_id, log_dir, attempt_name: (
+            AP.PromptResult(turn_count=1, agent_ended=True, stop_reason="agent_end",
+                             assistant_text="codex did it"),
+            "fake-session-id",
+        ))
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=False)
+    AP._run_exercise("faker", "ex", "fake/model", agent="codex", verbose=False, retry=False)
+
+    pi_traj = tmp_path / "logs" / "pi" / "faker" / "ex" / "trajectory_1.txt"
+    codex_traj = tmp_path / "logs" / "codex" / "faker" / "ex" / "trajectory_1.txt"
+    assert pi_traj.exists() and codex_traj.exists()
+    assert "codex did it" not in pi_traj.read_text()
+    assert "codex did it" in codex_traj.read_text()
 
 
 def test_run_id_is_stable_within_a_process():
@@ -180,10 +223,13 @@ def test_dump_trajectory_persists_notifications_when_given(tmp_path):
     assert payload["notifications"] == notes
 
 
-def test_run_exercise_delta_slices_notifications_between_attempts(tmp_path, monkeypatch):
-    """rpc.notifications() accumulates for the WHOLE session, not per-prompt
-    -- attempt 2's dump must only carry attempt 2's own notifications, not
-    attempt 1's re-included. Regression guard for exactly this double-count."""
+def test_run_exercise_notifications_are_isolated_per_attempt(tmp_path, monkeypatch):
+    """Each attempt now opens a FRESH PiRpc session (see _run_exercise's own
+    comment), so rpc.notifications() is already scoped to just that attempt
+    -- no delta-slicing across a shared session is needed (or possible)
+    anymore. This guards that attempt 2's dump doesn't somehow pick up
+    attempt 1's notifications despite the two running in separate fake
+    instances."""
     src = tmp_path / "practice" / "ex"
     src.mkdir(parents=True)
     (src / "ex.py").write_text("stub")
@@ -205,7 +251,7 @@ def test_run_exercise_delta_slices_notifications_between_attempts(tmp_path, monk
 
     AP._run_exercise("faker2", "ex", "fake/model", verbose=False, retry=True)
 
-    log_dir = tmp_path / "logs" / "faker2" / "ex"
+    log_dir = tmp_path / "logs" / "pi" / "faker2" / "ex"
     payload_1 = json.loads((log_dir / "trajectory_1.json").read_text())
     payload_2 = json.loads((log_dir / "trajectory_2.json").read_text())
 

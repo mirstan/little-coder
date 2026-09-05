@@ -77,6 +77,92 @@ def main():
         time.sleep(30)
         return
 
+    if mode == "busy_then_ready":
+        # Simulates the readiness-retry race: the first send is rejected
+        # because a previous turn is still winding down, and that previous
+        # turn's own leftover agent_end lands in the queue before the
+        # retry's real completion does, with the leftover written
+        # immediately (before the retry is even sent). Regression fixture
+        # for the stale-event-queue bug: without discarding events that
+        # predate the retry's own acceptance, this leftover agent_end gets
+        # mistaken for the new turn's completion.
+        emit({"type": "response", "id": rid, "success": False,
+              "error": "Agent is already processing"})
+        emit({"type": "agent_end"})  # stale leftover from the "previous" turn
+        msg2 = read_prompt()
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "real answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "busy_then_late_stale":
+        # Harder variant of busy_then_ready: what makes this harder is
+        # ORDER, not delay -- the previous turn's leftover agent_end is
+        # written AFTER the retry has already been sent (read_prompt()
+        # below has already returned it), whereas busy_then_ready writes it
+        # immediately after the rejection, before the retry is even sent. A
+        # fix that discards stale events only once, right before resending
+        # (rather than by watermarking the moment of the retry's own
+        # acceptance), happens to still catch the immediate case but not
+        # this one: the leftover lands in the queue after that one-time
+        # clear and is never removed.
+        emit({"type": "response", "id": rid, "success": False,
+              "error": "Agent is already processing"})
+        msg2 = read_prompt()  # the retry -- arrives while we're still "busy"
+        emit({"type": "agent_end"})  # stale leftover, written after the retry was sent
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "real answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "stray_end_then_clean_reuse":
+        # A stray leftover can reach a session that is reused WITHOUT any
+        # rejection ever happening -- PiRpc's own docstring advertises reuse
+        # "across prompts within a session". Turn 1 completes normally, but
+        # pi (in whatever internal state motivates this whole PR) emits a
+        # second, stray agent_end right after its real one. The next prompt
+        # is then accepted outright, no "already processing" involved. A fix
+        # that only trims the queue on the readiness-retry path (gated on a
+        # rejection having occurred) never runs here, so the stray agent_end
+        # from turn 1 sits at the head of the queue and turn 2's own drain
+        # returns on it immediately.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "first answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_end"})  # stray duplicate, no rejection involved
+        msg2 = read_prompt()
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "second answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
     # default: clean single turn with one tool call
     emit({"type": "response", "id": rid, "success": True})
     emit({"type": "agent_start"})

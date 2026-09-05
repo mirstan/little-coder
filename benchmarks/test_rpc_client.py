@@ -69,6 +69,35 @@ def test_rpc_allowed_tools_env_propagates(tmp_path):
         rpc.close(timeout=3)
 
 
+def test_rpc_thinking_flag_reaches_pi(tmp_path):
+    """thinking= should reach pi's own --thinking CLI flag, not just be
+    accepted and silently dropped. get_state reports the level pi actually
+    resolved, so this checks the real effect, not just that no error was
+    raised.
+
+    Regression note: this test originally used thinking="high" and would
+    have passed even with the parameter deleted entirely, because this
+    machine's ~/.pi/agent/settings.json sets defaultThinkingLevel: "high" --
+    the exact value pi resolves to with NO --thinking flag at all. "low" and
+    "off" are both confirmed distinguishable from every ambient default
+    pi has (its own compiled default is "medium"), so either exposes a
+    reverted parameter as a real assertion failure instead of a silent pass.
+    """
+    rpc = PiRpc(
+        model="llamacpp/qwen3.6-35b-a3b",
+        cwd=str(tmp_path),
+        thinking="low",
+    )
+    try:
+        rid = str(uuid.uuid4())
+        rpc._send({"id": rid, "type": "get_state"})
+        resp = rpc._await_response(rid, timeout=20)
+        assert resp["success"] is True
+        assert resp["data"]["thinkingLevel"] == "low"
+    finally:
+        rpc.close(timeout=3)
+
+
 def test_rpc_tb_mode_env_propagates(tmp_path):
     """tb_mode=True sets LITTLE_CODER_TB_MODE=1 for the subprocess."""
     rpc = PiRpc(

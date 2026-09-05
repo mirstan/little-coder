@@ -29,6 +29,25 @@ def fake_pi(monkeypatch):
     return _spawn
 
 
+def test_thinking_flag_appears_in_argv(fake_pi, tmp_path):
+    """Hermetic companion to test_rpc_thinking_flag_reaches_pi (which needs a
+    real pi binary and is machine-dependent on ambient settings): this checks
+    the literal subprocess argv against a fake pi, so it can never be fooled
+    by a local ~/.pi/agent/settings.json default and runs in CI."""
+    with fake_pi("clean", tmp_path, thinking="high") as rpc:
+        args = rpc._proc.args
+    assert "--thinking" in args
+    assert args[args.index("--thinking") + 1] == "high"
+
+
+def test_no_thinking_flag_when_unset(fake_pi, tmp_path):
+    """The flag must be genuinely absent when unset, not passed as an empty
+    or default value -- pi's own default should apply unmodified."""
+    with fake_pi("clean", tmp_path) as rpc:
+        args = rpc._proc.args
+    assert "--thinking" not in args
+
+
 def test_clean_run_reports_agent_end(fake_pi, tmp_path):
     with fake_pi("clean", tmp_path) as rpc:
         r = rpc.prompt_and_collect("go", timeout=30)
@@ -95,6 +114,51 @@ def test_close_is_idempotent(fake_pi, tmp_path):
     rpc = fake_pi("clean", tmp_path)
     rpc.close()
     rpc.close()
+
+
+def test_busy_then_ready_recovers_without_stale_event(fake_pi, tmp_path):
+    """Regression guard: a rejected send must not let a leftover event from
+    the turn pi was still finishing be mistaken for the retry's own
+    completion. Without discarding stale events, _drain_events_until would
+    pop the leftover agent_end first and return empty -- indistinguishable
+    from a genuinely empty response."""
+    with fake_pi("busy_then_ready", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert "real answer" in r.assistant_text
+
+
+def test_busy_then_late_stale_event_still_discarded(fake_pi, tmp_path):
+    """Harder ordering than the above: the leftover event is written AFTER
+    the retry has already been sent, not before. A fix that discards stale
+    events only once, right before resending, passes the case above but
+    fails this one -- the leftover lands in the queue after that one-time
+    clear and is never removed. Only a fix keyed to the retry's own
+    acceptance (not to when the resend happened) handles both."""
+    with fake_pi("busy_then_late_stale", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert "real answer" in r.assistant_text
+
+
+def test_stray_event_on_reused_session_does_not_corrupt_next_turn(fake_pi, tmp_path):
+    """The stale-event bug doesn't require a rejection at all: PiRpc's own
+    docstring advertises reuse "across prompts within a session" (line 72).
+    If pi emits a stray duplicate agent_end right after a turn's real one,
+    and the NEXT prompt is accepted outright with no readiness retry
+    involved, a fix gated on readiness_attempt > 0 never runs -- the stray
+    event sits ahead of the second turn's own completion and the drain
+    returns on it immediately, same silent-empty-response symptom as the
+    readiness-retry case."""
+    with fake_pi("stray_end_then_clean_reuse", tmp_path) as rpc:
+        r1 = rpc.prompt_and_collect("go", timeout=30)
+        r2 = rpc.prompt_and_collect("go again", timeout=30)
+    assert "first answer" in r1.assistant_text
+    assert r2.agent_ended is True
+    assert r2.stop_reason == "agent_end"
+    assert "second answer" in r2.assistant_text
 
 
 def test_promptresult_still_constructible_with_no_args():

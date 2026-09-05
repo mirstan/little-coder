@@ -78,6 +78,16 @@ below must match them exactly:
   value written per exercise under `results["exercises"][f"{lang}/{name}"]`):
   `{"run_id", "status" (pass_1/pass_2/fail/fail_timeout/empty_response/error),
   "stop_reason_1", "stop_reason_2", "elapsed_s", "turn_count", "scoring_params"}`.
+  **SCHEMA EVOLVED (merged from `dev`, generalizing retries from a hardcoded
+  2 attempts to `--max-attempts` N attempts)**: `stop_reason_1`/`stop_reason_2`
+  became a `stop_reasons` list (one entry per attempt that ran), and `status`
+  can now be `pass_N` for any N, not just `pass_1`/`pass_2`. A hardcoded
+  2-entry score lookup silently scored any `pass_3`+ as a failure -- confirmed
+  real bug, caught while resolving the merge, fixed via `_pass_n_score()`
+  (decaying score floored at 0.4, exactly preserving the original
+  `pass_1`=1.0/`pass_2`=0.7 values). `aider_polyglot_ingest.py` handles BOTH
+  schemas: `stop_reasons` when present, falling back to the old fixed fields
+  for already-captured real data that predates this change.
 
 - tb adapter logs — **UPDATE (superseded the original guess below): confirmed
   against a real captured `tb run` (hello-world task, pi routed through
