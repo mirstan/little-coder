@@ -207,3 +207,38 @@ def test_load_generalizes_pass_n_scoring_beyond_pass_2(tmp_path, status, expecte
     traj = aider_polyglot_ingest.load(log_root, results_json)[0]
     assert traj.success is True, f"{status} must be a genuine pass, not scored as a failure"
     assert traj.partial_score == expected_score
+
+
+def test_load_picks_latest_attempt_by_numeric_not_lexicographic_order(tmp_path):
+    """Real bug, confirmed by review: sorting trajectory_*.json by filename
+    STRING put "trajectory_10" before "trajectory_2" (lexicographic), so
+    with >=10 attempts the wrong (earlier) file supplied
+    summarized_transcript/components_used/raw_paths for what should be the
+    latest attempt."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "ex"
+    ex.mkdir(parents=True)
+    for n in range(1, 11):
+        _write_trajectory(ex / f"trajectory_{n}.json", assistant_text=f"attempt {n}")
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/ex": {"status": "fail", "stop_reasons": ["agent_end"], "turn_count": 10},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    assert "attempt 10" in traj.summarized_transcript
+    assert traj.raw_paths["trajectory"].endswith("trajectory_10.json")
+
+
+def test_load_skips_exercise_key_that_would_escape_log_root(tmp_path):
+    """Real bug (hardening), confirmed by review: a corrupted/malicious
+    "lang/exercise" key containing ".." would otherwise let ex_dir escape
+    log_root entirely. results_full_polyglot.json is repo-controlled data
+    today, but this is cheap to validate regardless."""
+    log_root = tmp_path / "logs"
+    log_root.mkdir(parents=True)
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "../../etc/passwd": {"status": "pass_1", "stop_reasons": ["agent_end"], "turn_count": 1},
+    }}))
+    trajs = aider_polyglot_ingest.load(log_root, results_json)
+    assert trajs == []

@@ -55,13 +55,22 @@ def load(log_root: Path, results_json_path: Path) -> list[NormalizedTrajectory]:
     if not results_json_path.exists():
         raise FileNotFoundError(f"results_full_polyglot.json not found: {results_json_path}")
 
+    log_root = Path(log_root)
     results = json.loads(results_json_path.read_text())
     exercises = results.get("exercises", {})
 
     trajectories = []
     for key, record in exercises.items():
         lang, _, exercise = key.partition("/")
-        trajectories.append(_build_trajectory(Path(log_root), lang, exercise, key, record))
+        # results_full_polyglot.json is repo-controlled data today, but a
+        # corrupted or malicious "lang/exercise" key (e.g. containing "..")
+        # would otherwise let ex_dir below escape log_root entirely -- cheap
+        # to validate, so validate it.
+        ex_dir = (log_root / lang / exercise).resolve()
+        if not ex_dir.is_relative_to(log_root.resolve()):
+            logger.warning("aider_polyglot_ingest: skipping %r, escapes log_root", key)
+            continue
+        trajectories.append(_build_trajectory(log_root, lang, exercise, key, record))
     return trajectories
 
 
@@ -84,10 +93,15 @@ def _build_trajectory(log_root: Path, lang: str, exercise: str, key: str, record
     raw_paths: dict[str, str] = {}
 
     if ex_dir.is_dir():
-        attempt_files = sorted(
-            ex_dir.glob("trajectory_*.json"),
-            key=lambda p: p.stem,
-        )
+        # Sort by the parsed attempt NUMBER, not the filename string --
+        # lexicographic order puts "trajectory_10" before "trajectory_2"
+        # (real bug, confirmed by review: with >=10 attempts the wrong file
+        # supplied summarized_transcript/components_used/raw_paths).
+        def _attempt_num(p: Path) -> int:
+            m = re.search(r"_(\d+)$", p.stem)
+            return int(m.group(1)) if m else -1
+
+        attempt_files = sorted(ex_dir.glob("trajectory_*.json"), key=_attempt_num)
         if attempt_files:
             latest = attempt_files[-1]
             try:
