@@ -41,3 +41,10 @@ brainstorm_outputs/
 
 # deep-research batch eval artifacts
 benchmarks/deep_research_runs/
+
+# self-improve (GEPA loop): venv, generated system prompt, per-run output
+benchmarks/self_improve/.venv/
+benchmarks/self_improve/runs/
+benchmarks/self_improve/*.egg-info/
+.pi/.system-prompt.generated.md
+.env
