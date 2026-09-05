@@ -20,6 +20,7 @@ from pathlib import Path
 
 import dspy
 import yaml
+from dotenv import load_dotenv
 from dspy.utils.dummies import DummyLM
 
 from benchmarks.self_improve.components import build_harness_program, load_components
@@ -32,6 +33,12 @@ from benchmarks.self_improve.schema import NormalizedTrajectory
 REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
 
 logger = logging.getLogger(__name__)
+
+# Load benchmarks/self_improve/.env (gitignored) at import time, so
+# REFLECTION_LM_API_KEY can live in a file instead of requiring the caller to
+# export it into every shell that invokes this script. Never overrides an
+# already-exported env var (override=False, the default).
+load_dotenv(Path(__file__).parent / ".env")
 
 DEFAULT_WEIGHTS = {"aider_polyglot": 0.4, "gaia": 0.3, "harbor": 0.15, "tb": 0.15}
 
