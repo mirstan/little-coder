@@ -20,6 +20,7 @@ truth):
     task_name: "org/name" (e.g. "hello-world/hello-world")
   <log_root>/<trial_name>/agent/*.log     (singular "agent", not "agent-logs")
 """
+import json
 from pathlib import Path
 
 from benchmarks.self_improve.ingest import harbor_tb_ingest
@@ -154,3 +155,58 @@ def test_harbor_load_components_used_is_empty():
     enough to reconstruct which specific skills fired."""
     trajs = harbor_tb_ingest.load(HARBOR_FIXTURE_ROOT, benchmark="harbor")
     assert trajs[0].components_used == []
+
+
+def test_harbor_load_handles_explicit_null_rewards(tmp_path):
+    """Real bug, confirmed by review: `.get("rewards", {})` only guards a
+    MISSING key, not an explicit JSON null -- an incomplete verifier write
+    can leave "rewards": null, and the old code raised AttributeError
+    calling .get("reward") on None. Must degrade to success=False, not crash."""
+    trial = tmp_path / "trial-1"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps({
+        "task_name": "x/y", "verifier_result": {"rewards": None},
+    }))
+    trajs = harbor_tb_ingest.load(tmp_path, benchmark="harbor")
+    assert len(trajs) == 1
+    assert trajs[0].success is False
+
+
+def test_harbor_load_handles_non_numeric_reward(tmp_path):
+    """A malformed reward value (e.g. a string) must not crash float()."""
+    trial = tmp_path / "trial-1"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps({
+        "task_name": "x/y", "verifier_result": {"rewards": {"reward": "not-a-number"}},
+    }))
+    trajs = harbor_tb_ingest.load(tmp_path, benchmark="harbor")
+    assert len(trajs) == 1
+    assert trajs[0].success is False
+
+
+def test_harbor_load_handles_missing_log_root_gracefully(tmp_path):
+    assert harbor_tb_ingest.load(tmp_path / "does-not-exist", benchmark="harbor") == []
+
+
+def test_tb_load_handles_missing_log_root_gracefully(tmp_path):
+    assert harbor_tb_ingest.load(tmp_path / "does-not-exist", benchmark="tb") == []
+
+
+def test_harbor_load_picks_deterministic_log_when_multiple_exist(tmp_path):
+    """Real bug, confirmed by review: glob() order is filesystem-dependent
+    -- with more than one *.log file in a trial's agent/ dir, the chosen
+    log (and therefore its stop_reason/transcript) must be stable across
+    runs on identical input, not whatever order the filesystem returns."""
+    trial = tmp_path / "trial-1"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps({
+        "task_name": "x/y", "verifier_result": {"rewards": {"reward": 1.0}},
+    }))
+    agent_dir = trial / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "z_second.log").write_text(">> should_not_be_picked({})\n")
+    (agent_dir / "a_first.log").write_text(">> should_be_picked({})\n")
+
+    trajs = harbor_tb_ingest.load(tmp_path, benchmark="harbor")
+    assert "should_be_picked" in trajs[0].summarized_transcript
+    assert "should_not_be_picked" not in trajs[0].summarized_transcript

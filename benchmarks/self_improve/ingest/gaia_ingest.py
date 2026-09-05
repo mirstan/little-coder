@@ -18,15 +18,20 @@ from benchmarks.self_improve.schema import NormalizedTrajectory
 
 logger = logging.getLogger(__name__)
 
-_RUN_LEVEL_FILES = {"manifest.json", "results.json", "submission.jsonl"}
-
 
 def load(log_root: Path) -> list[NormalizedTrajectory]:
+    log_root = Path(log_root)
+    if not log_root.is_dir():
+        logger.warning("gaia_ingest: log_root does not exist or is not a directory: %s", log_root)
+        return []
+
     trajectories: list[NormalizedTrajectory] = []
-    for entry in sorted(Path(log_root).iterdir()):
+    for entry in sorted(log_root.iterdir()):
+        # manifest.json/results.json/submission.jsonl are run-level FILES,
+        # not directories, so this already excludes them -- no separate
+        # name-based check needed (a prior one here was dead code: it ran
+        # after this same is_dir() filter, so it could never match).
         if not entry.is_dir():
-            continue
-        if entry.name in _RUN_LEVEL_FILES:
             continue
         traj = _load_task(entry)
         if traj is not None:
@@ -40,7 +45,11 @@ def _load_task(task_dir: Path) -> NormalizedTrajectory | None:
         logger.warning("gaia_ingest: skipping %s, no result.json", task_dir)
         return None
 
-    result = json.loads(result_path.read_text())
+    try:
+        result = json.loads(result_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("gaia_ingest: malformed result.json at %s: %s", result_path, e)
+        return None
     success = bool(result.get("correct", False))
 
     stderr_path = task_dir / "stderr.log"
@@ -56,8 +65,15 @@ def _load_task(task_dir: Path) -> NormalizedTrajectory | None:
     tool_calls = []
     if tool_calls_path.exists():
         for line in tool_calls_path.read_text().splitlines():
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 tool_calls.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                # A partially-flushed final line is the most likely
+                # corruption for an append-only file written during a
+                # crashed run -- skip it rather than failing the whole task.
+                logger.warning("gaia_ingest: malformed line in %s: %s", tool_calls_path, e)
 
     transcript_path = task_dir / "transcript.txt"
     assistant_text = transcript_path.read_text() if transcript_path.exists() else ""

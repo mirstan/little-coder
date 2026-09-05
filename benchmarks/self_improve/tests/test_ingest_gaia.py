@@ -62,3 +62,42 @@ def test_load_defaults_stop_reason_when_absent(gaia_run):
     trajs = {t.task_id: t for t in gaia_ingest.load(gaia_run)}
     assert trajs["task-001"].stop_reason == "agent_end"
     assert trajs["task-002"].stop_reason != ""
+
+
+def test_load_skips_task_with_malformed_result_json(tmp_path):
+    """Real bug, confirmed by review: an unguarded json.loads() on a
+    truncated/malformed result.json (e.g. harness killed mid-write) crashed
+    the whole ingestion run instead of skipping just that one task."""
+    good = tmp_path / "task-good"
+    good.mkdir()
+    (good / "result.json").write_text('{"correct": true}')
+
+    bad = tmp_path / "task-bad"
+    bad.mkdir()
+    (bad / "result.json").write_text("not valid json{{{")
+
+    trajs = gaia_ingest.load(tmp_path)
+    assert {t.task_id for t in trajs} == {"task-good"}
+
+
+def test_load_skips_malformed_line_in_tool_calls_jsonl(tmp_path):
+    """Real bug, confirmed by review: a partially-flushed final line in an
+    append-only tool_calls.jsonl (the most likely corruption from a crashed
+    run) crashed the whole task's ingestion instead of just skipping that
+    one line."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text('{"correct": true}')
+    (task / "tool_calls.jsonl").write_text(
+        '{"name": "bash", "args": {}}\n'
+        '{"name": "read", "args": {}\n'  # truncated mid-write, invalid JSON
+    )
+    trajs = gaia_ingest.load(tmp_path)
+    assert len(trajs) == 1
+    assert trajs[0].turn_count == 1  # only the valid line counted
+
+
+def test_load_handles_missing_log_root_gracefully(tmp_path):
+    """load() must never raise on a missing/non-directory log_root --
+    matches the module's own graceful-degradation contract."""
+    assert gaia_ingest.load(tmp_path / "does-not-exist") == []

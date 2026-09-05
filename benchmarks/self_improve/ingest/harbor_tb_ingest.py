@@ -47,8 +47,13 @@ def load(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[NormalizedT
 # ── harbor ────────────────────────────────────────────────────────────────
 
 def _load_harbor(log_root: Path) -> list[NormalizedTrajectory]:
+    log_root = Path(log_root)
+    if not log_root.is_dir():
+        logger.warning("harbor_tb_ingest: log_root does not exist or is not a directory: %s", log_root)
+        return []
+
     trajectories = []
-    for trial_dir in sorted(Path(log_root).iterdir()):
+    for trial_dir in sorted(log_root.iterdir()):
         if not trial_dir.is_dir():
             continue
         traj = _load_harbor_trial(trial_dir)
@@ -69,8 +74,16 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
         return None
 
     task_id = result.get("task_name", trial_dir.name)
-    reward = (result.get("verifier_result") or {}).get("rewards", {}).get("reward")
-    success = bool(reward) and float(reward) > 0.0
+    # Both .get()s guard against an explicit JSON null (not just a missing
+    # key) at each level -- an incomplete verifier write can leave
+    # verifier_result or rewards present but null, and `.get(k, {})` alone
+    # does not protect against that (only against the key being absent).
+    reward = ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    try:
+        success = reward is not None and float(reward) > 0.0
+    except (TypeError, ValueError):
+        logger.warning("harbor_tb_ingest: non-numeric reward %r in %s", reward, result_path)
+        success = False
 
     metadata = (result.get("agent_result") or {}).get("metadata") or {}
     stop_reason = metadata.get("stop_reason", "unknown")
@@ -80,7 +93,9 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
     summarized = ""
     log_dir = trial_dir / "agent"
     if log_dir.is_dir():
-        log_paths = list(log_dir.glob("*.log"))
+        # sorted(): glob() order is filesystem-dependent: pick the same log
+        # deterministically across runs when a trial has more than one.
+        log_paths = sorted(log_dir.glob("*.log"))
         if log_paths:
             raw_paths["log"] = str(log_paths[0])
             try:
@@ -107,8 +122,13 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
 # ── tb (classic terminal-bench) ──────────────────────────────────────────
 
 def _load_tb(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[NormalizedTrajectory]:
+    log_root = Path(log_root)
+    if not log_root.is_dir():
+        logger.warning("harbor_tb_ingest: log_root does not exist or is not a directory: %s", log_root)
+        return []
+
     trajectories = []
-    for task_dir in sorted(Path(log_root).iterdir()):
+    for task_dir in sorted(log_root.iterdir()):
         if not task_dir.is_dir():
             continue
         for trial_dir in sorted(task_dir.iterdir()):
@@ -134,7 +154,9 @@ def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> Norma
     task_id = result.get("task_id", trial_dir.parent.name)
     success = bool(result.get("is_resolved", False))
 
-    log_paths = list((trial_dir / "agent-logs").glob("*.log")) if (trial_dir / "agent-logs").is_dir() else []
+    # sorted(): glob() order is filesystem-dependent: pick the same log
+    # deterministically across runs when a trial has more than one.
+    log_paths = sorted((trial_dir / "agent-logs").glob("*.log")) if (trial_dir / "agent-logs").is_dir() else []
     stop_reason = "unknown"
     turn_count = 0
     summarized = ""
