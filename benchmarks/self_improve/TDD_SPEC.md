@@ -79,11 +79,33 @@ below must match them exactly:
   `{"run_id", "status" (pass_1/pass_2/fail/fail_timeout/empty_response/error),
   "stop_reason_1", "stop_reason_2", "elapsed_s", "turn_count", "scoring_params"}`.
 
-- harbor/tb adapter logs (`benchmarks/harbor_adapter/little_coder_agent.py`,
-  `benchmarks/tb_adapter/little_coder_agent.py`): free-text log files with lines
-  `=== stop_reason: <value> ===` and `>> {tool_name}({args})` — no structured JSON
-  per-task file today. Treated as the least-structured source; ingestion must not
-  crash on missing/malformed data.
+- tb adapter logs — **UPDATE (superseded the original guess below): confirmed
+  against a real captured `tb run` (hello-world task, pi routed through
+  fake_pi.py via `LITTLE_CODER_PI_BIN_OVERRIDE`, no LLM cost). Real structure**,
+  see `tests/fixtures/real_tb_run/`:
+  ```
+  <log_root>/results.json                                    run-level aggregate (ignored)
+  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/results.json     per-trial: is_resolved (GROUND TRUTH)
+  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/agent-logs/*.log little-coder's own log:
+    === stop_reason: X ===
+    === assistant text ===
+    >> tool(args)
+    << result
+  ```
+  **Confirmed real bug this superseded**: a flat `*.log` glob directly under
+  `log_root` matches terminal-bench's own top-level `run.log` (task_id="run",
+  meaningless data) instead of the real nested agent log — `harbor_tb_ingest.py`
+  now walks `<task_id>/<trial>/agent-logs/*.log` explicitly.
+  **Confirmed real ground-truth mismatch**: `stop_reason == agent_end` is NOT a
+  reliable success proxy — the real fixture has `stop_reason=agent_end` (pi
+  finished its turn) but `is_resolved=false` (the task actually failed; a fake
+  agent finishing a turn cleanly says nothing about whether it solved the task).
+  `success` must come from the trial's own `results.json::is_resolved`.
+  harbor's real output format (as opposed to tb's) remains unconfirmed —
+  `harbor_adapter/little_coder_agent.py` writes the same `=== stop_reason ===`
+  log style, but its surrounding directory/results.json shape has not been
+  captured against a real harbor run. Treated as the least-confirmed source;
+  ingestion must not crash on missing/malformed data regardless.
 
 **Gap to flag explicitly (do not silently paper over in the plan)**: aider_polyglot's
 `_dump_trajectory` does not currently capture `rpc.notifications()`, unlike gaia and
