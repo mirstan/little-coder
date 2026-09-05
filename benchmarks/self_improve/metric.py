@@ -87,7 +87,22 @@ def metric(gold, pred, trace=None, pred_name=None, pred_trace=None, program_trac
 
     usage = _find_usage(traj, pred_name)
     if usage is None:
-        return ScoreWithFeedback(score=base_score, feedback=None)
+        # Real bug, confirmed by review: HarnessProgram.forward() calls
+        # EVERY predictor for every example (required so GEPA has a real
+        # trace entry per predictor -- see components.py), so "this
+        # component wasn't used in this trajectory" is the COMMON case, not
+        # rare. feedback=None was passed straight through into dspy's
+        # reflection prompt renderer, which stringifies it -- the paid
+        # reflection LM was reading a literal "# Feedback\nNone" for most
+        # rows. A real, informative string costs nothing extra and gives
+        # the reflection step an actual signal instead of noise.
+        outcome = "passed" if traj.success else "failed"
+        return ScoreWithFeedback(
+            score=base_score,
+            feedback=f"{pred_name} was not injected in this trajectory "
+                     f"(task {traj.task_id}, {traj.benchmark}, {outcome}). "
+                     f"Its text had no effect on this outcome.",
+        )
 
     return ScoreWithFeedback(
         score=base_score,

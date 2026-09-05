@@ -90,17 +90,23 @@ def test_metric_pass_2_scores_partial_credit():
     assert result == 0.7
 
 
-def test_metric_component_not_used_returns_score_no_feedback():
-    """When pred_name is a specific component but it wasn't active in this
-    trajectory, there's no attributable signal -- score still reflects the
-    episode outcome, but feedback must be None (not fabricated text)."""
+def test_metric_component_not_used_returns_real_feedback_not_none():
+    """Real bug, confirmed by review: HarnessProgram.forward() calls EVERY
+    predictor for every example, so "this component wasn't used" is the
+    COMMON case, not rare -- feedback=None was passed straight into dspy's
+    reflection prompt renderer, which stringified it as a literal "None"
+    for most rows, wasting the paid reflection LM's attention on noise.
+    Must be a real, informative string instead."""
     traj = NormalizedTrajectory(benchmark="gaia", task_id="t", success=False,
                                  stop_reason="deadline", turn_count=2, partial_score=0.0,
                                  components_used=[])
     result = metric(FakeExample(traj), pred=None, trace=None,
                      pred_name="skills_tools_bash", pred_trace=None)
     assert result.score == 0.0
-    assert result.feedback is None
+    assert result.feedback is not None
+    assert isinstance(result.feedback, str)
+    assert "skills_tools_bash" in result.feedback
+    assert "not injected" in result.feedback
 
 
 def test_metric_component_used_in_failure_returns_grounded_feedback():
@@ -135,13 +141,23 @@ def test_metric_component_used_in_success_returns_positive_feedback():
     assert result.feedback is not None
 
 
-def test_score_for_benchmark_dispatches_by_benchmark_literal():
-    """Unit-test the internal dispatcher directly -- each benchmark's
-    partial_score->score mapping must be independently verifiable, not only
-    exercised transitively through metric()."""
+def test_score_for_benchmark_falls_back_to_success_when_partial_score_absent():
+    """Real bug (test-quality), confirmed by review: the old name/docstring
+    claimed per-benchmark dispatch, but _score_for_benchmark does not branch
+    on traj.benchmark at all -- it only checks whether partial_score is
+    set. The single assertion here could never fail for any benchmark
+    value, so it wasn't actually testing what it claimed. Renamed to match
+    the real behavior, and the partial_score-present case is added below so
+    both branches of the actual logic are covered."""
     assert _score_for_benchmark(NormalizedTrajectory(
         benchmark="gaia", task_id="t", success=True, stop_reason="agent_end",
         turn_count=1)) == 1.0
+
+
+def test_score_for_benchmark_prefers_partial_score_when_present():
+    assert _score_for_benchmark(NormalizedTrajectory(
+        benchmark="aider_polyglot", task_id="t", success=True, stop_reason="agent_end",
+        turn_count=1, partial_score=0.7)) == 0.7
 
 
 def test_aggregate_score_applies_benchmark_weights():
