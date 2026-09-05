@@ -49,6 +49,27 @@ def _extension_paths() -> list[str]:
     return paths
 
 
+def _build_system_prompt() -> Path:
+    """Resolve the file passed to pi's --system-prompt flag.
+
+    If PRINCIPLES.md exists alongside AGENTS.md, concatenate them into a
+    generated file (gitignored, rewritten on every call so edits to either
+    source file are always picked up) and point at that instead. If
+    PRINCIPLES.md is absent, behavior is unchanged: point straight at
+    AGENTS.md, matching pre-existing behavior exactly.
+    """
+    agents_md = REPO_ROOT / "AGENTS.md"
+    principles_md = REPO_ROOT / "PRINCIPLES.md"
+    if not principles_md.exists():
+        return agents_md
+
+    generated = REPO_ROOT / ".pi" / ".system-prompt.generated.md"
+    generated.parent.mkdir(parents=True, exist_ok=True)
+    content = agents_md.read_text() + "\n\n# Principles\n\n" + principles_md.read_text()
+    generated.write_text(content)
+    return generated
+
+
 class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
 
@@ -119,16 +140,17 @@ class PiRpc:
         # handles execution-level blocking for defense in depth.
         if allowed_tools:
             cmd.extend(["--tools", ",".join(allowed_tools)])
-        # Use AGENTS.md as THE system prompt, not as appended Project Context.
-        # Pi's --system-prompt resolves an existing path to file content
-        # (resource-loader.js::resolvePromptInput). --no-context-files prevents
-        # AGENTS.md from also being auto-discovered and double-appended under
-        # `# Project Context`. Effect: pi's hardcoded "You are an expert coding
-        # assistant operating inside pi…" identity and the "Pi documentation"
-        # block both go away; AGENTS.md alone defines the agent.
-        agents_md = REPO_ROOT / "AGENTS.md"
-        if agents_md.exists():
-            cmd.extend(["--no-context-files", "--system-prompt", str(agents_md)])
+        # Use AGENTS.md (plus PRINCIPLES.md, if present) as THE system prompt,
+        # not as appended Project Context. Pi's --system-prompt resolves an
+        # existing path to file content (resource-loader.js::resolvePromptInput).
+        # --no-context-files prevents AGENTS.md from also being auto-discovered
+        # and double-appended under `# Project Context`. Effect: pi's hardcoded
+        # "You are an expert coding assistant operating inside pi…" identity and
+        # the "Pi documentation" block both go away; AGENTS.md (+ PRINCIPLES.md)
+        # alone defines the agent.
+        system_prompt_path = _build_system_prompt()
+        if system_prompt_path.exists():
+            cmd.extend(["--no-context-files", "--system-prompt", str(system_prompt_path)])
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
