@@ -279,6 +279,13 @@ _ENV_KNOBS = (
     "PI_REASONING_MAX_TOKENS", "LITTLE_CODER_BASH_ALLOW",
     "LITTLE_CODER_PERMISSION_MODE", "LITTLE_CODER_INJECT_MODE",
     "LITTLE_CODER_SUBCODER_CONCURRENCY", "LITTLE_CODER_COMPACT_AT_PERCENT",
+    # Now that --thinking is a first-class scoring parameter: the
+    # thinking-budget extension can force the level to "off" mid-attempt
+    # once this budget is exceeded, so a run recorded at a high --thinking
+    # level may spend much of its budget at "off" in practice. This knob
+    # directly gates that, and PI_REASONING_MAX_TOKENS (already listed
+    # above) is the analogous budget for the reasoning-token cap itself.
+    "LITTLE_CODER_THINKING_BUDGET",
 )
 
 
@@ -416,6 +423,7 @@ def _run_exercise(
     model: str,
     verbose: bool,
     retry: bool,
+    *,
     max_attempts: int = 2,
     thinking: str | None = None,
 ):
@@ -543,9 +551,12 @@ def main():
                      help="Total attempts including the first; default 2 matches "
                           "the original hardcoded one-retry behavior")
     ap.add_argument("--thinking", default=None,
-                     help="--thinking level passed to the pi CLI "
-                          "(off/minimal/low/medium/high/xhigh/max). Unset = pi's "
-                          "own default (medium).")
+                     choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                     help="--thinking level passed to the pi CLI. Unset means "
+                          "whatever pi itself resolves to with no flag -- its "
+                          "compiled default is 'medium', but a user- or "
+                          "machine-local ~/.pi/agent/settings.json can override "
+                          "that, so 'unset' is not a fixed, reproducible level.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

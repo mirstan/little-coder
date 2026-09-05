@@ -80,6 +80,7 @@ class PiRpc:
         self,
         model: str,
         cwd: Optional[str] = None,
+        *,
         benchmark: Optional[str] = None,
         allowed_tools: Optional[list[str]] = None,
         session_id: Optional[str] = None,

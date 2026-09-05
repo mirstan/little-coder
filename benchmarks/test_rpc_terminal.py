@@ -29,6 +29,25 @@ def fake_pi(monkeypatch):
     return _spawn
 
 
+def test_thinking_flag_appears_in_argv(fake_pi, tmp_path):
+    """Hermetic companion to test_rpc_thinking_flag_reaches_pi (which needs a
+    real pi binary and is machine-dependent on ambient settings): this checks
+    the literal subprocess argv against a fake pi, so it can never be fooled
+    by a local ~/.pi/agent/settings.json default and runs in CI."""
+    with fake_pi("clean", tmp_path, thinking="high") as rpc:
+        args = rpc._proc.args
+    assert "--thinking" in args
+    assert args[args.index("--thinking") + 1] == "high"
+
+
+def test_no_thinking_flag_when_unset(fake_pi, tmp_path):
+    """The flag must be genuinely absent when unset, not passed as an empty
+    or default value -- pi's own default should apply unmodified."""
+    with fake_pi("clean", tmp_path) as rpc:
+        args = rpc._proc.args
+    assert "--thinking" not in args
+
+
 def test_clean_run_reports_agent_end(fake_pi, tmp_path):
     with fake_pi("clean", tmp_path) as rpc:
         r = rpc.prompt_and_collect("go", timeout=30)
