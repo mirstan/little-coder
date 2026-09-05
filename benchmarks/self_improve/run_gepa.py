@@ -5,8 +5,11 @@ HarnessProgram from the real components.yaml-mapped files, run metric() over
 every trajectory for every pred_name its components_used references plus the
 episode-level pred_name=None call, compute the weighted aggregate score, and
 print a summary -- WITHOUT constructing a dspy.LM or calling GEPA.compile().
-Real (non-dry-run) GEPA runs are not implemented yet; that's Layer 4 and
-requires explicit reflection_lm/API-key configuration.
+
+Real (non-dry-run) GEPA runs (Layer 4) are implemented in _real_run() but
+gated behind three independent, redundant checks (--reflection-model,
+$REFLECTION_LM_API_KEY, --confirm-real-run) that must ALL be present, or the
+run refuses and exits without spending anything. See README.md for usage.
 """
 import argparse
 import logging
