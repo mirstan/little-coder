@@ -41,13 +41,31 @@ def _load_components_yaml(components_yaml_path: Path) -> dict[str, str]:
     return yaml.safe_load(Path(components_yaml_path).read_text()) or {}
 
 
+def _resolve_component_path(repo_root: Path, rel_path: str) -> Path:
+    """Join rel_path onto repo_root and verify the result stays inside it.
+
+    components.yaml is repo-controlled data today, but `Path(repo_root) /
+    rel_path` alone provides no containment: an ABSOLUTE rel_path discards
+    repo_root entirely (pathlib's `/` operator replaces the left side when
+    the right is absolute), and a relative one can still escape via `../`
+    segments. Cheap to validate regardless of current trust level
+    (confirmed hardening gap by review) -- this is the only thing standing
+    between a components.yaml edit and an arbitrary file read/overwrite.
+    """
+    repo_root = Path(repo_root).resolve()
+    resolved = (repo_root / rel_path).resolve()
+    if not resolved.is_relative_to(repo_root):
+        raise ValueError(f"component path {rel_path!r} escapes repo_root {repo_root}")
+    return resolved
+
+
 def load_components(components_yaml_path: Path, repo_root: Path) -> dict[str, str]:
     """Load every component's body text (frontmatter stripped) keyed by
     pred_name, per components.yaml."""
     mapping = _load_components_yaml(components_yaml_path)
     components = {}
     for pred_name, rel_path in mapping.items():
-        text = (Path(repo_root) / rel_path).read_text()
+        text = _resolve_component_path(repo_root, rel_path).read_text()
         _frontmatter, body = split_frontmatter(text)
         components[pred_name] = body
     return components
@@ -111,7 +129,7 @@ def write_components_back(
         rel_path = mapping.get(pred_name)
         if rel_path is None:
             continue
-        file_path = Path(repo_root) / rel_path
+        file_path = _resolve_component_path(repo_root, rel_path)
         current_text = file_path.read_text()
         frontmatter, current_body = split_frontmatter(current_text)
         if new_body == current_body:

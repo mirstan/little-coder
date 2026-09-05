@@ -1,3 +1,4 @@
+import pytest
 import yaml
 
 from benchmarks.self_improve.components import (
@@ -103,3 +104,29 @@ def test_write_components_back_reports_changed_files(tmp_path):
     written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
     assert "target_tool: bash" in written  # frontmatter still present
     assert "v2" in written
+
+
+def _make_repo_with_escaping_entry(tmp_path, rel_path):
+    (tmp_path / "AGENTS.md").write_text("# little-coder\n\nBody text.\n")
+    components_yaml = tmp_path / "components.yaml"
+    components_yaml.write_text(yaml.dump({"escaping": rel_path}))
+    return components_yaml
+
+
+@pytest.mark.parametrize("rel_path", ["../../etc/passwd", "/etc/passwd"])
+def test_load_components_rejects_path_that_escapes_repo_root(tmp_path, rel_path):
+    """Real hardening gap, confirmed by review: a components.yaml entry with
+    an absolute path or '../' traversal must be rejected, not silently read
+    from outside repo_root."""
+    components_yaml = _make_repo_with_escaping_entry(tmp_path, rel_path)
+    with pytest.raises(ValueError, match="escapes repo_root"):
+        load_components(components_yaml, repo_root=tmp_path)
+
+
+@pytest.mark.parametrize("rel_path", ["../../etc/passwd", "/etc/passwd"])
+def test_write_components_back_rejects_path_that_escapes_repo_root(tmp_path, rel_path):
+    """Same containment guard on the write path -- this is the side that
+    could otherwise overwrite an arbitrary file outside repo_root."""
+    components_yaml = _make_repo_with_escaping_entry(tmp_path, rel_path)
+    with pytest.raises(ValueError, match="escapes repo_root"):
+        write_components_back(components_yaml, repo_root=tmp_path, optimized={"escaping": "pwned"})
