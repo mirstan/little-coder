@@ -118,3 +118,29 @@ def test_real_run_happy_path_passes_reflection_model_through(tmp_path, monkeypat
 
     stub = _StubGEPA.last_instance
     assert stub.reflection_lm.model == "anthropic/claude-opus-4-6"
+
+
+def test_real_run_happy_path_passes_reasoning_effort_through_when_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("REFLECTION_LM_API_KEY", "sk-fake-not-real-never-used")
+    monkeypatch.setattr(dspy, "GEPA", _StubGEPA)
+
+    _real_run(
+        [_traj("t1")], {"agents_md": "Body."},
+        _args(tmp_path, reflection_model="openai/gpt-5.6-luna", reflection_reasoning_effort="xhigh"),
+    )
+
+    stub = _StubGEPA.last_instance
+    assert stub.reflection_lm.kwargs.get("reasoning_effort") == "xhigh"
+
+
+def test_real_run_happy_path_omits_reasoning_effort_when_not_set(tmp_path, monkeypatch):
+    """Models that don't support reasoning_effort must not get the kwarg at
+    all -- absence, not a null/empty value, since dspy.LM forwards kwargs
+    verbatim to the underlying provider call."""
+    monkeypatch.setenv("REFLECTION_LM_API_KEY", "sk-fake-not-real-never-used")
+    monkeypatch.setattr(dspy, "GEPA", _StubGEPA)
+
+    _real_run([_traj("t1")], {"agents_md": "Body."}, _args(tmp_path, reflection_model="anthropic/claude-opus-4-6"))
+
+    stub = _StubGEPA.last_instance
+    assert "reasoning_effort" not in stub.reflection_lm.kwargs

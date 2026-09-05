@@ -226,7 +226,10 @@ def _real_run(
     # actual generated text, since metric() scores from gold.trajectory).
     dspy.settings.configure(lm=DummyLM([{"guidance": "n/a"}] * 10_000))
 
-    reflection_lm = dspy.LM(model=args.reflection_model, api_key=api_key)
+    lm_kwargs = {}
+    if getattr(args, "reflection_reasoning_effort", None):
+        lm_kwargs["reasoning_effort"] = args.reflection_reasoning_effort
+    reflection_lm = dspy.LM(model=args.reflection_model, api_key=api_key, **lm_kwargs)
 
     gepa = dspy.GEPA(metric=metric, reflection_lm=reflection_lm, auto="light")
     print(f"Starting real GEPA.compile(): {len(trainset)} train, {len(valset)} val examples, "
@@ -255,6 +258,9 @@ def main():
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reflection-model", default=None)
+    ap.add_argument("--reflection-reasoning-effort", default=None,
+                     help="Passed through to dspy.LM as reasoning_effort, e.g. "
+                          "'xhigh' for models that support a reasoning-effort param.")
     ap.add_argument("--confirm-real-run", action="store_true",
                      help="Required in addition to --reflection-model and "
                           f"${REFLECTION_LM_API_KEY_ENV} to actually spend API budget.")
