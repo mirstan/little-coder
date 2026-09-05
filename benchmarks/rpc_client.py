@@ -27,7 +27,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).parent.parent
-PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
+# LITTLE_CODER_PI_BIN_OVERRIDE: integration-testing hook only. Lets a
+# host-side harness (e.g. `tb run`, which runs pi on the host per
+# tb_adapter's own comment) point PI_BIN at a stand-in (fake_pi.py) without
+# modifying any tracked file. Unset -> byte-identical to prior behavior.
+PI_BIN = Path(os.environ.get(
+    "LITTLE_CODER_PI_BIN_OVERRIDE",
+    str(REPO_ROOT / "node_modules" / ".bin" / "pi"),
+))
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
 
