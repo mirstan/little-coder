@@ -100,10 +100,25 @@ def test_close_is_idempotent(fake_pi, tmp_path):
 def test_busy_then_ready_recovers_without_stale_event(fake_pi, tmp_path):
     """Regression guard: a rejected send must not let a leftover event from
     the turn pi was still finishing be mistaken for the retry's own
-    completion. Without clearing the event queue after a successful retry,
-    _drain_events_until would pop the stale agent_end first and return
-    empty -- indistinguishable from a genuinely empty response."""
+    completion. Without discarding stale events, _drain_events_until would
+    pop the leftover agent_end first and return empty -- indistinguishable
+    from a genuinely empty response."""
     with fake_pi("busy_then_ready", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert "real answer" in r.assistant_text
+
+
+def test_busy_then_late_stale_event_still_discarded(fake_pi, tmp_path):
+    """Harder timing than the above: the leftover event is written AFTER
+    the client's own backoff would already have elapsed, but still before
+    the retry is acked. A fix that discards stale events only once, right
+    before resending, passes the case above but fails this one -- the
+    leftover lands in the queue after that one-time clear and is never
+    removed. Only a fix keyed to the retry's own acceptance (not to when
+    the resend happened) handles both."""
+    with fake_pi("busy_then_late_stale", tmp_path) as rpc:
         r = rpc.prompt_and_collect("go", timeout=30)
     assert r.agent_ended is True
     assert r.stop_reason == "agent_end"

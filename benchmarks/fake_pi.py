@@ -81,14 +81,41 @@ def main():
         # Simulates the readiness-retry race: the first send is rejected
         # because a previous turn is still winding down, and that previous
         # turn's own leftover agent_end lands in the queue before the
-        # retry's real completion does. Regression fixture for the
-        # stale-event-queue bug: without clearing the queue after a
-        # successful retry, this leftover agent_end gets mistaken for the
-        # new turn's completion.
+        # retry's real completion does, with the leftover written
+        # immediately (before the retry is even sent). Regression fixture
+        # for the stale-event-queue bug: without discarding events that
+        # predate the retry's own acceptance, this leftover agent_end gets
+        # mistaken for the new turn's completion.
         emit({"type": "response", "id": rid, "success": False,
               "error": "Agent is already processing"})
         emit({"type": "agent_end"})  # stale leftover from the "previous" turn
         msg2 = read_prompt()
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "real answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "busy_then_late_stale":
+        # Harder variant of busy_then_ready: the previous turn's leftover
+        # agent_end is written LATE -- after the client's own backoff sleep
+        # would already have elapsed -- but still before the retry is acked.
+        # A fix that discards stale events only once, right before resending
+        # (rather than by watermarking the moment of the retry's own
+        # acceptance), passes busy_then_ready but fails this: the leftover
+        # lands in the queue after that one-time clear and is never removed.
+        emit({"type": "response", "id": rid, "success": False,
+              "error": "Agent is already processing"})
+        msg2 = read_prompt()  # the retry -- arrives while we're still "busy"
+        time.sleep(2.5)  # outlast the client's 2s backoff before it resends
+        emit({"type": "agent_end"})  # stale leftover, written late
         if msg2 is None:
             return
         rid2 = msg2.get("id")

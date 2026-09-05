@@ -193,6 +193,12 @@ class PiRpc:
                 continue
             with self._cv:
                 if msg.get("type") == "response" and msg.get("id"):
+                    # Stamped here, under the same lock and in the same
+                    # message-stream position the response itself arrived in,
+                    # so a caller can later tell exactly which queued events
+                    # existed strictly before this response -- see
+                    # prompt_and_collect()'s readiness-retry handling.
+                    msg["_event_q_watermark"] = len(self._event_q)
                     self._responses[msg["id"]] = msg
                 else:
                     self._event_q.append(msg)
@@ -307,21 +313,6 @@ class PiRpc:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
         resp = None
         for readiness_attempt in range(5):
-            if readiness_attempt > 0:
-                # A rejected send means pi was still finishing the PREVIOUS
-                # turn. Whatever events that turn produced while we back off
-                # -- including, in whatever internal state causes this race,
-                # a leftover agent_end -- are sitting in the queue ahead of
-                # anything from the turn we're about to (re)request. Clear it
-                # here, before resending, not after the retry is acked: at
-                # this exact point nothing new has been asked for yet, so
-                # everything queued is unambiguously stale. Clearing after
-                # the ack instead would race the reader thread, which can
-                # queue the new turn's own events before this thread gets
-                # scheduled again -- discarding the response it came here
-                # to collect.
-                with self._cv:
-                    self._event_q.clear()
             rid = str(uuid.uuid4())
             self._send({"id": rid, "type": "prompt", "message": message})
             resp = self._await_response(rid, timeout=30)
@@ -332,6 +323,28 @@ class PiRpc:
                 time.sleep(2 * (readiness_attempt + 1))
                 continue
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
+
+        if readiness_attempt > 0:
+            # A rejected send means pi was still finishing the PREVIOUS turn;
+            # whatever it produced -- including, in whatever internal state
+            # causes this race, a leftover agent_end -- can still be sitting
+            # in the queue ahead of anything from the turn just accepted.
+            #
+            # Neither "clear before resending" nor "clear right after the
+            # ack" is race-free: the former leaves a gap for pi to enqueue a
+            # stale event between the clear and the ack (reproduced: pi can
+            # write a turn's agent_end right up until the moment it frees
+            # itself to accept the next one), and the latter can instead
+            # discard the real turn's own events if the reader thread queues
+            # them before this thread wakes from _await_response(). Trimming
+            # to the watermark recorded at the exact moment THIS response was
+            # stored is race-free in both directions: anything queued before
+            # that point in the message stream cannot belong to a turn pi
+            # had not yet accepted when it wrote the response, and anything
+            # queued at or after it is preserved regardless of scheduling.
+            watermark = resp.get("_event_q_watermark", 0)
+            with self._cv:
+                del self._event_q[:watermark]
 
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",
