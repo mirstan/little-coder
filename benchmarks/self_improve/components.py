@@ -9,6 +9,7 @@ repo-relative file path.
 """
 from pathlib import Path
 
+import dspy
 import yaml
 
 _FRONTMATTER_DELIM = "---\n"
@@ -50,6 +51,32 @@ def load_components(components_yaml_path: Path, repo_root: Path) -> dict[str, st
         _frontmatter, body = split_frontmatter(text)
         components[pred_name] = body
     return components
+
+
+class HarnessProgram(dspy.Module):
+    """Addressable text container for GEPA: one dspy.Predict per artifact.
+    Never executed against a live model as part of scoring -- forward() is
+    not called by the offline metric path (see run_gepa.py); GEPA's
+    .compile() may invoke it during internal probing, but scoring always
+    comes from replaying already-collected trajectories through metric().
+    """
+    def __init__(self, components: dict[str, str]):
+        super().__init__()
+        self.predictors: dict[str, dspy.Predict] = {}
+        for pred_name, body_text in components.items():
+            sig = dspy.make_signature(
+                "task_context -> guidance",
+                instructions=body_text,
+                signature_name=f"{pred_name}_signature",
+            )
+            self.predictors[pred_name] = dspy.Predict(sig)
+
+    def forward(self, pred_name: str, task_context: str = ""):
+        return self.predictors[pred_name](task_context=task_context)
+
+
+def build_harness_program(components: dict[str, str]) -> HarnessProgram:
+    return HarnessProgram(components)
 
 
 def write_components_back(
