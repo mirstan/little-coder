@@ -37,6 +37,21 @@ def test_build_system_prompt_generated_file_is_gitignored_path(tmp_path, monkeyp
     assert path.name.startswith(".system-prompt.generated")
 
 
+def test_build_system_prompt_falls_back_to_agents_md_path_when_agents_md_missing(tmp_path, monkeypatch):
+    """Real bug, confirmed by review: the pre-existing "AGENTS.md missing ->
+    degrade gracefully" guard (the caller checks .exists() on this
+    function's return value) was bypassed when PRINCIPLES.md was present
+    but AGENTS.md was not -- the unconditional agents_md.read_text() raised
+    an uncaught FileNotFoundError inside PiRpc.__init__ instead of falling
+    back the same way the no-PRINCIPLES path already does."""
+    (tmp_path / "PRINCIPLES.md").write_text("Be concise.\n")
+    # deliberately no AGENTS.md
+    monkeypatch.setattr(rpc_client, "REPO_ROOT", tmp_path)
+    path = rpc_client._build_system_prompt()
+    assert path == tmp_path / "AGENTS.md"
+    assert not path.exists()  # caller's existence check correctly sees this as absent
+
+
 def test_build_system_prompt_refreshes_on_each_call(tmp_path, monkeypatch):
     """Edits to PRINCIPLES.md between two PiRpc constructions must be picked
     up -- the generated file is rewritten every call, not cached."""

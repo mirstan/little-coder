@@ -31,10 +31,17 @@ REPO_ROOT = Path(__file__).parent.parent
 # host-side harness (e.g. `tb run`, which runs pi on the host per
 # tb_adapter's own comment) point PI_BIN at a stand-in (fake_pi.py) without
 # modifying any tracked file. Unset -> byte-identical to prior behavior.
-PI_BIN = Path(os.environ.get(
-    "LITTLE_CODER_PI_BIN_OVERRIDE",
-    str(REPO_ROOT / "node_modules" / ".bin" / "pi"),
-))
+#
+# `or`, not os.environ.get(name, default): .get() returns "" (not the
+# default) when the var is exported EMPTY -- a real risk from a harness
+# script doing `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"`.
+# Path("") == Path("."), whose .exists() is True, silently defeating the
+# "pi not found" FileNotFoundError check below and surfacing later as an
+# opaque Popen error instead (confirmed by review).
+PI_BIN = Path(
+    os.environ.get("LITTLE_CODER_PI_BIN_OVERRIDE")
+    or str(REPO_ROOT / "node_modules" / ".bin" / "pi")
+)
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
 
@@ -67,7 +74,14 @@ def _build_system_prompt() -> Path:
     """
     agents_md = REPO_ROOT / "AGENTS.md"
     principles_md = REPO_ROOT / "PRINCIPLES.md"
-    if not principles_md.exists():
+    # Real bug, confirmed by review: the pre-existing "AGENTS.md missing ->
+    # degrade gracefully" guard (the caller checks system_prompt_path.exists()
+    # after this returns) was bypassed on THIS path -- with PRINCIPLES.md
+    # present but AGENTS.md absent, the read_text() below raised an
+    # uncaught FileNotFoundError inside PiRpc.__init__, killing the whole
+    # benchmark run instead of falling back the same way the no-PRINCIPLES
+    # path already does.
+    if not principles_md.exists() or not agents_md.exists():
         return agents_md
 
     generated = REPO_ROOT / ".pi" / ".system-prompt.generated.md"

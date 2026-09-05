@@ -200,10 +200,11 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     tool call; the work dir is a TemporaryDirectory destroyed on scope exit,
     taking the model's actual code with it.
 
-    notifications: this attempt's OWN slice of rpc.notifications() (the caller
-    must delta-slice for attempt 2, since notifications() accumulates for the
-    whole session, not per-prompt) -- extension activity (skill-inject,
-    knowledge-inject, quality-monitor, etc.) otherwise invisible in this dump.
+    notifications: this attempt's OWN rpc.notifications(). Each attempt opens
+    a fresh PiRpc session (see _run_exercise), so this is already scoped to
+    just this attempt -- no delta-slicing across attempts needed or possible
+    anymore. Extension activity (skill-inject, knowledge-inject,
+    quality-monitor, etc.) otherwise invisible in this dump.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """

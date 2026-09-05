@@ -29,3 +29,15 @@ def test_pi_bin_uses_override_when_set(monkeypatch, tmp_path):
     monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(fake))
     rpc_client = _reload_rpc_client()
     assert rpc_client.PI_BIN == fake
+
+
+def test_pi_bin_falls_back_to_default_when_override_is_empty_string(monkeypatch):
+    """Real bug, confirmed by review: os.environ.get(name, default) returns
+    "" (not the default) when the var is exported EMPTY, e.g. via
+    `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"` in a harness
+    script. Path("") == Path("."), whose .exists() is True, which silently
+    defeated the "pi CLI not found" check and surfaced later as an opaque
+    Popen error instead."""
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", "")
+    rpc_client = _reload_rpc_client()
+    assert rpc_client.PI_BIN == rpc_client.REPO_ROOT / "node_modules" / ".bin" / "pi"
