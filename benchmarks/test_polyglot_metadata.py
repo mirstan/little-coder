@@ -189,3 +189,46 @@ def test_empty_response_does_not_abort_remaining_attempts(tmp_path, monkeypatch)
     assert calls["n"] == 2, "attempt 2 never ran -- empty_response aborted the loop"
     assert rec["status"] == "pass_2"
     assert rec["stop_reasons"] == ["agent_end", "agent_end"]
+
+
+def test_config_label_recorded_in_meta_not_scoring_params(tmp_path, monkeypatch):
+    """--config-label is result-file bookkeeping for distinguishing runs of the
+    same --agent/--model under different tuning configs (e.g. server-side
+    sampling params, invisible to this script) -- compare_agents.py groups on
+    meta.config_label. It must land there, but stay out of _scoring_params:
+    unlike --thinking/--max-attempts it doesn't change how an attempt runs,
+    so a --resume under a different --config-label must not be flagged as a
+    scoring-parameter mismatch."""
+    monkeypatch.setattr(AP, "RESULTS_FILE", tmp_path / "results.json")
+    monkeypatch.setattr(sys, "argv", [
+        "aider_polyglot.py", "--language", "python",
+        "--exercise", "definitely-not-an-exercise",
+        "--model", "fake/model", "--config-label", "tuned",
+    ])
+    AP.main()
+
+    saved = json.loads((tmp_path / "results.json").read_text())
+    assert saved["meta"]["config_label"] == "tuned"
+    assert "config_label" not in saved["meta"]["scoring_params"]
+
+
+def test_config_label_persists_across_resume_without_the_flag(tmp_path, monkeypatch):
+    """A --resume run that omits --config-label must not blank out the label
+    recorded by the run that originally set it."""
+    monkeypatch.setattr(AP, "RESULTS_FILE", tmp_path / "results.json")
+    monkeypatch.setattr(sys, "argv", [
+        "aider_polyglot.py", "--language", "python",
+        "--exercise", "definitely-not-an-exercise",
+        "--model", "fake/model", "--config-label", "tuned",
+    ])
+    AP.main()
+
+    monkeypatch.setattr(sys, "argv", [
+        "aider_polyglot.py", "--language", "python",
+        "--exercise", "definitely-not-an-exercise",
+        "--model", "fake/model", "--resume",
+    ])
+    AP.main()
+
+    saved = json.loads((tmp_path / "results.json").read_text())
+    assert saved["meta"]["config_label"] == "tuned"

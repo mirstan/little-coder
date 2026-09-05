@@ -777,6 +777,14 @@ def main():
                           "compiled default is 'medium', but a user- or "
                           "machine-local ~/.pi/agent/settings.json can override "
                           "that, so 'unset' is not a fixed, reproducible level.")
+    ap.add_argument("--config-label", default=None,
+                     help="Recorded in meta.config_label for result-file bookkeeping when the "
+                          "same --agent/--model is run under different tuning configs (e.g. "
+                          "sampling params changed on the server, not visible to this script) "
+                          "-- avoids collisions in compare_agents.py's (agent, model) grouping. "
+                          "Not itself a scoring parameter -- unlike --thinking/--max-attempts, "
+                          "it doesn't affect how an attempt runs, so a --resume with a different "
+                          "--config-label is not flagged as a mismatch.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -791,6 +799,8 @@ def main():
         sys.exit("--model is required for --agent codex (e.g. --model gpt-5.1-codex-max)")
 
     results = _load_results() if args.resume else {"exercises": {}, "meta": {}}
+    if args.config_label:
+        results["meta"]["config_label"] = args.config_label
 
     desc = LANG_DESCRIPTORS.get(args.language)
     if desc is None:
