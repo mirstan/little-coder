@@ -94,6 +94,9 @@ class _CountingRpc:
     def close(self):
         pass
 
+    def notifications(self):
+        return []
+
     def prompt_and_collect(self, message, timeout=900):
         class R:
             stop_reason = "agent_end"
@@ -141,6 +144,9 @@ class _EmptyThenRealRpc:
 
     def __exit__(self, *a):
         return False
+
+    def notifications(self):
+        return []
 
     def prompt_and_collect(self, message, timeout=900):
         n = self.n

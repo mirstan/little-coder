@@ -192,13 +192,19 @@ def _clip(value, limit: int):
     return value if len(text) <= limit else text[:limit]
 
 
-def _dump_trajectory(log_dir, attempt_name, result, work=None):
+def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
     """Persist what the harness otherwise discards.
 
     Only the final pytest output survives a run today, so a failure can be seen
     but not explained. PromptResult already carries the assistant text and every
     tool call; the work dir is a TemporaryDirectory destroyed on scope exit,
-    taking the model's actual code with it.
+    taking the model's actual code with it. `notifications` (ctx.ui.notify
+    events -- skill/knowledge injections, and critically the thinking-budget
+    extension's "the model has thought long enough" harness intervention) was
+    the other thing this dropped: an attempt that read files and stopped
+    without writing anything looked identical whether the model chose to stop
+    or the harness force-aborted its thinking, unless you happened to re-run
+    it live with rpc.notifications() -- see docs/STATE.md.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -219,6 +225,7 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None):
                 }
                 for tc in getattr(result, "tool_calls", [])
             ],
+            "notifications": notifications or [],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),
@@ -228,6 +235,10 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None):
             lines.append(f"--- [{i}] {tc.get('name')} err={tc.get('is_error')} ---")
             lines.append(f"    args: {json.dumps(tc.get('args', {}), default=str)[:1500]}")
             lines.append(f"    result: {str(tc.get('result_text', ''))[:1500]}")
+        if payload["notifications"]:
+            lines.append("=== notifications ===")
+            for n in payload["notifications"]:
+                lines.append(f"    [{n.get('notifyType')}] {n.get('message')}")
         lines.append("=== assistant text ===")
         lines.append(payload["assistant_text"][:20000])
         (log_dir / f"trajectory_{attempt_name}.txt").write_text(
@@ -658,6 +669,7 @@ def _run_exercise(
         turn_total = 0
         current_prompt = prompt
         codex_session_id = None
+        attempt_notifications: list[dict] = []
         for i in range(1, effective_attempts + 1):
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
@@ -670,6 +682,11 @@ def _run_exercise(
                     # budget-capped attempt is otherwise indistinguishable
                     # from a completed one.
                     r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
+                    # ctx.ui.notify events -- skill/knowledge injections, and
+                    # critically the thinking-budget extension's "the model
+                    # has thought long enough" intervention. Read before the
+                    # session closes; harmless if this list ends up empty.
+                    attempt_notifications = rpc.notifications()
             elif agent == "codex":
                 # Unlike pi's fresh-session-per-attempt (see above), codex
                 # resumes its own prior session from attempt 2 onward --
@@ -689,7 +706,7 @@ def _run_exercise(
             stop_reasons.append(_stop_reason(r))
             # Snapshot BEFORE the tests run and before any retry prompt is
             # sent, so the artifact reflects what THIS attempt produced.
-            _dump_trajectory(log_dir, str(i), r, work)
+            _dump_trajectory(log_dir, str(i), r, work, notifications=attempt_notifications)
             passed, out = _score(desc, work, desc["timeout_s"])
             (log_dir / f"final_output_{i}.txt").write_text(out)
             if passed:
