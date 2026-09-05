@@ -1,11 +1,37 @@
 import pytest
 
 from benchmarks.self_improve.metric import (
+    ScoreWithFeedback,
     _score_for_benchmark,
     metric,
     weighted_aggregate,
 )
 from benchmarks.self_improve.schema import ComponentUsage, NormalizedTrajectory
+
+
+def test_score_with_feedback_resolves_to_the_real_dspy_class_not_the_fallback():
+    """Confirmed real bug (third one found via an actual GEPA run):
+    `from dspy.teleprompt.gepa import ScoreWithFeedback` silently
+    ImportErrors (the package doesn't re-export it at that top level) and
+    falls through to the local dataclass fallback, even with dspy fully
+    installed. The fallback isn't dict-subscriptable, but dspy's own
+    internal feedback_fn does o["feedback"] on whatever metric() returns --
+    crashing GEPA's reflective step the moment it tried to use a real
+    component-targeted result. This test pins the module the class actually
+    resolves from, so a future import-path regression fails immediately in
+    CI rather than only inside a real, paid GEPA run."""
+    assert ScoreWithFeedback.__module__ != "benchmarks.self_improve.metric", (
+        "ScoreWithFeedback silently fell back to the local dataclass -- "
+        "the real dspy.teleprompt.gepa.gepa import is broken again"
+    )
+
+
+def test_score_with_feedback_instances_are_dict_subscriptable():
+    """The real dspy class supports o["feedback"]/o["score"] -- dspy's own
+    GEPA internals rely on this. The local fallback dataclass does not."""
+    inst = ScoreWithFeedback(score=1.0, feedback="hi")
+    assert inst["feedback"] == "hi"
+    assert inst["score"] == 1.0
 
 
 class FakeExample:

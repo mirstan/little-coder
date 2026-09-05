@@ -3,13 +3,24 @@
 Per TDD_SPEC.md §6.2: define a local ScoreWithFeedback fallback so this
 module (and its tests) import cleanly without dspy installed; swap to the
 real dspy.teleprompt.gepa type once real GEPA wiring begins.
+
+CONFIRMED REAL BUG (third one found via an actual GEPA run): the package
+`dspy.teleprompt.gepa` does NOT re-export ScoreWithFeedback at its
+top level -- `from dspy.teleprompt.gepa import ScoreWithFeedback` silently
+raises ImportError and falls through to the local dataclass fallback below,
+even with dspy fully installed. The local fallback isn't dict-subscriptable,
+but dspy's OWN internal feedback_fn (dspy/teleprompt/gepa/gepa.py) does
+`o["feedback"]` on whatever metric() returns -- crashing with "'ScoreWithFeedback'
+object is not subscriptable" the moment GEPA's reflective step tried to use
+it. The real, subscriptable class lives one level deeper, at
+dspy.teleprompt.gepa.gepa (re-exported from gepa_utils).
 """
 from dataclasses import dataclass
 
 from benchmarks.self_improve.schema import ComponentUsage, NormalizedTrajectory
 
 try:
-    from dspy.teleprompt.gepa import ScoreWithFeedback  # type: ignore
+    from dspy.teleprompt.gepa.gepa import ScoreWithFeedback  # type: ignore
 except ImportError:
     @dataclass
     class ScoreWithFeedback:  # type: ignore[no-redef]
