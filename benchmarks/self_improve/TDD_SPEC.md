@@ -107,19 +107,22 @@ below must match them exactly:
   captured against a real harbor run. Treated as the least-confirmed source;
   ingestion must not crash on missing/malformed data regardless.
 
-**Gap to flag explicitly (do not silently paper over in the plan)**: aider_polyglot's
-`_dump_trajectory` does not currently capture `rpc.notifications()`, unlike gaia and
-the harbor/tb adapters which do. This means `components_used` extraction for
-aider_polyglot trajectories will be **empty** until a small upstream change adds
-notification capture there too. The ingestion layer must handle this by degrading
-gracefully (empty `components_used`, not an error) — this is a real, confirmed gap,
-not a hypothetical one. Flag it in the ingestion module's docstring and in
-`self_improve/README.md`; fixing `aider_polyglot.py` to persist notifications is a
-one-line addition to `_dump_trajectory`'s payload dict and belongs in a small
-prerequisite PR before per-skill (as opposed to per-master-prompt) optimization on
-aider_polyglot data is meaningful. AGENTS.md/PRINCIPLES.md-level optimization from
-aider_polyglot data works fine without this fix, since those don't need per-component
-attribution.
+**Gap CLOSED** (was originally flagged here as a known gap; fixed in a later pass):
+aider_polyglot's `_dump_trajectory` now takes a `notifications=` kwarg,
+populated by the caller (`_run_exercise`) with `rpc.notifications()`,
+delta-sliced between attempt 1 and attempt 2 since `PiRpc.notifications()`
+accumulates for the whole rpc session, not per-prompt (a real correctness
+detail — without the delta slice, attempt 2's trajectory would double-count
+attempt 1's notifications). `aider_polyglot_ingest.py` extracts
+`components_used` from this field the same way `gaia_ingest.py` already did,
+via the shared `merge_component_usage()` helper. Older `trajectory_*.json`
+files written before this change have no `"notifications"` key at all and
+must still degrade gracefully to `components_used=[]` — kept as a test case
+(`test_load_components_used_degrades_gracefully_for_older_trajectories_without_notifications`)
+rather than removed, since real historical data in this shape will keep
+showing up. See `benchmarks/test_polyglot_artifacts.py` for the upstream
+`_dump_trajectory`/`_run_exercise` tests (delta-slicing correctness in
+particular) and `aider_polyglot_ingest.py`'s own tests for the ingestion side.
 
 ---
 

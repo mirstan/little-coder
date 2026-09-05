@@ -109,10 +109,14 @@ reviewed the local commit.
 
 ## Known gaps / next steps
 
-1. `aider_polyglot.py`'s `_dump_trajectory()` doesn't currently capture
-   `rpc.notifications()`, so `components_used` is always empty for
-   aider_polyglot trajectories — per-skill (as opposed to per-master-prompt)
-   optimization needs this fixed upstream first.
+1. ~~`aider_polyglot.py`'s `_dump_trajectory()` doesn't capture
+   `rpc.notifications()`~~ **Closed**: `_dump_trajectory()` now takes a
+   `notifications=` kwarg (delta-sliced per attempt, since `PiRpc.notifications()`
+   accumulates for the whole session, not per-prompt), and
+   `aider_polyglot_ingest.py` extracts `components_used` from it the same way
+   `gaia_ingest.py` already did. Older `trajectory_*.json` files written
+   before this change have no `"notifications"` key and degrade gracefully
+   to `components_used=[]`.
 2. gaia dataset access needs to be requested on HuggingFace before gaia can
    feed the training signal.
 3. harbor's real output format should be captured the same way `tb`'s was

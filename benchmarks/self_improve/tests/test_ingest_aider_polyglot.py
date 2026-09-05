@@ -88,15 +88,39 @@ def test_load_uses_stop_reason_2_when_present_else_stop_reason_1(aider_run):
     assert trajs["python/two-fer"].stop_reason == "agent_end"   # only stop_reason_1 exists
 
 
-def test_load_components_used_is_empty_pending_notification_capture(aider_run):
-    """Confirmed gap (see TDD_SPEC.md §0): aider_polyglot trajectories do not
-    currently carry notifications, so components_used MUST be empty, not
-    fabricated or inferred from tool_calls. This test locks in the gap so a
-    future fix to aider_polyglot.py's _dump_trajectory is a deliberate,
-    visible change to this test's expectation -- not a silent behavior
-    drift."""
+def test_load_components_used_degrades_gracefully_for_older_trajectories_without_notifications(aider_run):
+    """The gap this test used to lock in permanently is now closed upstream
+    (aider_polyglot.py's _dump_trajectory takes notifications=), but older
+    trajectory_*.json files written before that change have no
+    "notifications" key at all -- must degrade to [], not KeyError."""
     for t in aider_polyglot_ingest.load(aider_run["log_root"], aider_run["results_json"]):
         assert t.components_used == []
+
+
+def test_load_components_used_populates_when_notifications_present(tmp_path):
+    """The gap is closed: when a trajectory_*.json DOES carry a
+    "notifications" field (post-fix data), components_used must actually
+    populate from it via the same merge_component_usage() helper
+    gaia_ingest.py already uses -- not silently ignored."""
+    log_root = tmp_path / "logs"
+    ex = log_root / "python" / "bash-heavy"
+    ex.mkdir(parents=True)
+    _write_trajectory(
+        ex / "trajectory_1.json",
+        notifications=[
+            {"message": "skill-inject: +1 [bash]", "notifyType": "info"},
+            {"message": "skill-inject: +1 [bash]", "notifyType": "info"},
+        ],
+    )
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        "python/bash-heavy": {"status": "pass_1", "stop_reason_1": "agent_end",
+                               "stop_reason_2": None, "turn_count": 1},
+    }}))
+    traj = aider_polyglot_ingest.load(log_root, results_json)[0]
+    assert len(traj.components_used) == 1
+    assert traj.components_used[0].pred_name == "skills_tools_bash"
+    assert traj.components_used[0].invocation_count == 2
 
 
 def test_load_skips_exercise_missing_from_results_json(tmp_path):

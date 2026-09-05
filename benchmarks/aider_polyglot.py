@@ -187,13 +187,18 @@ def _clip(value, limit: int):
     return value if len(text) <= limit else text[:limit]
 
 
-def _dump_trajectory(log_dir, attempt_name, result, work=None):
+def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
     """Persist what the harness otherwise discards.
 
     Only the final pytest output survives a run today, so a failure can be seen
     but not explained. PromptResult already carries the assistant text and every
     tool call; the work dir is a TemporaryDirectory destroyed on scope exit,
     taking the model's actual code with it.
+
+    notifications: this attempt's OWN slice of rpc.notifications() (the caller
+    must delta-slice for attempt 2, since notifications() accumulates for the
+    whole session, not per-prompt) -- extension activity (skill-inject,
+    knowledge-inject, quality-monitor, etc.) otherwise invisible in this dump.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -214,6 +219,7 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None):
                 }
                 for tc in getattr(result, "tool_calls", [])
             ],
+            "notifications": notifications or [],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),
@@ -451,7 +457,12 @@ def _run_exercise(
             # sent, so the artifact reflects what THIS attempt produced. Both
             # dumps previously happened after the block, so trajectory_1 and
             # trajectory_2 captured the same post-retry tree.
-            _dump_trajectory(log_dir, "1", r1, work)
+            # notifications() accumulates for the whole rpc session, not per
+            # prompt -- notif_1 is attempt 1's own slice (everything so far);
+            # attempt 2 below takes the delta past this point, so it isn't
+            # double-counted into attempt 2's own trajectory.
+            notif_1 = rpc.notifications() if hasattr(rpc, "notifications") else []
+            _dump_trajectory(log_dir, "1", r1, work, notifications=notif_1)
             passed, out = _score(desc, work, desc["timeout_s"])
             (log_dir / "final_output_1.txt").write_text(out)
             attempt = "pass_1" if passed else None
@@ -466,7 +477,9 @@ def _run_exercise(
                 outcome_2 = _attempt_outcome(r2)
                 if outcome_2 in ("deadline", "process_exit"):
                     rpc.close()
-                _dump_trajectory(log_dir, "2", r2, work)
+                notif_2 = (rpc.notifications()[len(notif_1):]
+                           if hasattr(rpc, "notifications") else [])
+                _dump_trajectory(log_dir, "2", r2, work, notifications=notif_2)
                 passed, out = _score(desc, work, desc["timeout_s"])
                 (log_dir / "final_output_2.txt").write_text(out)
                 if passed:
