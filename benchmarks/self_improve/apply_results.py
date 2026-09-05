@@ -33,23 +33,45 @@ def create_branch_and_commit(
         raise ValueError("create_branch_and_commit called with no changed files -- "
                           "caller must check write_components_back()'s return value first")
 
-    subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_root, check=True,
-                    capture_output=True)
-    subprocess.run(["git", "add", *[str(p) for p in changed_files]], cwd=repo_root, check=True,
-                    capture_output=True)
-    subprocess.run(["git", "commit", "-q", "-m", commit_message], cwd=repo_root, check=True,
-                    capture_output=True)
+    # write_components_back() already wrote changed_files to disk before this
+    # function runs -- any failure below leaves those writes in place, so
+    # name them in the error rather than leaving the caller to guess.
+    ref_check = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch_name],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if ref_check.returncode != 0:
+        raise ValueError(f"invalid branch name {branch_name!r}: {ref_check.stderr.strip()}")
+
+    steps = [
+        ["git", "checkout", "-b", branch_name],
+        ["git", "add", "--", *[str(p) for p in changed_files]],
+        ["git", "commit", "-q", "-m", commit_message],
+    ]
+    for step in steps:
+        try:
+            subprocess.run(step, cwd=repo_root, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"{' '.join(step)!r} failed: {e.stderr}\n"
+                f"Files already written to disk but NOT committed: "
+                f"{', '.join(str(p) for p in changed_files)}"
+            ) from e
 
 
 def create_pull_request(repo_root: Path, branch_name: str, title: str, body: str) -> str:
     """Push branch_name and open a real GitHub PR via gh. NEVER call this
     without explicit human intent -- it is a real, visible-to-others action.
     Returns the PR URL."""
-    subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=repo_root, check=True)
-    result = subprocess.run(
-        ["gh", "pr", "create", "--title", title, "--body", body],
-        cwd=repo_root, check=True, capture_output=True, text=True,
-    )
+    try:
+        subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=repo_root,
+                        check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["gh", "pr", "create", "--title", title, "--body", body],
+            cwd=repo_root, check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"{' '.join(e.cmd)!r} failed: {e.stderr}") from e
     return result.stdout.strip()
 
 
@@ -67,7 +89,7 @@ def apply_and_open_pr(
     changed, or when push_and_open_pr is left False for local-only review)."""
     import yaml
 
-    from benchmarks.self_improve.components import write_components_back
+    from benchmarks.self_improve.components import _resolve_component_path, write_components_back
 
     changed = write_components_back(components_yaml_path, repo_root, optimized)
     if not changed:
@@ -77,9 +99,11 @@ def apply_and_open_pr(
     # e.g. skills/tools/bash.md's stem is "bash", but score_deltas and the
     # caller's `optimized` dict are keyed by pred_name "skills_tools_bash";
     # a bare filename stem would silently never match either).
+    # Resolved the same way write_components_back() resolved them, so a
+    # components.yaml entry that would escape repo_root is rejected here too.
     mapping = yaml.safe_load(Path(components_yaml_path).read_text()) or {}
     path_to_pred_name = {
-        (Path(repo_root) / rel_path).resolve(): pred_name
+        _resolve_component_path(repo_root, rel_path): pred_name
         for pred_name, rel_path in mapping.items()
     }
     changed_names = [path_to_pred_name.get(p.resolve(), p.stem) for p in changed]

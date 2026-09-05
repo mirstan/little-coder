@@ -92,6 +92,42 @@ def test_create_branch_and_commit_raises_when_no_changed_files(scratch_repo):
         )
 
 
+def test_create_branch_and_commit_rejects_malformed_branch_name(scratch_repo):
+    """Real hardening gap, confirmed by review: an unvalidated branch_name
+    passed straight to `git checkout -b` could be misparsed as a git option
+    (e.g. a name starting with '-'). check-ref-format catches this before
+    any git subprocess that could mutate the repo runs."""
+    (scratch_repo / "file.md").write_text("changed\n")
+    with pytest.raises(ValueError, match="invalid branch name"):
+        create_branch_and_commit(
+            repo_root=scratch_repo,
+            branch_name="-not-a-real-branch",
+            changed_files=[scratch_repo / "file.md"],
+            commit_message="test commit",
+        )
+    # rejected before any git state changed
+    assert _current_branch(scratch_repo) in ("main", "master")
+
+
+def test_create_branch_and_commit_handles_path_starting_with_dash(scratch_repo):
+    """Real hardening gap, confirmed by review: `git add` without a `--`
+    path-terminator would parse a changed file name starting with '-' as a
+    git option instead of a path."""
+    dash_file = scratch_repo / "-weird-name.md"
+    dash_file.write_text("changed\n")
+    create_branch_and_commit(
+        repo_root=scratch_repo,
+        branch_name="self-improve/gepa-dash-test",
+        changed_files=[dash_file],
+        commit_message="test commit",
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=scratch_repo,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == ""  # committed cleanly, not left untracked/misparsed
+
+
 def test_build_commit_message_cites_component_score_deltas():
     msg = build_commit_message(
         changed_components=["skills_tools_bash"],
@@ -196,6 +232,26 @@ def test_apply_and_open_pr_returns_none_and_touches_nothing_when_unchanged(tmp_p
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert branch == original_branch  # never switched branches -- nothing to commit
+
+
+def test_apply_and_open_pr_rejects_component_path_that_escapes_repo_root(tmp_path):
+    """Real hardening gap, confirmed by review: a components.yaml entry
+    resolving outside repo_root must be rejected before any git operation
+    runs, not silently written to disk elsewhere."""
+    components_yaml = _make_component_repo(tmp_path)
+    mapping = yaml.safe_load(components_yaml.read_text())
+    mapping["escaping"] = "../../etc/passwd"
+    components_yaml.write_text(yaml.dump(mapping))
+
+    with pytest.raises(ValueError, match="escapes repo_root"):
+        apply_and_open_pr(
+            components_yaml_path=components_yaml,
+            repo_root=tmp_path,
+            optimized={"escaping": "pwned"},
+            score_deltas={},
+            branch_name="self-improve/gepa-escape-test",
+            push_and_open_pr=False,
+        )
 
 
 # ── create_pull_request: STRUCTURAL check only, subprocess.run fully mocked.
