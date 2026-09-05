@@ -48,3 +48,7 @@ benchmarks/self_improve/runs/
 benchmarks/self_improve/*.egg-info/
 .pi/.system-prompt.generated.md
 .env
+
+# Committed real-data test fixture -- overrides the blanket *.log rule above,
+# which otherwise silently drops this file from the repo.
+!benchmarks/self_improve/tests/fixtures/**/*.log
