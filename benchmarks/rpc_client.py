@@ -292,13 +292,30 @@ class PiRpc:
 
     # ── Public API ───────────────────────────────────────────────────────
     def prompt_and_collect(self, message: str, timeout: float = 900) -> PromptResult:
-        """Send a prompt, drain events until agent_end, return summary."""
+        """Send a prompt, drain events until agent_end, return summary.
+
+        Retries the SEND (not the whole turn) a few times on "Agent is already
+        processing" -- a real, reproducible race under higher --thinking
+        effort: pi's agent_end event can fire before pi's internal state has
+        actually settled back to idle, so a prompt sent immediately after a
+        previous prompt_and_collect() returns can be rejected even though the
+        caller correctly waited for agent_end. Not observed at pi's default
+        thinking level; higher effort apparently widens whatever internal
+        window this races on.
+        """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
-        rid = str(uuid.uuid4())
-        self._send({"id": rid, "type": "prompt", "message": message})
-        resp = self._await_response(rid, timeout=30)
-        if not resp.get("success"):
+        resp = None
+        for readiness_attempt in range(5):
+            rid = str(uuid.uuid4())
+            self._send({"id": rid, "type": "prompt", "message": message})
+            resp = self._await_response(rid, timeout=30)
+            if resp.get("success"):
+                break
+            err = str(resp.get("error", ""))
+            if "already processing" in err.lower() and readiness_attempt < 4:
+                time.sleep(2 * (readiness_attempt + 1))
+                continue
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
 
         events = self._drain_events_until(

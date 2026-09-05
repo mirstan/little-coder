@@ -430,8 +430,23 @@ def _run_exercise(
 
         t0 = time.time()
         r2 = None
+        # Each attempt opens a FRESH PiRpc session rather than reusing one
+        # continuous conversation across the retry. Reusing one session lets
+        # context balloon with every attempt's full verbose reasoning trail
+        # (worse at higher --thinking effort), and on a real multi-attempt
+        # failure this drove pi's own client to cancel the stream mid-turn --
+        # after which pi's internal turn-state never recovered ("Agent is
+        # already processing" on every subsequent prompt in that session, no
+        # matter how long you wait). A fresh session per attempt keeps each
+        # prompt's context bounded to "current file state + latest failure,"
+        # sidestepping the bug entirely: the model still sees its own previous
+        # edit by reading the file (which persists in `work` across
+        # attempts), just not its own prior reasoning transcript. As a side
+        # effect this also makes the old "close before reading the tree"
+        # belt-and-braces call unnecessary -- the `with` block now always
+        # closes the session before trajectory dumping / scoring run.
         with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
-                   session_id=f"poly-{lang}-{ex_name}",
+                   session_id=f"poly-{lang}-{ex_name}-attempt1",
                    env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
             # prompt_and_collect() returns partial events *silently* when
             # agent_end never arrives (_drain_events_until returns `collected`,
@@ -440,37 +455,35 @@ def _run_exercise(
             # regardless of --no-retry, and re-evaluated for whichever attempt
             # ran last so a capped RETRY is not mislabelled a plain failure.
             r1 = rpc.prompt_and_collect(prompt, timeout=ATTEMPT_TIMEOUT_S)
-            outcome_1 = _attempt_outcome(r1)
-            outcome_2 = None
-            # Belt-and-braces: an attempt that did not end cleanly may still
-            # have work in flight. Stop it before anything reads the tree.
-            # close() is idempotent, and this path never retries anyway.
-            if outcome_1 in ("deadline", "process_exit"):
-                rpc.close()
-            # Snapshot BEFORE the tests run and before any retry prompt is
-            # sent, so the artifact reflects what THIS attempt produced. Both
-            # dumps previously happened after the block, so trajectory_1 and
-            # trajectory_2 captured the same post-retry tree.
-            _dump_trajectory(log_dir, "1", r1, work)
-            passed, out = _score(desc, work, desc["timeout_s"])
-            (log_dir / "final_output_1.txt").write_text(out)
-            attempt = "pass_1" if passed else None
+        outcome_1 = _attempt_outcome(r1)
+        outcome_2 = None
+        # Snapshot BEFORE the tests run and before any retry prompt is
+        # sent, so the artifact reflects what THIS attempt produced. Both
+        # dumps previously happened after the block, so trajectory_1 and
+        # trajectory_2 captured the same post-retry tree.
+        _dump_trajectory(log_dir, "1", r1, work)
+        passed, out = _score(desc, work, desc["timeout_s"])
+        (log_dir / "final_output_1.txt").write_text(out)
+        attempt = "pass_1" if passed else None
 
-            if not passed and retry and outcome_1 == "completed":
-                retry_prompt = (
-                    "The tests failed. Output:\n\n```\n"
-                    + out[-4000:]
-                    + "\n```\n\nFix the implementation and try again."
-                )
+        if not passed and retry and outcome_1 == "completed":
+            retry_prompt = (
+                "The tests failed. Output:\n\n```\n"
+                + out[-4000:]
+                + "\n```\n\nThe file(s) still contain your previous attempt's "
+                  "code -- read the current state, then fix the "
+                  "implementation and try again."
+            )
+            with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
+                       session_id=f"poly-{lang}-{ex_name}-attempt2",
+                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
                 r2 = rpc.prompt_and_collect(retry_prompt, timeout=ATTEMPT_TIMEOUT_S)
-                outcome_2 = _attempt_outcome(r2)
-                if outcome_2 in ("deadline", "process_exit"):
-                    rpc.close()
-                _dump_trajectory(log_dir, "2", r2, work)
-                passed, out = _score(desc, work, desc["timeout_s"])
-                (log_dir / "final_output_2.txt").write_text(out)
-                if passed:
-                    attempt = "pass_2"
+            outcome_2 = _attempt_outcome(r2)
+            _dump_trajectory(log_dir, "2", r2, work)
+            passed, out = _score(desc, work, desc["timeout_s"])
+            (log_dir / "final_output_2.txt").write_text(out)
+            if passed:
+                attempt = "pass_2"
 
         elapsed = time.time() - t0
         (log_dir / "final_output.txt").write_text(out)
