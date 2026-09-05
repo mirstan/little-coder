@@ -65,13 +65,24 @@ def apply_and_open_pr(
     push_and_open_pr=True (default False) -- push and open a real PR.
     Returns the PR URL if one was opened, else None (including when nothing
     changed, or when push_and_open_pr is left False for local-only review)."""
+    import yaml
+
     from benchmarks.self_improve.components import write_components_back
 
     changed = write_components_back(components_yaml_path, repo_root, optimized)
     if not changed:
         return None
 
-    changed_names = [p.stem for p in changed]
+    # Map changed file paths back to pred_name (NOT the file's own stem --
+    # e.g. skills/tools/bash.md's stem is "bash", but score_deltas and the
+    # caller's `optimized` dict are keyed by pred_name "skills_tools_bash";
+    # a bare filename stem would silently never match either).
+    mapping = yaml.safe_load(Path(components_yaml_path).read_text()) or {}
+    path_to_pred_name = {
+        (Path(repo_root) / rel_path).resolve(): pred_name
+        for pred_name, rel_path in mapping.items()
+    }
+    changed_names = [path_to_pred_name.get(p.resolve(), p.stem) for p in changed]
     commit_message = build_commit_message(changed_names, score_deltas)
     create_branch_and_commit(repo_root, branch_name, changed, commit_message)
 
