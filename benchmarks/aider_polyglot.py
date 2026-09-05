@@ -282,7 +282,7 @@ _ENV_KNOBS = (
 )
 
 
-def _scoring_params(model: str, language: str, retry: bool, desc: dict) -> dict:
+def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_attempts: int = 2) -> dict:
     """Everything that affects whether an exercise passes.
 
     Absent from results until now, so `--resume` could silently blend runs made
@@ -296,6 +296,7 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict) -> dict:
         "attempt_timeout_s": ATTEMPT_TIMEOUT_S,
         "test_timeout_s": desc.get("timeout_s"),
         "retry": retry,
+        "max_attempts": max_attempts if retry else 1,
         "score_in_copy": bool(desc.get("score_in_copy")),
         "allowed_tools": sorted(set(ALLOWED_TOOLS)),
         "env": {k: os.environ[k] for k in _ENV_KNOBS if k in os.environ},
@@ -362,23 +363,24 @@ def _attempt_outcome(result) -> str:
     return "completed"
 
 
-def _classify_status(passed: bool, attempt: str | None,
-                     outcome_1: str, outcome_2: str | None = None) -> str:
+def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> str:
     """Precedence for the recorded status. Pure, so it can be table-tested.
 
-    `passed` wins over everything: a pi that exits right after writing a correct
-    solution must not be downgraded from a pass to an error.
+    `passed` wins over everything: a pi that exits right after writing a
+    correct solution must not be downgraded from a pass to an error.
+    Generalized from a hardcoded two attempts to however many `outcomes`
+    actually ran, so --max-attempts can be raised without touching this
+    function.
     """
     if passed:
         return attempt or "pass_1"
-    last = outcome_2 if outcome_2 is not None else outcome_1
-    if outcome_2 is None:
-        # Only one attempt ran, so a dead process means the run itself failed.
-        if outcome_1 == "process_exit":
-            return "error"
-    elif outcome_2 == "process_exit":
-        # Attempt 1 was scored, so this is a failed exercise, not a broken run.
-        return "fail"
+    if not outcomes:
+        return "error"
+    last = outcomes[-1]
+    if last == "process_exit" and len(outcomes) == 1:
+        # Only one attempt ran, so a dead process means the run itself
+        # failed, not that the exercise was genuinely attempted and failed.
+        return "error"
     if last == "deadline":
         return "fail_timeout"
     if last == "empty_response":
@@ -412,6 +414,7 @@ def _run_exercise(
     model: str,
     verbose: bool,
     retry: bool,
+    max_attempts: int = 2,
 ):
     desc = LANG_DESCRIPTORS.get(lang)
     if desc is None:
@@ -431,9 +434,15 @@ def _run_exercise(
         prompt = _build_prompt(ex_name, stubs, tests, desc["syntax_hint"])
 
         t0 = time.time()
-        r2 = None
+        # Generalized from a hardcoded one retry (2 attempts) into N attempts,
+        # so a higher --max-attempts can be tested without changing anything
+        # else about the loop (result-JSON shape beyond stop_reasons/
+        # turn_count below, pass_N labeling convention). --no-retry
+        # (retry=False) still means exactly 1 attempt regardless of
+        # --max-attempts, matching the previous behavior of that flag.
+        #
         # Each attempt opens a FRESH PiRpc session rather than reusing one
-        # continuous conversation across the retry. Reusing one session lets
+        # continuous conversation across attempts. Reusing one session lets
         # context balloon with every attempt's full verbose reasoning trail
         # (worse at higher --thinking effort), and on a real multi-attempt
         # failure this drove pi's own client to cancel the stream mid-turn --
@@ -443,42 +452,59 @@ def _run_exercise(
         # prompt's context bounded to "current file state + latest failure,"
         # sidestepping the bug entirely: the model still sees its own previous
         # edit by reading the file (which persists in `work` across
-        # attempts), just not its own prior reasoning transcript. As a side
-        # effect this also makes the old "close before reading the tree"
-        # belt-and-braces call unnecessary -- the `with` block now always
-        # closes the session before trajectory dumping / scoring run.
-        with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
-                   session_id=f"poly-{lang}-{ex_name}-attempt1",
-                   env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
-            # prompt_and_collect() returns partial events *silently* when
-            # agent_end never arrives (_drain_events_until returns `collected`,
-            # it does not raise), so a budget-capped attempt is otherwise
-            # indistinguishable from a completed one. Classified the same way
-            # regardless of --no-retry, and re-evaluated for whichever attempt
-            # ran last so a capped RETRY is not mislabelled a plain failure.
-            r1 = rpc.prompt_and_collect(prompt, timeout=ATTEMPT_TIMEOUT_S)
-        outcome_1 = _attempt_outcome(r1)
-        outcome_2 = None
-        # Snapshot BEFORE the tests run and before any retry prompt is
-        # sent, so the artifact reflects what THIS attempt produced. Both
-        # dumps previously happened after the block, so trajectory_1 and
-        # trajectory_2 captured the same post-retry tree.
-        _dump_trajectory(log_dir, "1", r1, work)
-        passed, out = _score(desc, work, desc["timeout_s"])
-        (log_dir / "final_output_1.txt").write_text(out)
-        attempt = "pass_1" if passed else None
-
-        if not passed and retry and outcome_1 == "completed":
+        # attempts), just not its own prior reasoning transcript.
+        effective_attempts = max_attempts if retry else 1
+        attempt = None
+        passed, out = False, ""
+        outcomes: list[str] = []
+        stop_reasons: list[str] = []
+        turn_total = 0
+        current_prompt = prompt
+        for i in range(1, effective_attempts + 1):
+            with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
+                       session_id=f"poly-{lang}-{ex_name}-attempt{i}",
+                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
+                # prompt_and_collect() returns partial events *silently* when
+                # agent_end never arrives (_drain_events_until returns
+                # `collected`, it does not raise), so a budget-capped attempt
+                # is otherwise indistinguishable from a completed one.
+                r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
+            turn_total += r.turn_count
+            outcome = _attempt_outcome(r)
+            outcomes.append(outcome)
+            stop_reasons.append(_stop_reason(r))
+            # Snapshot BEFORE the tests run and before any retry prompt is
+            # sent, so the artifact reflects what THIS attempt produced.
+            _dump_trajectory(log_dir, str(i), r, work)
+            passed, out = _score(desc, work, desc["timeout_s"])
+            (log_dir / f"final_output_{i}.txt").write_text(out)
+            if passed:
+                attempt = f"pass_{i}"
+                break
+            if outcome in ("deadline", "process_exit"):
+                # A capped or crashed attempt has nothing more for a retry to
+                # build on -- stop rather than spend the remaining budget
+                # repeating the same failure. empty_response is deliberately
+                # NOT included here: per _is_empty_response, it means the
+                # provider returned an empty completion with the work tree
+                # untouched -- a transient provider-side fault, not a failed
+                # attempt with nothing to build on. It's the single most
+                # retryable outcome (6 of 16 logged attempts in this repo's
+                # own log tree look like this), so let it fall through to a
+                # normal retry instead of aborting the rest of the budget on
+                # a failure mode that didn't actually consume an attempt's
+                # worth of the model's effort.
+                break
             # Repeats the original prompt in full, not just the failure --
-            # each attempt is now a fresh session (see above), so a retry
-            # prompt built from the failure alone drops the exercise name,
-            # the stub/test file paths, the "tests are for reference only --
-            # DO NOT edit" constraint, and the syntax hint. Without those, an
-            # agent scoring itself against a copy of the tree (_score()) has
-            # nothing stopping it from "fixing" the failure by editing the
-            # test file instead of the implementation and recording a
-            # fabricated pass.
-            retry_prompt = (
+            # each attempt is a fresh session (see above) with no memory of
+            # this one, so a retry prompt built from the failure alone drops
+            # the exercise name, the stub/test file paths, the "tests are
+            # for reference only -- DO NOT edit" constraint, and the syntax
+            # hint. Without those, an agent scoring itself against a copy of
+            # the tree (_score()) has nothing stopping it from "fixing" the
+            # failure by editing the test file instead of the
+            # implementation and recording a fabricated pass.
+            current_prompt = (
                 prompt
                 + "\n\n---\n\nThis is a retry: the file(s) already contain "
                   "your previous attempt's code (read the current state "
@@ -486,16 +512,6 @@ def _run_exercise(
                 + out[-4000:]
                 + "\n```\n\nFix the implementation and try again."
             )
-            with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
-                       session_id=f"poly-{lang}-{ex_name}-attempt2",
-                       env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"}) as rpc:
-                r2 = rpc.prompt_and_collect(retry_prompt, timeout=ATTEMPT_TIMEOUT_S)
-            outcome_2 = _attempt_outcome(r2)
-            _dump_trajectory(log_dir, "2", r2, work)
-            passed, out = _score(desc, work, desc["timeout_s"])
-            (log_dir / "final_output_2.txt").write_text(out)
-            if passed:
-                attempt = "pass_2"
 
         elapsed = time.time() - t0
         (log_dir / "final_output.txt").write_text(out)
@@ -504,14 +520,10 @@ def _run_exercise(
 
         return {
             "run_id": RUN_ID,
-            "status": _classify_status(passed, attempt, outcome_1, outcome_2),
-            "stop_reason_1": _stop_reason(r1),
-            "stop_reason_2": _stop_reason(r2) if r2 is not None else None,
+            "status": _classify_status(passed, attempt, outcomes),
+            "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
-            # Sum whatever actually ran. The previous expression dropped
-            # r2.turn_count whenever the exercise failed, so a two-attempt
-            # failure under-reported its own effort.
-            "turn_count": r1.turn_count + (r2.turn_count if r2 is not None else 0),
+            "turn_count": turn_total,
         }
 
 
@@ -523,8 +535,14 @@ def main():
     ap.add_argument("--exercises", type=int, default=0, help="Run first N exercises (0 = all)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-retry", action="store_true")
+    ap.add_argument("--max-attempts", type=int, default=2,
+                     help="Total attempts including the first; default 2 matches "
+                          "the original hardcoded one-retry behavior")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.max_attempts < 1:
+        sys.exit(f"--max-attempts must be >= 1, got {args.max_attempts}")
 
     results = _load_results() if args.resume else {"exercises": {}, "meta": {}}
 
@@ -532,7 +550,7 @@ def main():
     if desc is None:
         sys.exit(f"No descriptor for language '{args.language}'. Supported: {list(LANG_DESCRIPTORS)}")
 
-    params = _scoring_params(args.model, args.language, not args.no_retry, desc)
+    params = _scoring_params(args.model, args.language, not args.no_retry, desc, max_attempts=args.max_attempts)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -569,7 +587,7 @@ def main():
     written_this_run: dict[str, dict] = {}
     for name in names:
         key = f"{args.language}/{name}"
-        if args.resume and results["exercises"].get(key, {}).get("status") in ("pass_1", "pass_2"):
+        if args.resume and str(results["exercises"].get(key, {}).get("status", "")).startswith("pass_"):
             continue
         # Results are checkpointed atomically per exercise one line below, but
         # an exception anywhere in _run_exercise still discarded every remaining
@@ -582,6 +600,7 @@ def main():
                 args.language, name, args.model,
                 verbose=args.verbose,
                 retry=not args.no_retry,
+                max_attempts=args.max_attempts,
             )
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
