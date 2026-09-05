@@ -111,18 +111,35 @@ def test_busy_then_ready_recovers_without_stale_event(fake_pi, tmp_path):
 
 
 def test_busy_then_late_stale_event_still_discarded(fake_pi, tmp_path):
-    """Harder timing than the above: the leftover event is written AFTER
-    the client's own backoff would already have elapsed, but still before
-    the retry is acked. A fix that discards stale events only once, right
-    before resending, passes the case above but fails this one -- the
-    leftover lands in the queue after that one-time clear and is never
-    removed. Only a fix keyed to the retry's own acceptance (not to when
-    the resend happened) handles both."""
+    """Harder ordering than the above: the leftover event is written AFTER
+    the retry has already been sent, not before. A fix that discards stale
+    events only once, right before resending, passes the case above but
+    fails this one -- the leftover lands in the queue after that one-time
+    clear and is never removed. Only a fix keyed to the retry's own
+    acceptance (not to when the resend happened) handles both."""
     with fake_pi("busy_then_late_stale", tmp_path) as rpc:
         r = rpc.prompt_and_collect("go", timeout=30)
     assert r.agent_ended is True
     assert r.stop_reason == "agent_end"
     assert "real answer" in r.assistant_text
+
+
+def test_stray_event_on_reused_session_does_not_corrupt_next_turn(fake_pi, tmp_path):
+    """The stale-event bug doesn't require a rejection at all: PiRpc's own
+    docstring advertises reuse "across prompts within a session" (line 72).
+    If pi emits a stray duplicate agent_end right after a turn's real one,
+    and the NEXT prompt is accepted outright with no readiness retry
+    involved, a fix gated on readiness_attempt > 0 never runs -- the stray
+    event sits ahead of the second turn's own completion and the drain
+    returns on it immediately, same silent-empty-response symptom as the
+    readiness-retry case."""
+    with fake_pi("stray_end_then_clean_reuse", tmp_path) as rpc:
+        r1 = rpc.prompt_and_collect("go", timeout=30)
+        r2 = rpc.prompt_and_collect("go again", timeout=30)
+    assert "first answer" in r1.assistant_text
+    assert r2.agent_ended is True
+    assert r2.stop_reason == "agent_end"
+    assert "second answer" in r2.assistant_text
 
 
 def test_promptresult_still_constructible_with_no_args():

@@ -391,10 +391,12 @@ def _score(desc, work: Path, timeout: int):
 
     prompt_and_collect returning does not mean pi is finished: measured on three
     real exercises, pi still had a live child process at the moment the tests
-    would start. Scoring a copy removes the race on every path, keeps the retry's
-    session alive, and stops the test runner's droppings landing in the agent's
-    tree. Not enabled for cpp/rust, whose build dirs are absolute-path-bound and
-    would force a full rebuild per scoring pass.
+    would start (the process is now closed by the `with PiRpc(...)` block before
+    this runs, but a spawned bash grandchild can still outlive that close()).
+    Scoring a copy avoids that leftover process's writes landing mid-score, and
+    stops the test runner's own droppings landing in the agent's tree. Not
+    enabled for cpp/rust, whose build dirs are absolute-path-bound and would
+    force a full rebuild per scoring pass.
     """
     if not desc.get("score_in_copy"):
         return desc["run_tests"](work, timeout)

@@ -324,27 +324,30 @@ class PiRpc:
                 continue
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
 
-        if readiness_attempt > 0:
-            # A rejected send means pi was still finishing the PREVIOUS turn;
-            # whatever it produced -- including, in whatever internal state
-            # causes this race, a leftover agent_end -- can still be sitting
-            # in the queue ahead of anything from the turn just accepted.
-            #
-            # Neither "clear before resending" nor "clear right after the
-            # ack" is race-free: the former leaves a gap for pi to enqueue a
-            # stale event between the clear and the ack (reproduced: pi can
-            # write a turn's agent_end right up until the moment it frees
-            # itself to accept the next one), and the latter can instead
-            # discard the real turn's own events if the reader thread queues
-            # them before this thread wakes from _await_response(). Trimming
-            # to the watermark recorded at the exact moment THIS response was
-            # stored is race-free in both directions: anything queued before
-            # that point in the message stream cannot belong to a turn pi
-            # had not yet accepted when it wrote the response, and anything
-            # queued at or after it is preserved regardless of scheduling.
-            watermark = resp.get("_event_q_watermark", 0)
-            with self._cv:
-                del self._event_q[:watermark]
+        # Trim any event still queued from before THIS response was recorded
+        # -- not gated on readiness_attempt > 0, because the same corruption
+        # doesn't require a rejection at all: PiRpc is documented as "reused
+        # across prompts within a session", and pi emitting a stray/duplicate
+        # agent_end after a turn's real one leaves it queued regardless of
+        # whether the *next* send happened to be accepted outright or needed
+        # a retry first. On a clean session this is a no-op: the watermark is
+        # 0 when nothing stale is queued.
+        #
+        # Neither "clear before resending" nor "clear right after the ack"
+        # is race-free: the former leaves a gap for pi to enqueue a stale
+        # event between the clear and the ack (reproduced: pi can write a
+        # turn's agent_end right up until the moment it frees itself to
+        # accept the next one), and the latter can instead discard the real
+        # turn's own events if the reader thread queues them before this
+        # thread wakes from _await_response(). Trimming to the watermark
+        # recorded at the exact moment THIS response was stored is race-free
+        # in both directions: anything queued before that point in the
+        # message stream cannot belong to a turn pi had not yet accepted
+        # when it wrote the response, and anything queued at or after it is
+        # preserved regardless of scheduling.
+        watermark = resp.get("_event_q_watermark", 0)
+        with self._cv:
+            del self._event_q[:watermark]
 
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",
