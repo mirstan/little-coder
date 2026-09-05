@@ -282,7 +282,7 @@ _ENV_KNOBS = (
 )
 
 
-def _scoring_params(model: str, language: str, retry: bool, max_attempts: int, desc: dict) -> dict:
+def _scoring_params(model: str, language: str, retry: bool, desc: dict, *, max_attempts: int = 2) -> dict:
     """Everything that affects whether an exercise passes.
 
     Absent from results until now, so `--resume` could silently blend runs made
@@ -541,7 +541,7 @@ def main():
     if desc is None:
         sys.exit(f"No descriptor for language '{args.language}'. Supported: {list(LANG_DESCRIPTORS)}")
 
-    params = _scoring_params(args.model, args.language, not args.no_retry, args.max_attempts, desc)
+    params = _scoring_params(args.model, args.language, not args.no_retry, desc, max_attempts=args.max_attempts)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
