@@ -457,6 +457,7 @@ def _run_exercise(
         attempt = None
         passed, out = False, ""
         outcomes: list[str] = []
+        stop_reasons: list[str] = []
         turn_total = 0
         current_prompt = prompt
         for i in range(1, effective_attempts + 1):
@@ -471,6 +472,7 @@ def _run_exercise(
             turn_total += r.turn_count
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
+            stop_reasons.append(_stop_reason(r))
             # Snapshot BEFORE the tests run and before any retry prompt is
             # sent, so the artifact reflects what THIS attempt produced.
             _dump_trajectory(log_dir, str(i), r, work)
@@ -510,7 +512,7 @@ def _run_exercise(
         return {
             "run_id": RUN_ID,
             "status": _classify_status(passed, attempt, outcomes),
-            "stop_reasons": outcomes,
+            "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
         }
@@ -529,6 +531,9 @@ def main():
                           "the original hardcoded one-retry behavior")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.max_attempts < 1:
+        sys.exit(f"--max-attempts must be >= 1, got {args.max_attempts}")
 
     results = _load_results() if args.resume else {"exercises": {}, "meta": {}}
 
@@ -573,7 +578,7 @@ def main():
     written_this_run: dict[str, dict] = {}
     for name in names:
         key = f"{args.language}/{name}"
-        if args.resume and results["exercises"].get(key, {}).get("status") in ("pass_1", "pass_2"):
+        if args.resume and str(results["exercises"].get(key, {}).get("status", "")).startswith("pass_"):
             continue
         # Results are checkpointed atomically per exercise one line below, but
         # an exception anywhere in _run_exercise still discarded every remaining
