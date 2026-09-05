@@ -73,7 +73,13 @@ class _FakeRpc:
 
     def __init__(self, *a, **kw):
         self.cwd = Path(kw["cwd"])
-        self.n = 0
+        # Session ids are now "poly-<lang>-<ex>-attempt<i>" -- one fresh PiRpc
+        # per attempt -- rather than one id shared across the whole retry, so
+        # derive which attempt this instance represents from that id instead
+        # of a per-instance call counter (each attempt gets its own fresh
+        # instance now, not a shared one whose call count tracked the
+        # attempt number).
+        self.n = int(kw["session_id"].rsplit("attempt", 1)[-1])
 
     def __enter__(self):
         return self
@@ -82,7 +88,6 @@ class _FakeRpc:
         return False
 
     def prompt_and_collect(self, message, timeout=900):
-        self.n += 1
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
 
         class R:
