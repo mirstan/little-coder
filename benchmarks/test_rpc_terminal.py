@@ -97,6 +97,19 @@ def test_close_is_idempotent(fake_pi, tmp_path):
     rpc.close()
 
 
+def test_busy_then_ready_recovers_without_stale_event(fake_pi, tmp_path):
+    """Regression guard: a rejected send must not let a leftover event from
+    the turn pi was still finishing be mistaken for the retry's own
+    completion. Without clearing the event queue after a successful retry,
+    _drain_events_until would pop the stale agent_end first and return
+    empty -- indistinguishable from a genuinely empty response."""
+    with fake_pi("busy_then_ready", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert "real answer" in r.assistant_text
+
+
 def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False

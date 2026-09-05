@@ -307,6 +307,21 @@ class PiRpc:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
         resp = None
         for readiness_attempt in range(5):
+            if readiness_attempt > 0:
+                # A rejected send means pi was still finishing the PREVIOUS
+                # turn. Whatever events that turn produced while we back off
+                # -- including, in whatever internal state causes this race,
+                # a leftover agent_end -- are sitting in the queue ahead of
+                # anything from the turn we're about to (re)request. Clear it
+                # here, before resending, not after the retry is acked: at
+                # this exact point nothing new has been asked for yet, so
+                # everything queued is unambiguously stale. Clearing after
+                # the ack instead would race the reader thread, which can
+                # queue the new turn's own events before this thread gets
+                # scheduled again -- discarding the response it came here
+                # to collect.
+                with self._cv:
+                    self._event_q.clear()
             rid = str(uuid.uuid4())
             self._send({"id": rid, "type": "prompt", "message": message})
             resp = self._await_response(rid, timeout=30)

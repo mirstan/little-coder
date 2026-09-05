@@ -77,6 +77,31 @@ def main():
         time.sleep(30)
         return
 
+    if mode == "busy_then_ready":
+        # Simulates the readiness-retry race: the first send is rejected
+        # because a previous turn is still winding down, and that previous
+        # turn's own leftover agent_end lands in the queue before the
+        # retry's real completion does. Regression fixture for the
+        # stale-event-queue bug: without clearing the queue after a
+        # successful retry, this leftover agent_end gets mistaken for the
+        # new turn's completion.
+        emit({"type": "response", "id": rid, "success": False,
+              "error": "Agent is already processing"})
+        emit({"type": "agent_end"})  # stale leftover from the "previous" turn
+        msg2 = read_prompt()
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "real answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
     # default: clean single turn with one tool call
     emit({"type": "response", "id": rid, "success": True})
     emit({"type": "agent_start"})
