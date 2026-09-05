@@ -89,13 +89,14 @@ reviewed the local commit.
 
 ## Current validation status (see VALIDATION_PLAN.md for the full picture)
 
-- **Layer 2** (real-data ingestion): passing for **aider_polyglot** and **tb**
-  — both validated against real, freshly-generated data (not fixtures), which
-  surfaced and fixed two real bugs in `harbor_tb_ingest.py` along the way.
-  **gaia** is blocked on `gaia-benchmark/GAIA`'s gated HuggingFace access
-  (request access at the dataset page, then re-attempt ingestion). **harbor**'s
-  real output format has not been captured yet — only `tb`'s has; the parser
-  is shared, so it should work, but this is unconfirmed.
+- **Layer 2** (real-data ingestion): passing for **aider_polyglot**, **tb**,
+  and **harbor** — all three validated against real, freshly-generated data
+  (not fixtures). harbor turned out to have a genuinely different real
+  structure from tb (not a naming variant), which `harbor_tb_ingest.py` now
+  handles via two separate internal loaders rather than one shared parser.
+  **gaia** remains blocked on `gaia-benchmark/GAIA`'s gated HuggingFace access
+  (request access at the dataset page, then re-attempt ingestion) — the only
+  benchmark not yet validated against real data.
 - **Layer 3** (dry-run smoke test): passing.
 - **Layer 4** (real GEPA run): fully implemented and safety-gated, never
   executed — needs a human to supply `--reflection-model` +
@@ -119,10 +120,14 @@ reviewed the local commit.
    to `components_used=[]`.
 2. gaia dataset access needs to be requested on HuggingFace before gaia can
    feed the training signal.
-3. harbor's real output format should be captured the same way `tb`'s was
-   (run one real harbor task with `pi` routed through `fake_pi.py` via
-   `LITTLE_CODER_PI_BIN_OVERRIDE`) before trusting `harbor_tb_ingest.py`
-   against it.
+3. ~~harbor's real output format should be captured~~ **Closed**: captured
+   against a real `harbor run` (hello-world, same `fake_pi.py`/
+   `LITTLE_CODER_PI_BIN_OVERRIDE` technique as tb). It's genuinely different
+   from tb's structure — single-level trial dirs, singular `result.json`,
+   reward-float ground truth, and richer structured `agent_result.metadata`
+   (no log regex needed for stop_reason/turn_count, unlike tb) —
+   `harbor_tb_ingest.py` now has two separate internal loaders, not one
+   shared parser.
 4. Full-scope expansion (all ~32 components at once) should only happen after
    the single-component case (e.g. just `skills/tools/bash.md`) clears
    Layers 4 and 5, per `VALIDATION_PLAN.md`'s closing summary table.

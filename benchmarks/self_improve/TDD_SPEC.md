@@ -101,11 +101,29 @@ below must match them exactly:
   finished its turn) but `is_resolved=false` (the task actually failed; a fake
   agent finishing a turn cleanly says nothing about whether it solved the task).
   `success` must come from the trial's own `results.json::is_resolved`.
-  harbor's real output format (as opposed to tb's) remains unconfirmed —
-  `harbor_adapter/little_coder_agent.py` writes the same `=== stop_reason ===`
-  log style, but its surrounding directory/results.json shape has not been
-  captured against a real harbor run. Treated as the least-confirmed source;
-  ingestion must not crash on missing/malformed data regardless.
+- harbor adapter logs — **CONFIRMED against a real captured `harbor run`**
+  (hello-world task, same `fake_pi.py`/`LITTLE_CODER_PI_BIN_OVERRIDE`
+  technique, no LLM cost). **Genuinely different real structure from tb** —
+  not a naming variant, a different harness entirely — see
+  `tests/fixtures/real_harbor_run/`:
+  ```
+  <log_root>/result.json                          run-level aggregate (ignored)
+  <log_root>/<trial_name>/result.json              (SINGULAR) per-trial, richer:
+    agent_result.metadata: {stop_reason, n_tool_calls, n_turns, n_compactions, n_notifications}
+    verifier_result.rewards.reward: float           GROUND TRUTH (0.0/1.0, not a boolean)
+    task_name: "org/name"  (e.g. "hello-world/hello-world")
+  <log_root>/<trial_name>/agent/*.log              (singular "agent", not "agent-logs")
+  ```
+  Confirmed real differences from tb: single-level trial dirs (not nested
+  `<task_id>/<trial>/`), singular `result.json` filename (tb's is plural
+  `results.json`), reward-float ground truth instead of an `is_resolved`
+  boolean, and — genuinely useful — `agent_result.metadata` already carries
+  structured `stop_reason`/`n_turns`/etc., so harbor ingestion reads that
+  directly rather than regex-parsing the log file the way tb's ingestion
+  must (tb's `results.json` has no equivalent structured field).
+  `harbor_tb_ingest.py::load()` dispatches on the `benchmark` argument to two
+  separate internal loaders (`_load_harbor`/`_load_tb`) rather than one
+  shared parser, since the real shapes don't actually share a code path.
 
 **Gap CLOSED** (was originally flagged here as a known gap; fixed in a later pass):
 aider_polyglot's `_dump_trajectory` now takes a `notifications=` kwarg,

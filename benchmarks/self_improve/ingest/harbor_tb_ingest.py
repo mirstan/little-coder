@@ -1,23 +1,28 @@
 """Ingest harbor_adapter/tb_adapter run logs into NormalizedTrajectory
 objects.
 
-Real structure, confirmed by actually running `tb run` (hello-world task,
-pi routed through fake_pi.py via LITTLE_CODER_PI_BIN_OVERRIDE) -- see
-tests/fixtures/real_tb_run/:
-  <log_root>/results.json                                    run-level aggregate (ignored)
-  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/results.json     per-trial: is_resolved (ground truth)
-  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/agent-logs/*.log little-coder's own log:
-    === stop_reason: X ===
-    === assistant text ===
-    >> tool(args)
-    << result
+harbor and tb have GENUINELY DIFFERENT real structures -- confirmed by
+actually running both real CLIs (`harbor run` / `tb run`, hello-world task,
+pi routed through fake_pi.py via LITTLE_CODER_PI_BIN_OVERRIDE), not assumed
+from one shared format. Dispatched by the `benchmark` argument, since the
+caller already knows which one it is.
 
-is_resolved is the ground-truth success signal -- NOT stop_reason. A run
-can report stop_reason=agent_end (pi finished the turn) while the task
-itself still failed (confirmed: fake_pi's "clean" mode always reports
-agent_end, but the real terminal-bench test suite found hello.txt was never
-created). Graceful degradation is the core contract: never raise from
-load() on a missing/malformed trial.
+tb (classic terminal-bench), see tests/fixtures/real_tb_run/:
+  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/results.json     (plural) per-trial: is_resolved
+  <log_root>/<task_id>/<task_id>.N-of-M.<ts>/agent-logs/*.log little-coder's own log:
+    === stop_reason: X === / === assistant text === / >> tool(args)
+
+harbor (Terminal-Bench 2.0), see tests/fixtures/real_harbor_run/:
+  <log_root>/<trial_name>/result.json     (singular) per-trial, richer:
+    agent_result.metadata: {stop_reason, n_tool_calls, n_turns, n_compactions, n_notifications}
+    verifier_result.rewards.reward: float -- GROUND TRUTH (0.0/1.0, not a boolean)
+    task_name: "org/name"
+  <log_root>/<trial_name>/agent/*.log     (singular "agent", not "agent-logs")
+  harbor's structured metadata is read directly -- no log regex needed for
+  stop_reason/turn_count, unlike tb where it's the only source.
+
+Graceful degradation is the core contract for both: never raise from load()
+on missing/malformed data.
 """
 import json
 import logging
@@ -34,6 +39,74 @@ _TOOL_CALL_RE = re.compile(r"^>>\s+(.*)$", re.MULTILINE)
 
 
 def load(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[NormalizedTrajectory]:
+    if benchmark == "harbor":
+        return _load_harbor(log_root)
+    return _load_tb(log_root, benchmark)
+
+
+# ── harbor ────────────────────────────────────────────────────────────────
+
+def _load_harbor(log_root: Path) -> list[NormalizedTrajectory]:
+    trajectories = []
+    for trial_dir in sorted(Path(log_root).iterdir()):
+        if not trial_dir.is_dir():
+            continue
+        traj = _load_harbor_trial(trial_dir)
+        if traj is not None:
+            trajectories.append(traj)
+    return trajectories
+
+
+def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
+    result_path = trial_dir / "result.json"
+    if not result_path.exists():
+        return None
+
+    try:
+        result = json.loads(result_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("harbor_tb_ingest: malformed result.json at %s: %s", result_path, e)
+        return None
+
+    task_id = result.get("task_name", trial_dir.name)
+    reward = (result.get("verifier_result") or {}).get("rewards", {}).get("reward")
+    success = bool(reward) and float(reward) > 0.0
+
+    metadata = (result.get("agent_result") or {}).get("metadata") or {}
+    stop_reason = metadata.get("stop_reason", "unknown")
+    turn_count = metadata.get("n_turns", 0) or 0
+
+    raw_paths = {"result": str(result_path)}
+    summarized = ""
+    log_dir = trial_dir / "agent"
+    if log_dir.is_dir():
+        log_paths = list(log_dir.glob("*.log"))
+        if log_paths:
+            raw_paths["log"] = str(log_paths[0])
+            try:
+                text = log_paths[0].read_text(encoding="utf-8", errors="strict")
+                tool_lines = _TOOL_CALL_RE.findall(text)
+                summarized = "\n".join(f">> {line}" for line in tool_lines)[:8_000]
+            except (UnicodeDecodeError, OSError) as e:
+                logger.warning("harbor_tb_ingest: unreadable log %s: %s", log_paths[0], e)
+
+    return NormalizedTrajectory(
+        benchmark="harbor",
+        task_id=task_id,
+        success=success,
+        stop_reason=stop_reason,
+        turn_count=turn_count,
+        partial_score=1.0 if success else 0.0,
+        components_used=[],
+        failure_signals=[] if success else ["reward_zero"],
+        summarized_transcript=summarized,
+        raw_paths=raw_paths,
+    )
+
+
+# ── tb (classic terminal-bench) ──────────────────────────────────────────
+
+def _load_tb(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[NormalizedTrajectory]:
     trajectories = []
     for task_dir in sorted(Path(log_root).iterdir()):
         if not task_dir.is_dir():
@@ -41,13 +114,13 @@ def load(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[NormalizedT
         for trial_dir in sorted(task_dir.iterdir()):
             if not trial_dir.is_dir():
                 continue
-            traj = _load_trial(trial_dir, benchmark)
+            traj = _load_tb_trial(trial_dir, benchmark)
             if traj is not None:
                 trajectories.append(traj)
     return trajectories
 
 
-def _load_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> NormalizedTrajectory | None:
+def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> NormalizedTrajectory | None:
     results_path = trial_dir / "results.json"
     if not results_path.exists():
         return None
