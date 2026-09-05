@@ -38,7 +38,14 @@ logger = logging.getLogger(__name__)
 # REFLECTION_LM_API_KEY can live in a file instead of requiring the caller to
 # export it into every shell that invokes this script. Never overrides an
 # already-exported env var (override=False, the default).
-load_dotenv(Path(__file__).parent / ".env")
+#
+# SELF_IMPROVE_DOTENV overrides which file gets loaded -- exists so tests can
+# point at a throwaway tmp_path fixture instead of ever touching the real
+# .env (which holds a real API key): a test that wrote fake content into the
+# real file and restored it in `finally` would permanently destroy the real
+# key on a hard crash or SIGKILL, since the file is gitignored/untracked and
+# has no git history to recover from. Confirmed real risk, not hypothetical.
+load_dotenv(Path(os.environ.get("SELF_IMPROVE_DOTENV", str(Path(__file__).parent / ".env"))))
 
 DEFAULT_WEIGHTS = {"aider_polyglot": 0.4, "gaia": 0.3, "harbor": 0.15, "tb": 0.15}
 
