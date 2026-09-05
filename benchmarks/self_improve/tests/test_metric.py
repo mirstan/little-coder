@@ -20,6 +20,28 @@ def test_metric_episode_level_returns_base_score_for_pass():
     assert result.score == 1.0
 
 
+def test_metric_works_with_standard_3_arg_dspy_evaluate_call_signature():
+    """Real bug, confirmed via an actual GEPA run: dspy's plain Evaluate
+    (used for full valset/trainset scoring, not just GEPA's reflective
+    credit-assignment step) calls metric(gold, pred, trace) with only 3
+    positional args -- pred_name/pred_trace must default, or every such
+    call crashes with 'missing 2 required positional arguments', which
+    dspy's parallelizer silently swallows into a 0.0 score, producing a
+    fully broken optimization run with no real signal."""
+    traj = NormalizedTrajectory(benchmark="aider_polyglot", task_id="t", success=True,
+                                 stop_reason="agent_end", turn_count=1, partial_score=1.0)
+    result = metric(FakeExample(traj), None, None)  # exactly 3 positional args, no keywords
+    assert result.score == 1.0
+
+
+def test_metric_works_with_2_arg_call_signature():
+    """Some dspy code paths call metric(gold, pred) with no trace at all."""
+    traj = NormalizedTrajectory(benchmark="gaia", task_id="t", success=False,
+                                 stop_reason="deadline", turn_count=1, partial_score=0.0)
+    result = metric(FakeExample(traj), None)
+    assert result.score == 0.0
+
+
 def test_metric_episode_level_returns_base_score_for_fail():
     traj = NormalizedTrajectory(benchmark="gaia", task_id="t", success=False,
                                  stop_reason="deadline", turn_count=3, partial_score=0.0)

@@ -47,7 +47,17 @@ def _component_feedback(traj: NormalizedTrajectory, usage: ComponentUsage, pred_
     return " ".join(parts)
 
 
-def metric(gold, pred, trace, pred_name, pred_trace, program_trace=None) -> ScoreWithFeedback:
+def metric(gold, pred, trace=None, pred_name=None, pred_trace=None, program_trace=None) -> ScoreWithFeedback:
+    """trace/pred_name/pred_trace/program_trace all default to None: dspy
+    calls metrics under multiple conventions depending on context -- plain
+    Evaluate (full valset/trainset scoring, used by GEPA's own Pareto
+    tracking) calls metric(gold, pred, trace) with only 3 positional args,
+    while GEPA's reflective credit-assignment step calls the full 6-arg
+    form. Confirmed via a real GEPA run: without these defaults, EVERY
+    Evaluate-driven call crashed with 'missing 2 required positional
+    arguments', silently scoring every trajectory as an exception (dspy's
+    parallelizer swallows the traceback into a 0.0), producing a fully
+    broken optimization pass with no real signal at all."""
     traj: NormalizedTrajectory = gold.trajectory
     base_score = _score_for_benchmark(traj)
 
