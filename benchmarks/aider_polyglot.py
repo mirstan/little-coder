@@ -481,10 +481,19 @@ def _run_exercise(
             if passed:
                 attempt = f"pass_{i}"
                 break
-            if outcome != "completed":
+            if outcome in ("deadline", "process_exit"):
                 # A capped or crashed attempt has nothing more for a retry to
                 # build on -- stop rather than spend the remaining budget
-                # repeating the same failure.
+                # repeating the same failure. empty_response is deliberately
+                # NOT included here: per _is_empty_response, it means the
+                # provider returned an empty completion with the work tree
+                # untouched -- a transient provider-side fault, not a failed
+                # attempt with nothing to build on. It's the single most
+                # retryable outcome (6 of 16 logged attempts in this repo's
+                # own log tree look like this), so let it fall through to a
+                # normal retry instead of aborting the rest of the budget on
+                # a failure mode that didn't actually consume an attempt's
+                # worth of the model's effort.
                 break
             # Repeats the original prompt in full, not just the failure --
             # each attempt is a fresh session (see above) with no memory of
