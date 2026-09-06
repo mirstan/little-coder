@@ -32,6 +32,8 @@ from benchmarks.self_improve.schema import NormalizedTrajectory
 # always a distinct, typically stronger model (architecture §6).
 REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
 
+_KNOWN_LOG_ROOT_KEYS = {"aider", "gaia", "harbor", "tb"}
+
 logger = logging.getLogger(__name__)
 
 # Load benchmarks/self_improve/.env (gitignored) at import time, so
@@ -132,7 +134,7 @@ def _dry_run(trajectories: list[NormalizedTrajectory], components: dict[str, str
         return
 
     per_benchmark_scores: dict[str, list[float]] = {}
-    per_component_counts: dict[str, int] = {}
+    per_component_usage_counts: dict[str, int] = {}
     errors = 0
 
     for traj in trajectories:
@@ -166,8 +168,13 @@ def _dry_run(trajectories: list[NormalizedTrajectory], components: dict[str, str
                                 traj.benchmark, traj.task_id, usage.pred_name, e)
                 errors += 1
                 continue
-            if comp_result.feedback is not None:
-                per_component_counts[usage.pred_name] = per_component_counts.get(usage.pred_name, 0) + 1
+            # Real gap, confirmed by review: metric() ALWAYS returns a real
+            # feedback string for any real pred_name call (both the "not
+            # injected" and injected branches set one) -- `comp_result` is
+            # never used beyond this, so `if comp_result.feedback is not
+            # None:` was dead code, not an actual filter. This is really
+            # just a per-usage occurrence count.
+            per_component_usage_counts[usage.pred_name] = per_component_usage_counts.get(usage.pred_name, 0) + 1
 
     per_benchmark_avg = {
         b: sum(scores) / len(scores) for b, scores in per_benchmark_scores.items()
@@ -181,12 +188,12 @@ def _dry_run(trajectories: list[NormalizedTrajectory], components: dict[str, str
     print(f"\nWeighted aggregate score: {aggregate:.3f}")
     assert 0.0 <= aggregate <= 1.0, f"aggregate out of [0,1] range: {aggregate}"
 
-    print(f"\nPer-component attributed-feedback counts (nonzero only):")
-    if per_component_counts:
-        for name, count in sorted(per_component_counts.items(), key=lambda kv: -kv[1]):
+    print(f"\nPer-component usage counts:")
+    if per_component_usage_counts:
+        for name, count in sorted(per_component_usage_counts.items(), key=lambda kv: -kv[1]):
             print(f"  {name}: {count}")
     else:
-        print("  (none -- no trajectory attributed feedback to any component)")
+        print("  (none -- no trajectory used any known component)")
 
     print(f"\nErrors encountered: {errors}")
     if errors:
@@ -345,9 +352,24 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
+    # Real bug, confirmed by review: an unrecognized or malformed --log-roots
+    # token (a typo'd key, or one missing "=<value>") was silently absorbed
+    # into log_roots under whatever key partition() produced, then silently
+    # never matched any of _ingest_all's "aider"/"gaia"/"harbor"/"tb" checks --
+    # a confirmed real run could believe a source was ingested when it was
+    # never even attempted, with zero warning.
     log_roots = {}
     for kv in args.log_roots:
-        key, _, value = kv.partition("=")
+        key, sep, value = kv.partition("=")
+        if not sep or not value:
+            print(f"Invalid --log-roots entry {kv!r}: expected KEY=VALUE", file=sys.stderr)
+            return 1
+        if key not in _KNOWN_LOG_ROOT_KEYS:
+            print(
+                f"Invalid --log-roots entry {kv!r}: unknown key {key!r}, "
+                f"expected one of {sorted(_KNOWN_LOG_ROOT_KEYS)}", file=sys.stderr,
+            )
+            return 1
         log_roots[key] = value
 
     trajectories, empty_sources = _ingest_all(log_roots, repo_root=Path(args.repo_root))

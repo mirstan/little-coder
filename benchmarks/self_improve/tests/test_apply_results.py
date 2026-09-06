@@ -234,6 +234,56 @@ def test_apply_and_open_pr_returns_none_and_touches_nothing_when_unchanged(tmp_p
     assert branch == original_branch  # never switched branches -- nothing to commit
 
 
+def test_apply_and_open_pr_aborts_on_optimized_pred_name_unknown_to_components_yaml(tmp_path):
+    """Real gap, confirmed by review: write_components_back() only WARNS and
+    skips an unrecognized pred_name (the right contract for its own direct
+    callers), but apply_and_open_pr() is the highest-stakes caller -- it
+    commits (and can open a real PR for) whatever DID get written as if the
+    whole `optimized` set were applied. Must abort loudly on a scope
+    mismatch instead of silently committing a partial subset, and must not
+    write anything before it does."""
+    components_yaml = _make_component_repo(tmp_path)
+    with pytest.raises(ValueError, match="not in"):
+        apply_and_open_pr(
+            components_yaml_path=components_yaml,
+            repo_root=tmp_path,
+            optimized={
+                "skills_tools_bash": "## `bash` Tool (v2)\nRevised guidance.\n",
+                "not_a_real_pred_name": "some optimized text",
+            },
+            score_deltas={},
+            branch_name="self-improve/gepa-scope-mismatch-test",
+            push_and_open_pr=False,
+        )
+    written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
+    assert "v2" not in written  # nothing written -- aborted before any write
+
+
+def test_apply_and_open_pr_ignores_unrelated_escaping_entry_in_components_yaml(tmp_path):
+    """Real bug, confirmed by review: apply_and_open_pr() used to re-resolve
+    EVERY components.yaml entry (not just the ones in `optimized`) to build
+    its path->pred_name lookup, so an unrelated escaping/invalid entry
+    elsewhere in the file raised AFTER write_components_back() already wrote
+    the real, valid changes to disk -- leaving the working tree dirty with
+    no branch/commit. An entry this call never touches must not block it."""
+    components_yaml = _make_component_repo(tmp_path)
+    mapping = yaml.safe_load(components_yaml.read_text())
+    mapping["unrelated_escaping_entry"] = "../../etc/passwd"
+    components_yaml.write_text(yaml.dump(mapping))
+
+    result = apply_and_open_pr(
+        components_yaml_path=components_yaml,
+        repo_root=tmp_path,
+        optimized={"skills_tools_bash": "## `bash` Tool (v2)\nRevised guidance.\n"},
+        score_deltas={},
+        branch_name="self-improve/gepa-unrelated-entry-test",
+        push_and_open_pr=False,
+    )
+    assert result is None  # no PR opened -- push_and_open_pr was False, but no error either
+    written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
+    assert "v2" in written
+
+
 def test_apply_and_open_pr_rejects_component_path_that_escapes_repo_root(tmp_path):
     """Real hardening gap, confirmed by review: a components.yaml entry
     resolving outside repo_root must be rejected before any git operation

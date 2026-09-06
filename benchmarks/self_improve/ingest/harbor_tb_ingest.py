@@ -56,7 +56,17 @@ def _load_harbor(log_root: Path) -> list[NormalizedTrajectory]:
     for trial_dir in sorted(log_root.iterdir()):
         if not trial_dir.is_dir():
             continue
-        traj = _load_harbor_trial(trial_dir)
+        try:
+            traj = _load_harbor_trial(trial_dir)
+        except (AttributeError, TypeError) as e:
+            # Real gap, confirmed by review: this module's own docstring
+            # promises "never raise from load() on missing/malformed data",
+            # but a result.json that's valid JSON with the WRONG TYPE at some
+            # level (e.g. verifier_result is a list/string, not an object)
+            # was only guarded against explicit null, not against a
+            # wrong-typed value -- `.get()` on a non-dict raises AttributeError.
+            logger.warning("harbor_tb_ingest: malformed structure in %s: %s", trial_dir, e)
+            continue
         if traj is not None:
             trajectories.append(traj)
     return trajectories
@@ -134,7 +144,12 @@ def _load_tb(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[Normali
         for trial_dir in sorted(task_dir.iterdir()):
             if not trial_dir.is_dir():
                 continue
-            traj = _load_tb_trial(trial_dir, benchmark)
+            try:
+                traj = _load_tb_trial(trial_dir, benchmark)
+            except (AttributeError, TypeError) as e:
+                # Same gap as _load_harbor -- see its comment.
+                logger.warning("harbor_tb_ingest: malformed structure in %s: %s", trial_dir, e)
+                continue
             if traj is not None:
                 trajectories.append(traj)
     return trajectories
@@ -152,7 +167,16 @@ def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> Norma
         return None
 
     task_id = result.get("task_id", trial_dir.parent.name)
-    success = bool(result.get("is_resolved", False))
+    is_resolved = result.get("is_resolved", False)
+    if not isinstance(is_resolved, bool):
+        # Hardening, confirmed by review: real captured data has this as a
+        # genuine JSON boolean (tests/fixtures/real_tb_run), but bool(...) on
+        # any OTHER type is a classic Python trap -- bool("false") is True.
+        # Treat a wrong-typed value as unresolved/failed rather than trust it.
+        logger.warning("harbor_tb_ingest: non-boolean is_resolved %r in %s, treating as unresolved",
+                        is_resolved, results_path)
+        is_resolved = False
+    success = is_resolved
 
     # sorted(): glob() order is filesystem-dependent: pick the same log
     # deterministically across runs when a trial has more than one.

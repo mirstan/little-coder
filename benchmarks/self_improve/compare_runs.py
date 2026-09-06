@@ -18,6 +18,26 @@ def compare_pass_rates(
     before_by_id = {(t.benchmark, t.task_id): t for t in before}
     after_by_id = {(t.benchmark, t.task_id): t for t in after}
 
+    # Real bug, confirmed by review: a dict comprehension silently keeps only
+    # the LAST trajectory for a duplicate (benchmark, task_id) key (e.g. a
+    # harbor/tb run with multiple trials of the same task) -- discarding an
+    # earlier trial's outcome could hide exactly the regression this layer
+    # exists to catch. Reject duplicates outright rather than guess which
+    # trial should win.
+    if len(before_by_id) != len(before):
+        raise ValueError("compare_pass_rates: duplicate (benchmark, task_id) trials in `before`")
+    if len(after_by_id) != len(after):
+        raise ValueError("compare_pass_rates: duplicate (benchmark, task_id) trials in `after`")
+
+    # Real bug, confirmed by review: with both `before` and `after` empty,
+    # the set-equality check below passes vacuously (set() == set()) and n=0
+    # made both pass rates default to 0.0 with is_regression=False --
+    # reporting a Layer 5 comparison as safe when nothing was actually
+    # compared (e.g. an upstream ingest failure silently produced no
+    # trajectories at all).
+    if not before_by_id:
+        raise ValueError("compare_pass_rates: no trajectories to compare (both `before` and `after` are empty)")
+
     if set(before_by_id) != set(after_by_id):
         raise ValueError(
             "compare_pass_rates requires the same (benchmark, task_id) set in both runs; "
@@ -35,9 +55,9 @@ def compare_pass_rates(
         elif not was and now:
             improvements.append(key)
 
-    n = len(before_by_id)
-    before_pass_rate = sum(t.success for t in before_by_id.values()) / n if n else 0.0
-    after_pass_rate = sum(t.success for t in after_by_id.values()) / n if n else 0.0
+    n = len(before_by_id)  # always > 0 here -- the empty-input case raised above
+    before_pass_rate = sum(t.success for t in before_by_id.values()) / n
+    after_pass_rate = sum(t.success for t in after_by_id.values()) / n
 
     return {
         "before_pass_rate": before_pass_rate,

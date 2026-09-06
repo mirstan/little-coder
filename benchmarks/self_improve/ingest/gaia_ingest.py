@@ -5,9 +5,16 @@ Layout (confirmed against benchmarks/gaia.py, TDD_SPEC.md §0):
   <log_root>/<task_id>/{prompt.txt, transcript.txt, tool_calls.jsonl,
                         notifications.txt, stderr.log, result.json}
 
-Confirmed gap: gaia's per-task result.json does not carry stop_reason (only
-the run-level manifest.json's aggregate does) -- default to "agent_end" for a
-correct/complete run, "unknown" otherwise, per TDD_SPEC.md §3.2.
+result.json DOES carry a real per-task stop_reason and turn_count (both
+straight from PiRpc's own result, see benchmarks/gaia.py:199,206,235,240) --
+an earlier version of this comment claimed otherwise (stale/incomplete
+research); a computed fallback is used only for older data written before
+gaia.py recorded these fields. "correct" (and therefore success/gold) is
+only present when gaia.py was run with a gold answer to score against
+(score_against_gold=True) -- an unlabeled task has no "correct" key at all
+and is skipped entirely, not treated as a failure (real bug, confirmed by
+review: `result.get("correct", False)` silently turned every unlabeled task
+into a false negative).
 """
 import json
 import logging
@@ -70,7 +77,19 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("gaia_ingest: malformed result.json at %s: %s", result_path, e)
         return None
-    success = bool(result.get("correct", False))
+
+    # Real bug, confirmed by review against benchmarks/gaia.py:244-249:
+    # "correct" is only added to result.json `if score_against_gold:` -- a
+    # gaia run against tasks with no gold answer (the unlabeled/test split)
+    # produces a result.json with NO "correct" key at all. The previous
+    # `result.get("correct", False)` treated every such unlabeled task as a
+    # hard FAILURE, feeding false negatives into GEPA's scoring. Skip
+    # unscoreable tasks entirely instead -- NormalizedTrajectory.success is
+    # a required bool, there's no honest value to put there.
+    if "correct" not in result:
+        logger.warning("gaia_ingest: skipping %s, no gold answer to score against (no 'correct' key)", task_dir)
+        return None
+    success = bool(result["correct"])
 
     stderr_path = task_dir / "stderr.log"
     failure_signals = []
@@ -98,7 +117,16 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
     transcript_path = task_dir / "transcript.txt"
     assistant_text = transcript_path.read_text() if transcript_path.exists() else ""
 
-    stop_reason = "agent_end" if success else ("harness_error" if failure_signals else "unknown")
+    # Real bug, confirmed by review against benchmarks/gaia.py:206,240: gaia.py
+    # DOES persist a real per-task stop_reason in result.json (from
+    # PiRpc's actual result, e.g. "agent_end"/"deadline"/"process_exit") --
+    # this module's own prior "gaia doesn't carry stop_reason" comment was
+    # wrong (based on stale/incomplete research). Prefer the persisted value;
+    # only fall back to the computed heuristic for older data written before
+    # gaia.py recorded this field (empty string there too, per gaia.py:183).
+    stop_reason = result.get("stop_reason") or (
+        "agent_end" if success else ("harness_error" if failure_signals else "unknown")
+    )
 
     raw_paths = {
         name: str(task_dir / fname)
@@ -112,12 +140,21 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
         if (task_dir / fname).exists()
     }
 
+    # Real bug, confirmed by review against benchmarks/gaia.py:199,235: gaia.py
+    # persists a real per-task turn_count (from PiRpc's own turn accounting) --
+    # len(tool_calls) is a distinct count of individual tool invocations, not
+    # turns (multiple tool calls can happen in one turn). Prefer the
+    # persisted value; fall back for older data that predates this field.
+    turn_count = result.get("turn_count")
+    if not isinstance(turn_count, int):
+        turn_count = len(tool_calls)
+
     return NormalizedTrajectory(
         benchmark="gaia",
         task_id=task_dir.name,
         success=success,
         stop_reason=stop_reason,
-        turn_count=len(tool_calls),
+        turn_count=turn_count,
         partial_score=1.0 if success else 0.0,
         components_used=components_used,
         failure_signals=failure_signals,

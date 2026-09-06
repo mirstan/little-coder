@@ -192,6 +192,52 @@ def test_tb_load_handles_missing_log_root_gracefully(tmp_path):
     assert harbor_tb_ingest.load(tmp_path / "does-not-exist", benchmark="tb") == []
 
 
+def test_harbor_load_skips_trial_with_non_object_verifier_result(tmp_path):
+    """Real bug, confirmed by review: this module's own docstring promises
+    'never raise from load() on missing/malformed data', but a
+    wrong-TYPED (not just null/missing) nested field -- e.g. verifier_result
+    is a list, not an object -- made .get("rewards") raise AttributeError,
+    crashing the whole harbor ingest instead of skipping just this trial."""
+    good = tmp_path / "trial-good"
+    good.mkdir()
+    (good / "result.json").write_text(json.dumps({
+        "task_name": "x/y", "verifier_result": {"rewards": {"reward": 1.0}},
+    }))
+    bad = tmp_path / "trial-bad"
+    bad.mkdir()
+    (bad / "result.json").write_text(json.dumps({
+        "task_name": "x/z", "verifier_result": ["not", "an", "object"],
+    }))
+    trajs = harbor_tb_ingest.load(tmp_path, benchmark="harbor")
+    assert {t.task_id for t in trajs} == {"x/y"}
+
+
+def test_harbor_load_skips_trial_with_non_object_json_root(tmp_path):
+    trial = tmp_path / "trial-1"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps(["not", "an", "object"]))
+    assert harbor_tb_ingest.load(tmp_path, benchmark="harbor") == []
+
+
+def test_tb_load_treats_non_boolean_is_resolved_as_unresolved(tmp_path):
+    """Hardening, confirmed by review: real captured data always has this as
+    a genuine JSON boolean, but bool(...) on a wrong-typed value (e.g. the
+    STRING "false") is a classic Python trap -- bool("false") is True. A
+    non-boolean value must be treated as unresolved/failed, never trusted."""
+    task_dir = tmp_path / "some-task" / "some-task.1-of-1.ts"
+    task_dir.mkdir(parents=True)
+    (task_dir / "results.json").write_text(json.dumps({"task_id": "some-task", "is_resolved": "false"}))
+    traj = harbor_tb_ingest.load(tmp_path, benchmark="tb")[0]
+    assert traj.success is False
+
+
+def test_tb_load_skips_trial_with_non_object_json_root(tmp_path):
+    task_dir = tmp_path / "some-task" / "some-task.1-of-1.ts"
+    task_dir.mkdir(parents=True)
+    (task_dir / "results.json").write_text(json.dumps(["not", "an", "object"]))
+    assert harbor_tb_ingest.load(tmp_path, benchmark="tb") == []
+
+
 def test_harbor_load_picks_deterministic_log_when_multiple_exist(tmp_path):
     """Real bug, confirmed by review: glob() order is filesystem-dependent
     -- with more than one *.log file in a trial's agent/ dir, the chosen

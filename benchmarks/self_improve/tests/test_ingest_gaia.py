@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from benchmarks.self_improve.ingest import gaia_ingest
@@ -130,6 +131,73 @@ def test_load_drops_knowledge_inject_usage_without_repo_root(tmp_path):
 
     trajs = gaia_ingest.load(tmp_path)
     assert trajs[0].components_used == []
+
+
+def test_load_skips_task_with_no_gold_answer_instead_of_scoring_it_a_failure(tmp_path):
+    """Real bug, confirmed by review against benchmarks/gaia.py:244-249:
+    "correct" is only added to result.json `if score_against_gold:` -- an
+    unlabeled task (gaia's test split, no gold answer) has no "correct" key
+    at all. result.get("correct", False) used to silently score every such
+    task as a hard failure, feeding false negatives into GEPA."""
+    labeled = tmp_path / "task-labeled"
+    labeled.mkdir()
+    (labeled / "result.json").write_text(json.dumps({"correct": True}))
+
+    unlabeled = tmp_path / "task-unlabeled"
+    unlabeled.mkdir()
+    (unlabeled / "result.json").write_text(json.dumps({"model_answer": "42"}))  # no "correct" key
+
+    trajs = gaia_ingest.load(tmp_path)
+    assert {t.task_id for t in trajs} == {"task-labeled"}
+
+
+def test_load_prefers_persisted_stop_reason_from_result_json(tmp_path):
+    """Real bug, confirmed by review against benchmarks/gaia.py:206,240:
+    gaia.py DOES persist a real per-task stop_reason -- the computed
+    fallback heuristic must only apply when it's genuinely absent (older
+    data), not override a real value that would otherwise be mislabeled
+    (e.g. a "deadline" timeout that nonetheless scored correct)."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text(json.dumps({"correct": True, "stop_reason": "deadline"}))
+    traj = gaia_ingest.load(tmp_path)[0]
+    assert traj.stop_reason == "deadline"  # not the heuristic's "agent_end"
+
+
+def test_load_falls_back_to_heuristic_stop_reason_when_absent(tmp_path):
+    """Backward compat: older result.json files written before gaia.py
+    recorded stop_reason (or a genuinely empty one) still degrade to the
+    computed heuristic, not an empty string."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text(json.dumps({"correct": True, "stop_reason": ""}))
+    traj = gaia_ingest.load(tmp_path)[0]
+    assert traj.stop_reason == "agent_end"
+
+
+def test_load_prefers_persisted_turn_count_from_result_json(tmp_path):
+    """Real bug, confirmed by review against benchmarks/gaia.py:199,235:
+    gaia.py persists a real per-task turn_count distinct from
+    len(tool_calls) (multiple tool calls can happen within one turn)."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text(json.dumps({"correct": True, "turn_count": 7}))
+    (task / "tool_calls.jsonl").write_text(
+        "\n".join(json.dumps({"name": "bash", "args": {}}) for _ in range(20)) + "\n"
+    )
+    traj = gaia_ingest.load(tmp_path)[0]
+    assert traj.turn_count == 7  # not 20 (len(tool_calls))
+
+
+def test_load_falls_back_to_tool_call_count_when_turn_count_absent(tmp_path):
+    """Backward compat: older result.json files written before gaia.py
+    recorded turn_count still degrade to len(tool_calls)."""
+    task = tmp_path / "task-001"
+    task.mkdir()
+    (task / "result.json").write_text(json.dumps({"correct": True}))
+    (task / "tool_calls.jsonl").write_text(json.dumps({"name": "bash", "args": {}}) + "\n")
+    traj = gaia_ingest.load(tmp_path)[0]
+    assert traj.turn_count == 1
 
 
 def test_load_skips_task_with_non_utf8_file_instead_of_crashing_whole_run(tmp_path):

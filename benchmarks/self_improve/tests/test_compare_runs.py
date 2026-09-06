@@ -1,6 +1,8 @@
 """compare_runs.py: before/after pass-rate comparison for VALIDATION_PLAN.md
 Layer 5's held-out live regression check. Pure comparison logic against
 NormalizedTrajectory lists -- no execution of any benchmark happens here."""
+import pytest
+
 from benchmarks.self_improve.compare_runs import compare_pass_rates
 from benchmarks.self_improve.schema import NormalizedTrajectory
 
@@ -69,9 +71,37 @@ def test_compare_pass_rates_raises_on_mismatched_task_sets():
     over whatever partial overlap happens to exist."""
     before = [_traj("a", True)]
     after = [_traj("b", True)]
-    import pytest
     with pytest.raises(ValueError):
         compare_pass_rates(before, after)
+
+
+def test_compare_pass_rates_raises_on_duplicate_trials_in_before():
+    """Real bug, confirmed by review: a dict comprehension keyed by
+    (benchmark, task_id) silently keeps only the LAST of two duplicate
+    trials (e.g. a harbor/tb run with multiple trials of the same task) --
+    discarding an earlier trial's outcome could hide exactly the regression
+    Layer 5 exists to catch. Must raise, not silently pick a winner."""
+    before = [_traj("a", True), _traj("a", False)]  # two trials, same (benchmark, task_id)
+    after = [_traj("a", True)]
+    with pytest.raises(ValueError, match="duplicate"):
+        compare_pass_rates(before, after)
+
+
+def test_compare_pass_rates_raises_on_duplicate_trials_in_after():
+    before = [_traj("a", True)]
+    after = [_traj("a", True), _traj("a", False)]
+    with pytest.raises(ValueError, match="duplicate"):
+        compare_pass_rates(before, after)
+
+
+def test_compare_pass_rates_raises_on_empty_input_instead_of_reporting_safe():
+    """Real bug, confirmed by review: with both `before` and `after` empty,
+    the set-equality check passed vacuously and n=0 made both pass rates
+    default to 0.0 with is_regression=False -- reporting a Layer 5
+    comparison as SAFE when nothing was actually compared (e.g. an upstream
+    ingest failure silently produced zero trajectories)."""
+    with pytest.raises(ValueError, match="no trajectories"):
+        compare_pass_rates([], [])
 
 
 def test_compare_pass_rates_no_change_is_not_a_regression():
