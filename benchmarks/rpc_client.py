@@ -429,6 +429,11 @@ class PiRpc:
         rid = str(uuid.uuid4())
         self._send({"id": rid, "type": "get_state"})
         resp = self._await_response(rid, timeout=timeout)
+        if not resp.get("success"):
+            # Matches prompt_and_collect()'s handling: an error response has
+            # no "data" at all, so returning {} here would be indistinguishable
+            # from a legitimately empty (but successful) state.
+            raise RuntimeError(f"pi rejected get_state: {resp.get('error')}")
         return resp.get("data", {})
 
     def _settle_stderr(self, timeout: float = 1.0):
@@ -486,11 +491,24 @@ class PiRpc:
 def _read_json(path: Path) -> Optional[dict]:
     """Best-effort JSON read. None (not a raise) on any failure, including a
     missing file -- callers distinguish "file missing/unreadable" (None) from
-    "file present but empty of the field we wanted" ({})."""
+    "file present but empty of the field we wanted" ({}). Also None if the
+    file parses but isn't a JSON object (a list, a bare string, null) -- every
+    caller here calls .get()/iterates the result, so a syntactically-valid
+    but wrong-shape file must not masquerade as usable config and crash the
+    whole run (confirmed live with a JSON array in place of an object)."""
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _as_dict(value) -> dict:
+    """Coerce a JSON value that should be an object but might not be (an
+    explicit `null`, or some other type) to {} rather than let a nested
+    .get() raise. Config files are operator-edited and can have any shape
+    that's still valid JSON."""
+    return value if isinstance(value, dict) else {}
 
 
 def _resolve_little_coder_models_file() -> tuple[Path, str]:
@@ -509,15 +527,26 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
 def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     """maxTokens resolution: the user-override file wins if it defines this
     model; otherwise fall back to the shipped default at REPO_ROOT/models.json
-    (the same file llama-cpp-provider's own pkgRoot points at)."""
+    (the same file llama-cpp-provider's own pkgRoot points at).
+
+    NOTE: unlike llama-cpp-provider/config.ts's mergeProviders(), which
+    replaces a provider's entire `models` array wholesale if the override
+    file mentions that provider at all, this falls back per-model. Documented
+    divergence, not fixed here -- matching the TS merge semantics exactly
+    would need provider-level short-circuiting, a larger behavior change.
+    """
     out = {"value": None, "source_file": None, "resolution": None}
     override_path, resolution = _resolve_little_coder_models_file()
     for path, res in ((override_path, resolution), (_LC_MODELS_SHIPPED_DEFAULT, "shipped_default")):
         data = _read_json(path)
-        if not data:
+        if data is None:
             continue
-        for entry in data.get("providers", {}).get(provider, {}).get("models", []):
-            if entry.get("id") == model_id:
+        providers = _as_dict(data.get("providers"))
+        models = _as_dict(providers.get(provider)).get("models")
+        if not isinstance(models, list):
+            continue
+        for entry in models:
+            if isinstance(entry, dict) and entry.get("id") == model_id:
                 out.update(value=entry.get("maxTokens"), source_file=str(path), resolution=res)
                 return out
     return out
@@ -556,22 +585,24 @@ def _capture_omlx_sampling(model_id: str, errors: list[dict]) -> dict:
     if global_settings is None:
         errors.append({"source": "server_sampling", "error": f"unreadable or missing: {_OMLX_SETTINGS}"})
     else:
-        raw = global_settings.get("sampling", {})
+        raw = _as_dict(global_settings.get("sampling"))
         out["global_default"] = {k: raw[k] for k in _OMLX_SAMPLING_KEYS if k in raw}
 
     model_settings = _read_json(_OMLX_MODEL_SETTINGS)
     if model_settings is None:
         errors.append({"source": "server_sampling", "error": f"unreadable or missing: {_OMLX_MODEL_SETTINGS}"})
-    elif model_id in model_settings.get("models", {}):
-        raw = model_settings["models"][model_id]
-        out["per_model_override"] = {k: raw[k] for k in _OMLX_SAMPLING_KEYS if k in raw}
+    else:
+        models = _as_dict(model_settings.get("models"))
+        if model_id in models:
+            raw = _as_dict(models.get(model_id))
+            out["per_model_override"] = {k: raw[k] for k in _OMLX_SAMPLING_KEYS if k in raw}
 
     if out["global_default"] is not None or out["per_model_override"] is not None:
         out["effective"] = {**(out["global_default"] or {}), **(out["per_model_override"] or {})}
     return out
 
 
-def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None) -> dict:
+def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None, agent: str = "pi") -> dict:
     """Best-effort snapshot of config that affects generation but isn't visible
     to the harness's own CLI args: the machine-local default thinking level
     pi falls back to when --thinking is unset, the model's maxTokens, the
@@ -583,6 +614,14 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
     survive `npm ci`, so a fresh worktree can silently lose it with no other
     indication).
 
+    `agent` gates everything except `model`/`agent` themselves: provider/
+    model_id parsing, thinking level, little-coder's own maxTokens config,
+    omlx sampling, and pi's own vendored patch are all meaningless for a
+    codex run (a codex model id like "gpt-5.1-codex-max" has no provider
+    prefix at all -- not a malformed pi model string) and would otherwise
+    read as misleadingly authoritative pi-flavored provenance for a run
+    that never touches pi.
+
     Reflects on-disk config, not necessarily a currently-running server's
     already-loaded state -- a hand-edited settings file the server hasn't
     picked up yet (no restart) would still read as the new value here.
@@ -591,16 +630,37 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
     with a breadcrumb in "errors", not a crashed run -- this must not be the
     reason a benchmark exercise fails.
     """
+    if agent != "pi":
+        return {
+            "model": model,
+            "agent": agent,
+            "note": f"environment snapshot only covers agent='pi' today; agent={agent!r} not introspected",
+            "errors": [],
+        }
+
     provider, sep, model_id = model.partition("/")
     errors: list[dict] = []
     if not sep:
         errors.append({"source": "model", "error": f"no provider prefix in {model!r}"})
 
+    try:
+        thinking = _resolve_thinking(cli_thinking)
+    except Exception as exc:
+        errors.append({"source": "thinking", "error": f"{type(exc).__name__}: {exc}"})
+        thinking = {"cli_value": cli_thinking, "pi_default_setting": None,
+                    "resolved": None, "source": "error", "confirmed_live": None}
+    try:
+        max_tokens = _find_model_max_tokens(provider, model_id)
+    except Exception as exc:
+        errors.append({"source": "max_tokens", "error": f"{type(exc).__name__}: {exc}"})
+        max_tokens = {"value": None, "source_file": None, "resolution": None}
+
     snapshot = {
         "model": model,
+        "agent": agent,
         "provider": provider,
-        "thinking": _resolve_thinking(cli_thinking),
-        "max_tokens": _find_model_max_tokens(provider, model_id),
+        "thinking": thinking,
+        "max_tokens": max_tokens,
     }
 
     if provider == "omlx":

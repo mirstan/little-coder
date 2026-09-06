@@ -604,6 +604,7 @@ def _run_exercise(
     max_attempts: int = 2,
     thinking: str | None = None,
     agent: str = "pi",
+    confirm_thinking: bool = False,
 ):
     desc = LANG_DESCRIPTORS.get(lang)
     if desc is None:
@@ -659,21 +660,26 @@ def _run_exercise(
         current_prompt = prompt
         codex_session_id = None
         confirmed_thinking_level = None
+        confirmed_thinking_error = None
         for i in range(1, effective_attempts + 1):
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                            session_id=f"poly-{lang}-{ex_name}-attempt{i}",
                            env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
                            thinking=thinking) as rpc:
-                    if i == 1:
-                        # Best-effort: confirms the thinking level pi actually
-                        # resolved to (vs. our own static-file guess in
-                        # capture_environment_snapshot), straight from pi's
-                        # own get_state. Never worth failing the exercise over.
+                    if i == 1 and confirm_thinking:
+                        # Best-effort, and only once per RUN (the caller
+                        # passes confirm_thinking=True only until it gets a
+                        # value back) -- not once per exercise. This confirms
+                        # the thinking level pi actually resolved to (vs. our
+                        # own static-file guess in capture_environment_snapshot)
+                        # straight from pi's own get_state; config doesn't
+                        # change mid-run, so a second, third, ... confirmation
+                        # would just be 200+ redundant RPC round-trips.
                         try:
                             confirmed_thinking_level = rpc.get_state().get("thinkingLevel")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            confirmed_thinking_error = f"{type(exc).__name__}: {exc}"
                     # prompt_and_collect() returns partial events *silently*
                     # when agent_end never arrives (_drain_events_until
                     # returns `collected`, it does not raise), so a
