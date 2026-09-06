@@ -235,6 +235,58 @@ def test_dump_trajectory_persists_non_text_deltas_when_present(tmp_path):
     assert payload["non_text_deltas"] == [{"type": "thinking_delta", "delta": "reasoning..."}]
 
 
+def test_cap_non_text_deltas_returns_input_unchanged_when_under_budget():
+    deltas = [{"type": "thinking_delta", "delta": f"chunk {i}"} for i in range(5)]
+    assert AP._cap_non_text_deltas(deltas, char_budget=10_000) == deltas
+
+
+def test_cap_non_text_deltas_keeps_head_and_tail_drops_middle():
+    # Each entry ~40 raw JSON chars; budget 400 splits to 200 head/200 tail,
+    # i.e. ~5 entries survive on each end out of 100.
+    deltas = [{"type": "thinking_delta", "delta": f"chunk number {i:03d}"} for i in range(100)]
+    result = AP._cap_non_text_deltas(deltas, char_budget=400)
+    assert result[0] == deltas[0]
+    assert result[-1] == deltas[-1]
+    marker = next(d for d in result if d.get("type") == "_omitted")
+    assert marker["omitted_count"] > 0
+    # Head, marker, tail -- middle entries genuinely gone, not just hidden.
+    assert marker["omitted_count"] == 100 - (len(result) - 1)
+    kept_indices = [deltas.index(d) for d in result if d is not marker]
+    assert kept_indices == sorted(kept_indices)  # order preserved, no shuffling
+
+
+def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
+    huge = {"type": "toolcall_delta", "delta": "x" * 1_000_000}
+    result = AP._cap_non_text_deltas([huge, {"type": "thinking_delta", "delta": "short"}], char_budget=1_000)
+    # Doesn't raise, and still bounds the result to something sane.
+    assert isinstance(result, list)
+
+
+def test_dump_trajectory_no_longer_drops_the_tail_of_a_long_but_small_reasoning_stream(tmp_path):
+    """Regression for the exact bug fixed here: the OLD policy was a flat
+    first-200-entries cutoff BY COUNT, so a 250-chunk reasoning stream lost
+    its last 50 chunks outright -- including whatever reasoning happened
+    right before the model's final decision, exactly what
+    live_eval.py's _reasoning_excerpt_from_trajectory needs. The new
+    char-budget policy keeps everything here, since the whole stream is
+    tiny in bytes even at 250 entries."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+        non_text_deltas = [{"type": "thinking_delta", "delta": f"chunk {i}"} for i in range(250)]
+
+    AP._dump_trajectory(log_dir, "1", R())
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    # Index 249 -- entirely dropped by the old [:200] cutoff -- survives now.
+    assert {"type": "thinking_delta", "delta": "chunk 249"} in payload["non_text_deltas"]
+
+
 def test_dump_trajectory_persists_notifications_when_given(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
