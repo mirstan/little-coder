@@ -699,11 +699,12 @@ def _run_exercise(
                 # ctx.ui.notify events -- skill/knowledge injections, and
                 # critically the thinking-budget extension's "the model has
                 # thought long enough" intervention. Read AFTER the `with`
-                # block (not inside it): PiRpc.close() doesn't clear
-                # _notifications or join the reader thread, it only waits
-                # for the process to exit, so reading here can only see
-                # equal-or-more of what the reader thread drained, never
-                # less. Harmless if this list ends up empty.
+                # block (not inside it): PiRpc.close() joins the reader
+                # thread before returning, so by the time __exit__ finishes,
+                # everything the reader ever drained is guaranteed to be in
+                # self._notifications -- reading before close() started (as
+                # an earlier version of this code did) had no such guarantee.
+                # Harmless if this list ends up empty.
                 attempt_notifications = rpc.notifications()
             elif agent == "codex":
                 # Unlike pi's fresh-session-per-attempt (see above), codex
