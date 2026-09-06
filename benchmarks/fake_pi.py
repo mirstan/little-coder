@@ -8,12 +8,44 @@ expressed against a real agent anyway: it needs a process that exits on cue.
 Mode comes from FAKE_PI_MODE. Reads JSONL requests on stdin, emits JSONL on
 stdout, exactly as rpc_client expects.
 """
-import json, os, sys, time
+import base64, json, os, sys, time
 
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def _system_prompt_path_from_argv() -> str | None:
+    """pi's real argv includes `--system-prompt <path>` whenever
+    rpc_client._build_system_prompt() resolved one (rpc_client.py:205) --
+    fake_pi.py is launched with the exact same argv via
+    LITTLE_CODER_PI_BIN_OVERRIDE, so this is how a test can see what
+    candidate text an agent invocation actually received."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--system-prompt" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+def _write_solution_files():
+    """FAKE_PI_WRITE_FILES: JSON {"relative/path.py": "base64 content", ...}.
+    Writes each, relative to os.getcwd() (the exercise workdir -- PiRpc is
+    constructed with cwd=str(work), aider_polyglot.py:671-686), and emits a
+    realistic tool_execution_start/end pair per file so tool_calls looks real."""
+    raw = os.environ.get("FAKE_PI_WRITE_FILES")
+    if not raw:
+        return
+    files = json.loads(raw)
+    for i, (rel_path, content_b64) in enumerate(files.items()):
+        content = base64.b64decode(content_b64).decode("utf-8")
+        target = os.path.join(os.getcwd(), rel_path)
+        emit({"type": "tool_execution_start", "toolCallId": f"w{i}", "toolName": "write",
+              "args": {"path": rel_path}})
+        with open(target, "w") as fh:
+            fh.write(content)
+        emit({"type": "tool_execution_end", "toolCallId": f"w{i}", "toolName": "write",
+              "result": {"content": [{"type": "text", "text": "ok"}]}, "isError": False})
 
 
 def read_prompt():
@@ -161,6 +193,84 @@ def main():
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         time.sleep(30)
+        return
+
+    if mode == "solve_from_env":
+        # Writes FAKE_PI_WRITE_FILES unconditionally, then finishes cleanly.
+        # Exits promptly (no sleep(30)) -- these modes back a real
+        # subprocess-per-exercise e2e test that runs many times per test
+        # session, and a lingering sleep(30) child (harmless since
+        # PiRpc.close() kills it regardless, but needless) has no purpose
+        # here the way it does for the hang/crash regression fixtures above.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "noop_then_solve":
+        # Solves only on the SECOND invocation. Attempts are separate
+        # PROCESSES -- aider_polyglot.py opens a fresh PiRpc (and therefore a
+        # fresh fake_pi.py subprocess) per attempt, deliberately (its own
+        # comment: reusing one session across attempts ballooned context and
+        # wedged pi) -- so "which attempt is this" must be tracked
+        # out-of-process via FAKE_PI_STATE_FILE, not an in-memory counter.
+        state_file = os.environ["FAKE_PI_STATE_FILE"]
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if os.path.exists(state_file):
+            _write_solution_files()
+        else:
+            with open(state_file, "w") as fh:
+                fh.write("attempt-1-done\n")
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "read_system_prompt_echo":
+        # Copies the system-prompt file's content to FAKE_PI_ECHO_FILE, so a
+        # test can assert a candidate's proposed text actually reached the
+        # agent invocation -- the regression test for the exact bug this
+        # whole live-eval rewrite exists to fix (the old frozen-data design
+        # never let a candidate's text affect anything).
+        echo_file = os.environ["FAKE_PI_ECHO_FILE"]
+        system_prompt_path = _system_prompt_path_from_argv()
+        with open(echo_file, "w") as fh:
+            fh.write(open(system_prompt_path).read() if system_prompt_path else "")
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "solve_if_prompt_contains":
+        # Solves only if the RECEIVED system prompt contains
+        # FAKE_PI_MAGIC_TOKEN -- lets a test feed two candidates that differ
+        # only in instruction text and assert they score differently,
+        # without needing a real model to "decide" based on the text.
+        token = os.environ["FAKE_PI_MAGIC_TOKEN"]
+        system_prompt_path = _system_prompt_path_from_argv()
+        prompt_text = open(system_prompt_path).read() if system_prompt_path else ""
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if token in prompt_text:
+            _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "sleep_forever":
+        # Like hang_after_ack, but the sleep duration is configurable so a
+        # deadline/timeout test doesn't have to wait out a hardcoded 3600s.
+        sleep_s = float(os.environ.get("FAKE_PI_SLEEP_S", "3600"))
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        time.sleep(sleep_s)
         return
 
     # default: clean single turn with one tool call
