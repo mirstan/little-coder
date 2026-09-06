@@ -155,8 +155,8 @@ export default function (pi: ExtensionAPI) {
     safeSetThinkingLevel(pi, "off");
     try {
       pi.sendUserMessage(
-        "[thinking budget exceeded] Please commit to an implementation now. " +
-          "Stop deliberating and use your tools to make progress.",
+        "[thinking budget exceeded] Stop deliberating and make concrete progress now — " +
+          "call a tool, write code, or give your answer.",
         { deliverAs: "followUp" },
       );
     } catch {
@@ -164,7 +164,7 @@ export default function (pi: ExtensionAPI) {
     }
     harnessIntervention(
       ctx,
-      "the model has thought long enough — forcing it to start implementing.",
+      "the model has thought long enough — forcing it to act.",
     );
     ctx.abort();
   });
