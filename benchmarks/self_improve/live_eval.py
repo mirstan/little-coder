@@ -31,6 +31,28 @@ from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
 
+#: Mirrors aider_polyglot.py's own ATTEMPT_TIMEOUT_S default. Read from the
+#: SAME env var that module reads (not hardcoded), so the two can never
+#: silently drift apart the way a bare literal here already did once: this
+#: harness-level default was still 900 when aider_polyglot.py's own default
+#: was tripled to 2700 for a local reasoning model, meaning the OUTER
+#: subprocess timeout below would have fired and killed the exercise via
+#: SIGTERM/SIGKILL before even ONE inner attempt's own (now longer) budget
+#: had a chance to time out gracefully -- turning a clean, correctly-
+#: classified fail_timeout into an abrupt harness_error instead.
+_ATTEMPT_TIMEOUT_S_DEFAULT = 2700
+
+
+def _attempt_timeout_s() -> int:
+    raw = os.environ.get("ATTEMPT_TIMEOUT_S")
+    if raw and raw.strip():
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _ATTEMPT_TIMEOUT_S_DEFAULT
+
+
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
@@ -138,11 +160,12 @@ class PolyglotLiveRunner:
         #: it refuses to start silently score 0.0, which would poison the
         #: search with a reason that has nothing to do with the candidate.
         self.budget = budget
-        # 900s/attempt (aider_polyglot's own ATTEMPT_TIMEOUT_S default) + 90s
-        # test budget, times max_attempts, plus headroom -- a belt-and-braces
-        # ceiling ABOVE aider_polyglot's own per-attempt budget so a wedged
-        # pi session can't stall a run indefinitely.
-        self.per_exercise_timeout_s = per_exercise_timeout_s or (max_attempts * (900 + 90) + 180)
+        # aider_polyglot's own ATTEMPT_TIMEOUT_S per attempt (see
+        # _attempt_timeout_s() above) + 90s test budget, times max_attempts,
+        # plus headroom -- a belt-and-braces ceiling ABOVE aider_polyglot's
+        # own per-attempt budget so a wedged pi session can't stall a run
+        # indefinitely.
+        self.per_exercise_timeout_s = per_exercise_timeout_s or (max_attempts * (_attempt_timeout_s() + 90) + 180)
         self.python_executable = python_executable
         #: Optional callable(LiveRunResult) -- invoked as EACH result becomes
         #: available inside run_batch() (cache hits included), not after the

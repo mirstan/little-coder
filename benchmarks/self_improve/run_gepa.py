@@ -49,7 +49,7 @@ from benchmarks.self_improve.live_budget import (
     render_estimate,
 )
 from benchmarks.self_improve.live_cache import LiveResultCache
-from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _sanitize_candidate
+from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s, _sanitize_candidate
 from benchmarks.self_improve.polyglot_adapter import PolyglotGEPAAdapter
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 from benchmarks.self_improve.spend_log import SpendLog
@@ -278,7 +278,7 @@ def _run_live(args: argparse.Namespace) -> int:
         print("Refusing to run: zero components selected.", file=sys.stderr)
         return 1
 
-    per_exercise_timeout_s = args.per_exercise_timeout_s or (args.max_attempts * (900 + 90) + 180)
+    per_exercise_timeout_s = args.per_exercise_timeout_s or (args.max_attempts * (_attempt_timeout_s() + 90) + 180)
     assumed_seconds = args.assumed_exercise_seconds
     if assumed_seconds is None:
         assumed_seconds = median_exercise_seconds_from_results(

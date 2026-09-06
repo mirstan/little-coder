@@ -303,3 +303,37 @@ def test_on_result_still_fires_for_exercises_completed_before_a_later_budget_exc
 
     assert len(seen) == 1
     assert seen[0].task_id == "python/wordy"
+
+
+def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real bug, confirmed by review: this default used to hardcode a bare
+    900 literal for aider_polyglot's own per-attempt budget, independent of
+    the ATTEMPT_TIMEOUT_S env var that module actually reads. When
+    aider_polyglot.py's own default was tripled to 2700s for a local
+    reasoning model, this harness-level ceiling silently stayed at the old,
+    now-too-short value -- the OUTER subprocess timeout would fire and kill
+    an exercise via SIGTERM before even one INNER attempt's own (longer)
+    budget had a chance to time out gracefully."""
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s
+    from benchmarks.self_improve.scratch_worktree import scratch_worktree
+
+    monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
+    assert _attempt_timeout_s() == 2700  # matches aider_polyglot.py's own current default
+
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+        runner = PolyglotLiveRunner(
+            worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+            model="fake/model", max_attempts=2, benchmark_root=fake_practice,
+        )
+        assert runner.per_exercise_timeout_s == 2 * (2700 + 90) + 180
+
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    assert _attempt_timeout_s() == 30
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+        runner = PolyglotLiveRunner(
+            worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+            model="fake/model", max_attempts=2, benchmark_root=fake_practice,
+        )
+        assert runner.per_exercise_timeout_s == 2 * (30 + 90) + 180
