@@ -101,9 +101,13 @@ def test_dry_run_produces_a_plausible_weighted_aggregate_across_benchmarks(tmp_p
         "aider": f"{log_root},{results_json}",
         "tb": str(REAL_TB_FIXTURE),
     }
-    trajectories, _empty_sources = _ingest_all(log_roots)
-
     real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
+    # repo_root: real gap, confirmed by review -- main() always passes
+    # repo_root through to _ingest_all() (needed to resolve knowledge-inject
+    # component usage), so omitting it here made this integration test
+    # exercise a calling convention main() never actually uses.
+    trajectories, _empty_sources = _ingest_all(log_roots, repo_root=real_repo_root)
+
     components = load_components(
         real_repo_root / "benchmarks" / "self_improve" / "config" / "components.yaml",
         repo_root=real_repo_root,

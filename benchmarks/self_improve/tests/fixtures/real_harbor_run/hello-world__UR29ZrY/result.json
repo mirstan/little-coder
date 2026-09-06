@@ -2,7 +2,7 @@
     "id": "47266831-5c10-41aa-96de-3dff9abe75a2",
     "task_name": "hello-world/hello-world",
     "trial_name": "hello-world__UR29ZrY",
-    "trial_uri": "file:///Users/stanmiroshnikov/git/mirstan/little-coder-self-improve/benchmarks/harbor_runs/2026-09-05__14-57-31/hello-world__UR29ZrY",
+    "trial_uri": "file:///REDACTED/harbor_runs/2026-09-05__14-57-31/hello-world__UR29ZrY",
     "task_id": {
         "org": "hello-world",
         "name": "hello-world",
@@ -22,7 +22,7 @@
             "source": null
         },
         "trial_name": "hello-world__UR29ZrY",
-        "trials_dir": "/Users/stanmiroshnikov/git/mirstan/little-coder-self-improve/benchmarks/harbor_runs/2026-09-05__14-57-31",
+        "trials_dir": "/REDACTED/harbor_runs/2026-09-05__14-57-31",
         "install_only": false,
         "timeout_multiplier": 1.0,
         "agent_timeout_multiplier": null,

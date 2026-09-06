@@ -1,11 +1,19 @@
 # self-improve: GEPA-based self-improvement loop for little-coder
 
 Offline, human-reviewed optimization loop that reads little-coder's collected
-benchmark trajectories and proposes rewrites to `AGENTS.md`, `PRINCIPLES.md`,
-and skill files (`skills/tools/*.md`, `skills/knowledge/*.md`,
-`skills/protocols/*.md`) using [DSPy](https://dspy.ai)'s GEPA optimizer. Never
-modifies the runtime agent loop, never auto-commits, never auto-merges —
-results are always proposed as a PR for human review.
+benchmark trajectories and proposes rewrites to `AGENTS.md` and skill files
+(`skills/tools/*.md`, `skills/knowledge/*.md`, `skills/protocols/*.md`) using
+[DSPy](https://dspy.ai)'s GEPA optimizer. Never modifies the runtime agent
+loop, never auto-commits, never auto-merges — results are always proposed as
+a PR for human review.
+
+Note: `PRINCIPLES.md`, when present, is concatenated into the runtime system
+prompt by `rpc_client.py::_build_system_prompt()` (see Layer 6 below), but is
+NOT currently an optimizable component -- `config/components.yaml` (the
+single source of truth `load_components()` reads from) has no `principles_md`
+entry. Add one there to make it a GEPA target; until then, editing it is a
+manual, non-GEPA-driven action (confirmed by review: the opening paragraph
+here previously implied otherwise).
 
 See `TDD_SPEC.md` for the test-first implementation spec and `VALIDATION_PLAN.md`
 for the 6-layer end-to-end validation gate this loop must clear before real
@@ -98,9 +106,17 @@ reviewed the local commit.
   (request access at the dataset page, then re-attempt ingestion) — the only
   benchmark not yet validated against real data.
 - **Layer 3** (dry-run smoke test): passing.
-- **Layer 4** (real GEPA run): fully implemented and safety-gated, never
-  executed — needs a human to supply `--reflection-model` +
-  `$REFLECTION_LM_API_KEY` + `--confirm-real-run`.
+- **Layer 4** (real GEPA run): executed successfully once, with a real
+  reflection_lm API key, against a tiny real fixture dataset scoped to
+  `skills_tools_bash` only — completed without error and reported no
+  improvement over the seed instructions on that dataset (a real, structural
+  finding: with the current `metric()` design, GEPA's score is identical for
+  every candidate on the same example regardless of what that candidate's
+  instructions actually say, so its default strict-improvement acceptance
+  criterion can never accept a proposed rewrite on ANY dataset size -- see
+  `metric.py`'s module docstring). Confirmed by review; not yet resolved.
+  Still safety-gated behind `--reflection-model` + `$REFLECTION_LM_API_KEY` +
+  `--confirm-real-run` for any further real run.
 - **Layer 5** (held-out live regression check): comparison utility
   (`compare_runs.py::compare_pass_rates`) built and tested; execution is
   downstream of a real Layer 4 run producing a PR to check out and re-test.

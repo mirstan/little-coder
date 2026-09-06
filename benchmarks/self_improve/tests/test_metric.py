@@ -138,7 +138,13 @@ def test_metric_component_used_in_success_returns_positive_feedback():
     result = metric(FakeExample(traj), pred=None, trace=None,
                      pred_name="skills_tools_bash", pred_trace=None)
     assert result.score == 1.0
-    assert result.feedback is not None
+    # Real gap, confirmed by review: `feedback is not None` alone doesn't
+    # pin the POSITIVE-signal behavior this test's name/docstring claim --
+    # a regression that made the success path emit the "was not injected"
+    # fallback text (or any other generic string) would still pass a bare
+    # not-None check. Assert on the actual grounded content instead.
+    assert "passed" in result.feedback
+    assert "skills_tools_bash was injected 1 time(s)" in result.feedback
 
 
 def test_score_for_benchmark_falls_back_to_success_when_partial_score_absent():

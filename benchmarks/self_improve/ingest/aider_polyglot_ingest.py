@@ -3,14 +3,19 @@
 One trajectory per (lang, exercise) key in results_full_polyglot.json -- NOT
 per attempt file. The aggregate record's status already captures which
 attempt (if any) passed; per-attempt trajectory_<n>.json files under
-log_root/<lang>/<exercise>/ are used only to populate summarized_transcript,
-components_used, and raw_paths from the latest attempt.
+log_root/<lang>/<exercise>/ populate summarized_transcript and raw_paths from
+the LATEST successfully-parsed attempt, but components_used is a UNION across
+EVERY successfully-parsed attempt (a skill injected on an earlier, failed
+attempt but not re-triggered on the one that ultimately passed still
+genuinely influenced the outcome; docstring corrected per review -- it
+previously said "latest attempt" here too, which stopped matching the
+implementation once that was fixed).
 
 Formerly a confirmed gap (TDD_SPEC.md §0/§4.2): aider_polyglot's
 _dump_trajectory did not persist rpc.notifications(), so components_used was
 always empty here. Closed upstream (benchmarks/aider_polyglot.py's
 _dump_trajectory now takes a notifications= kwarg) -- components_used
-populates from the latest attempt's "notifications" field when present, and
+populates from each attempt's "notifications" field when present, and
 degrades to [] gracefully for older-format data that predates this field.
 
 Result-record schema evolved twice, both handled here with fallback:

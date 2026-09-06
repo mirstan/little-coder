@@ -14,6 +14,27 @@ but dspy's OWN internal feedback_fn (dspy/teleprompt/gepa/gepa.py) does
 object is not subscriptable" the moment GEPA's reflective step tried to use
 it. The real, subscriptable class lives one level deeper, at
 dspy.teleprompt.gepa.gepa (re-exported from gepa_utils).
+
+CONFIRMED ARCHITECTURAL FINDING, NOT YET RESOLVED (found via PR review,
+verified against installed gepa 3.3.1 source,
+gepa/strategies/acceptance.py::StrictImprovementAcceptance -- the DEFAULT
+acceptance criterion dspy.GEPA uses whenever the caller doesn't override it,
+which run_gepa.py does not): `base_score` below is computed ENTIRELY from
+`gold.trajectory` (the historical, already-collected ground truth) and never
+reads `pred` (the candidate program's actual rollout output for this
+example) -- by design, per HarnessProgram's own docstring in components.py.
+This means every candidate gets the IDENTICAL score for the same example,
+regardless of what that candidate's instructions say. StrictImprovementAcceptance
+accepts a proposed rewrite only if `new_sum > old_sum` over a minibatch --
+since old_sum and new_sum are always equal here, that condition can never be
+true, on any dataset of any size. GEPA can therefore never accept a single
+proposed rewrite as currently designed; this fully explains why the real
+Layer 4 run (see README.md) reported no improvement. Fixing this needs a
+design decision (e.g. switching acceptance criteria and accepting a
+zero-quality-gate "always take the newest LLM rewrite" loop, making scoring
+genuinely candidate-sensitive by replaying `pred` through a real evaluator
+per candidate, or dropping GEPA's accept/reject loop for a pure
+single-proposal-per-review workflow) -- not a metric.py code fix on its own.
 """
 from dataclasses import dataclass
 

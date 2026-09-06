@@ -1,8 +1,16 @@
 """Tests for run_gepa.py's real (non-dry-run) path, up to but NEVER including
 the actual GEPA.compile() call -- that spends real API budget and must only
 ever run on explicit human invocation with a real reflection_lm configured.
-No test here sets REFLECTION_LM_API_KEY or passes --confirm-real-run with a
-real model, so _real_run() always exits via the safety gate in these tests.
+
+Most tests here never set REFLECTION_LM_API_KEY or pass --confirm-real-run
+with a real model, so _real_run() exits via the safety gate before reaching
+dspy.GEPA at all. The one exception,
+test_real_run_allows_partial_ingest_when_explicitly_overridden, DOES set all
+three gates (a fake API key, a fake model string, confirm_real_run=True) to
+exercise the code path past them -- but only dspy.GEPA itself is stubbed
+there (its .compile() never runs), so no real API call is made even though
+the safety gate is genuinely satisfied and passed (docstring corrected per
+review: the previous blanket claim was inaccurate for that one test).
 """
 import argparse
 import os
