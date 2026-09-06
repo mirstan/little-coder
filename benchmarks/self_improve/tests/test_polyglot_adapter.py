@@ -135,6 +135,15 @@ def test_reflective_dataset_record_has_required_fields():
     assert "AssertionError: boom" in record["Feedback"]
 
 
+def test_reflective_dataset_generated_outputs_includes_reasoning_excerpt():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", reasoning_excerpt="thought about it")})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    record = adapter.make_reflective_dataset({"skills_tools_bash": "text"}, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert record["Generated Outputs"]["reasoning_excerpt"] == "thought about it"
+
+
 def test_reflective_dataset_says_not_injected_when_component_absent_from_notifications():
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a", notifications=[])})

@@ -2,7 +2,8 @@
 scratch worktree, runs a real aider_polyglot.py exercise as a subprocess per
 exercise (not in-process -- see scratch_worktree.py's module docstring for
 why), and parses the result into a graded score plus real feedback material
-(diff, pytest output, transcript excerpt) for the reflection step.
+(diff, pytest output, transcript excerpt, reasoning excerpt) for the
+reflection step.
 """
 from __future__ import annotations
 
@@ -56,7 +57,34 @@ def _attempt_timeout_s() -> int:
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
+#: Reasoning traces run long (a single real bowling attempt hit the 200-entry
+#: non_text_deltas cap in aider_polyglot.py's own trajectory dump, almost
+#: all of it thinking_delta) -- tail-truncate like transcript_excerpt so the
+#: reflection prompt sees the model's LATEST reasoning, not its opening
+#: thoughts truncated mid-sentence.
+_MAX_REASONING_CHARS = 4_000
 _ATTEMPT_NUM_RE = re.compile(r"_(\d+)$")
+
+
+def _reasoning_excerpt_from_trajectory(traj_data: Mapping) -> str:
+    """Reconstructs the model's reasoning stream from non_text_deltas the
+    same way rpc_client.py's own prompt_and_collect() builds assistant_text
+    from text_delta: concatenate each thinking_delta's "delta" field in
+    order. Confirmed against a real gepa.optimize() run (2026-09-06,
+    omlx/tiel-coder-oq4e, thinking=high) that "thinking_delta" is pi's real
+    event type for this -- previously only a guessed stand-in (see
+    PromptResult.non_text_deltas' own docstring in rpc_client.py).
+
+    Entries can be non-dict here: aider_polyglot.py's _dump_trajectory._clip
+    falls back to a truncated JSON string for any single delta that
+    serializes past TRAJECTORY_FIELD_CHARS -- skip those defensively rather
+    than crash on a malformed cache/trajectory entry."""
+    chunks = [
+        d.get("delta", "")
+        for d in traj_data.get("non_text_deltas", [])
+        if isinstance(d, dict) and d.get("type") == "thinking_delta"
+    ]
+    return "".join(chunks)[-_MAX_REASONING_CHARS:]
 
 
 def _attempt_num(p: Path) -> int:
@@ -108,6 +136,7 @@ class LiveRunResult:
     turn_count: int = 0
     test_output_tail: str = ""
     transcript_excerpt: str = ""
+    reasoning_excerpt: str = ""
     diff_summary: str = ""
     notifications: list = field(default_factory=list)
     error: str | None = None
@@ -454,6 +483,7 @@ class PolyglotLiveRunner:
             test_output_tail = final_output.read_text()[-_MAX_TAIL_CHARS:]
 
         transcript_excerpt = ""
+        reasoning_excerpt = ""
         # Unioned across EVERY attempt, not just the latest: a component
         # (e.g. a skill) can be injected on an earlier failed attempt whose
         # guidance still shapes a LATER attempt's success (or a retry can
@@ -479,6 +509,7 @@ class PolyglotLiveRunner:
             try:
                 traj_data = json.loads(latest.read_text())
                 transcript_excerpt = (traj_data.get("assistant_text") or "")[-_MAX_TRANSCRIPT_CHARS:]
+                reasoning_excerpt = _reasoning_excerpt_from_trajectory(traj_data)
             except (json.JSONDecodeError, OSError):
                 pass
             workdir = ex_log_dir / f"workdir_{_attempt_num(latest)}"
@@ -491,6 +522,7 @@ class PolyglotLiveRunner:
             stop_reasons=stop_reasons, elapsed_s=record.get("elapsed_s", 0.0) or 0.0,
             turn_count=record.get("turn_count", 0) or 0,
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
+            reasoning_excerpt=reasoning_excerpt,
             diff_summary=diff_summary, notifications=notifications,
             **base_kwargs,
         )

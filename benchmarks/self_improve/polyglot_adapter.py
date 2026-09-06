@@ -170,6 +170,7 @@ class PolyglotGEPAAdapter:
                         "status": result.status,
                         "attempts": result.attempts,
                         "transcript_excerpt": result.transcript_excerpt,
+                        "reasoning_excerpt": result.reasoning_excerpt,
                     },
                     "Feedback": _component_feedback(component, result, self.knowledge_topic_index),
                     "score": result.score,

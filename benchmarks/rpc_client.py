@@ -150,21 +150,19 @@ class PromptResult:
     #: infer this from elapsed time -- a crash burns the full budget too,
     #: because stdout EOF used not to wake the drain.
     stop_reason: str = "agent_end"
-    #: DIAGNOSTIC, not yet a real feature: every assistantMessageEvent whose
-    #: type is anything other than "text_delta" (e.g. a reasoning/thinking
-    #: delta, if pi's underlying @earendil-works/pi-ai stream emits one for
-    #: an extended-thinking model), captured verbatim. assistant_text only
-    #: ever accumulates "text_delta" content -- any reasoning/thinking-delta
-    #: stream a model like omlx/tiel-coder-oq4e produces at a high thinking
-    #: level was previously silently dropped here with zero record it even
-    #: existed. Static analysis of pi's own compiled types (ExtensionEvent
-    #: in dist/core/extensions/types.d.ts) confirmed there is no separate
-    #: top-level reasoning event -- if it streams at all, it comes through
-    #: THIS SAME channel with a different `type` value -- but the exact
-    #: value is defined in @earendil-works/pi-ai, which isn't installed as
-    #: inspectable source, so it can't be pinned without guessing. This
-    #: captures whatever actually shows up, verbatim, so the real event
-    #: shape can be read off a live run instead of assumed.
+    #: Every assistantMessageEvent whose type is anything other than
+    #: "text_delta", captured verbatim. assistant_text only ever accumulates
+    #: "text_delta" content -- any reasoning/thinking-delta stream a model
+    #: like omlx/tiel-coder-oq4e produces at a high thinking level was
+    #: previously silently dropped here with zero record it even existed.
+    #: CONFIRMED (2026-09-06, against a real gepa.optimize() run,
+    #: omlx/tiel-coder-oq4e at thinking=high): the real event type is
+    #: "thinking_delta", carrying incremental text in the same "delta" key
+    #: text_delta uses -- benchmarks/self_improve/live_eval.py's
+    #: _reasoning_excerpt_from_trajectory() reconstructs it the same way
+    #: assistant_text is built above. Other observed types this run:
+    #: thinking_start/thinking_end (bracket a reasoning block),
+    #: toolcall_start/toolcall_delta/toolcall_end, text_start/text_end.
     non_text_deltas: list[dict] = field(default_factory=list)
 
 

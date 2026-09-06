@@ -285,6 +285,28 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "emit_multi_thinking_delta":
+        # Regression fixture for live_eval.py's
+        # _reasoning_excerpt_from_trajectory(): emits several thinking_delta
+        # chunks (like a real reasoning stream, which arrives incrementally,
+        # not as one blob -- see the real 162-chunk trace this fixture is
+        # modeled on) interleaved with a tool call and text_delta content,
+        # then writes the real solution so the exercise actually passes.
+        # Proves both that the chunks get concatenated IN ORDER and that
+        # reasoning content never leaks into transcript_excerpt (which must
+        # only ever accumulate text_delta).
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        for chunk in ("Let me read the stub", " and the test file first.", " Now I understand the task."):
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "delta": chunk}})
+        _write_solution_files()
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "Implemented and tests pass."}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "sleep_forever":
         # Like hang_after_ack, but the sleep duration is configurable so a
         # deadline/timeout test doesn't have to wait out a hardcoded 3600s.

@@ -127,6 +127,23 @@ def test_pipeline_scores_a_pass_as_one(runner_factory, monkeypatch):
     assert results[0].success is True
 
 
+def test_reasoning_excerpt_is_reconstructed_from_thinking_delta_chunks(runner_factory, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "emit_multi_thinking_delta")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    result = results[0]
+    assert result.status == "pass_1"
+    # The three thinking_delta chunks, concatenated in order -- not the
+    # text_delta content, which is a separate channel entirely.
+    assert result.reasoning_excerpt == (
+        "Let me read the stub and the test file first. Now I understand the task."
+    )
+    assert "Implemented and tests pass" not in result.reasoning_excerpt
+    assert "Implemented and tests pass" in result.transcript_excerpt
+    assert "Let me read the stub" not in result.transcript_excerpt
+
+
 def test_pipeline_scores_a_genuine_failure_as_zero(runner_factory, monkeypatch):
     monkeypatch.setenv("FAKE_PI_MODE", "clean")  # writes nothing relevant
     for runner in runner_factory():
