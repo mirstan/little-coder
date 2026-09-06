@@ -60,6 +60,12 @@ def _pass_n_score(status: str) -> tuple[bool, float] | None:
     return True, score
 
 
+#: Public alias for live_eval.py -- reused rather than reimplemented, since
+#: it's the exact same graded scoring scheme (pass_1=1.0/pass_2=0.7/pass_3+=0.4)
+#: applied to a real aider_polyglot.py "status" string either way.
+pass_n_score = _pass_n_score
+
+
 def load(
     log_root: Path, results_json_path: Path, repo_root: Path | None = None
 ) -> list[NormalizedTrajectory]:
