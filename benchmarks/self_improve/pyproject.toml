@@ -4,7 +4,14 @@ version = "0.1.0"
 description = "GEPA-based self-improvement loop for little-coder's master prompt, principles, and skills"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    # dspy-ai is no longer used by the live-eval loop itself (run_gepa.py
+    # calls gepa.optimize() directly against a hand-built GEPAAdapter) --
+    # it remains only because tests/conftest.py's _restore_dspy_settings
+    # fixture still imports it. Drop it once that fixture (and its own test,
+    # test_conftest_dspy_settings_restore.py) are removed in a separate
+    # follow-up commit, per the live-eval plan doc.
     "dspy-ai>=3.3,<4.0",
+    "gepa>=0.1",
     "pydantic>=2",
     "pyyaml",
     "python-dotenv",

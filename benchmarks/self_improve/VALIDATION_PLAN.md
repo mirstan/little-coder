@@ -6,21 +6,39 @@ cannot reach: real trajectory data, real GEPA cost and behavior, and real mutati
 of files a live agent depends on. Six layers, each a hard gate on the next — do not
 proceed to layer N+1 until layer N passes.
 
+**Design note (supersedes this doc's original Layer 3/4 framing)**: `run_gepa.py`
+no longer scores GEPA candidates from frozen historical trajectories — that design
+was confirmed structurally incapable of ever accepting a candidate (every
+candidate's score was independent of its actual text; see `polyglot_adapter.py`'s
+module docstring). `run_gepa.py` now implements `gepa.core.adapter.GEPAAdapter`
+directly and calls `gepa.optimize()`, scoring every candidate by actually running
+it against real `aider_polyglot.py` exercises in a disposable git worktree
+(`live_eval.py`, `scratch_worktree.py`). This makes Layer 4 genuinely live by
+construction — it is no longer possible to "pass" Layer 4 without a real rollout.
+The old ingest-and-score dry-run pipeline still exists, unchanged in spirit, as
+`report_trajectories.py` — a free, GEPA-independent reporting tool over historical
+logs (Layers 2-3 below), decoupled from the live-eval loop it used to feed.
+
 ---
 
 ## Layer 1 — Unit tests (prerequisite, specified elsewhere)
 
 ```
-python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_prompt.py -q
+python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_prompt.py \
+  benchmarks/test_polyglot_env_overrides.py benchmarks/test_fake_pi_modes.py -q
 ```
 
-Fast, deterministic, no API calls, no live `dspy` execution beyond import. Fully
-specified in `TDD_SPEC.md`. This is the gate before Layer 2 runs at all — do not
-debug ingestion/metric behavior against real data while a unit test is red; fix the
-unit test first, since it isolates the failure far more cheaply.
+Fast, deterministic, no API calls, no live model calls, no real git worktrees
+(the session-scoped `_no_stray_real_worktrees` fixture in `tests/conftest.py`
+fails loudly if any test touches the real repo's worktree list). Fully specified
+in `TDD_SPEC.md`; the live-eval CLI's own gate/refusal logic is specified in
+`tests/test_run_gepa_live_gate.py`. This is the gate before Layer 2 runs at all —
+do not debug ingestion/live-eval behavior against real data while a unit test is
+red; fix the unit test first, since it isolates the failure far more cheaply.
 
-**Pass criterion**: zero failures, zero skips (once `dspy-ai` is installed as a dev
-dependency, no test should skip via `importorskip`).
+**Pass criterion**: zero failures, zero unexpected skips (once `dspy-ai` is
+installed as a dev dependency, only `tests/conftest.py`'s own `importorskip`
+guard — for hosts without the optional deps at all — should ever skip).
 
 ---
 
@@ -69,53 +87,64 @@ ingestion; the others stay flagged as unvalidated until a run exists.
 
 ---
 
-## Layer 3 — `--dry-run` pipeline smoke test (no API cost)
+## Layer 3 — `report_trajectories.py` smoke test (no API cost, no live rollouts)
 
-**Why**: this is the cheapest point at which ingestion, schema, metric, and
-component-loading are exercised together end-to-end, before any money is spent on
-reflection_lm calls.
+**Why**: this is the cheapest point at which ingestion, schema, and
+component-loading are exercised together end-to-end, entirely independent of the
+live-eval loop. It no longer rehearses what GEPA will do (GEPA now always scores
+live — there is no offline stand-in for that), but it remains the fast, free check
+that historical log ingestion and component loading both still work before
+spending anything on Layer 4.
 
 **Procedure**:
-1. `run_gepa.py --dry-run --log-roots aider=<real log root from Layer 2> gaia=<real log root>` (harbor/tb included only if Layer 2 validated them).
-2. `--dry-run` must: run full ingestion, build `HarnessProgram` from the actual
-   current `AGENTS.md` + real skill files (via `components.yaml`), run `metric()`
-   over every ingested trajectory for every `pred_name` that trajectory's
-   `components_used` references plus the episode-level `pred_name=None` call, and
-   compute the weighted aggregate score — then stop, printing a summary, without
-   constructing a `dspy.LM` or calling GEPA's `.compile()`.
+1. `python -m benchmarks.self_improve.report_trajectories --log-roots aider=<real log root from Layer 2>,<results.json> gaia=<real log root>` (harbor/tb included only if Layer 2 validated them).
+2. This runs full ingestion, loads the actual current `AGENTS.md` + real skill
+   files (via `components.yaml`), computes each trajectory's own recorded
+   pass/partial score, the weighted aggregate across benchmarks, and per-component
+   usage counts (from real `components_used` data) — then stops. No `gepa`, no LM
+   of any kind, no live rollout.
 3. Inspect the printed summary for:
-   - No `None` scores, no unhandled exceptions per-trajectory (a single bad
-     trajectory should be logged and skipped, not crash the run — verify this by
-     deliberately corrupting one fixture and re-running).
+   - No unhandled exceptions per-trajectory (a single bad trajectory should be
+     logged and skipped, not crash the run — verify this by deliberately
+     corrupting one fixture and re-running).
    - The weighted aggregate is a plausible number in `[0, 1]`.
-   - Per-component score/feedback counts look sane — e.g. `skills_tools_bash`
-     should have a nonzero count of attributed trajectories for gaia (since gaia
-     does capture notifications) but zero for aider_polyglot (per the confirmed
-     gap) — an unexpected mismatch here means Layer 2's confirmation was wrong or
-     the metric's attribution logic has a bug.
+   - Per-component usage counts look sane — e.g. `skills_tools_bash` should have a
+     nonzero count of attributed trajectories for gaia (since gaia does capture
+     notifications) but zero for aider_polyglot (per the confirmed gap) — an
+     unexpected mismatch here means Layer 2's confirmation was wrong or
+     `merge_component_usage`'s attribution logic has a bug.
 
-**Pass criterion**: dry run completes without exceptions, produces a plausible
+**Pass criterion**: report completes without exceptions, produces a plausible
 aggregate score, and per-component attribution counts match the benchmark-specific
 capabilities confirmed in Layer 2.
 
 ---
 
-## Layer 4 — Single-component, capped-cost real GEPA run
+## Layer 4 — Single-component, capped-cost real live GEPA run
 
-**Why**: first time real money and a real reflection model are involved. Scope
-tightly to bound cost and make the output easy to judge by eye.
+**Why**: first time real money, a real model under test, AND real live rollouts
+are involved. `run_gepa.py`'s `gepa.optimize()` call always scores candidates by
+actually running them — there is no cheaper offline substitute for this layer
+anymore, so scope tightly (one component, a small exercise set, a hard
+`--max-metric-calls` cap) to bound cost and make the output easy to judge by eye.
 
 **Procedure**:
-1. Create a scoped `components.yaml` containing exactly one entry:
-   `skills_tools_bash -> skills/tools/bash.md`.
-2. `--train-frac` small enough that the val set still has a handful of both
-   pass and fail examples for `bash`-using trajectories specifically — pick this
-   from Layer 2/3's printed counts, not a fixed default, since availability varies
-   by which real logs exist.
-3. Run for real: `run_gepa.py --components-config <scoped yaml> --reflection-model <configured model> ...` (no `--dry-run`).
-4. Record wall-clock time and, if the reflection model API reports usage/cost,
-   record that too.
-5. Read the resulting `apply_results.py`-produced diff for `skills/tools/bash.md`:
+1. Use the existing scoped config, `config/components_bash_only.yaml` (or create
+   one with exactly one entry: `skills_tools_bash -> skills/tools/bash.md`).
+2. **Always start with `--estimate-only`** (spends nothing, no worktree, no
+   adapter) to see the projected live-run count and wall-clock ceiling before
+   authorizing anything: `python -m benchmarks.self_improve.run_gepa --estimate-only --components-config <scoped yaml> --model <model under test> --confirm-live-rollouts --max-metric-calls <small N> --exercise-count <small> --val-count <small>`.
+3. **Then run `--baseline-only`** (real live rollouts, no reflection LM) to confirm
+   the whole pipeline works end to end and the seed isn't already saturated at a
+   perfect score on the chosen exercises: same flags, swap `--estimate-only` for
+   `--baseline-only --yes`. Inspect `<out-dir>/seed_baseline.json` and
+   `spend_log.jsonl`.
+4. Only then run for real: add `--reflection-model <configured model>` +
+   `$REFLECTION_LM_API_KEY` + `--confirm-real-run` and drop `--baseline-only`.
+5. Record wall-clock time and, if the reflection model API reports usage/cost,
+   record that too. `spend_log.jsonl` (append-only, flushed per line) is the
+   authoritative record of what actually ran, regardless of how the process exited.
+6. Read the resulting `apply_results.py`-produced diff for `skills/tools/bash.md`:
    - Frontmatter block is byte-identical to before (this is the one thing Layer 1's
      roundtrip unit test already gives strong confidence on, but confirming it
      against a real GEPA-produced body — not a hand-typed test string — is the
@@ -126,32 +155,34 @@ tightly to bound cost and make the output easy to judge by eye.
      original verbatim if a change was expected, not introducing formatting the
      skill-inject extension can't handle — check against
      `.pi/extensions/skill-inject/index.ts`'s expected `buildBlock`/injection shape).
-   - The PR description's reported score delta is independently recomputable: take
-     the val-set trajectories, manually run the OLD `bash.md` body and NEW body
-     through `metric()`'s `_score_for_benchmark` logic and confirm the reported
-     delta isn't fabricated or miscalculated.
+   - The reported score delta is independently recomputable from `spend_log.jsonl`'s
+     per-exercise records and the run's own `run_dir`/GEPA state — since scores now
+     come from real live runs, this check is about confirming the reported numbers
+     match what `spend_log.jsonl` actually recorded, not re-deriving them from a
+     frozen dataset.
 
 **Pass criterion**: run completes within a documented cost/time budget, PR diff is
 human-legible and correct (frontmatter untouched, body coherent), reported score
-delta is independently verified.
+delta matches `spend_log.jsonl`.
 
 **If this layer fails** (e.g. degenerate output, cost wildly over budget, score
 delta doesn't reproduce): do not proceed to Layer 5 or 6's full-scope work. Fix the
-metric/feedback-text construction or reflection_lm configuration and re-run Layer 4
+adapter/feedback-text construction or reflection_lm configuration and re-run Layer 4
 before expanding scope.
 
 ---
 
 ## Layer 5 — Live re-run regression check (closes the loop)
 
-**Why**: this is the layer most likely to be skipped by accident, and it's the only
-one that validates against reality rather than against GEPA's own offline scoring
-of the training data it just learned from. GEPA's internal score during
-optimization is computed from the *same* trajectories it used to propose the
-rewrite — a rewrite can look like a clear improvement on that data and still be
-overfit, or subtly break the actual model's behavior in a way the offline metric
-can't see (tone shifts, instructions that parse fine as text but confuse the model
-in-context, etc).
+**Why**: this is the layer most likely to be skipped by accident, and it remains
+distinct from Layer 4 even though Layer 4's scoring is now live: Layer 4's whole
+loop (train + val exercises, cache, reflection feedback) draws from one small,
+fixed exercise pool selected up front (`exercises.py::select_exercises`) — a
+rewrite can still overfit to the quirks of *that* pool and not generalize, or
+subtly change the model's behavior in a way a pass/fail score on the same handful
+of exercises doesn't surface (tone shifts, instructions that parse fine as text but
+confuse the model in-context, etc). Layer 5 re-runs against exercises/tasks
+independent of Layer 4's own pool.
 
 **Procedure**:
 1. Check out the PR branch from Layer 4 into a **separate scratch worktree** (not
@@ -217,8 +248,8 @@ when `PRINCIPLES.md` is absent; observably-effective prompt content when present
 |---|---|---|---|
 | 1 | Unit-level correctness | Free | Nothing — first gate |
 | 2 | Ingestion vs. real log shapes | Free | Layer 1 green |
-| 3 | Full pipeline wiring, no API spend | Free | Layer 2 confirmed (per-benchmark) |
-| 4 | Real GEPA output quality, single component | $ (bounded) | Layer 3 clean |
+| 3 | Ingestion + component loading, no API spend | Free | Layer 2 confirmed (per-benchmark) |
+| 4 | Real live GEPA output quality, single component | $ + compute (bounded by `--max-metric-calls`) | Layer 3 clean |
 | 5 | Live regression check, held-out set | Compute (benchmark re-runs) | Layer 4 pass |
 | 6 | Runtime backward-compatibility | Free/cheap | Independent — can run parallel to 2-5 |
 

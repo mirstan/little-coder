@@ -1,5 +1,23 @@
 # TDD Spec — `benchmarks/self_improve/`
 
+**Status note**: §6 (`metric.py`) below describes a design that has since been
+replaced. `metric.py` (and the `dspy.GEPA`/`HarnessProgram`/`DummyLM` apparatus
+it existed to satisfy) was deleted: it scored GEPA candidates from frozen
+historical trajectories, which was confirmed structurally incapable of ever
+letting GEPA accept a proposed rewrite (every candidate scored identically
+regardless of its actual text). The live-execution replacement —
+`live_eval.py`, `polyglot_adapter.py`, `scratch_worktree.py`, `live_cache.py`,
+`live_budget.py`, `exercises.py`, and the rewritten `run_gepa.py` — is specified
+by its own test suites directly (`tests/test_live_eval_e2e_fake_pi.py`,
+`tests/test_polyglot_adapter.py`, `tests/test_scratch_worktree.py`,
+`tests/test_live_cache.py`, `tests/test_live_budget.py`,
+`tests/test_exercises.py`, `tests/test_run_gepa_live_gate.py`) rather than by a
+prose spec in this document; see `README.md` and `VALIDATION_PLAN.md` for the
+current architecture and usage. §6 is kept below as a historical record of the
+superseded design, not a spec to implement against. Everything else in this
+document (§0–5, §7–8: ingestion, schema, `components.py` roundtrip, the
+`rpc_client.py` system-prompt change) is unaffected and still accurate.
+
 Scope: build order steps 1–3 from the plan (`ingest/`, `metric.py`, `components.py` +
 `apply_results.py`'s roundtrip logic) plus the `rpc_client.py` system-prompt change,
 all fully test-driven. Steps 4+ (real GEPA runs) are explicitly out of scope for this
@@ -591,9 +609,9 @@ approximated as the count of `>> ` lines.
 
 ---
 
-## 6. `metric.py`
+## 6. `metric.py` (SUPERSEDED — see status note at the top of this document; file deleted)
 
-### 6.1 Test file: `tests/test_metric.py`
+### 6.1 Test file: `tests/test_metric.py` (deleted)
 
 No DSPy import required for these tests — `metric()` is pure Python taking plain
 objects, guard the module's own import with
