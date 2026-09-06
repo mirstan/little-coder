@@ -44,19 +44,30 @@ function assistantTurn(opts: { text?: string; toolCalls?: number; stopReason?: s
   return { message: { content, stopReason: opts.stopReason } };
 }
 
+async function startRun(h: ReturnType<typeof makeHarness>, maxTurns?: number) {
+  await fire(h.pi, "session_start", {}, h.ctx);
+  await fire(
+    h.pi,
+    "before_agent_start",
+    { systemPromptOptions: maxTurns ? { littleCoder: { maxTurns } } : {} },
+    h.ctx,
+  );
+}
+
 describe("gaia-finalize-guard", () => {
   beforeEach(() => {
     process.env.LITTLE_CODER_BENCHMARK = "gaia";
   });
   afterEach(() => {
     delete process.env.LITTLE_CODER_BENCHMARK;
+    delete process.env.LITTLE_CODER_MAX_TURNS;
   });
 
   it("does nothing outside GAIA", async () => {
     process.env.LITTLE_CODER_BENCHMARK = "terminal_bench";
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me check that." }), h.ctx);
     expect(h.calls).toEqual([]);
   });
@@ -64,7 +75,7 @@ describe("gaia-finalize-guard", () => {
   it("does nothing when the turn made a tool call", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(
       h.pi,
       "turn_end",
@@ -77,7 +88,7 @@ describe("gaia-finalize-guard", () => {
   it("does nothing when the reply ends with an Answer: line", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Reasoning...\nAnswer: 42" }), h.ctx);
     expect(h.calls).toEqual([]);
   });
@@ -85,15 +96,48 @@ describe("gaia-finalize-guard", () => {
   it("accepts a Final Answer: line too (matches gaia_scorer.py's regex)", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Final Answer: backtick" }), h.ctx);
+    expect(h.calls).toEqual([]);
+  });
+
+  it("accepts an indented Answer: line (mirrors the scorer's line.strip())", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "  Answer: 42" }), h.ctx);
+    expect(h.calls).toEqual([]);
+  });
+
+  it("nudges on a bare 'Answer:' with no value (scorer would score it wrong anyway)", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Reasoning...\nAnswer:" }), h.ctx);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("nudges when the value is on a different physical line than Answer: (scorer requires same line)", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Reasoning...\nAnswer:\n42" }), h.ctx);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("does nothing on a genuinely empty response (quality-monitor's territory)", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "" }), h.ctx);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "   " }), h.ctx);
     expect(h.calls).toEqual([]);
   });
 
   it("skips aborted and errored turns", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(
       h.pi,
       "turn_end",
@@ -112,7 +156,7 @@ describe("gaia-finalize-guard", () => {
   it("nudges via steer + notifies when the turn trails off with no tool call and no Answer: line", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(
       h.pi,
       "turn_end",
@@ -128,7 +172,7 @@ describe("gaia-finalize-guard", () => {
   it("fires at most once per run", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look further." }), h.ctx);
     expect(h.sent).toHaveLength(1);
@@ -137,12 +181,32 @@ describe("gaia-finalize-guard", () => {
   it("resets per session, so a new task can nudge again", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
     expect(h.sent).toHaveLength(1);
 
-    await fire(h.pi, "session_start", {}, h.ctx);
+    await startRun(h);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into that too." }), h.ctx);
     expect(h.sent).toHaveLength(2);
+  });
+
+  it("does not nudge once the run is already at turn-cap (the nudge would be aborted before the model sees it)", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h, 3);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx); // turnsThisRun === capForRun (3)
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
+    expect(h.calls).toEqual([]);
+  });
+
+  it("still nudges with headroom below turn-cap", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h, 10);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
+    expect(h.sent).toHaveLength(1);
   });
 });

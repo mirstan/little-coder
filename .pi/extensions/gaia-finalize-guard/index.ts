@@ -28,21 +28,69 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 // open-ended retry loop. If the model still doesn't finalize, the run ends
 // on whatever it says next, same as before this extension existed.
 
-// Mirrors gaia_scorer.py's extract_final_answer() regex exactly — kept in
-// lockstep by hand since there's no shared source of truth between the
-// Python scorer and this TS extension.
-const ANSWER_LINE_RE = /^(?:final\s+answer|answer)\s*[:\-]\s*(.+)$/im;
+// A close mirror of gaia_scorer.py's extract_final_answer() regex, applied
+// per physical line like the Python version (splitlines() + line.strip()) —
+// NOT the naive line-blob version this extension shipped with initially,
+// which used a bare `\s*` between the colon and the value. That let the
+// value cross a newline (e.g. "Answer:\n42"), which the Python scorer never
+// allows (it matches within one already-newline-free line), so this guard
+// could wrongly treat a multi-line trailer as "answered" when the scorer
+// would actually reject it and fall through to its own last-non-empty-line
+// fallback. Fixed here:
+//   - `^\s*` tolerates leading indentation, mirroring the scorer's
+//     line.strip() before matching.
+//   - `[ \t]*` (not `\s*`) between the colon and the value can't cross a
+//     newline, matching the scorer's same-physical-line requirement.
+//   - `(\S.*)$` requires a non-whitespace value, catching a bare "Answer:"
+//     with nothing meaningful after it — worth nudging on even though the
+//     scorer itself doesn't special-case it (it would match, .strip() the
+//     captured value down to "", and return that empty string rather than
+//     falling back — deliberately stricter here, not a scorer bug we need
+//     to reproduce exactly, since a bare "Answer:" is exactly the kind of
+//     unfinished reply this guard exists to catch).
+const ANSWER_LINE_RE = /^\s*(?:final\s+answer|answer)\s*[:\-][ \t]*(\S.*)$/im;
 
 let nudgedThisRun = false;
+// Mirrors turn-cap's own turn counting (turnsThisRun/capForRun), duplicated
+// rather than imported since turn-cap keeps this state module-private. A
+// steer queued on turn N becomes the prompt for turn N+1 — but if N+1 would
+// exceed turn-cap's limit, turn-cap aborts at that turn's turn_start before
+// the model ever sees the nudge (turn-cap fires first: ctx.abort() there
+// happens synchronously in the same before-generation window, so the
+// steered message never reaches the model). Nudging in that situation is
+// pure waste, so skip it once we're already at the cap.
+let turnsThisRun = 0;
+let capForRun = 0;
+
+function envTurnCap(): number {
+  const raw = process.env.LITTLE_CODER_MAX_TURNS;
+  if (!raw) return 0;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     nudgedThisRun = false;
   });
 
+  pi.on("before_agent_start", async (event) => {
+    turnsThisRun = 0;
+    const opts: any = (event as any).systemPromptOptions ?? {};
+    const lcCap = Number(opts?.littleCoder?.maxTurns);
+    capForRun = Number.isFinite(lcCap) && lcCap > 0 ? lcCap : envTurnCap();
+  });
+
+  pi.on("turn_start", async () => {
+    turnsThisRun++;
+  });
+
   pi.on("turn_end", async (event, ctx) => {
     if (process.env.LITTLE_CODER_BENCHMARK !== "gaia") return;
     if (nudgedThisRun) return;
+    // A nudge queued now would become the prompt for turnsThisRun + 1;
+    // if that exceeds the cap, turn-cap aborts before the model sees it.
+    if (capForRun > 0 && turnsThisRun >= capForRun) return;
 
     const message: any = (event as any).message;
     if (!message) return;
@@ -58,6 +106,11 @@ export default function (pi: ExtensionAPI) {
       .filter((c: any) => c?.type === "text")
       .map((c: any) => c.text ?? "")
       .join("\n");
+    // A genuinely empty response (no text, no tool calls) is quality-monitor's
+    // territory (its own "empty_response" steer) — stay out of its way
+    // rather than queue a second, possibly conflicting correction for the
+    // same turn.
+    if (!text.trim()) return;
     if (ANSWER_LINE_RE.test(text)) return; // followed the convention — nothing to do
 
     nudgedThisRun = true;
