@@ -81,6 +81,7 @@ class _FakeRpc:
         # instance now, not a shared one whose call count tracked the
         # attempt number).
         self.n = int(kw["session_id"].rsplit("attempt", 1)[-1])
+        self._notifications = []
 
     def __enter__(self):
         return self
@@ -93,6 +94,9 @@ class _FakeRpc:
 
     def prompt_and_collect(self, message, timeout=900):
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+        self._notifications.append(
+            {"message": f"skill-inject: +1 [bash]  # attempt {self.n}", "notifyType": "info"}
+        )
 
         class R:
             agent_ended = True
@@ -101,6 +105,9 @@ class _FakeRpc:
             assistant_text = f"attempt {self.n}"
             tool_calls = []
         return R()
+
+    def notifications(self):
+        return list(self._notifications)
 
 
 def test_attempt1_snapshot_predates_the_retry_prompt(tmp_path, monkeypatch):
@@ -182,6 +189,157 @@ def test_log_dir_namespaced_by_agent(tmp_path, monkeypatch):
 
 def test_run_id_is_stable_within_a_process():
     assert AP.RUN_ID and AP.RUN_ID == AP.RUN_ID
+
+
+def test_dump_trajectory_notifications_default_to_empty_list(tmp_path):
+    """Backward compat: existing callers (this file's own R() fixture class)
+    don't pass notifications -- must not raise, payload gets []."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+
+    AP._dump_trajectory(log_dir, "1", R())
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    assert payload["notifications"] == []
+    # Same backward-compat guarantee for non_text_deltas: R() above has no
+    # such attribute at all (an older PromptResult, or any caller that
+    # hasn't been touched by the rpc_client.py diagnostic-capture change),
+    # must not raise, payload gets [].
+    assert payload["non_text_deltas"] == []
+
+
+def test_dump_trajectory_persists_non_text_deltas_when_present(tmp_path):
+    """PromptResult.non_text_deltas (rpc_client.py) -- diagnostic capture of
+    any assistantMessageEvent whose type isn't "text_delta" (a candidate
+    reasoning/thinking-content stream) -- must survive into the persisted
+    trajectory so it can actually be inspected after a real run."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+        non_text_deltas = [{"type": "thinking_delta", "delta": "reasoning..."}]
+
+    AP._dump_trajectory(log_dir, "1", R())
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    assert payload["non_text_deltas"] == [{"type": "thinking_delta", "delta": "reasoning..."}]
+
+
+def test_cap_non_text_deltas_returns_input_unchanged_when_under_budget():
+    deltas = [{"type": "thinking_delta", "delta": f"chunk {i}"} for i in range(5)]
+    assert AP._cap_non_text_deltas(deltas, char_budget=10_000) == deltas
+
+
+def test_cap_non_text_deltas_keeps_head_and_tail_drops_middle():
+    # Each entry ~40 raw JSON chars; budget 400 splits to 200 head/200 tail,
+    # i.e. ~5 entries survive on each end out of 100.
+    deltas = [{"type": "thinking_delta", "delta": f"chunk number {i:03d}"} for i in range(100)]
+    result = AP._cap_non_text_deltas(deltas, char_budget=400)
+    assert result[0] == deltas[0]
+    assert result[-1] == deltas[-1]
+    marker = next(d for d in result if d.get("type") == "_omitted")
+    assert marker["omitted_count"] > 0
+    # Head, marker, tail -- middle entries genuinely gone, not just hidden.
+    assert marker["omitted_count"] == 100 - (len(result) - 1)
+    kept_indices = [deltas.index(d) for d in result if d is not marker]
+    assert kept_indices == sorted(kept_indices)  # order preserved, no shuffling
+
+
+def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
+    huge = {"type": "toolcall_delta", "delta": "x" * 1_000_000}
+    result = AP._cap_non_text_deltas([huge, {"type": "thinking_delta", "delta": "short"}], char_budget=1_000)
+    # Doesn't raise, and still bounds the result to something sane.
+    assert isinstance(result, list)
+
+
+def test_dump_trajectory_no_longer_drops_the_tail_of_a_long_but_small_reasoning_stream(tmp_path):
+    """Regression for the exact bug fixed here: the OLD policy was a flat
+    first-200-entries cutoff BY COUNT, so a 250-chunk reasoning stream lost
+    its last 50 chunks outright -- including whatever reasoning happened
+    right before the model's final decision, exactly what
+    live_eval.py's _reasoning_excerpt_from_trajectory needs. The new
+    char-budget policy keeps everything here, since the whole stream is
+    tiny in bytes even at 250 entries."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+        non_text_deltas = [{"type": "thinking_delta", "delta": f"chunk {i}"} for i in range(250)]
+
+    AP._dump_trajectory(log_dir, "1", R())
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    # Index 249 -- entirely dropped by the old [:200] cutoff -- survives now.
+    assert {"type": "thinking_delta", "delta": "chunk 249"} in payload["non_text_deltas"]
+
+
+def test_dump_trajectory_persists_notifications_when_given(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+
+    notes = [{"message": "skill-inject: +1 [bash]", "notifyType": "info"}]
+    AP._dump_trajectory(log_dir, "1", R(), notifications=notes)
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    assert payload["notifications"] == notes
+
+
+def test_run_exercise_notifications_are_isolated_per_attempt(tmp_path, monkeypatch):
+    """Each attempt now opens a FRESH PiRpc session (see _run_exercise's own
+    comment), so rpc.notifications() is already scoped to just that attempt
+    -- no delta-slicing across a shared session is needed (or possible)
+    anymore. This guards that attempt 2's dump doesn't somehow pick up
+    attempt 1's notifications despite the two running in separate fake
+    instances."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker2", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),   # always fail -> retry
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpc)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    AP._run_exercise("faker2", "ex", "fake/model", verbose=False, retry=True)
+
+    log_dir = tmp_path / "logs" / "pi" / "faker2" / "ex"
+    payload_1 = json.loads((log_dir / "trajectory_1.json").read_text())
+    payload_2 = json.loads((log_dir / "trajectory_2.json").read_text())
+
+    assert len(payload_1["notifications"]) == 1
+    assert "attempt 1" in payload_1["notifications"][0]["message"]
+    assert len(payload_2["notifications"]) == 1
+    assert "attempt 2" in payload_2["notifications"][0]["message"]
 
 
 class _FakeRpcWithNotifications(_FakeRpc):

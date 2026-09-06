@@ -41,3 +41,15 @@ brainstorm_outputs/
 
 # deep-research batch eval artifacts
 benchmarks/deep_research_runs/
+
+# self-improve (GEPA loop): venv, generated system prompt, per-run output
+benchmarks/self_improve/.venv/
+benchmarks/self_improve/runs/
+benchmarks/self_improve/*.egg-info/
+benchmarks/self_improve/build/
+.pi/.system-prompt.generated.md
+.env
+
+# Committed real-data test fixture -- overrides the blanket *.log rule above,
+# which otherwise silently drops this file from the repo.
+!benchmarks/self_improve/tests/fixtures/**/*.log

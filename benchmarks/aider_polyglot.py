@@ -34,10 +34,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import PiRpc, PromptResult, capture_environment_snapshot  # noqa: E402
 
-BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
+# `or`, not os.environ.get(name, default): an exported-but-empty override
+# must still fall back -- Path("") normalizes to Path("."), whose .exists()
+# is True, silently pointing at the wrong directory instead of the intended
+# default (same trap documented for LITTLE_CODER_PI_BIN_OVERRIDE in
+# rpc_client.py). These three exist so a live-eval test harness can point
+# an isolated subprocess invocation of this script at a synthetic benchmark
+# root/results file/log dir, without which none of that machinery is
+# testable without a real paid model run (BENCHMARK_ROOT feeds
+# LANG_DESCRIPTORS below at IMPORT time).
+BENCHMARK_ROOT = Path(os.environ.get("POLYGLOT_BENCHMARK_ROOT") or (Path.home() / "Documents" / "polyglot-benchmark"))
 REPO_ROOT = Path(__file__).parent.parent
-RESULTS_FILE = Path(__file__).parent / "results_full_polyglot.json"
-LOG_ROOT = Path(__file__).parent / "full_polyglot_logs"
+RESULTS_FILE = Path(os.environ.get("POLYGLOT_RESULTS_FILE") or (Path(__file__).parent / "results_full_polyglot.json"))
+LOG_ROOT = Path(os.environ.get("POLYGLOT_LOG_ROOT") or (Path(__file__).parent / "full_polyglot_logs"))
 #: Identifies one invocation, so records and artifacts can be traced back to the
 #: run that produced them. RESULTS_FILE and LOG_ROOT are both deterministic and
 #: shared across runs, which has already caused artifacts from different runs to
@@ -46,6 +55,10 @@ RUN_ID = f"{datetime.datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
 #: Caps applied to persisted trajectories -- see _dump_trajectory.
 TRAJECTORY_TEXT_CHARS = 200_000
 TRAJECTORY_FIELD_CHARS = 20_000
+#: Combined raw-size budget for non_text_deltas, split between a head slice
+#: and a tail slice (see _cap_non_text_deltas) -- see that function's
+#: docstring for why a flat "first N entries" cutoff was wrong.
+TRAJECTORY_NON_TEXT_DELTA_CHARS = 200_000
 #: Give up if this many exercises fail in a row -- a broken environment,
 #: not broken exercises.
 MAX_CONSECUTIVE_ERRORS = 3
@@ -197,6 +210,54 @@ def _clip(value, limit: int):
     return value if len(text) <= limit else text[:limit]
 
 
+def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DELTA_CHARS) -> list:
+    """Keep a HEAD slice and a TAIL slice of `deltas`, dropping only the
+    middle, splitting char_budget evenly between the two ends.
+
+    The previous policy -- keep the first 200 entries, full stop -- silently
+    dropped the END of a long reasoning stream. Confirmed against a real
+    live run (a ~13min bowling attempt hit exactly the 200-entry cap, almost
+    all thinking_delta): live_eval.py's own _reasoning_excerpt_from_trajectory
+    tail-truncates whatever survives here, on the assumption it's getting
+    the model's LATEST reasoning -- but with a first-N cutoff, "whatever
+    survives" was already truncated to the OLDEST content, so that downstream
+    tail-truncation was operating on the wrong end entirely.
+
+    A char budget (not a flat entry count) also keeps output size bounded
+    regardless of entry size: a handful of toolcall_* deltas (each carrying
+    a full "partial" state dump) can dwarf hundreds of small thinking_delta
+    chunks, so counting entries alone doesn't bound bytes.
+
+    Sizes are measured on the RAW (pre-_clip) entries -- close enough for a
+    budget, and avoids serializing twice. If nothing needs dropping, returns
+    `deltas` unchanged (no synthetic marker)."""
+    if not deltas:
+        return []
+    sizes = [len(json.dumps(d, default=str)) for d in deltas]
+    if sum(sizes) <= char_budget:
+        return deltas
+
+    head_budget = char_budget // 2
+    tail_budget = char_budget - head_budget
+
+    head_end = 0
+    used = 0
+    while head_end < len(deltas) and used + sizes[head_end] <= head_budget:
+        used += sizes[head_end]
+        head_end += 1
+
+    tail_start = len(deltas)
+    used = 0
+    while tail_start - 1 >= head_end and used + sizes[tail_start - 1] <= tail_budget:
+        tail_start -= 1
+        used += sizes[tail_start]
+
+    omitted = tail_start - head_end
+    if omitted <= 0:
+        return deltas
+    return deltas[:head_end] + [{"type": "_omitted", "omitted_count": omitted}] + deltas[tail_start:]
+
+
 def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
     """Persist what the harness otherwise discards.
 
@@ -212,6 +273,12 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     it live with rpc.notifications() to compare (this is exactly how the
     thinking-budget intervention was first discovered, on a real `bowling`
     failure -- nothing in the persisted trajectory said so).
+
+    notifications: this attempt's OWN rpc.notifications(). Each attempt opens
+    a fresh PiRpc session (see _run_exercise), so this is already scoped to
+    just this attempt -- no delta-slicing across attempts needed or possible
+    anymore. Extension activity (skill-inject, knowledge-inject,
+    quality-monitor, etc.) otherwise invisible in this dump.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -239,6 +306,17 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
             "notifications": [
                 {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
                 for n in (notifications or [])
+            ],
+            # Every assistantMessageEvent delta whose type wasn't
+            # "text_delta" -- confirmed to be real reasoning/thinking content
+            # (thinking_delta, mostly) for a thinking-enabled model, plus
+            # toolcall_*/text_start/text_end bracketing events. Head+tail
+            # capped by _cap_non_text_deltas (see its docstring for why a
+            # flat first-N cutoff was wrong), then each surviving entry
+            # clipped to TRAJECTORY_FIELD_CHARS, same policy as tool_calls.
+            "non_text_deltas": [
+                _clip(d, TRAJECTORY_FIELD_CHARS)
+                for d in _cap_non_text_deltas(getattr(result, "non_text_deltas", None) or [])
             ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(

@@ -1,0 +1,6 @@
+=== stop_reason: agent_end ===
+=== assistant text ===
+hello
+
+>> read({'path': 'x'})
+<< ok
