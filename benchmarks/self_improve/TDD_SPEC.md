@@ -906,6 +906,7 @@ since real GEPA wiring (out of this spec's scope) needs all three together.
 After §1–8 are green, the exit criteria for this TDD pass are: `python -m pytest
 benchmarks/self_improve/tests/ benchmarks/test_rpc_system_prompt.py -q` passes with
 zero failures and zero skips (the `pytest.importorskip("dspy")` guard should not
-trigger any skips once `requirements.txt` is installed in the dev environment;
-document that `dspy-ai` is a required dev dependency for running these tests, not
-merely for real GEPA runs, since one `ScoreWithFeedback` import path is exercised).
+trigger any skips once `pip install -e .[dev]` has been run in the dev environment
+per README.md's Setup section; document that `dspy-ai` is a required dev
+dependency for running these tests, not merely for real GEPA runs, since one
+`ScoreWithFeedback` import path is exercised).

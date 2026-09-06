@@ -20,4 +20,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = []
+# Real bug, confirmed by review: the prior `py-modules = []` (no `packages`)
+# made `pip install -e .` build an EMPTY distribution -- verified by
+# installing into a throwaway venv and confirming
+# `import benchmarks.self_improve` failed from an unrelated directory. Every
+# import in this codebase uses the fully-qualified `benchmarks.self_improve.*`
+# name, but this pyproject.toml lives INSIDE that same directory
+# (benchmarks/self_improve/), two path segments short of the name its own
+# code expects -- package-dir maps the dotted name back onto ".", the
+# directory this file already lives in, so setuptools finds real code at the
+# path it actually sits at. Confirmed by installing into a fresh venv and
+# importing benchmarks.self_improve(.ingest) from a completely unrelated cwd.
+package-dir = {"benchmarks.self_improve" = "."}
+packages = ["benchmarks.self_improve", "benchmarks.self_improve.ingest"]

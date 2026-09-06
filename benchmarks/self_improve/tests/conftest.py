@@ -4,10 +4,10 @@ from pathlib import Path
 import pytest
 
 # Real bug, confirmed by CI failure on this branch's PR: benchmarks/self_improve
-# is an opt-in subsystem (its own pyproject.toml/requirements.txt, installed via
-# `pip install -e benchmarks/self_improve`) deliberately kept out of the existing
-# dependency-free benchmarks/*.py scripts' footprint -- CI's `benchmarks pytest`
-# job only `pip install`s `pytest` itself. Every test file here imports
+# is an opt-in subsystem (its own pyproject.toml, installed via
+# `pip install -e benchmarks/self_improve[dev]`) deliberately kept out of the
+# existing dependency-free benchmarks/*.py scripts' footprint -- CI's
+# `benchmarks pytest` job only `pip install`s `pytest` itself. Every test file here imports
 # benchmarks.self_improve modules at collection time, which import yaml/
 # pydantic/dspy unconditionally, so without this guard collection fails HARD
 # for the whole job (14 errors), not just for this directory -- breaking CI for
