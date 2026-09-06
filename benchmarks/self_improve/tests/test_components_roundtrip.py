@@ -100,7 +100,12 @@ def test_write_components_back_reports_changed_files(tmp_path):
         components_yaml, repo_root=tmp_path,
         optimized={"skills_tools_bash": "## `bash` Tool (v2)\nRevised.\n"},
     )
-    assert changed == [tmp_path / "skills" / "tools" / "bash.md"]
+    # .resolve(): real brittleness, confirmed by review -- write_components_back
+    # returns paths resolved through resolve_contained_path (which .resolve()s
+    # both base and result), so on a platform where pytest's tmp_path goes
+    # through a symlink (e.g. macOS /var -> /private/var), an unresolved
+    # comparison could differ even though the write genuinely succeeded.
+    assert changed == [(tmp_path / "skills" / "tools" / "bash.md").resolve()]
     written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
     assert "target_tool: bash" in written  # frontmatter still present
     assert "v2" in written

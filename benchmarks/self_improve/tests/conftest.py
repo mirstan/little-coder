@@ -1,3 +1,4 @@
+import importlib
 import json
 from pathlib import Path
 
@@ -37,6 +38,42 @@ def _isolated_git_config(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_global))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(fake_global.parent / "does-not-exist"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+def _dspy_settings_snapshot_and_restore():
+    """Plain generator backing the _restore_dspy_settings fixture below --
+    kept separate from @pytest.fixture so test_conftest_dspy_settings_restore.py
+    can drive it directly (pytest fixtures can't be called directly).
+
+    Real gap, confirmed by review: dspy.settings is a process-wide
+    singleton backed by a module-level dict (dspy.dsp.utils.settings's
+    main_thread_config) -- _real_run() (and any other code exercised here)
+    calls dspy.settings.configure(lm=DummyLM(...)) directly, which is never
+    undone. Every test in this directory that reaches that call permanently
+    leaves the global LM as DummyLM for the REST of the pytest session, so a
+    later test asserting on dspy's default settings could pass or fail based
+    on prior test order rather than its own behavior, and a future
+    regression that removed the configure() call from _real_run() could go
+    uncaught by any test that reads dspy.settings.lm back instead of
+    asserting on what was actually passed to configure().
+
+    dspy.dsp.utils.settings.settings (the singleton instance) has no public
+    "reset" API and overrides __setattr__ to route through configure()
+    itself (see components.py's own note on this), so the only way to
+    restore state is to snapshot/restore the real module's dict directly --
+    `import dspy.dsp.utils.settings as m` resolves to the singleton
+    INSTANCE, not the module (the package's __init__ shadows the name), so
+    importlib.import_module() is used to reach the actual module object."""
+    settings_module = importlib.import_module("dspy.dsp.utils.settings")
+    snapshot = dict(settings_module.main_thread_config)
+    yield
+    settings_module.main_thread_config.clear()
+    settings_module.main_thread_config.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _restore_dspy_settings():
+    yield from _dspy_settings_snapshot_and_restore()
 
 
 @pytest.fixture

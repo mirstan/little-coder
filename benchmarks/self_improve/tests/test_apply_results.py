@@ -98,6 +98,12 @@ def test_create_branch_and_commit_rejects_malformed_branch_name(scratch_repo):
     (e.g. a name starting with '-'). check-ref-format catches this before
     any git subprocess that could mutate the repo runs."""
     (scratch_repo / "file.md").write_text("changed\n")
+    # Real brittleness, confirmed by review: git init's default branch name
+    # inherits init.defaultBranch from the environment (global/CI config
+    # could set e.g. "trunk"), not always "main" or "master" -- the real
+    # intent is only "the branch was not switched," so capture and compare
+    # against the ACTUAL starting branch instead of assuming its name.
+    original_branch = _current_branch(scratch_repo)
     with pytest.raises(ValueError, match="invalid branch name"):
         create_branch_and_commit(
             repo_root=scratch_repo,
@@ -106,7 +112,7 @@ def test_create_branch_and_commit_rejects_malformed_branch_name(scratch_repo):
             commit_message="test commit",
         )
     # rejected before any git state changed
-    assert _current_branch(scratch_repo) in ("main", "master")
+    assert _current_branch(scratch_repo) == original_branch
 
 
 def test_create_branch_and_commit_handles_path_starting_with_dash(scratch_repo):
