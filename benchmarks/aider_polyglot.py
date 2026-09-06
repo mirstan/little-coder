@@ -777,6 +777,8 @@ def _run_exercise(
             # not meant to sit on every individual exercise record (it's a
             # run-invariant fact, not something that varies per exercise).
             record["_confirmed_thinking_level"] = confirmed_thinking_level
+        elif confirmed_thinking_error is not None:
+            record["_confirmed_thinking_error"] = confirmed_thinking_error
         return record
 
 
@@ -860,6 +862,11 @@ def main():
     results["meta"]["scoring_params"] = params
     results["meta"]["environment_snapshot"] = env_snapshot
     results["meta"]["run_id"] = RUN_ID
+    # Otherwise a --resume that skips every already-passed exercise (or an
+    # empty exercise set) never reaches the per-exercise _save_results()
+    # below, and this run's metadata -- including which config/environment
+    # it ran under -- is silently never persisted at all.
+    _save_results(results)
 
     practice = desc["practice_dir"]
     if args.exercise:
@@ -900,6 +907,7 @@ def main():
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
         confirmed_level = r.pop("_confirmed_thinking_level", None)
+        confirmed_error = r.pop("_confirmed_thinking_error", None)
         if confirmed_level is not None and env_snapshot["thinking"]["confirmed_live"] is None:
             # Only the first exercise to report one sets it -- config doesn't
             # change mid-run, and this keeps meta.environment_snapshot a
@@ -908,6 +916,12 @@ def main():
             # already references (assigned once, above) -- mutating it here
             # is what actually takes effect, no reassignment needed.
             env_snapshot["thinking"]["confirmed_live"] = confirmed_level
+        elif confirmed_error is not None and env_snapshot["thinking"]["confirmed_live"] is None:
+            # A failed confirmation attempt must not just vanish -- otherwise
+            # confirmed_live staying null is indistinguishable from "never
+            # tried" versus "tried and pi's get_state rejected the request".
+            env_snapshot.setdefault("errors", []).append(
+                {"source": "confirmed_thinking", "error": confirmed_error})
 
         r["scoring_params"] = params
         results["exercises"][key] = r

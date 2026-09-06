@@ -547,7 +547,10 @@ def _find_model_max_tokens(provider: str, model_id: str) -> dict:
             continue
         for entry in models:
             if isinstance(entry, dict) and entry.get("id") == model_id:
-                out.update(value=entry.get("maxTokens"), source_file=str(path), resolution=res)
+                # pi's own fillModelDefaults() (config.ts) applies maxTokens: 4096
+                # when a model entry omits the field -- {...defaults, ...m}, so an
+                # absent key still means 4096 in effect, not "unknown".
+                out.update(value=entry.get("maxTokens", 4096), source_file=str(path), resolution=res)
                 return out
     return out
 
