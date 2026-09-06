@@ -294,8 +294,8 @@ class PolyglotLiveRunner:
         # from "this exercise subprocess is still alive and using the
         # worktree" -- start_new_session=True means this child has its own
         # process group/pid and does NOT die when the orchestrator does.
-        self.worktree.set_active_pid(proc.pid)
         try:
+            self.worktree.set_active_pid(proc.pid)
             try:
                 _stdout, stderr = proc.communicate(timeout=effective_timeout)
                 exit_code = proc.returncode
@@ -319,16 +319,19 @@ class PolyglotLiveRunner:
                     status="harness_error", score=0.0, success=False,
                     error=f"subprocess timed out after {effective_timeout:.0f}s",
                 )
-            except BaseException:
-                # Any other exception unwinding here (notably the
-                # KeyboardInterrupt run_gepa.py's own signal handler raises
-                # on a second Ctrl-C) must not leave this detached
-                # (start_new_session=True) subprocess running -- it never
-                # received the interrupt itself, and would otherwise keep
-                # driving a real paid rollout against a worktree the caller
-                # may be about to remove.
-                self._kill_process_group(proc)
-                raise
+        except BaseException:
+            # Any other exception unwinding here (notably the
+            # KeyboardInterrupt run_gepa.py's own signal handler raises on a
+            # second Ctrl-C, but also one raised by set_active_pid()'s own
+            # marker-file I/O before communicate() is even reached) must not
+            # leave this detached (start_new_session=True) subprocess
+            # running -- it never received the interrupt itself, and would
+            # otherwise keep driving a real paid rollout against a worktree
+            # the caller may be about to remove. Calling this twice (the
+            # budget_clamped raise above already killed it) is safe --
+            # _kill_process_group treats an already-dead process as a no-op.
+            self._kill_process_group(proc)
+            raise
         finally:
             self.worktree.set_active_pid(None)
 

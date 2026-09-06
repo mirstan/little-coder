@@ -307,8 +307,7 @@ def test_refuses_when_a_leftover_stop_file_already_exists(
 
     code = _run_main([
         "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
-        "--benchmark-root", str(fake_practice), "--exercises", "wordy", "--exercise-count", "1",
-        "--val-count", "0",
+        "--benchmark-root", str(fake_practice), "--exercise-count", "3", "--val-count", "1",
         "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "1",
         "--out-dir", str(out_dir), "--baseline-only", "--yes",
     ])
