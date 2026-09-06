@@ -134,6 +134,21 @@ def test_reflection_minibatch_check_does_not_apply_to_baseline_only(monkeypatch)
     assert messages == []
 
 
+def test_refuses_non_positive_reflection_minibatch_size_even_for_baseline_only(monkeypatch):
+    """Real bug, confirmed by review: unlike the train-pool-compatibility
+    check above (genuinely irrelevant to baseline mode), this basic sanity
+    bound must apply regardless of --baseline-only -- estimate_cost() is
+    called unconditionally in BOTH modes to print the pre-authorization
+    banner, and a negative value there produces a negative, nonsensical
+    cost/wall-clock estimate before a human even decides whether to
+    authorize a real (--baseline-only) run."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    messages = _check_gates(_args(
+        **AUTHORIZED_ROLLOUT, baseline_only=True, reflection_minibatch_size=-1,
+    ))
+    assert any("--reflection-minibatch-size" in m for m in messages)
+
+
 def test_refuses_val_count_at_least_exercise_count(monkeypatch):
     monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
     monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")

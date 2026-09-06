@@ -112,7 +112,14 @@ def _check_gates(args: argparse.Namespace) -> list[str]:
             "'unlimited' mode here -- every metric call is a real live exercise run."
         )
 
-    if not args.baseline_only and args.reflection_minibatch_size <= 0:
+    # Unlike the train-pool-compatibility check below (genuinely irrelevant
+    # to baseline mode, which never touches minibatch sampling), this basic
+    # sanity bound applies regardless of --baseline-only: estimate_cost() is
+    # called unconditionally in BOTH modes to print the pre-authorization
+    # banner, and a negative --reflection-minibatch-size there produces a
+    # negative (nonsensical) cost/wall-clock estimate before the human even
+    # gets to decide whether to authorize anything.
+    if args.reflection_minibatch_size <= 0:
         messages.append(f"--reflection-minibatch-size must be > 0, got {args.reflection_minibatch_size}.")
 
     # select_exercises() ignores --exercise-count entirely when --exercises
