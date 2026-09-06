@@ -204,7 +204,9 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     the other thing this dropped: an attempt that read files and stopped
     without writing anything looked identical whether the model chose to stop
     or the harness force-aborted its thinking, unless you happened to re-run
-    it live with rpc.notifications() -- see docs/STATE.md.
+    it live with rpc.notifications() to compare (this is exactly how the
+    thinking-budget intervention was first discovered, on a real `bowling`
+    failure -- nothing in the persisted trajectory said so).
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -225,7 +227,14 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
                 }
                 for tc in getattr(result, "tool_calls", [])
             ],
-            "notifications": notifications or [],
+            # Same policy as tool_calls above -- extension notify text is
+            # normally short, but it's authored by extensions (including
+            # third-party ones a run may load), and this is otherwise the
+            # one field in this payload exempt from the file's own size cap.
+            "notifications": [
+                {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
+                for n in (notifications or [])
+            ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),
@@ -238,7 +247,7 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
         if payload["notifications"]:
             lines.append("=== notifications ===")
             for n in payload["notifications"]:
-                lines.append(f"    [{n.get('notifyType')}] {n.get('message')}")
+                lines.append(f"    [{n.get('notifyType')}] {str(n.get('message', ''))[:1500]}")
         lines.append("=== assistant text ===")
         lines.append(payload["assistant_text"][:20000])
         (log_dir / f"trajectory_{attempt_name}.txt").write_text(
@@ -669,8 +678,13 @@ def _run_exercise(
         turn_total = 0
         current_prompt = prompt
         codex_session_id = None
-        attempt_notifications: list[dict] = []
         for i in range(1, effective_attempts + 1):
+            # Reset every iteration, not just declared once before the loop:
+            # if a future branch (or an exception) ever skipped reassigning
+            # it, this attempt would otherwise be dumped carrying the PRIOR
+            # attempt's notifications -- silently wrong forensics in exactly
+            # the artifact this exists to make trustworthy.
+            attempt_notifications: list[dict] = []
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                            session_id=f"poly-{lang}-{ex_name}-attempt{i}",
@@ -682,11 +696,15 @@ def _run_exercise(
                     # budget-capped attempt is otherwise indistinguishable
                     # from a completed one.
                     r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
-                    # ctx.ui.notify events -- skill/knowledge injections, and
-                    # critically the thinking-budget extension's "the model
-                    # has thought long enough" intervention. Read before the
-                    # session closes; harmless if this list ends up empty.
-                    attempt_notifications = rpc.notifications()
+                # ctx.ui.notify events -- skill/knowledge injections, and
+                # critically the thinking-budget extension's "the model has
+                # thought long enough" intervention. Read AFTER the `with`
+                # block (not inside it): PiRpc.close() doesn't clear
+                # _notifications or join the reader thread, it only waits
+                # for the process to exit, so reading here can only see
+                # equal-or-more of what the reader thread drained, never
+                # less. Harmless if this list ends up empty.
+                attempt_notifications = rpc.notifications()
             elif agent == "codex":
                 # Unlike pi's fresh-session-per-attempt (see above), codex
                 # resumes its own prior session from attempt 2 onward --

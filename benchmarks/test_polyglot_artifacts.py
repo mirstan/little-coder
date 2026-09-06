@@ -187,8 +187,8 @@ def test_run_id_is_stable_within_a_process():
 class _FakeRpcWithNotifications(_FakeRpc):
     """Same as _FakeRpc, but simulates the thinking-budget extension firing --
     the ctx.ui.notify event that was invisible in every trajectory before
-    this was wired up (see docs/STATE.md: it took a live manual re-run with
-    rpc.notifications() to discover this on a real `bowling` failure)."""
+    this was wired up -- it took a live manual re-run with rpc.notifications()
+    to discover this on a real `bowling` failure."""
 
     def notifications(self):
         return [
