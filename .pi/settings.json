@@ -76,6 +76,16 @@
         "skill_token_budget": 300,
         "knowledge_token_budget": 200,
         "temperature": 0.3
+      },
+      "omlx/tiel-coder-oq4e": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
+      },
+      "rapidmlx/tiel-coder-oq4e": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
       }
     }
   }
