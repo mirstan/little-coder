@@ -96,7 +96,7 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
     monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
 
-    def _make(cache=None, budget=None, pi_bin=FAKE_PI, per_exercise_timeout_s=60):
+    def _make(cache=None, budget=None, pi_bin=FAKE_PI, per_exercise_timeout_s=60, on_result=None):
         with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=pi_bin) as wt:
             yield PolyglotLiveRunner(
                 worktree=wt,
@@ -107,6 +107,7 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
                 cache=cache,
                 per_exercise_timeout_s=per_exercise_timeout_s,
                 budget=budget,
+                on_result=on_result,
             )
 
     return _make
@@ -271,3 +272,34 @@ def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, m
     for runner in runner_factory(budget=budget, per_exercise_timeout_s=120):
         with pytest.raises(LiveEvalBudgetExceeded):
             runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+
+def test_on_result_still_fires_for_exercises_completed_before_a_later_budget_exceeded(
+    runner_factory, fake_practice, monkeypatch,
+):
+    """Real bug, confirmed by review: the audit callback used to be invoked
+    only after run_batch() returned the WHOLE batch, so a later exercise
+    hitting LiveBudget's backstop lost the audit record for every exercise
+    that already genuinely ran earlier in the same batch."""
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
+
+    ex_dir = fake_practice / "python" / "exercises" / "practice" / "acronym"
+    ex_dir.mkdir(parents=True)
+    (ex_dir / "acronym.py").write_text(_WORDY_STUB)
+    (ex_dir / "acronym_test.py").write_text(_WORDY_TEST.replace("wordy", "acronym"))
+
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({
+        "wordy.py": _b64(_WORDY_SOLUTION), "acronym.py": _b64(_WORDY_SOLUTION),
+    }))
+
+    seen = []
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=1)
+    for runner in runner_factory(budget=budget, on_result=seen.append):
+        with pytest.raises(LiveEvalBudgetExceeded):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy"), ExerciseSpec("acronym")])
+
+    assert len(seen) == 1
+    assert seen[0].task_id == "python/wordy"

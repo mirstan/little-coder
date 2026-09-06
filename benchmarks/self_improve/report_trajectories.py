@@ -181,7 +181,12 @@ def _resolve_components_yaml(repo_root: Path, components_config: str) -> Path:
     somewhere other than the caller's own working directory."""
     rel = Path(components_config)
     if rel.is_absolute():
-        rel = rel.relative_to(repo_root)
+        try:
+            rel = rel.relative_to(repo_root)
+        except ValueError:
+            raise ValueError(
+                f"--components-config {components_config!r} is outside --repo-root {repo_root}"
+            ) from None
     return repo_root / rel
 
 
@@ -202,7 +207,11 @@ def main() -> int:
         return 1
 
     repo_root = Path(args.repo_root).resolve()
-    components_yaml = _resolve_components_yaml(repo_root, args.components_config)
+    try:
+        components_yaml = _resolve_components_yaml(repo_root, args.components_config)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     trajectories, empty_sources = ingest_all(log_roots, repo_root=repo_root)
     components = load_components(components_yaml, repo_root=repo_root)

@@ -112,6 +112,9 @@ def _check_gates(args: argparse.Namespace) -> list[str]:
             "'unlimited' mode here -- every metric call is a real live exercise run."
         )
 
+    if args.reflection_minibatch_size <= 0:
+        messages.append(f"--reflection-minibatch-size must be > 0, got {args.reflection_minibatch_size}.")
+
     # select_exercises() ignores --exercise-count entirely when --exercises
     # is given (exercises.py: `chosen = list(explicit)`) -- computing these
     # two gates from the raw --exercise-count flag in that case checks a
@@ -210,7 +213,14 @@ def _resolve_components_yaml(repo_root: Path, components_config: str) -> tuple[P
     invoked with --repo-root pointing elsewhere than the working directory."""
     rel = Path(components_config)
     if rel.is_absolute():
-        rel = rel.relative_to(repo_root)
+        try:
+            rel = rel.relative_to(repo_root)
+        except ValueError:
+            raise ValueError(
+                f"--components-config {components_config!r} is outside --repo-root {repo_root} -- "
+                "the scratch worktree only ever contains repo_root's own files, so a path outside "
+                "it could never be read there anyway."
+            ) from None
     return repo_root / rel, rel
 
 
@@ -226,7 +236,11 @@ def _run_live(args: argparse.Namespace) -> int:
             return 1
 
     repo_root = Path(args.repo_root).resolve()
-    components_yaml, components_rel = _resolve_components_yaml(repo_root, args.components_config)
+    try:
+        components_yaml, components_rel = _resolve_components_yaml(repo_root, args.components_config)
+    except ValueError as e:
+        print(f"Refusing to run: {e}", file=sys.stderr)
+        return 1
 
     if not args.allow_dirty_components:
         dirty_errors = _check_components_clean(repo_root, components_yaml)
@@ -362,6 +376,17 @@ def _run_live(args: argparse.Namespace) -> int:
             thinking=args.thinking, benchmark_root=benchmark_root,
             cache=cache, per_exercise_timeout_s=per_exercise_timeout_s,
             budget=budget,
+            # Called per-result INSIDE run_batch() (cache hits included), not
+            # after a whole batch returns -- a later exercise in the same
+            # batch raising (e.g. the budget backstop) must not erase the
+            # audit trail for exercises that already genuinely ran. A cache
+            # hit logs duration_s=0.0 (not the original run's elapsed_s):
+            # SpendLog.summarize()'s total_wall_s would otherwise double-count
+            # the same real wall-clock time every time that result is reused.
+            on_result=lambda r: spend_log.exercise(
+                exercise_id=r.task_id, status=r.status, score=r.score,
+                memo_hit=r.from_cache, duration_s=0.0 if r.from_cache else r.elapsed_s,
+            ),
         )
 
         if args.baseline_only:
@@ -369,6 +394,8 @@ def _run_live(args: argparse.Namespace) -> int:
             # honor the same printed stop_file/signal-driven graceful stop by
             # checking it between exercises (one runner.run_batch() call per
             # exercise; each call still consults the on-disk memo first).
+            # spend_log.exercise() is logged by the runner's on_result above,
+            # not duplicated here.
             results = []
             try:
                 for spec in specs:
@@ -380,9 +407,6 @@ def _run_live(args: argparse.Namespace) -> int:
                     results.append(result_one)
                     print(f"  {result_one.task_id}: status={result_one.status} score={result_one.score:.2f} "
                           f"{'(cached)' if result_one.from_cache else ''}")
-                    spend_log.exercise(exercise_id=result_one.task_id, status=result_one.status,
-                                        score=result_one.score, memo_hit=result_one.from_cache,
-                                        duration_s=result_one.elapsed_s)
             except LiveEvalBudgetExceeded as e:
                 print(f"\nBudget backstop fired: {e}", file=sys.stderr)
                 # Persist whatever DID run before the cap hit -- spend_log's
@@ -406,10 +430,6 @@ def _run_live(args: argparse.Namespace) -> int:
         adapter = PolyglotGEPAAdapter(
             runner, component_paths=component_paths, practice_dir_path=pdir,
             knowledge_topic_index=knowledge_topic_index,
-            on_result=lambda r: spend_log.exercise(
-                exercise_id=r.task_id, status=r.status, score=r.score,
-                memo_hit=r.from_cache, duration_s=r.elapsed_s,
-            ),
         )
 
         import gepa

@@ -40,9 +40,10 @@ class CostEstimate:
 
 def _ceil_div(numerator: int, denominator: int) -> int:
     """max(0, ceil(numerator / denominator)); 0 whenever numerator <= 0 or
-    denominator is 0 (a non-positive remaining budget affords zero
-    iterations, not a nonsensical negative or division-by-zero result)."""
-    if numerator <= 0 or not denominator:
+    denominator is non-positive (a non-positive remaining budget or a
+    negative/zero --reflection-minibatch-size affords zero iterations, not a
+    nonsensical negative or division-by-zero result)."""
+    if numerator <= 0 or denominator <= 0:
         return 0
     return -(-numerator // denominator)
 

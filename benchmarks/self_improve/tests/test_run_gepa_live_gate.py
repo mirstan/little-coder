@@ -187,6 +187,14 @@ def test_resolve_components_yaml_absolute_path_under_repo_root():
     assert rel_path == Path("config/components.yaml")
 
 
+def test_resolve_components_yaml_raises_a_clean_error_when_absolute_path_escapes_repo_root():
+    """Real bug, confirmed by review: an absolute --components-config
+    outside --repo-root made Path.relative_to() raise an UNCAUGHT
+    ValueError -- a raw traceback instead of a clean CLI refusal."""
+    with pytest.raises(ValueError, match="outside --repo-root"):
+        _resolve_components_yaml(Path("/repo"), "/somewhere/else/components.yaml")
+
+
 @pytest.fixture
 def source_repo(tmp_path):
     """A throwaway git repo, committed, with real-shaped component files and
@@ -386,3 +394,40 @@ def test_baseline_only_stops_at_the_exact_max_metric_calls_cap(
     assert code == 3  # budget backstop, not a full run of all 3 exercises
     seed_baseline = json.loads((out_dir / "seed_baseline.json").read_text())
     assert len(seed_baseline) == 1
+
+
+def test_spend_log_zeroes_duration_for_a_cache_hit(source_repo, fake_practice, tmp_path, monkeypatch):
+    """Real bug, confirmed by review: logging a cache hit's ORIGINAL
+    elapsed_s let SpendLog.summarize()'s total_wall_s double-count the same
+    real wall-clock time every time a candidate's result was reused from the
+    on-disk memo."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({
+        "wordy.py": _b64(_WORDY_SOLUTION), "acronym.py": _b64(_WORDY_SOLUTION),
+    }))
+    live_cache_dir = tmp_path / "shared_cache"
+
+    common_args = [
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy,acronym",
+        "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes", "--live-cache-dir", str(live_cache_dir),
+    ]
+    # first run: real subprocess, populates the cache
+    out_dir_1 = tmp_path / "run_out_1"
+    code1 = _run_main([*common_args, "--out-dir", str(out_dir_1), "--scratch-dir", str(tmp_path / "scratch1")])
+    assert code1 == 0
+
+    # second run: identical candidate/model/etc -> cache hit, no subprocess
+    out_dir_2 = tmp_path / "run_out_2"
+    code2 = _run_main([*common_args, "--out-dir", str(out_dir_2), "--scratch-dir", str(tmp_path / "scratch2")])
+    assert code2 == 0
+
+    records = [json.loads(line) for line in (out_dir_2 / "spend_log.jsonl").read_text().splitlines()]
+    exercise_records = [r for r in records if r.get("event") == "exercise"]
+    assert len(exercise_records) == 2
+    assert all(r["memo_hit"] is True for r in exercise_records)
+    assert all(r["duration_s"] == 0.0 for r in exercise_records)

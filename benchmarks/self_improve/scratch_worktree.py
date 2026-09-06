@@ -45,6 +45,36 @@ from typing import Iterator, Mapping
 SCRATCH_MARKER_NAME = ".self-improve-scratch.json"
 
 
+def _write_marker_atomic(marker_path: Path, marker: dict) -> None:
+    """Write the marker file via a randomly-named temp file + os.replace,
+    never through marker_path directly.
+
+    marker_path lives INSIDE the scratch worktree, which the exercise
+    subprocess (a bash-driven coding agent, per the candidate under
+    evaluation) has full read/write access to as its own cwd. A plain
+    `marker_path.write_text(...)` would follow a symlink if the agent
+    replaced this predictably-named file with one pointing outside the
+    worktree, letting a live exercise's own file operations overwrite an
+    arbitrary path the orchestrator process can write to (e.g. back into the
+    real source checkout) via this bookkeeping write. `os.replace()` acts on
+    the directory entry itself (POSIX rename semantics), so it swaps the
+    symlink out atomically instead of writing through it -- and
+    `tempfile.mkstemp` (not a predictable `.tmp-<pid>` name) additionally
+    means the temp file's own creation can't be pre-empted by a planted
+    symlink either."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(marker_path.parent), prefix=f".{marker_path.name}.tmp-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(marker, indent=2))
+        os.replace(tmp_name, marker_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 class ScratchWorktreeError(RuntimeError):
     """Base error for scratch worktree lifecycle failures."""
 
@@ -130,8 +160,10 @@ class ScratchWorktree:
             marker = json.loads(marker_path.read_text())
         except (json.JSONDecodeError, OSError):
             marker = {}
+        if not isinstance(marker, dict):
+            marker = {}
         marker["active_pid"] = pid
-        marker_path.write_text(json.dumps(marker, indent=2))
+        _write_marker_atomic(marker_path, marker)
 
     def reset(self) -> None:
         """Hard-reset to base_commit and remove every untracked file except
@@ -221,7 +253,7 @@ def scratch_worktree(
             "base_commit": base_commit,
             "repo_root": str(source_repo_root),
         }
-        (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker, indent=2))
+        _write_marker_atomic(scratch_path / SCRATCH_MARKER_NAME, marker)
     except BaseException:
         try:
             _run_git(["worktree", "remove", "--force", str(scratch_path)], cwd=source_repo_root)

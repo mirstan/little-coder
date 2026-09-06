@@ -2,6 +2,7 @@
 tmp_path -- NEVER the real checkout. The session-scoped _no_stray_real_worktrees
 fixture in conftest.py is the backstop that fails the whole session if that
 invariant is ever violated."""
+import json
 import subprocess
 
 import pytest
@@ -152,6 +153,30 @@ def test_keep_preserves_worktree_on_exception_without_masking_it(source_repo, tm
     assert "PRESERVED FOR POST-MORTEM" in capsys.readouterr().out
     subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path_holder["path"])],
                     cwd=source_repo, check=True)
+
+
+def test_set_active_pid_does_not_follow_a_symlink_planted_at_the_marker_path(source_repo, tmp_path):
+    """Real security-relevant bug, confirmed by review: the marker file
+    lives INSIDE the scratch worktree, which a live exercise subprocess (a
+    bash-driven coding agent) has full write access to as its own cwd. A
+    plain write_text() through that path would follow a symlink planted
+    there, letting the orchestrator's own bookkeeping write clobber an
+    arbitrary file the agent chose (e.g. back into the real source
+    checkout). set_active_pid() must swap the marker in atomically instead
+    of ever opening the (possibly-attacker-controlled) path directly."""
+    outside_target = tmp_path / "outside_target.txt"
+    outside_target.write_text("do not overwrite me\n")
+
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        marker_path = wt.path / SCRATCH_MARKER_NAME
+        marker_path.unlink()
+        marker_path.symlink_to(outside_target)
+
+        wt.set_active_pid(12345)
+
+        assert outside_target.read_text() == "do not overwrite me\n"
+        assert not marker_path.is_symlink()  # swapped for a real file, not written through
+        assert json.loads(marker_path.read_text())["active_pid"] == 12345
 
 
 def test_reset_restores_tree_after_arbitrary_mutation(source_repo, tmp_path):

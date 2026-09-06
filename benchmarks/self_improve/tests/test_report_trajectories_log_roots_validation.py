@@ -67,3 +67,20 @@ def test_resolve_components_yaml_absolute_path_under_repo_root():
     repo_root = Path("/repo")
     result = _resolve_components_yaml(repo_root, "/repo/config/components.yaml")
     assert result == repo_root / "config" / "components.yaml"
+
+
+def test_resolve_components_yaml_raises_a_clean_error_when_absolute_path_escapes_repo_root():
+    """Real bug, confirmed by review: an absolute --components-config
+    outside --repo-root made Path.relative_to() raise an UNCAUGHT
+    ValueError before the report ever started."""
+    with pytest.raises(ValueError, match="outside --repo-root"):
+        _resolve_components_yaml(Path("/repo"), "/somewhere/else/components.yaml")
+
+
+def test_main_reports_a_clean_error_when_components_config_escapes_repo_root(monkeypatch, capsys, tmp_path):
+    code = _run_main(monkeypatch, [
+        "--repo-root", str(tmp_path),
+        "--components-config", str(tmp_path.parent / "outside" / "components.yaml"),
+    ])
+    assert code == 1
+    assert "outside --repo-root" in capsys.readouterr().err

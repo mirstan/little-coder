@@ -96,26 +96,21 @@ class PolyglotGEPAAdapter:
         component_paths: Mapping[str, str],
         practice_dir_path: Path,
         knowledge_topic_index: Mapping[str, str] | None = None,
-        on_result=None,
     ):
         self.runner = runner
         self.component_paths = dict(component_paths)
         self.practice_dir_path = Path(practice_dir_path)
         self.knowledge_topic_index = dict(knowledge_topic_index or {})
-        #: Optional callable(LiveRunResult) -- invoked once per exercise result
-        #: (cache hits included) right after run_batch() returns, so a caller
-        #: (run_gepa.py's SpendLog) can audit every real live invocation this
-        #: adapter causes, independent of what GEPA itself logs.
-        self.on_result = on_result
 
     def evaluate(
         self, batch: Sequence[ExerciseSpec], candidate: dict[str, str], capture_traces: bool = False,
     ) -> EvaluationBatch:
         specs = list(batch)
+        # Audit logging (run_gepa.py's SpendLog) happens via runner.on_result,
+        # called per-result INSIDE run_batch() -- not here after the fact --
+        # so a later exercise in this same batch raising doesn't erase the
+        # audit trail for exercises that already genuinely ran.
         results = self.runner.run_batch(candidate, specs)  # candidate IS read -- this is the fix.
-        if self.on_result is not None:
-            for r in results:
-                self.on_result(r)
 
         outputs = [
             PolyglotRolloutOutput(task_id=r.task_id, status=r.status, score=r.score, from_cache=r.from_cache)

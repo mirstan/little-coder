@@ -122,6 +122,7 @@ class PolyglotLiveRunner:
         per_exercise_timeout_s: int | None = None,
         python_executable: str = sys.executable,
         budget=None,
+        on_result=None,
     ):
         self.worktree = worktree
         self.components_yaml = Path(components_yaml)
@@ -143,6 +144,13 @@ class PolyglotLiveRunner:
         # pi session can't stall a run indefinitely.
         self.per_exercise_timeout_s = per_exercise_timeout_s or (max_attempts * (900 + 90) + 180)
         self.python_executable = python_executable
+        #: Optional callable(LiveRunResult) -- invoked as EACH result becomes
+        #: available inside run_batch() (cache hits included), not after the
+        #: whole batch returns. A caller auditing every live invocation
+        #: (run_gepa.py's SpendLog) would otherwise lose every
+        #: already-completed result in a batch that raises partway through
+        #: (e.g. LiveBudget's own backstop firing on exercise N of M).
+        self.on_result = on_result
 
     @property
     def run_config(self) -> dict:
@@ -236,6 +244,8 @@ class PolyglotLiveRunner:
                 result = LiveRunResult.from_dict(cached)
                 result.from_cache = True
                 results[spec.task_id] = result
+                if self.on_result is not None:
+                    self.on_result(result)
             else:
                 misses.append(spec)
 
@@ -250,6 +260,12 @@ class PolyglotLiveRunner:
                 results[spec.task_id] = result
                 if self.cache is not None:
                     self.cache.put(candidate, run_config, spec.task_id, result.to_dict())
+                # Emitted here, per-result, rather than after the whole batch
+                # returns -- a later exercise in this same batch raising
+                # (e.g. the budget backstop above) must not erase the audit
+                # trail for exercises that already genuinely ran.
+                if self.on_result is not None:
+                    self.on_result(result)
 
         return [results[spec.task_id] for spec in specs]
 
@@ -342,13 +358,14 @@ class PolyglotLiveRunner:
         """A plain subprocess timeout only kills the DIRECT child --
         aider_polyglot.py's own comments document that a spawned bash
         grandchild (from the agent's own tool calls) can still outlive
-        that. start_new_session=True (in _run_one_uncached) puts this
-        subprocess in its own process group, so os.killpg reaches the
-        whole tree."""
-        try:
-            pgid = os.getpgid(proc.pid)
-        except ProcessLookupError:
-            return
+        that. start_new_session=True (in _run_one_uncached) makes this
+        process its own session AND process group leader, so its pgid is
+        exactly proc.pid at creation time -- used directly here rather than
+        looked up via os.getpgid(proc.pid), which can raise ProcessLookupError
+        (and previously caused this whole method to give up) once the direct
+        child has exited even while its process group still has live
+        descendants to reach."""
+        pgid = proc.pid
         try:
             os.killpg(pgid, signal.SIGTERM)
             proc.wait(timeout=15)
