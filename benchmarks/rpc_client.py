@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -94,6 +95,7 @@ class PiRpc:
             raise FileNotFoundError(f"pi CLI not found at {PI_BIN}. Run `npm install` in {REPO_ROOT}.")
 
         self._tb_shell_handler = tb_shell_handler
+        self._session_id = session_id
 
         full_env = dict(os.environ)
         if env:
@@ -451,9 +453,25 @@ class PiRpc:
         # from _proc.wait() returning. Without this join, a caller reading
         # notifications() immediately after close() could still miss events
         # from the tail of the stream. In practice EOF follows process exit
-        # almost immediately, so this is normally a no-op wait.
-        self._reader.join(timeout=2)
-        self._stderr_reader.join(timeout=2)
+        # almost immediately, so 10s is very generous headroom, not a
+        # normal-case wait. Bounded rather than unbounded on purpose: a
+        # harness running 200+ exercises unattended must never be able to
+        # hang forever here even if a reader thread is somehow wedged --
+        # trading a rare, bounded, diagnostics-only gap (a few missed
+        # trailing notify events) for that guarantee. If it ever actually
+        # times out, that itself is surprising enough to be worth a loud
+        # warning rather than silently swallowing the possibility.
+        self._reader.join(timeout=10)
+        if self._reader.is_alive():
+            print(f"WARNING: PiRpc reader thread did not finish draining "
+                  f"stdout within 10s of process exit (session {self._session_id!r}) "
+                  f"-- trailing notifications/responses may be missing",
+                  file=sys.stderr)
+        self._stderr_reader.join(timeout=10)
+        if self._stderr_reader.is_alive():
+            print(f"WARNING: PiRpc stderr reader thread did not finish within "
+                  f"10s of process exit (session {self._session_id!r})",
+                  file=sys.stderr)
 
     def __enter__(self):
         return self
