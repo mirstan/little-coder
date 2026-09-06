@@ -604,7 +604,7 @@ def _run_exercise(
     max_attempts: int = 2,
     thinking: str | None = None,
     agent: str = "pi",
-    confirm_thinking: bool = False,
+    thinking_confirmation: dict | None = None,
 ):
     desc = LANG_DESCRIPTORS.get(lang)
     if desc is None:
@@ -659,27 +659,31 @@ def _run_exercise(
         turn_total = 0
         current_prompt = prompt
         codex_session_id = None
-        confirmed_thinking_level = None
-        confirmed_thinking_error = None
         for i in range(1, effective_attempts + 1):
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                            session_id=f"poly-{lang}-{ex_name}-attempt{i}",
                            env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
                            thinking=thinking) as rpc:
-                    if i == 1 and confirm_thinking:
-                        # Best-effort, and only once per RUN (the caller
-                        # passes confirm_thinking=True only until it gets a
-                        # value back) -- not once per exercise. This confirms
-                        # the thinking level pi actually resolved to (vs. our
-                        # own static-file guess in capture_environment_snapshot)
-                        # straight from pi's own get_state; config doesn't
-                        # change mid-run, so a second, third, ... confirmation
-                        # would just be 200+ redundant RPC round-trips.
+                    if i == 1 and thinking_confirmation is not None and not thinking_confirmation["attempted"]:
+                        # Best-effort, and only once per RUN, ever -- gated on
+                        # "attempted", not "got a value back", so a FAILED
+                        # confirmation also stops later exercises from
+                        # re-probing (config doesn't change mid-run; a second,
+                        # third, ... attempt after a first failure would just
+                        # be more of the same redundant/failing RPC round-trip).
+                        # Mutates the caller's dict directly and immediately,
+                        # rather than returning through `record` below: if
+                        # prompt_and_collect() on this same attempt then
+                        # raises, the exception unwinds out of _run_exercise
+                        # before any `return` -- a value threaded through the
+                        # return dict would be lost, but this mutation already
+                        # happened and is visible to the caller regardless.
+                        thinking_confirmation["attempted"] = True
                         try:
-                            confirmed_thinking_level = rpc.get_state().get("thinkingLevel")
+                            thinking_confirmation["confirmed_live"] = rpc.get_state().get("thinkingLevel")
                         except Exception as exc:
-                            confirmed_thinking_error = f"{type(exc).__name__}: {exc}"
+                            thinking_confirmation["error"] = f"{type(exc).__name__}: {exc}"
                     # prompt_and_collect() returns partial events *silently*
                     # when agent_end never arrives (_drain_events_until
                     # returns `collected`, it does not raise), so a
@@ -772,13 +776,6 @@ def _run_exercise(
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
         }
-        if confirmed_thinking_level is not None:
-            # Transient -- popped by the caller into meta.environment_snapshot,
-            # not meant to sit on every individual exercise record (it's a
-            # run-invariant fact, not something that varies per exercise).
-            record["_confirmed_thinking_level"] = confirmed_thinking_level
-        elif confirmed_thinking_error is not None:
-            record["_confirmed_thinking_error"] = confirmed_thinking_error
         return record
 
 
@@ -878,6 +875,14 @@ def main():
 
     consecutive_errors = 0
     written_this_run: dict[str, dict] = {}
+    # Owned by main(), mutated directly by _run_exercise on the first
+    # exercise's first attempt (see there for why: a dict mutation survives
+    # even if _run_exercise raises afterward, unlike a value threaded through
+    # its return dict). "attempted" gates on ATTEMPTED, not "got a value" --
+    # a failed confirmation must also stop every later exercise from
+    # re-probing and re-appending the same error, not just a successful one.
+    thinking_confirmation = {"attempted": False, "confirmed_live": None, "error": None}
+    confirmation_error_recorded = False
     for name in names:
         key = f"{args.agent}/{args.language}/{name}"
         if args.resume and str(results["exercises"].get(key, {}).get("status", "")).startswith("pass_"):
@@ -896,32 +901,28 @@ def main():
                 max_attempts=args.max_attempts,
                 thinking=args.thinking,
                 agent=args.agent,
-                # Only worth querying pi's get_state until the FIRST exercise
-                # confirms it -- config doesn't change mid-run, so the other
-                # ~224 exercises would just be redundant RPC round-trips for
-                # a value that's already known.
-                confirm_thinking=env_snapshot.get("thinking", {}).get("confirmed_live") is None,
+                thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
-        confirmed_level = r.pop("_confirmed_thinking_level", None)
-        confirmed_error = r.pop("_confirmed_thinking_error", None)
-        if confirmed_level is not None and env_snapshot["thinking"]["confirmed_live"] is None:
-            # Only the first exercise to report one sets it -- config doesn't
-            # change mid-run, and this keeps meta.environment_snapshot a
-            # single run-invariant fact rather than the last exercise's value.
-            # env_snapshot is the same object results["meta"]["environment_snapshot"]
-            # already references (assigned once, above) -- mutating it here
-            # is what actually takes effect, no reassignment needed.
-            env_snapshot["thinking"]["confirmed_live"] = confirmed_level
-        elif confirmed_error is not None and env_snapshot["thinking"]["confirmed_live"] is None:
+        # Idempotent after the first exercise (thinking_confirmation stops
+        # changing once "attempted" is True), so applying it unconditionally
+        # every iteration is harmless -- simpler than trying to detect "this
+        # was the exercise that just attempted it".
+        if thinking_confirmation["confirmed_live"] is not None:
+            env_snapshot["thinking"]["confirmed_live"] = thinking_confirmation["confirmed_live"]
+        elif thinking_confirmation["error"] is not None and not confirmation_error_recorded:
             # A failed confirmation attempt must not just vanish -- otherwise
             # confirmed_live staying null is indistinguishable from "never
             # tried" versus "tried and pi's get_state rejected the request".
+            # confirmation_error_recorded (a local, not part of env_snapshot
+            # itself) is the dedup flag, so this stays out of the persisted
+            # JSON -- env_snapshot only ever holds data meant to be written.
             env_snapshot.setdefault("errors", []).append(
-                {"source": "confirmed_thinking", "error": confirmed_error})
+                {"source": "confirmed_thinking", "error": thinking_confirmation["error"]})
+            confirmation_error_recorded = True
 
         r["scoring_params"] = params
         results["exercises"][key] = r
