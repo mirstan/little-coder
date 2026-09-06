@@ -40,7 +40,7 @@ def _args(**overrides):
     defaults = dict(
         model=None, confirm_live_rollouts=False, max_metric_calls=None,
         baseline_only=False, reflection_model=None, confirm_real_run=False,
-        exercise_count=6, val_count=3, reflection_minibatch_size=2,
+        exercises=None, exercise_count=6, val_count=3, reflection_minibatch_size=2,
     )
     defaults.update(overrides)
     return type("Args", (), defaults)()
@@ -143,6 +143,36 @@ def test_refuses_val_count_at_least_exercise_count(monkeypatch):
     assert any("--val-count" in m for m in messages)
 
 
+def test_gates_use_the_real_exercises_count_not_exercise_count_when_explicit(monkeypatch):
+    """Real bug, confirmed by review: select_exercises() ignores
+    --exercise-count entirely when --exercises is given (the real pool size
+    is len(explicit)), but the minibatch/val-count gates used to reason from
+    the raw --exercise-count flag regardless -- silently passing a
+    reflection-minibatch-size that would make GEPA pad the minibatch by
+    repeating an exercise (paying twice for zero extra signal)."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+    # exercise_count says 6 (a healthy train pool), but only 3 exercises are
+    # actually named -- val_count=2 leaves a real train pool of 1.
+    messages = _check_gates(_args(
+        **AUTHORIZED_ROLLOUT, **AUTHORIZED_REFLECTION,
+        exercises="a,b,c", exercise_count=6, val_count=2, reflection_minibatch_size=2,
+    ))
+    assert any("reflection-minibatch-size" in m for m in messages)
+
+
+def test_gates_val_count_against_real_exercises_length_not_exercise_count(monkeypatch):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+    # exercise_count=6 would normally allow val_count=2, but only 2 exercises
+    # are actually named -- val_count must be < 2, not < 6.
+    messages = _check_gates(_args(
+        **AUTHORIZED_ROLLOUT, **AUTHORIZED_REFLECTION,
+        exercises="a,b", exercise_count=6, val_count=2, reflection_minibatch_size=1,
+    ))
+    assert any("--val-count" in m for m in messages)
+
+
 def test_resolve_components_yaml_relative_path():
     repo_root = Path("/repo")
     abs_path, rel_path = _resolve_components_yaml(repo_root, "config/components.yaml")
@@ -198,6 +228,18 @@ def test_check_components_clean_refuses_on_uncommitted_changes(source_repo):
     assert "uncommitted changes" in messages[0]
 
 
+def test_check_components_clean_refuses_when_git_status_itself_fails(source_repo, tmp_path):
+    """Real bug, confirmed by review: a nonzero git-status exit (e.g. a
+    components.yaml entry escaping repo_root, or repo_root not being a git
+    checkout at all) was treated identically to "nothing is dirty" -- this
+    check must refuse when it can't verify its own invariant, not fail open."""
+    not_a_repo = tmp_path / "not-a-git-repo"
+    not_a_repo.mkdir()
+    messages = _check_components_clean(not_a_repo, source_repo / "config" / "components.yaml")
+    assert len(messages) == 1
+    assert "Could not verify" in messages[0]
+
+
 @pytest.fixture
 def fake_practice(tmp_path):
     """Three real exercises (stub + genuine failing pytest test each) so
@@ -249,6 +291,33 @@ def test_missing_gate_flags_refuse_before_touching_anything(source_repo, fake_pr
     assert not out_dir.exists()
 
 
+def test_refuses_when_a_leftover_stop_file_already_exists(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real bug, confirmed by review: --out-dir defaults to a FIXED path, so
+    a gepa.stop left over from a previous (correctly) stopped run would
+    otherwise silently no-op the very next run at the first stop check --
+    for a real gepa.optimize() call that's AFTER paying for the full seed
+    valset evaluation, writing back the untouched seed as
+    optimized_components.yaml and self-reporting "completed"."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "gepa.stop").write_text("")
+
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy", "--exercise-count", "1",
+        "--val-count", "0",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "1",
+        "--out-dir", str(out_dir), "--baseline-only", "--yes",
+    ])
+    assert code == 1
+    # the stop file itself is left in place -- refusal, not silent cleanup
+    assert (out_dir / "gepa.stop").exists()
+    assert not (out_dir / "seed_baseline.json").exists()
+
+
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
@@ -273,7 +342,7 @@ def test_baseline_only_end_to_end_real_pipeline(source_repo, fake_practice, tmp_
     ])
     assert code == 0
     assert (out_dir / "spend_log.jsonl").exists()
-    seed_baseline = yaml.safe_load((out_dir / "seed_baseline.json").read_text())
+    seed_baseline = json.loads((out_dir / "seed_baseline.json").read_text())
     assert "python/wordy" in seed_baseline
     assert seed_baseline["python/wordy"]["status"] == "pass_1"
 
@@ -316,5 +385,5 @@ def test_baseline_only_stops_at_the_exact_max_metric_calls_cap(
         "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
     ])
     assert code == 3  # budget backstop, not a full run of all 3 exercises
-    seed_baseline = yaml.safe_load((out_dir / "seed_baseline.json").read_text())
+    seed_baseline = json.loads((out_dir / "seed_baseline.json").read_text())
     assert len(seed_baseline) == 1

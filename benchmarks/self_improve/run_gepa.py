@@ -26,6 +26,7 @@ no longer touches.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -48,7 +49,7 @@ from benchmarks.self_improve.live_budget import (
     render_estimate,
 )
 from benchmarks.self_improve.live_cache import LiveResultCache
-from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _sanitize_candidate
 from benchmarks.self_improve.polyglot_adapter import PolyglotGEPAAdapter
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 from benchmarks.self_improve.spend_log import SpendLog
@@ -58,8 +59,6 @@ REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
 #: box refuse live rollouts no matter what command gets pasted into it.
 NO_LIVE_ROLLOUTS_ENV = "SELF_IMPROVE_NO_LIVE_ROLLOUTS"
 DEFAULT_BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
-
-logger = logging.getLogger(__name__)
 
 # See test_run_gepa_dotenv.py for why SELF_IMPROVE_DOTENV exists (never
 # touch the real .env from a test) -- unchanged from the old design.
@@ -113,7 +112,18 @@ def _check_gates(args: argparse.Namespace) -> list[str]:
             "'unlimited' mode here -- every metric call is a real live exercise run."
         )
 
-    train_pool_size = max(0, args.exercise_count - args.val_count)
+    # select_exercises() ignores --exercise-count entirely when --exercises
+    # is given (exercises.py: `chosen = list(explicit)`) -- computing these
+    # two gates from the raw --exercise-count flag in that case checks a
+    # number that isn't the real pool size, both wrongly passing (a small
+    # --exercises list padded by GEPA's sampler, paying twice for the same
+    # exercise) and wrongly refusing (a large --exercises list against a
+    # small default --exercise-count).
+    exercise_count = (
+        len([e for e in args.exercises.split(",") if e.strip()]) if args.exercises else args.exercise_count
+    )
+
+    train_pool_size = max(0, exercise_count - args.val_count)
     if not args.baseline_only and args.reflection_minibatch_size > max(1, train_pool_size):
         messages.append(
             f"--reflection-minibatch-size ({args.reflection_minibatch_size}) must be <= the "
@@ -121,10 +131,10 @@ def _check_gates(args: argparse.Namespace) -> list[str]:
             "exercises -- you'd pay for the same exercise twice in one minibatch for no extra signal."
         )
 
-    if args.val_count >= args.exercise_count:
+    if args.val_count >= exercise_count:
         messages.append(
-            f"--val-count ({args.val_count}) must be less than --exercise-count "
-            f"({args.exercise_count}) -- there must be at least one training exercise."
+            f"--val-count ({args.val_count}) must be less than the number of exercises "
+            f"({exercise_count}) -- there must be at least one training exercise."
         )
 
     return messages
@@ -153,7 +163,18 @@ def _check_components_clean(repo_root: Path, components_yaml_path: Path) -> list
     paths.extend(str(repo_root / rel) for rel in mapping.values())
     result = subprocess.run(["git", "status", "--porcelain", "--", *paths],
                              cwd=repo_root, capture_output=True, text=True)
-    if result.returncode != 0 or not result.stdout.strip():
+    if result.returncode != 0:
+        # A nonzero exit (a components.yaml entry escaping repo_root and
+        # producing a "outside repository" pathspec error, --repo-root not
+        # being a git checkout at all, etc.) is NOT "nothing is dirty" -- it
+        # means this check could not verify the invariant it exists to
+        # enforce at all, so it must refuse rather than fail open.
+        return [
+            f"Could not verify components are clean (git status exited {result.returncode}): "
+            f"{result.stderr.strip()}. Refusing rather than assuming a dirty check that failed "
+            "to run means the tree is clean."
+        ]
+    if not result.stdout.strip():
         return []
     dirty = [line[3:].strip() for line in result.stdout.splitlines() if line.strip()]
     return [
@@ -268,6 +289,21 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.estimate_only:
         return 0
 
+    if stop_file.exists():
+        # A leftover gepa.stop from a PREVIOUS run at this --out-dir (the
+        # default is a fixed path, benchmarks/self_improve/runs/latest) would
+        # otherwise stop the run at the very first check -- for a full
+        # gepa.optimize() call that's AFTER paying for the entire seed
+        # valset evaluation, silently writing back the untouched seed as
+        # optimized_components.yaml and logging "completed". Refuse instead
+        # of guessing whether this file is a leftover or a deliberate
+        # pre-stop.
+        print(
+            f"Refusing to run: a stop file already exists at {stop_file}. If this is a leftover "
+            f"from a previous run, remove it first: rm {stop_file}", file=sys.stderr,
+        )
+        return 1
+
     if not args.yes:
         if not sys.stdin.isatty():
             print(
@@ -354,13 +390,13 @@ def _run_live(args: argparse.Namespace) -> int:
                 # backstop firing after partial progress is not a reason to
                 # discard that progress.
                 (out_dir / "seed_baseline.json").write_text(
-                    yaml.dump({r.task_id: r.to_dict() for r in results})
+                    json.dumps({r.task_id: r.to_dict() for r in results}, indent=2, default=str)
                 )
                 spend_log.run_end(reason="budget_backstop", error=str(e))
                 return 3
             print("\n=== Baseline results ===")
             (out_dir / "seed_baseline.json").write_text(
-                yaml.dump({r.task_id: r.to_dict() for r in results})
+                json.dumps({r.task_id: r.to_dict() for r in results}, indent=2, default=str)
             )
             spend_log.run_end(reason="completed" if len(results) == len(specs) else "stopped_early")
             return 0
@@ -443,7 +479,6 @@ def _run_live(args: argparse.Namespace) -> int:
         # GEPA's own retained result. Without this, the exact frontmatter-
         # duplication bug the live-eval guard exists to prevent could still
         # land in the file this writes and get applied for real.
-        from benchmarks.self_improve.live_eval import _sanitize_candidate
         optimized = _sanitize_candidate(dict(result.best_candidate))
         (out_dir / "optimized_components.yaml").write_text(yaml.dump(optimized, sort_keys=True))
         print(f"\nWrote optimized component text to {out_dir / 'optimized_components.yaml'}")

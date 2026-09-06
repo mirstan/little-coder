@@ -204,7 +204,7 @@ def main() -> int:
     repo_root = Path(args.repo_root).resolve()
     components_yaml = _resolve_components_yaml(repo_root, args.components_config)
 
-    trajectories, _empty_sources = ingest_all(log_roots, repo_root=repo_root)
+    trajectories, empty_sources = ingest_all(log_roots, repo_root=repo_root)
     components = load_components(components_yaml, repo_root=repo_root)
 
     weights_path = components_yaml.parent / "benchmark_weights.yaml"
@@ -213,6 +213,14 @@ def main() -> int:
         weights = yaml.safe_load(weights_path.read_text()) or DEFAULT_WEIGHTS
 
     dry_run_report(trajectories, components, weights)
+    if empty_sources:
+        # ingest_all()'s own docstring says this return value exists so a
+        # run can't "believe a source was ingested when it was never even
+        # attempted" -- printing it here (not just the logger.warning inside
+        # ingest_all, which can scroll off above the report) is what
+        # actually keeps that promise for a human reading the final output.
+        print(f"\nWARNING: requested source(s) yielded ZERO trajectories: {sorted(empty_sources)} "
+              "-- the report above does not include them.", file=sys.stderr)
     return 0
 
 

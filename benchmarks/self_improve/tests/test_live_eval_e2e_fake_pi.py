@@ -96,8 +96,8 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
     monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
 
-    def _make(cache=None):
-        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+    def _make(cache=None, budget=None, pi_bin=FAKE_PI, per_exercise_timeout_s=60):
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=pi_bin) as wt:
             yield PolyglotLiveRunner(
                 worktree=wt,
                 components_yaml=source_repo / "config" / "components.yaml",
@@ -105,7 +105,8 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
                 max_attempts=2,
                 benchmark_root=fake_practice,
                 cache=cache,
-                per_exercise_timeout_s=60,
+                per_exercise_timeout_s=per_exercise_timeout_s,
+                budget=budget,
             )
 
     return _make
@@ -217,3 +218,56 @@ def test_cache_hit_skips_the_subprocess_entirely(runner_factory, tmp_path, monke
     assert second[0].from_cache is True
     assert second[0].status == first[0].status
     assert second[0].score == first[0].score
+
+
+def test_materialize_raises_when_candidate_has_a_component_not_in_components_yaml(runner_factory):
+    """Real bug, confirmed by review: write_components_back() only logs a
+    warning and silently skips a pred_name absent from the pinned
+    components.yaml -- every candidate variant of an unmapped component
+    would then materialize to IDENTICAL worktree content and score
+    identically, the exact "score independent of candidate text" failure
+    class this whole live-execution design exists to eliminate."""
+    for runner in runner_factory():
+        with pytest.raises(ValueError, match="not present in"):
+            runner.materialize({"agents_md": "text", "totally_unmapped_pred_name": "other text"})
+
+
+def test_run_config_includes_the_pi_binary(runner_factory):
+    for runner in runner_factory():
+        assert runner.run_config["pi_bin"] == str(FAKE_PI)
+
+
+def test_run_config_pi_bin_changes_with_a_different_binary(runner_factory, tmp_path):
+    """Real bug, confirmed by review: the pi binary IS the agent under
+    test -- omitting it from run_config meant a cache entry produced via
+    LITTLE_CODER_PI_BIN_OVERRIDE (e.g. a fake_pi.py smoke run) could be read
+    back as a genuine result by a later real run with the same model/etc."""
+    other_pi = tmp_path / "other_fake_pi.py"
+    other_pi.write_text(FAKE_PI.read_text())
+    for runner in runner_factory():
+        config_a = runner.run_config
+    for runner in runner_factory(pi_bin=other_pi):
+        config_b = runner.run_config
+    assert config_a["pi_bin"] != config_b["pi_bin"]
+
+
+def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, monkeypatch, tmp_path):
+    """Real bug, confirmed by review: clamping the subprocess timeout to
+    the remaining wall-clock budget, then treating the resulting kill as an
+    ordinary subprocess timeout, fabricated a real-looking harness_error/0.0
+    score for a run that was killed for budget reasons -- violating
+    LiveBudget's own documented invariant that a budget refusal must never
+    look like a genuine, scoreable outcome."""
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
+
+    monkeypatch.setenv("FAKE_PI_MODE", "sleep_forever")
+    monkeypatch.setenv("FAKE_PI_SLEEP_S", "30")
+    # per_exercise_timeout_s is generously large; the BUDGET deadline is what
+    # actually clamps the effective timeout down to ~2s, well short of the
+    # fake_pi process's own 30s sleep.
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 2, max_live_runs=1000)
+    for runner in runner_factory(budget=budget, per_exercise_timeout_s=120):
+        with pytest.raises(LiveEvalBudgetExceeded):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])

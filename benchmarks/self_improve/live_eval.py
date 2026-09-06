@@ -20,9 +20,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import yaml
+
 from benchmarks.self_improve.components import split_frontmatter, write_components_back
 from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
+from benchmarks.self_improve.live_budget import LiveEvalBudgetExceeded
 from benchmarks.self_improve.live_cache import LiveResultCache
 from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
@@ -146,15 +149,25 @@ class PolyglotLiveRunner:
         """Everything besides the candidate text that changes what a score
         means. Includes the harness files' own sha256 so a mid-project
         harness bugfix can't let a stale cache entry poison a later
-        comparison."""
+        comparison. Hashed from the WORKTREE copy (pinned at base_commit,
+        which is itself already part of this config), not the source repo --
+        hashing the source would make an uncommitted debug edit or a branch
+        switch in the source checkout change the cache key without changing
+        a single byte of what actually executes, causing spurious re-runs of
+        already-cached (and possibly still in-flight) work."""
         harness_files = [
-            self.worktree.source_repo_root / "benchmarks" / "aider_polyglot.py",
-            self.worktree.source_repo_root / "benchmarks" / "rpc_client.py",
+            self.worktree.path / "benchmarks" / "aider_polyglot.py",
+            self.worktree.path / "benchmarks" / "rpc_client.py",
         ]
         hasher = hashlib.sha256()
         for f in harness_files:
             if f.exists():
                 hasher.update(f.read_bytes())
+        pi_bin = Path(self.worktree.pi_bin)
+        try:
+            pi_bin_mtime = pi_bin.stat().st_mtime
+        except OSError:
+            pi_bin_mtime = None
         return {
             "model": self.model,
             "language": self.language,
@@ -169,6 +182,14 @@ class PolyglotLiveRunner:
             # versa) -- both change what a cached score actually measures.
             "benchmark_root": str(self.benchmark_root) if self.benchmark_root else None,
             "per_exercise_timeout_s": self.per_exercise_timeout_s,
+            # The pi binary IS the agent under test -- omitting it means a
+            # smoke run through fake_pi.py (LITTLE_CODER_PI_BIN_OVERRIDE) can
+            # populate the cache with fabricated results that a later real
+            # run, with an identical candidate/model/etc, would then read
+            # back as genuine. mtime (not a full content hash) also catches
+            # an `npm install` bumping the real pi binary mid-project.
+            "pi_bin": str(pi_bin),
+            "pi_bin_mtime": pi_bin_mtime,
         }
 
     def materialize(self, candidate: Mapping[str, str]) -> list[Path]:
@@ -177,6 +198,23 @@ class PolyglotLiveRunner:
         the tree changed."""
         self.worktree.reset()
         sanitized = _sanitize_candidate(candidate)
+        mapping = yaml.safe_load(Path(self.components_yaml).read_text()) or {}
+        unmapped = sorted(set(sanitized) - set(mapping))
+        if unmapped:
+            # write_components_back() only logs a warning and skips a
+            # pred_name absent from the pinned components.yaml -- every GEPA
+            # rewrite of an unmapped component would then be silently
+            # dropped, so every candidate variant materializes to the SAME
+            # worktree content and scores identically: the exact "score
+            # independent of candidate text" failure class this whole
+            # live-execution design exists to eliminate.
+            raise ValueError(
+                f"candidate has component(s) {unmapped} not present in "
+                f"{self.components_yaml} at the pinned commit {self.worktree.base_commit} -- "
+                "every proposed rewrite of these would be silently dropped and scored as a "
+                "no-op. Commit a components.yaml entry for them first, or use --only-components "
+                "to scope the candidate down to what's actually mapped."
+            )
         changed = write_components_back(self.components_yaml, self.worktree.path, sanitized)
         self.worktree.assert_only_expected_dirty(changed)
         return changed
@@ -240,8 +278,12 @@ class PolyglotLiveRunner:
         # larger) per_exercise_timeout_s could let --max-wall-clock-s be
         # exceeded by up to one full exercise timeout once it's underway.
         effective_timeout = self.per_exercise_timeout_s
+        budget_clamped = False
         if self.budget is not None:
-            effective_timeout = max(1.0, min(effective_timeout, self.budget.remaining_seconds()))
+            remaining = self.budget.remaining_seconds()
+            if remaining < effective_timeout:
+                effective_timeout = max(1.0, remaining)
+                budget_clamped = True
 
         proc = subprocess.Popen(
             cmd, cwd=str(self.worktree.path), env=env,
@@ -260,11 +302,33 @@ class PolyglotLiveRunner:
             except subprocess.TimeoutExpired:
                 self._kill_process_group(proc)
                 _stdout, stderr = proc.communicate()
+                if budget_clamped:
+                    # This kill was a budget decision, not a genuine
+                    # exercise timeout -- the exercise might well have
+                    # passed given its full per_exercise_timeout_s. Raising
+                    # (rather than returning a "harness_error"/0.0 result)
+                    # honors LiveBudget's own documented invariant: a budget
+                    # refusal must never look like a real, scoreable outcome.
+                    raise LiveEvalBudgetExceeded(
+                        f"wall-clock hard deadline reached while running {spec.task_id!r} "
+                        f"(killed after {effective_timeout:.0f}s of remaining budget, "
+                        f"short of its {self.per_exercise_timeout_s}s normal timeout)"
+                    )
                 return LiveRunResult(
                     task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
                     status="harness_error", score=0.0, success=False,
                     error=f"subprocess timed out after {effective_timeout:.0f}s",
                 )
+            except BaseException:
+                # Any other exception unwinding here (notably the
+                # KeyboardInterrupt run_gepa.py's own signal handler raises
+                # on a second Ctrl-C) must not leave this detached
+                # (start_new_session=True) subprocess running -- it never
+                # received the interrupt itself, and would otherwise keep
+                # driving a real paid rollout against a worktree the caller
+                # may be about to remove.
+                self._kill_process_group(proc)
+                raise
         finally:
             self.worktree.set_active_pid(None)
 
@@ -374,8 +438,21 @@ class PolyglotLiveRunner:
     def _compute_diff(self, spec: ExerciseSpec, workdir: Path) -> str:
         """Real diff between the agent's actual code and the pristine stub
         -- the single most useful thing a reflection LM can see, per the
-        live-eval plan doc."""
+        live-eval plan doc.
+
+        Python-only: for any other --language this silently returns "" (the
+        reflection LM just never sees a diff block for that exercise) rather
+        than raising, since aider_polyglot.py itself supports other
+        languages. Warn loudly so this gap is visible rather than a silent
+        quality regression for non-Python runs."""
         if self.benchmark_root is None:
+            return ""
+        if spec.language != "python":
+            logger.warning(
+                "_compute_diff: no diff support for language %r (exercise %r) -- the "
+                "reflective feedback for this run will be missing the code-change block.",
+                spec.language, spec.exercise,
+            )
             return ""
         pristine_dir = practice_dir(self.benchmark_root, spec.language) / spec.exercise
         if not pristine_dir.is_dir():
