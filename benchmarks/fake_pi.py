@@ -307,6 +307,24 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "emit_tool_error_then_solve":
+        # Regression fixture for live_eval.py's summarized_transcript
+        # (summarize_for_reflection): a recoverable tool failure mid-run,
+        # followed by a real solve -- proves the error still reaches
+        # reflection even though the attempt ultimately passes.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "tool_execution_start", "toolCallId": "e1", "toolName": "bash",
+              "args": {"command": "chmod +x ./run.sh"}})
+        emit({"type": "tool_execution_end", "toolCallId": "e1", "toolName": "bash",
+              "result": {"content": [{"type": "text", "text": "chmod: run.sh: Permission denied"}]},
+              "isError": True})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "sleep_forever":
         # Like hang_after_ack, but the sleep duration is configurable so a
         # deadline/timeout test doesn't have to wait out a hardcoded 3600s.

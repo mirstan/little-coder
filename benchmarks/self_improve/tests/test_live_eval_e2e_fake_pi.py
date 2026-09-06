@@ -144,6 +144,20 @@ def test_reasoning_excerpt_is_reconstructed_from_thinking_delta_chunks(runner_fa
     assert "Let me read the stub" not in result.transcript_excerpt
 
 
+def test_summarized_transcript_surfaces_a_recoverable_tool_error(runner_factory, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "emit_tool_error_then_solve")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    result = results[0]
+    # The attempt still ultimately passes -- the point is that reflection
+    # sees the recoverable error anyway, not just the happy ending.
+    assert result.status == "pass_1"
+    assert "[ERROR]" in result.summarized_transcript
+    assert "bash" in result.summarized_transcript
+    assert "Permission denied" in result.summarized_transcript
+
+
 def test_pipeline_scores_a_genuine_failure_as_zero(runner_factory, monkeypatch):
     monkeypatch.setenv("FAKE_PI_MODE", "clean")  # writes nothing relevant
     for runner in runner_factory():

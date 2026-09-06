@@ -144,6 +144,15 @@ def test_reflective_dataset_generated_outputs_includes_reasoning_excerpt():
     assert record["Generated Outputs"]["reasoning_excerpt"] == "thought about it"
 
 
+def test_reflective_dataset_generated_outputs_includes_summarized_transcript():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", summarized_transcript="[ERROR] bash(...) -> boom")})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    record = adapter.make_reflective_dataset({"skills_tools_bash": "text"}, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert record["Generated Outputs"]["summarized_transcript"] == "[ERROR] bash(...) -> boom"
+
+
 def test_reflective_dataset_says_not_injected_when_component_absent_from_notifications():
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a", notifications=[])})

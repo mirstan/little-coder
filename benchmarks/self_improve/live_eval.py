@@ -26,6 +26,7 @@ import yaml
 from benchmarks.self_improve.components import split_frontmatter, write_components_back
 from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
+from benchmarks.self_improve.ingest.common import summarize_for_reflection
 from benchmarks.self_improve.live_budget import LiveEvalBudgetExceeded
 from benchmarks.self_improve.live_cache import LiveResultCache
 from benchmarks.self_improve.scratch_worktree import ScratchWorktree
@@ -137,6 +138,12 @@ class LiveRunResult:
     test_output_tail: str = ""
     transcript_excerpt: str = ""
     reasoning_excerpt: str = ""
+    #: Error tool calls first ("[ERROR] name(args) -> result_text"), then a
+    #: backfill of assistant_text's tail -- see
+    #: ingest/common.py::summarize_for_reflection, reused verbatim here so a
+    #: tool crash reaches reflection deliberately instead of only incidentally
+    #: (via the model's own prose, or a downstream pytest failure).
+    summarized_transcript: str = ""
     diff_summary: str = ""
     notifications: list = field(default_factory=list)
     error: str | None = None
@@ -484,6 +491,7 @@ class PolyglotLiveRunner:
 
         transcript_excerpt = ""
         reasoning_excerpt = ""
+        summarized_transcript = ""
         # Unioned across EVERY attempt, not just the latest: a component
         # (e.g. a skill) can be injected on an earlier failed attempt whose
         # guidance still shapes a LATER attempt's success (or a retry can
@@ -508,8 +516,12 @@ class PolyglotLiveRunner:
             latest = traj_files[-1]
             try:
                 traj_data = json.loads(latest.read_text())
-                transcript_excerpt = (traj_data.get("assistant_text") or "")[-_MAX_TRANSCRIPT_CHARS:]
+                full_assistant_text = traj_data.get("assistant_text") or ""
+                transcript_excerpt = full_assistant_text[-_MAX_TRANSCRIPT_CHARS:]
                 reasoning_excerpt = _reasoning_excerpt_from_trajectory(traj_data)
+                summarized_transcript = summarize_for_reflection(
+                    full_assistant_text, traj_data.get("tool_calls") or [],
+                )
             except (json.JSONDecodeError, OSError):
                 pass
             workdir = ex_log_dir / f"workdir_{_attempt_num(latest)}"
@@ -522,7 +534,7 @@ class PolyglotLiveRunner:
             stop_reasons=stop_reasons, elapsed_s=record.get("elapsed_s", 0.0) or 0.0,
             turn_count=record.get("turn_count", 0) or 0,
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
-            reasoning_excerpt=reasoning_excerpt,
+            reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
             diff_summary=diff_summary, notifications=notifications,
             **base_kwargs,
         )
