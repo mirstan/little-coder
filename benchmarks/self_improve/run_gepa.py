@@ -112,7 +112,7 @@ def _check_gates(args: argparse.Namespace) -> list[str]:
             "'unlimited' mode here -- every metric call is a real live exercise run."
         )
 
-    if args.reflection_minibatch_size <= 0:
+    if not args.baseline_only and args.reflection_minibatch_size <= 0:
         messages.append(f"--reflection-minibatch-size must be > 0, got {args.reflection_minibatch_size}.")
 
     # select_exercises() ignores --exercise-count entirely when --exercises

@@ -258,14 +258,17 @@ class PolyglotLiveRunner:
                 if self.budget is not None:
                     self.budget.record_live_run()
                 results[spec.task_id] = result
-                if self.cache is not None:
-                    self.cache.put(candidate, run_config, spec.task_id, result.to_dict())
                 # Emitted here, per-result, rather than after the whole batch
                 # returns -- a later exercise in this same batch raising
                 # (e.g. the budget backstop above) must not erase the audit
-                # trail for exercises that already genuinely ran.
+                # trail for exercises that already genuinely ran. Fired
+                # BEFORE cache.put(): if the memo write itself raises (disk
+                # I/O), the audit record for an exercise that DID genuinely
+                # run must not be lost along with it.
                 if self.on_result is not None:
                     self.on_result(result)
+                if self.cache is not None:
+                    self.cache.put(candidate, run_config, spec.task_id, result.to_dict())
 
         return [results[spec.task_id] for spec in specs]
 
@@ -364,16 +367,30 @@ class PolyglotLiveRunner:
         looked up via os.getpgid(proc.pid), which can raise ProcessLookupError
         (and previously caused this whole method to give up) once the direct
         child has exited even while its process group still has live
-        descendants to reach."""
+        descendants to reach.
+
+        Escalation to SIGKILL is decided from the GROUP's own liveness, not
+        proc.wait()'s return: if the direct child exits quickly but a
+        descendant still holds the pipes open and ignores SIGTERM,
+        proc.wait() returns immediately (only ever waiting on the direct
+        child) -- naively treating that as "done" would skip SIGKILL
+        entirely and leave the caller's subsequent communicate() call
+        hanging forever on pipes that never close."""
         pgid = proc.pid
         try:
             os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            pass
+        try:
+            os.killpg(pgid, 0)  # raises ProcessLookupError iff the WHOLE group is gone
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 

@@ -288,6 +288,25 @@ def test_estimate_only_exits_zero_and_creates_no_worktree(source_repo, fake_prac
     assert not (out_dir / "spend_log.jsonl").exists()
 
 
+def test_main_reports_a_clean_error_when_components_config_escapes_repo_root(
+    source_repo, tmp_path, monkeypatch,
+):
+    """End-to-end version of test_resolve_components_yaml_raises_a_clean_error_
+    when_absolute_path_escapes_repo_root above: that test only exercises the
+    private helper directly, so it would keep passing even if _run_live's own
+    try/except around the call were ever removed, silently regressing the CLI
+    back to a raw traceback -- --estimate-only reaches _resolve_components_yaml
+    without needing any of the spend-gate flags, so this is a free, real check
+    of the actual refusal message a user would see."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    escaping_config = tmp_path.parent / "outside-repo-root" / "components.yaml"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", str(escaping_config),
+        "--estimate-only",
+    ])
+    assert code == 1
+
+
 def test_missing_gate_flags_refuse_before_touching_anything(source_repo, fake_practice, tmp_path, monkeypatch):
     monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
     out_dir = tmp_path / "run_out"
