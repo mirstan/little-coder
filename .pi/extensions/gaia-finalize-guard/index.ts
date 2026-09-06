@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
+import { resolveTurnCap } from "../_shared/turn-cap.ts";
 
 // GAIA's prompt (benchmarks/gaia.py:_build_prompt) instructs the model to end
 // its final reply with a single line: `Answer: <value>`. gaia_scorer.py's
@@ -51,23 +52,18 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 const ANSWER_LINE_RE = /^\s*(?:final\s+answer|answer)\s*[:\-][ \t]*(\S.*)$/im;
 
 let nudgedThisRun = false;
-// Mirrors turn-cap's own turn counting (turnsThisRun/capForRun), duplicated
-// rather than imported since turn-cap keeps this state module-private. A
-// steer queued on turn N becomes the prompt for turn N+1 — but if N+1 would
-// exceed turn-cap's limit, turn-cap aborts at that turn's turn_start before
-// the model ever sees the nudge (turn-cap fires first: ctx.abort() there
-// happens synchronously in the same before-generation window, so the
-// steered message never reaches the model). Nudging in that situation is
-// pure waste, so skip it once we're already at the cap.
+// Mirrors turn-cap's own turn counting: the cap VALUE comes from the shared
+// resolveTurnCap() (same resolution turn-cap and finalize-warn use), but the
+// turnsThisRun counter itself stays local — it's per-extension mutable
+// state, not something to share. A steer queued on turn N becomes the
+// prompt for turn N+1 — but if N+1 would exceed turn-cap's limit, turn-cap
+// aborts at that turn's turn_start before the model ever sees the nudge
+// (turn-cap fires first: ctx.abort() there happens synchronously in the
+// same before-generation window, so the steered message never reaches the
+// model). Nudging in that situation is pure waste, so skip it once we're
+// already at the cap.
 let turnsThisRun = 0;
 let capForRun = 0;
-
-function envTurnCap(): number {
-  const raw = process.env.LITTLE_CODER_MAX_TURNS;
-  if (!raw) return 0;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
@@ -76,9 +72,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     turnsThisRun = 0;
-    const opts: any = (event as any).systemPromptOptions ?? {};
-    const lcCap = Number(opts?.littleCoder?.maxTurns);
-    capForRun = Number.isFinite(lcCap) && lcCap > 0 ? lcCap : envTurnCap();
+    capForRun = resolveTurnCap(event);
   });
 
   pi.on("turn_start", async () => {
@@ -131,9 +125,11 @@ export default function (pi: ExtensionAPI) {
 
     try {
       pi.sendUserMessage(
-        "Your last reply didn't call a tool or end with `Answer: <value>`. " +
-          "If you're still working, call a tool to continue. If you have your answer, " +
-          "restate it ending with that exact line.",
+        "Your last reply didn't call a tool or end with a final line of exactly " +
+          "Answer: <value> (plain text, no code formatting or quotes around the value — " +
+          "the scorer only strips \" and ' from around it, not backticks). If you're " +
+          "still working, call a tool to continue. If you have your answer, restate it " +
+          "ending with that exact plain-text line.",
         { deliverAs: "steer" },
       );
     } catch {
@@ -143,10 +139,14 @@ export default function (pi: ExtensionAPI) {
       // nothing extra.
       return;
     }
-    // Only claim the one-shot slot and surface the notification once the
-    // send has actually succeeded — otherwise a failed send both burns the
-    // only nudge this run gets and shows an intervention message for
-    // something that was never delivered.
+    // Claim the one-shot slot and surface the notification only past this
+    // point — pi's sendUserMessage binding is fire-and-forget (returns void;
+    // an actual delivery failure surfaces later via pi's own emitError, not
+    // a catchable exception here), so this ordering can't confirm real
+    // delivery. What it DOES guarantee: a synchronous throw (the binding
+    // missing entirely, or a stale ctx) can't burn the one-shot slot or show
+    // a misleading "asking the model to..." notification for a call that
+    // never happened at all.
     nudgedThisRun = true;
     harnessIntervention(
       ctx,

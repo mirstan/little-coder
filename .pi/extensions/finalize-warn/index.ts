@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
+import { resolveTurnCap } from "../_shared/turn-cap.ts";
 
 // Pre-cap finalize-warn: when the agent has WARN_REMAINING turns left
 // (this turn included), inject a follow-up user message reminding it to
@@ -26,20 +27,11 @@ let turnsThisRun = 0;
 let capForRun = 0;
 let warnedThisRun = false;
 
-function envCap(): number {
-  const raw = process.env.LITTLE_CODER_MAX_TURNS;
-  if (!raw) return 0;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
 export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     turnsThisRun = 0;
     warnedThisRun = false;
-    const opts: any = (event as any).systemPromptOptions ?? {};
-    const lcCap = Number(opts?.littleCoder?.maxTurns);
-    capForRun = Number.isFinite(lcCap) && lcCap > 0 ? lcCap : envCap();
+    capForRun = resolveTurnCap(event);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -57,7 +49,8 @@ export default function (pi: ExtensionAPI) {
     warnedThisRun = true;
     const msg =
       `You have ${WARN_REMAINING} turns left. Produce your final reply now, ` +
-      `ending with a single line: \`Answer: <value>\`. ` +
+      `ending with a final line of exactly: Answer: <value> ` +
+      `(plain text, no code formatting or quotes around the value). ` +
       `Do not start new tool chains; if you need a fact you don't have, ` +
       `answer with your best supported guess from EvidenceList rather than ` +
       `leaving it blank.`;
