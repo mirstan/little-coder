@@ -356,3 +356,66 @@ def test_confirmation_error_survives_when_the_same_attempt_then_crashes(tmp_path
     errors = saved["meta"]["environment_snapshot"]["errors"]
     confirm_errors = [e for e in errors if e["source"] == "confirmed_thinking"]
     assert len(confirm_errors) == 1, "confirmation error must survive even though _run_exercise raised afterward"
+
+
+class _EmptyThinkingLevelRpc:
+    """get_state() succeeds but returns no thinkingLevel -- must not be
+    silently indistinguishable from "never attempted"."""
+
+    def __init__(self, *a, **kw):
+        self.cwd = Path(kw["cwd"])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def notifications(self):
+        return []
+
+    def get_state(self):
+        return {}
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "ex.py").write_text("fixed")
+
+        class R:
+            stop_reason = "agent_end"
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = "did work"
+            tool_calls = [{"name": "write"}]
+        return R()
+
+
+def test_successful_but_empty_get_state_records_an_error_not_silence(tmp_path, monkeypatch):
+    """A successful get_state() response with no thinkingLevel must leave a
+    breadcrumb -- otherwise confirmed_live=None, error=None reads exactly
+    like the confirmation was never attempted at all."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": lambda s, w: (AP._copy_exercise(s, w), ([w / "ex.py"], []))[1],
+        "run_tests": lambda where, timeout: (True, "ok"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _EmptyThinkingLevelRpc)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+    monkeypatch.setattr(AP, "RESULTS_FILE", tmp_path / "results.json")
+    monkeypatch.setattr(sys, "argv", [
+        "aider_polyglot.py", "--language", "faker", "--model", "fake/model",
+    ])
+
+    AP.main()
+
+    saved = json.loads((tmp_path / "results.json").read_text())
+    snap = saved["meta"]["environment_snapshot"]
+    assert snap["thinking"]["confirmed_live"] is None
+    confirm_errors = [e for e in snap["errors"] if e["source"] == "confirmed_thinking"]
+    assert len(confirm_errors) == 1, "empty thinkingLevel must be recorded as a breadcrumb, not silence"

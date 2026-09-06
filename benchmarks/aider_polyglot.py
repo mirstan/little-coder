@@ -681,7 +681,19 @@ def _run_exercise(
                         # happened and is visible to the caller regardless.
                         thinking_confirmation["attempted"] = True
                         try:
-                            thinking_confirmation["confirmed_live"] = rpc.get_state().get("thinkingLevel")
+                            state = rpc.get_state()
+                            level = state.get("thinkingLevel")
+                            if level:
+                                thinking_confirmation["confirmed_live"] = level
+                            else:
+                                # A successful response with no usable
+                                # thinkingLevel must not look identical to
+                                # "never attempted" -- both confirmed_live
+                                # and error staying None would be exactly
+                                # that ambiguity.
+                                thinking_confirmation["error"] = (
+                                    f"get_state succeeded but returned no thinkingLevel: {state!r}"
+                                )
                         except Exception as exc:
                             thinking_confirmation["error"] = f"{type(exc).__name__}: {exc}"
                     # prompt_and_collect() returns partial events *silently*
