@@ -120,6 +120,7 @@ class PolyglotLiveRunner:
         cache: LiveResultCache | None = None,
         per_exercise_timeout_s: int | None = None,
         python_executable: str = sys.executable,
+        budget=None,
     ):
         self.worktree = worktree
         self.components_yaml = Path(components_yaml)
@@ -130,6 +131,11 @@ class PolyglotLiveRunner:
         self.thinking = thinking
         self.benchmark_root = Path(benchmark_root) if benchmark_root else None
         self.cache = cache
+        #: Optional live_budget.LiveBudget -- checked before every live run
+        #: (never before a cache hit) and RAISES rather than letting a run
+        #: it refuses to start silently score 0.0, which would poison the
+        #: search with a reason that has nothing to do with the candidate.
+        self.budget = budget
         # 900s/attempt (aider_polyglot's own ATTEMPT_TIMEOUT_S default) + 90s
         # test budget, times max_attempts, plus headroom -- a belt-and-braces
         # ceiling ABOVE aider_polyglot's own per-attempt budget so a wedged
@@ -194,7 +200,11 @@ class PolyglotLiveRunner:
         if misses:
             self.materialize(candidate)
             for spec in misses:
+                if self.budget is not None:
+                    self.budget.check_before_exercise(spec.task_id)  # raises rather than faking a score
                 result = self._run_one_uncached(spec)
+                if self.budget is not None:
+                    self.budget.record_live_run()
                 results[spec.task_id] = result
                 if self.cache is not None:
                     self.cache.put(candidate, run_config, spec.task_id, result.to_dict())

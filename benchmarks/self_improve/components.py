@@ -10,7 +10,6 @@ repo-relative file path.
 import logging
 from pathlib import Path
 
-import dspy
 import yaml
 
 from benchmarks.self_improve.path_safety import resolve_contained_path
@@ -69,51 +68,6 @@ def load_components(components_yaml_path: Path, repo_root: Path) -> dict[str, st
         _frontmatter, body = split_frontmatter(text)
         components[pred_name] = body
     return components
-
-
-class HarnessProgram(dspy.Module):
-    """Addressable text container for GEPA: one dspy.Predict per artifact.
-
-    forward() calls EVERY predictor once per rollout so a real trace entry
-    exists for each one GEPA might attribute credit/blame to during
-    reflection (dspy's GEPA requires at least one real (predictor, inputs,
-    prediction) trace entry per predictor being optimized -- an empty trace
-    for any predictor crashes make_reflective_dataset(), confirmed against
-    installed dspy-ai 3.3.1 source, dspy/teleprompt/gepa/gepa_utils.py).
-
-    forward() does NOT take pred_name as an input: GEPA calls
-    program(**example.inputs()) using only the example's declared input
-    fields, and determines which predictor produced which trace entry by
-    inspecting dspy.settings.trace afterward -- pred_name is supplied to
-    OUR metric() by GEPA's own machinery, never by the caller of forward().
-
-    Scoring never depends on forward()'s actual output text -- metric()
-    reads gold.trajectory (historical, already-collected data) regardless
-    of what any predictor returns here. Run under dspy.settings.configure(
-    lm=DummyLM(...)) so every one of these calls is free and makes no
-    network request; see run_gepa.py.
-    """
-    def __init__(self, components: dict[str, str]):
-        super().__init__()
-        self.predictors: dict[str, dspy.Predict] = {}
-        for pred_name, body_text in components.items():
-            sig = dspy.make_signature(
-                "task_context -> guidance",
-                instructions=body_text,
-                signature_name=f"{pred_name}_signature",
-            )
-            self.predictors[pred_name] = dspy.Predict(sig)
-
-    def forward(self, task_context: str = ""):
-        outputs = {
-            name: predictor(task_context=task_context).guidance
-            for name, predictor in self.predictors.items()
-        }
-        return dspy.Prediction(**outputs)
-
-
-def build_harness_program(components: dict[str, str]) -> HarnessProgram:
-    return HarnessProgram(components)
 
 
 def write_components_back(
