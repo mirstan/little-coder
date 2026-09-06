@@ -88,6 +88,29 @@ def test_corrupt_entry_is_treated_as_a_miss_not_an_exception(tmp_path):
     assert cache.get(candidate, run_config, "python/wordy") is None
 
 
+def test_non_mapping_json_entry_is_treated_as_a_miss_not_an_exception(tmp_path):
+    """Valid JSON that isn't an object (e.g. a bare list) would otherwise be
+    returned as-is and crash far from here, deep inside
+    LiveRunResult.from_dict()'s **dict(d)."""
+    cache = LiveResultCache(tmp_path)
+    candidate = {"agents_md": "text"}
+    run_config = {"model": "m1"}
+    path = cache._path_for(candidate_hash(candidate), run_config_hash(run_config), "python/wordy")
+    path.parent.mkdir(parents=True)
+    path.write_text("[1, 2, 3]")
+    assert cache.get(candidate, run_config, "python/wordy") is None
+
+
+def test_invalid_utf8_entry_is_treated_as_a_miss_not_an_exception(tmp_path):
+    cache = LiveResultCache(tmp_path)
+    candidate = {"agents_md": "text"}
+    run_config = {"model": "m1"}
+    path = cache._path_for(candidate_hash(candidate), run_config_hash(run_config), "python/wordy")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00not valid utf8")
+    assert cache.get(candidate, run_config, "python/wordy") is None
+
+
 def test_writes_are_atomic_no_stray_tmp_file_left_behind(tmp_path):
     cache = LiveResultCache(tmp_path)
     candidate = {"agents_md": "text"}

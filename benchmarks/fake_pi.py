@@ -42,6 +42,7 @@ def _write_solution_files():
         target = os.path.join(os.getcwd(), rel_path)
         emit({"type": "tool_execution_start", "toolCallId": f"w{i}", "toolName": "write",
               "args": {"path": rel_path}})
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)  # matches the real pi write tool
         with open(target, "w") as fh:
             fh.write(content)
         emit({"type": "tool_execution_end", "toolCallId": f"w{i}", "toolName": "write",

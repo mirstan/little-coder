@@ -276,3 +276,45 @@ def test_baseline_only_end_to_end_real_pipeline(source_repo, fake_practice, tmp_
     seed_baseline = yaml.safe_load((out_dir / "seed_baseline.json").read_text())
     assert "python/wordy" in seed_baseline
     assert seed_baseline["python/wordy"]["status"] == "pass_1"
+
+
+def test_check_components_clean_catches_dirty_components_yaml_itself(source_repo):
+    """Real bug, confirmed by review: editing components.yaml to point a
+    pred_name at a DIFFERENT (already-committed) file left every mapped
+    file's own git status clean, so the old check missed that the mapping
+    itself -- what the scratch worktree will actually read at its pinned
+    commit -- had uncommitted changes."""
+    components_yaml = source_repo / "config" / "components.yaml"
+    components_yaml.write_text(components_yaml.read_text() + "\nextra_unmapped_key: AGENTS.md\n")
+    messages = run_gepa._check_components_clean(source_repo, components_yaml)
+    assert len(messages) == 1
+    assert "uncommitted changes" in messages[0]
+
+
+def test_baseline_only_stops_at_the_exact_max_metric_calls_cap(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real bug, confirmed by review: baseline-only's LiveBudget was
+    constructed with est.max_live_runs (max_metric_calls PLUS GEPA's
+    2*minibatch+valset overshoot allowance, which baseline mode never uses
+    at all), so a small --max-metric-calls cap silently let MORE exercises
+    run than requested. Here 3 exercises are selected but --max-metric-calls
+    1 must stop after exactly 1."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    out_dir = tmp_path / "run_out"
+    scratch_dir = tmp_path / "scratch"
+
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym,leap", "--exercise-count", "3", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "1",
+        "--out-dir", str(out_dir), "--scratch-dir", str(scratch_dir),
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
+    ])
+    assert code == 3  # budget backstop, not a full run of all 3 exercises
+    seed_baseline = yaml.safe_load((out_dir / "seed_baseline.json").read_text())
+    assert len(seed_baseline) == 1

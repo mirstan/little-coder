@@ -101,9 +101,19 @@ def _no_stray_real_worktrees():
     several feature branches). Every scratch-worktree test must operate
     against a THROWAWAY `git init` repo, never the real checkout -- this
     snapshots `git worktree list` on the REAL repo before and after the
-    whole test session and fails loudly if it ever changes, catching any
-    test (present or future) that accidentally touches real repo state
-    instead of a fixture repo."""
+    whole test session and fails loudly if it ever changes.
+
+    Limitation, confirmed by review: this only detects a NET change across
+    the whole session. A test that calls `scratch_worktree(REAL_REPO_ROOT,
+    ...)` -- the exact "touches real repo state instead of a fixture repo"
+    bug this fixture exists to catch -- both creates AND destroys that real
+    worktree within its own `with` block, so the porcelain snapshot is
+    identical before and after and this assertion never fires. It catches
+    LEAKED or OVERLAPPING real worktrees (e.g. a crash mid-test, or two
+    tests racing), not a transient one a single test cleanly creates and
+    removes against the real repo. `_forbid_real_pi` below is the stronger
+    per-test guard against the same class of mistake going all the way to a
+    real model call, but neither one closes this specific gap."""
     repo_root = Path(__file__).resolve().parents[3]
 
     def _snapshot() -> str:

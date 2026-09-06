@@ -125,12 +125,19 @@ capabilities confirmed in Layer 2.
 **Why**: first time real money, a real model under test, AND real live rollouts
 are involved. `run_gepa.py`'s `gepa.optimize()` call always scores candidates by
 actually running them — there is no cheaper offline substitute for this layer
-anymore, so scope tightly (one component, a small exercise set, a hard
-`--max-metric-calls` cap) to bound cost and make the output easy to judge by eye.
+anymore, so scope tightly (one component, a small exercise set,
+`--max-metric-calls` set low) to bound cost and make the output easy to judge by
+eye. `--max-metric-calls` is not itself the hard live-run ceiling: real live
+rollouts run up to `--max-metric-calls` **plus** the `2*reflection_minibatch_size
++ valset_size` overshoot allowance (`run_gepa.py --estimate-only` prints the
+actual number as "LIVE exercise executions"). Budget for that printed number,
+not the raw `--max-metric-calls` value, when deciding what a real invocation
+could cost.
 
 **Procedure**:
-1. Use the existing scoped config, `config/components_bash_only.yaml` (or create
-   one with exactly one entry: `skills_tools_bash -> skills/tools/bash.md`).
+1. Use the existing scoped config,
+   `benchmarks/self_improve/config/components_bash_only.yaml` (or create one
+   with exactly one entry: `skills_tools_bash -> skills/tools/bash.md`).
 2. **Always start with `--estimate-only`** (spends nothing, no worktree, no
    adapter) to see the projected live-run count and wall-clock ceiling before
    authorizing anything: `python -m benchmarks.self_improve.run_gepa --estimate-only --components-config <scoped yaml> --model <model under test> --confirm-live-rollouts --max-metric-calls <small N> --exercise-count <small> --val-count <small>`.

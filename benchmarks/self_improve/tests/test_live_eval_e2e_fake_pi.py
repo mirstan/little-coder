@@ -22,6 +22,14 @@ from benchmarks.self_improve.live_cache import LiveResultCache
 from benchmarks.self_improve.live_eval import PolyglotLiveRunner
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
+# This module unconditionally drives real `git init`/`git worktree add` and
+# real subprocesses -- unlike the sibling fake_pi tests, it never skips on a
+# minimal runner without git, which would otherwise hard-error every test
+# here (masking the rest of the self_improve suite's own results) instead of
+# skipping gracefully, the way the polyglot tests skip when
+# node_modules/.bin/pi is absent.
+pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is required for this e2e suite")
+
 REAL_REPO_ROOT = Path(__file__).resolve().parents[3]  # little-coder-self-improve/
 FAKE_PI = REAL_REPO_ROOT / "benchmarks" / "fake_pi.py"
 

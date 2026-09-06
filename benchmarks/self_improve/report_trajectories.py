@@ -46,6 +46,12 @@ def parse_log_roots(entries: list[str]) -> dict[str, str]:
                 f"Invalid --log-roots entry {entry!r}: unknown key {key!r}, "
                 f"expected one of {sorted(_KNOWN_LOG_ROOT_KEYS)}"
             )
+        if key in log_roots:
+            raise ValueError(
+                f"Invalid --log-roots entry {entry!r}: duplicate key {key!r} "
+                f"(already given as {log_roots[key]!r}) -- the earlier value would be "
+                "silently dropped, omitting requested data from the report with no error"
+            )
         log_roots[key] = value
     return log_roots
 
@@ -169,6 +175,16 @@ def dry_run_report(
     print("\n=== Report complete (no live execution, no GEPA, no LM calls) ===")
 
 
+def _resolve_components_yaml(repo_root: Path, components_config: str) -> Path:
+    """components.yaml paths are conventionally repo-relative -- resolving
+    against `cwd` instead silently breaks whenever --repo-root points
+    somewhere other than the caller's own working directory."""
+    rel = Path(components_config)
+    if rel.is_absolute():
+        rel = rel.relative_to(repo_root)
+    return repo_root / rel
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-roots", nargs="+", default=[],
@@ -185,10 +201,13 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    trajectories, _empty_sources = ingest_all(log_roots, repo_root=Path(args.repo_root))
-    components = load_components(Path(args.components_config), repo_root=Path(args.repo_root))
+    repo_root = Path(args.repo_root).resolve()
+    components_yaml = _resolve_components_yaml(repo_root, args.components_config)
 
-    weights_path = Path(args.components_config).parent / "benchmark_weights.yaml"
+    trajectories, _empty_sources = ingest_all(log_roots, repo_root=repo_root)
+    components = load_components(components_yaml, repo_root=repo_root)
+
+    weights_path = components_yaml.parent / "benchmark_weights.yaml"
     weights = DEFAULT_WEIGHTS
     if weights_path.exists():
         weights = yaml.safe_load(weights_path.read_text()) or DEFAULT_WEIGHTS

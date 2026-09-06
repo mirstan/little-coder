@@ -18,10 +18,13 @@ superseded design, not a spec to implement against. Everything else in this
 document (§0–5, §7–8: ingestion, schema, `components.py` roundtrip, the
 `rpc_client.py` system-prompt change) is unaffected and still accurate.
 
-Scope: build order steps 1–3 from the plan (`ingest/`, `metric.py`, `components.py` +
-`apply_results.py`'s roundtrip logic) plus the `rpc_client.py` system-prompt change,
-all fully test-driven. Steps 4+ (real GEPA runs) are explicitly out of scope for this
-spec — they are manual smoke tests, not unit-testable.
+Scope (historical, as originally written -- see the status note above for what
+actually exists today): build order steps 1–3 from the plan (`ingest/`,
+`metric.py`, `components.py` + `apply_results.py`'s roundtrip logic) plus the
+`rpc_client.py` system-prompt change, all fully test-driven. Steps 4+ (real
+GEPA runs) were explicitly out of scope for this spec — they were manual smoke
+tests, not unit-testable. `metric.py` no longer exists; do not implement
+against §6 below.
 
 Convention: every module below is specified as **test file first**, listing exact
 test names, fixture shapes, and assertions, followed by the **minimal implementation**
@@ -909,7 +912,7 @@ manually with `git status` showing it untracked after a run).
 
 ---
 
-## 9. Execution order for actually doing this
+## 9. Execution order for actually doing this (historical: describes the original build, §6/metric.py included; see the status note at the top for the current architecture)
 
 Work through sections 1 → 8 in order, each as its own red-green-refactor cycle:
 write the test file's contents, run `pytest` and confirm every test fails for the

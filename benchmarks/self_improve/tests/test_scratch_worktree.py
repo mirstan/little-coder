@@ -123,13 +123,33 @@ def test_worktree_removed_when_body_raises_keyboardinterrupt(source_repo, tmp_pa
     assert not scratch_path_holder["path"].exists()
 
 
-def test_keep_on_error_preserves_the_worktree(source_repo, tmp_path, capsys):
+def test_keep_preserves_worktree_on_normal_exit(source_repo, tmp_path, capsys):
     scratch_path_holder = {}
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
         scratch_path_holder["path"] = wt.path
     assert scratch_path_holder["path"].exists()
     assert "PRESERVED FOR POST-MORTEM" in capsys.readouterr().out
     # manual cleanup so this test doesn't itself leak a registration
+    subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path_holder["path"])],
+                    cwd=source_repo, check=True)
+
+
+def test_keep_preserves_worktree_on_exception_without_masking_it(source_repo, tmp_path, capsys):
+    """scratch_worktree()'s own docstring guarantees keep=True cleanup
+    'never masks an exception raised inside the `with` block' -- the
+    normal-exit test above doesn't exercise that path at all."""
+    scratch_path_holder = {}
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
+            scratch_path_holder["path"] = wt.path
+            raise _Boom("deliberate failure inside the with block")
+
+    assert scratch_path_holder["path"].exists()
+    assert "PRESERVED FOR POST-MORTEM" in capsys.readouterr().out
     subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path_holder["path"])],
                     cwd=source_repo, check=True)
 

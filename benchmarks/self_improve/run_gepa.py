@@ -135,14 +135,22 @@ def _load_component_paths(components_yaml_path: Path) -> dict[str, str]:
 
 
 def _check_components_clean(repo_root: Path, components_yaml_path: Path) -> list[str]:
-    """Refuse if any component file has uncommitted changes -- the seed
-    candidate is read from the working tree, but the scratch worktree is
-    checked out at a pinned commit. A mismatch there means the run isn't
-    evaluating what a human reviewing the resulting PR would think it is."""
+    """Refuse if components.yaml itself, or any component file it maps to,
+    has uncommitted changes -- the seed candidate is read from the working
+    tree, but the scratch worktree is checked out at a pinned commit. A
+    mismatch there means the run isn't evaluating what a human reviewing the
+    resulting PR would think it is.
+
+    components.yaml itself must be included: if it was just edited to point
+    a pred_name at a different (already-committed) file, that file's own git
+    status can be clean even though the MAPPING the scratch worktree will use
+    (read from the pinned commit) differs from the mapping just used to build
+    the seed candidate -- candidates would then be evaluated against the
+    wrong file, or silently dropped by write_components_back()'s own
+    mismatched-scope warning."""
+    paths = [str(components_yaml_path)]
     mapping = _load_component_paths(components_yaml_path)
-    paths = [str(repo_root / rel) for rel in mapping.values()]
-    if not paths:
-        return []
+    paths.extend(str(repo_root / rel) for rel in mapping.values())
     result = subprocess.run(["git", "status", "--porcelain", "--", *paths],
                              cwd=repo_root, capture_output=True, text=True)
     if result.returncode != 0 or not result.stdout.strip():
@@ -157,7 +165,14 @@ def _check_components_clean(repo_root: Path, components_yaml_path: Path) -> list
 
 
 def _resolve_exercises(args: argparse.Namespace):
-    benchmark_root = Path(args.benchmark_root) if args.benchmark_root else DEFAULT_BENCHMARK_ROOT
+    # Must be absolute: this same path is later handed to a subprocess whose
+    # cwd is the SCRATCH WORKTREE, not the caller's cwd -- a relative path
+    # would resolve to a different (missing) directory there, turning every
+    # exercise into a harness_error even though discovery just succeeded here.
+    if args.benchmark_root:
+        benchmark_root = Path(args.benchmark_root).expanduser().resolve()
+    else:
+        benchmark_root = DEFAULT_BENCHMARK_ROOT
     pdir = practice_dir(benchmark_root, args.language)
     available = discover_exercises(pdir)
     explicit = [e.strip() for e in args.exercises.split(",")] if args.exercises else None
@@ -246,8 +261,9 @@ def _run_live(args: argparse.Namespace) -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    stop_file = out_dir / "gepa.stop"
     print(f"\n  Run dir       : {out_dir}")
-    print(f"  Graceful stop : touch {out_dir / 'gepa.stop'}")
+    print(f"  Graceful stop : touch {stop_file}")
 
     if args.estimate_only:
         return 0
@@ -292,9 +308,15 @@ def _run_live(args: argparse.Namespace) -> int:
         cache = None if args.no_live_cache else LiveResultCache(
             Path(args.live_cache_dir) if args.live_cache_dir else out_dir / "live_cache"
         )
+        # A baseline-only run never touches gepa.optimize()'s own iteration
+        # loop, so est.max_live_runs' "+2B+V" overshoot allowance (meant for
+        # GEPA's parent/child minibatch + valset re-evaluation pattern) does
+        # not apply here -- with a small --max-metric-calls the padded
+        # allowance would let the runner execute MORE exercises than the cap
+        # actually authorized. Baseline mode's cap is exactly what was asked for.
         budget = LiveBudget(
             hard_deadline_monotonic=time.monotonic() + args.max_wall_clock_s,
-            max_live_runs=est.max_live_runs,
+            max_live_runs=args.max_metric_calls if args.baseline_only else est.max_live_runs,
         )
         runner = PolyglotLiveRunner(
             worktree=wt,
@@ -307,25 +329,52 @@ def _run_live(args: argparse.Namespace) -> int:
         )
 
         if args.baseline_only:
+            # No gepa.optimize() call here, so no GEPA-managed FileStopper --
+            # honor the same printed stop_file/signal-driven graceful stop by
+            # checking it between exercises (one runner.run_batch() call per
+            # exercise; each call still consults the on-disk memo first).
+            results = []
             try:
-                results = runner.run_batch(seed_candidate, specs)
+                for spec in specs:
+                    if stopper.requested or stop_file.exists():
+                        print(f"\nGraceful stop requested -- stopping baseline after "
+                              f"{len(results)}/{len(specs)} exercises.", file=sys.stderr)
+                        break
+                    (result_one,) = runner.run_batch(seed_candidate, [spec])
+                    results.append(result_one)
+                    print(f"  {result_one.task_id}: status={result_one.status} score={result_one.score:.2f} "
+                          f"{'(cached)' if result_one.from_cache else ''}")
+                    spend_log.exercise(exercise_id=result_one.task_id, status=result_one.status,
+                                        score=result_one.score, memo_hit=result_one.from_cache,
+                                        duration_s=result_one.elapsed_s)
             except LiveEvalBudgetExceeded as e:
                 print(f"\nBudget backstop fired: {e}", file=sys.stderr)
+                # Persist whatever DID run before the cap hit -- spend_log's
+                # whole purpose is to answer "what actually happened", and a
+                # backstop firing after partial progress is not a reason to
+                # discard that progress.
+                (out_dir / "seed_baseline.json").write_text(
+                    yaml.dump({r.task_id: r.to_dict() for r in results})
+                )
                 spend_log.run_end(reason="budget_backstop", error=str(e))
                 return 3
             print("\n=== Baseline results ===")
-            for r in results:
-                print(f"  {r.task_id}: status={r.status} score={r.score:.2f} "
-                      f"{'(cached)' if r.from_cache else ''}")
-                spend_log.exercise(exercise_id=r.task_id, status=r.status, score=r.score,
-                                    memo_hit=r.from_cache, duration_s=r.elapsed_s)
             (out_dir / "seed_baseline.json").write_text(
                 yaml.dump({r.task_id: r.to_dict() for r in results})
             )
-            spend_log.run_end(reason="completed")
+            spend_log.run_end(reason="completed" if len(results) == len(specs) else "stopped_early")
             return 0
 
-        adapter = PolyglotGEPAAdapter(runner, component_paths=component_paths, practice_dir_path=pdir)
+        from benchmarks.self_improve.ingest.common import build_knowledge_topic_index
+        knowledge_topic_index = build_knowledge_topic_index(repo_root)
+        adapter = PolyglotGEPAAdapter(
+            runner, component_paths=component_paths, practice_dir_path=pdir,
+            knowledge_topic_index=knowledge_topic_index,
+            on_result=lambda r: spend_log.exercise(
+                exercise_id=r.task_id, status=r.status, score=r.score,
+                memo_hit=r.from_cache, duration_s=r.elapsed_s,
+            ),
+        )
 
         import gepa
         from gepa.utils.stop_condition import TimeoutStopCondition
@@ -334,7 +383,25 @@ def _run_live(args: argparse.Namespace) -> int:
         if args.reflection_reasoning_effort:
             reflection_lm_kwargs["reasoning_effort"] = args.reflection_reasoning_effort
 
-        stop_callbacks = [stopper]
+        class _StopFileStopper:
+            """GEPA also auto-adds its own FileStopper at
+            <run_dir>/gepa.stop when run_dir= is passed, but that's a
+            different, nested path from the single one advertised in the
+            startup banner -- this checks the SAME path the banner prints,
+            so 'touch <that path>' is literally true regardless of run_dir."""
+            def __call__(self, gepa_state) -> bool:
+                return stop_file.exists()
+
+        class _SpendLogCallback:
+            def on_iteration_end(self, event) -> None:
+                state = event.get("state")
+                spend_log.iteration_end(
+                    iteration=event.get("iteration"),
+                    proposal_accepted=event.get("proposal_accepted"),
+                    total_num_evals=getattr(state, "total_num_evals", None),
+                )
+
+        stop_callbacks = [stopper, _StopFileStopper()]
         if args.max_wall_clock_s:
             stop_callbacks.append(TimeoutStopCondition(args.max_wall_clock_s * 0.8))
 
@@ -358,6 +425,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 track_best_outputs=True,
                 display_progress_bar=False,
                 run_dir=str(out_dir / "gepa"),
+                callbacks=[_SpendLogCallback()],
                 seed=args.seed,
                 raise_on_exception=True,
                 stop_callbacks=stop_callbacks,
@@ -367,12 +435,22 @@ def _run_live(args: argparse.Namespace) -> int:
             spend_log.run_end(reason="budget_backstop", error=str(e))
             return 3
 
-    optimized = dict(result.best_candidate)
-    (out_dir / "optimized_components.yaml").write_text(yaml.dump(optimized, sort_keys=True))
-    print(f"\nWrote optimized component text to {out_dir / 'optimized_components.yaml'}")
-    print("Review the diff, then use apply_results.py to open a PR -- nothing was "
-          "committed or pushed automatically.")
-    spend_log.run_end(reason="completed", total_metric_calls=getattr(result, "total_metric_calls", None))
+        # Sanitize before writing: GEPA's own candidate tracking (and hence
+        # best_candidate) carries whatever text the reflection LM proposed,
+        # including a re-emitted YAML frontmatter block if it "helpfully"
+        # produced one -- live_eval.py's materialize() strips that before
+        # every SCORING run, but that stripping never reaches back into
+        # GEPA's own retained result. Without this, the exact frontmatter-
+        # duplication bug the live-eval guard exists to prevent could still
+        # land in the file this writes and get applied for real.
+        from benchmarks.self_improve.live_eval import _sanitize_candidate
+        optimized = _sanitize_candidate(dict(result.best_candidate))
+        (out_dir / "optimized_components.yaml").write_text(yaml.dump(optimized, sort_keys=True))
+        print(f"\nWrote optimized component text to {out_dir / 'optimized_components.yaml'}")
+        print("Review the diff, then use apply_results.py to open a PR -- nothing was "
+              "committed or pushed automatically.")
+        spend_log.run_end(reason="completed", total_metric_calls=getattr(result, "total_metric_calls", None))
+
     return 0
 
 

@@ -93,9 +93,22 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
             continue
 
         if not path.exists():
-            if entry.get("prunable"):
+            # The marker lived INSIDE this now-gone directory, so it can
+            # never be checked here -- only remove automatically when the
+            # caller explicitly scoped us to a known scratch root (verified
+            # above via relative_to), which is real evidence this was ours.
+            # Without that, honor the stated "never touch without a marker"
+            # invariant literally and leave it for a plain `git worktree
+            # prune` (safe regardless, since the directory is already gone)
+            # rather than silently trusting "detached + prunable" alone.
+            if entry.get("prunable") and scratch_root_resolved is not None:
                 info["removable"] = True
-                info["reason"] = "directory gone, git already marks it prunable"
+                info["reason"] = "directory gone, git already marks it prunable, under configured scratch root"
+            elif entry.get("prunable"):
+                info["reason"] = (
+                    "directory gone, git marks it prunable, but no marker to verify and no "
+                    "--scratch-root given -- run `git worktree prune` directly if this is safe"
+                )
             else:
                 info["reason"] = "directory gone but git does not mark it prunable -- leave to `git worktree prune`"
             results.append(info)
@@ -114,7 +127,7 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
             results.append(info)
             continue
 
-        if not marker.get("little_coder_self_improve_scratch"):
+        if not isinstance(marker, dict) or not marker.get("little_coder_self_improve_scratch"):
             info["reason"] = "marker file present but missing the expected flag -- not ours, never touch"
             results.append(info)
             continue
@@ -122,6 +135,15 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
         info["marker"] = marker
         if _pid_alive(marker.get("pid")):
             info["reason"] = f"still running (pid {marker.get('pid')})"
+            results.append(info)
+            continue
+        # The orchestrator's own pid (above) can die on SIGKILL while a
+        # detached exercise subprocess (its own process group, recorded here
+        # by PolyglotLiveRunner) is still alive and actively using this
+        # worktree -- checking only the orchestrator's pid would call it
+        # orphaned and safe to remove out from under that live process.
+        if _pid_alive(marker.get("active_pid")):
+            info["reason"] = f"owning process is gone, but an exercise subprocess is still running (pid {marker.get('active_pid')})"
             results.append(info)
             continue
 
@@ -193,9 +215,15 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted.")
             return 2
 
+    # No unconditional repo-wide prune_stale() here: `git worktree remove
+    # --force` already deregisters each entry it succeeds on, and
+    # _remove_worktree() already prunes on its own failure fallback --
+    # a blanket prune afterward would also deregister OTHER prunable
+    # worktrees never selected by this invocation's own filters
+    # (--scratch-root / --older-than-hours), silently expanding a scoped
+    # cleanup into a repo-wide one.
     for entry in to_remove:
         _remove_worktree(repo_root, entry["path"])
-    prune_stale(repo_root)
     print(f"Removed {len(to_remove)} scratch worktree(s).")
     return 0
 

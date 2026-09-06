@@ -47,6 +47,31 @@ def test_estimate_warns_when_round_robin_cannot_reach_every_component():
     assert any("round_robin" in w for w in est.warnings)
 
 
+def test_iterations_use_ceiling_not_floor_division():
+    """GEPA's _should_stop is only checked at the TOP of the loop (the same
+    reason overshoot_allowance exists), so a partial remainder still buys
+    one more iteration attempt -- floor division would undercount that."""
+    est = estimate_cost(
+        max_metric_calls=101, valset_size=4, trainset_size=8, minibatch_size=2,
+        component_count=1, assumed_exercise_seconds=180, exercise_timeout_seconds=1800,
+    )
+    remaining = 101 - 4
+    assert est.iterations_worst_case == -(-remaining // 8)  # ceil(97/8) = 13, not floor's 12
+    assert est.iterations_best_case == -(-remaining // 4)   # ceil(97/4) = 25, not floor's 24
+
+
+def test_estimate_all_selector_reports_zero_components_when_no_iteration_affordable():
+    """The "all" selector otherwise claimed every component would be
+    optimized even when the budget can't afford a single iteration."""
+    est = estimate_cost(
+        max_metric_calls=4, valset_size=4, trainset_size=8, minibatch_size=2,
+        component_count=33, assumed_exercise_seconds=180, exercise_timeout_seconds=1800,
+        module_selector="all",
+    )
+    assert est.iterations_worst_case == 0
+    assert est.components_covered_worst == 0
+
+
 def test_estimate_does_not_warn_about_coverage_under_module_selector_all():
     est = estimate_cost(
         max_metric_calls=200, valset_size=4, trainset_size=8, minibatch_size=2,
@@ -113,6 +138,26 @@ def test_median_exercise_seconds_returns_none_on_malformed_json(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("not valid json{{{")
     assert median_exercise_seconds_from_results(bad) is None
+
+
+def test_median_exercise_seconds_returns_none_on_non_mapping_json(tmp_path):
+    """A valid but wrong-shaped results JSON (e.g. a bare array) would
+    otherwise crash the preflight estimate on data.get(...) instead of
+    falling back to the configured default."""
+    bad = tmp_path / "list.json"
+    bad.write_text("[1, 2, 3]")
+    assert median_exercise_seconds_from_results(bad) is None
+
+
+def test_live_budget_remaining_seconds_reflects_the_deadline():
+    budget = LiveBudget(hard_deadline_monotonic=time.monotonic() + 100, max_live_runs=1000)
+    remaining = budget.remaining_seconds()
+    assert 0 < remaining <= 100
+
+
+def test_live_budget_remaining_seconds_can_go_negative_past_the_deadline():
+    budget = LiveBudget(hard_deadline_monotonic=time.monotonic() - 5, max_live_runs=1000)
+    assert budget.remaining_seconds() < 0
 
 
 def test_live_budget_raises_when_max_live_runs_reached():

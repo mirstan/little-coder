@@ -56,6 +56,13 @@ def test_select_exercises_explicit_unknown_name_raises_with_available_list():
         select_exercises(["a", "b"], count=1, seed=1, explicit=["typo"])
 
 
+def test_select_exercises_explicit_duplicate_name_raises():
+    """A repeated --exercises name would otherwise let split_train_val place
+    the same task in both train and val."""
+    with pytest.raises(ValueError, match="duplicate exercise"):
+        select_exercises(["a", "b"], count=1, seed=1, explicit=["a", "a"])
+
+
 def test_select_exercises_raises_when_count_exceeds_available():
     with pytest.raises(ValueError, match="only 2 available"):
         select_exercises(["a", "b"], count=5, seed=1)

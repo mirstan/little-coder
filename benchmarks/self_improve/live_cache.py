@@ -64,11 +64,16 @@ class LiveResultCache:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+            payload = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeError):
             # A corrupt or unreadable entry is a MISS, never an exception --
             # a cache read must not be able to kill an expensive in-flight run.
             return None
+        # Valid JSON that isn't an object (e.g. a bare list or number) would
+        # otherwise be returned as-is and later blow up far from here, deep
+        # inside LiveRunResult.from_dict()'s **dict(d) -- treat it as a miss
+        # at the point where it's actually detected instead.
+        return payload if isinstance(payload, dict) else None
 
     def put(
         self, candidate: Mapping[str, str], run_config: Mapping[str, Any],

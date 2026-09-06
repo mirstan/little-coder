@@ -38,6 +38,15 @@ class CostEstimate:
     warnings: list[str] = field(default_factory=list)
 
 
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """max(0, ceil(numerator / denominator)); 0 whenever numerator <= 0 or
+    denominator is 0 (a non-positive remaining budget affords zero
+    iterations, not a nonsensical negative or division-by-zero result)."""
+    if numerator <= 0 or not denominator:
+        return 0
+    return -(-numerator // denominator)
+
+
 def estimate_cost(
     *, max_metric_calls: int, valset_size: int, trainset_size: int, minibatch_size: int,
     component_count: int, assumed_exercise_seconds: float, exercise_timeout_seconds: float,
@@ -53,14 +62,20 @@ def estimate_cost(
     max_live_runs = max_metric_calls + overshoot
     denom_worst = 2 * minibatch_size + valset_size
     denom_best = 2 * minibatch_size
-    iterations_worst_case = max(0, (max_metric_calls - valset_size) // denom_worst) if denom_worst else 0
-    iterations_best_case = max(0, (max_metric_calls - valset_size) // denom_best) if denom_best else 0
+    # Ceiling, not floor: GEPA's _should_stop is only checked at the TOP of
+    # the loop (the same reason overshoot_allowance exists above), so a
+    # partial remainder still buys one more iteration attempt, not zero.
+    remaining = max_metric_calls - valset_size
+    iterations_worst_case = _ceil_div(remaining, denom_worst)
+    iterations_best_case = _ceil_div(remaining, denom_best)
     max_reflection_calls = iterations_best_case
 
     if module_selector == "round_robin":
         components_covered_worst = min(component_count, iterations_worst_case)
     else:
-        components_covered_worst = component_count
+        # "all" touches every component every iteration -- but if the budget
+        # can't afford even one iteration, no component is actually reached.
+        components_covered_worst = component_count if iterations_worst_case > 0 else 0
 
     expected_wall = max_live_runs * assumed_exercise_seconds
     ceiling_wall = max_live_runs * exercise_timeout_seconds
@@ -140,6 +155,8 @@ def median_exercise_seconds_from_results(results_json: Path) -> float | None:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict):
+        return None
     exercises = data.get("exercises", {})
     if not isinstance(exercises, dict):
         return None
@@ -172,6 +189,16 @@ class LiveBudget:
             raise LiveEvalBudgetExceeded(f"wall-clock hard deadline reached before running {exercise_id!r}")
         if self.live_runs >= self.max_live_runs:
             raise LiveEvalBudgetExceeded(f"max_live_runs ({self.max_live_runs}) reached before running {exercise_id!r}")
+
+    def remaining_seconds(self) -> float:
+        """How long until the hard wall-clock deadline. check_before_exercise()
+        only gates whether an exercise may START -- once started, a
+        subprocess's own (much larger) per-exercise timeout would otherwise
+        let --max-wall-clock-s be exceeded by up to one full exercise
+        timeout. A caller should bound its own per-exercise timeout by this
+        value so the deadline is enforced during an exercise too, not just
+        between them."""
+        return self.hard_deadline_monotonic - time.monotonic()
 
     def record_live_run(self) -> None:
         self.live_runs += 1

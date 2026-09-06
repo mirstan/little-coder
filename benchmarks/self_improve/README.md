@@ -39,7 +39,8 @@ source .venv/bin/activate
 pip install -e .[dev]      # gepa, dspy-ai, pydantic, pyyaml, python-dotenv, pytest
 ```
 
-Run the test suite (fast, deterministic, no API calls, no real git worktrees):
+Run the test suite (fast, deterministic, no external API calls; some E2E tests
+create disposable local git worktrees, not against the real checkout):
 
 ```bash
 python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_prompt.py \
@@ -105,14 +106,17 @@ machine-level deny for a shared host. A graceful stop is available mid-run via
 `touch <out-dir>/gepa.stop` (printed in the startup banner) or Ctrl-C (a second
 Ctrl-C aborts immediately instead of waiting for the current iteration).
 
-**What actually costs money vs. compute**: `reflection_lm` calls are the only
-per-token API spend (the model that reads a live run's diff/pytest
-output/transcript and proposes a rewrite). Every live rollout is a real
-coding-agent run against a real exercise — real compute and real wall-clock
-time against whatever `--model` you configure as the model under test, capped
-hard by `--max-metric-calls` (never GEPA's `auto=` presets — confirmed to
-over-provision by orders of magnitude relative to a hand-picked minibatch
-size).
+**What actually costs money vs. compute**: both `reflection_lm` calls (the
+model that reads a live run's diff/pytest output/transcript and proposes a
+rewrite) AND every live rollout can cost real API dollars — a live rollout is
+a real coding-agent run against a real exercise using whatever `--model` you
+configure as the model under test, and if that's a hosted provider, each
+rollout consumes real provider tokens on top of the real compute and
+wall-clock time it takes. Rollout spend is capped hard by `--max-metric-calls`
+(never GEPA's `auto=` presets — confirmed to over-provision by orders of
+magnitude relative to a hand-picked minibatch size); reflection spend has no
+equivalent per-call cap beyond `--reflection-minibatch-size` and how many
+iterations the rollout budget allows.
 
 **Cost/runtime expectation**: depends entirely on `--max-metric-calls`,
 `--reflection-minibatch-size`, and how many exercises/components are in scope
@@ -171,10 +175,10 @@ reviewed the local commit.
   subprocess, real pytest scoring) is proven with `fake_pi.py` at zero cost
   (`tests/test_live_eval_e2e_fake_pi.py`, including a regression test that two
   candidates differing only in text now score differently). A real,
-  money-spending `--baseline-only` and full `gepa.optimize()` run against a
-  real model has not yet been executed under this design — still safety-gated
-  behind both the reflection-LM gate and the live-rollout gate for any real
-  invocation.
+  money-spending `--baseline-only` run (gated on the live-rollout gate alone)
+  or a full `gepa.optimize()` run (gated on both the live-rollout gate and the
+  reflection-LM gate) against a real model has not yet been executed under
+  this design.
 - **Layer 5** (held-out live regression check): comparison utility
   (`compare_runs.py::compare_pass_rates`) built and tested; execution is
   downstream of a real Layer 4 run producing a PR to check out and re-test.

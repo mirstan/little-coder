@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from benchmarks.self_improve.components import write_components_back
+from benchmarks.self_improve.components import split_frontmatter, write_components_back
 from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
 from benchmarks.self_improve.live_cache import LiveResultCache
@@ -28,7 +28,6 @@ from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
 
-_FRONTMATTER_DELIM = "---\n"
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
@@ -48,13 +47,12 @@ def _strip_leading_frontmatter_block(text: str) -> tuple[str, bool]:
     header after the real one, and skill-inject's parseSkillFile() finds no
     target_tool, silently killing injection for every subsequent candidate
     while scores just look uniformly bad. Confirmed non-obvious failure mode
-    from planning -- see the live-eval plan doc."""
-    if not text.startswith(_FRONTMATTER_DELIM):
-        return text, False
-    end = text.find("\n---\n", len(_FRONTMATTER_DELIM))
-    if end == -1:
-        return text, False
-    return text[end + len("\n---\n"):], True
+    from planning -- see the live-eval plan doc.
+
+    Reuses components.split_frontmatter (same delimiter, same windowing) so
+    the two frontmatter-stripping implementations can't drift apart."""
+    frontmatter, body = split_frontmatter(text)
+    return (body, True) if frontmatter is not None else (text, False)
 
 
 def _sanitize_candidate(candidate: Mapping[str, str]) -> dict[str, str]:
@@ -165,6 +163,12 @@ class PolyglotLiveRunner:
             "thinking": self.thinking,
             "base_commit": self.worktree.base_commit,
             "harness_hash": hasher.hexdigest(),
+            # A different benchmark checkout can mean different stub/test
+            # content for "the same" exercise name, and a different timeout
+            # can turn a would-be timeout into a genuine pass (or vice
+            # versa) -- both change what a cached score actually measures.
+            "benchmark_root": str(self.benchmark_root) if self.benchmark_root else None,
+            "per_exercise_timeout_s": self.per_exercise_timeout_s,
         }
 
     def materialize(self, candidate: Mapping[str, str]) -> list[Path]:
@@ -231,22 +235,38 @@ class PolyglotLiveRunner:
         if self.benchmark_root:
             env["POLYGLOT_BENCHMARK_ROOT"] = str(self.benchmark_root)
 
+        # check_before_exercise() only gates whether an exercise may START --
+        # without also bounding THIS timeout, a single exercise's own (much
+        # larger) per_exercise_timeout_s could let --max-wall-clock-s be
+        # exceeded by up to one full exercise timeout once it's underway.
+        effective_timeout = self.per_exercise_timeout_s
+        if self.budget is not None:
+            effective_timeout = max(1.0, min(effective_timeout, self.budget.remaining_seconds()))
+
         proc = subprocess.Popen(
             cmd, cwd=str(self.worktree.path), env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True,
         )
+        # Recorded so gepa_scratch_gc.py can tell "the orchestrator died" apart
+        # from "this exercise subprocess is still alive and using the
+        # worktree" -- start_new_session=True means this child has its own
+        # process group/pid and does NOT die when the orchestrator does.
+        self.worktree.set_active_pid(proc.pid)
         try:
-            _stdout, stderr = proc.communicate(timeout=self.per_exercise_timeout_s)
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            self._kill_process_group(proc)
-            _stdout, stderr = proc.communicate()
-            return LiveRunResult(
-                task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
-                status="harness_error", score=0.0, success=False,
-                error=f"subprocess timed out after {self.per_exercise_timeout_s}s",
-            )
+            try:
+                _stdout, stderr = proc.communicate(timeout=effective_timeout)
+                exit_code = proc.returncode
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(proc)
+                _stdout, stderr = proc.communicate()
+                return LiveRunResult(
+                    task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
+                    status="harness_error", score=0.0, success=False,
+                    error=f"subprocess timed out after {effective_timeout:.0f}s",
+                )
+        finally:
+            self.worktree.set_active_pid(None)
 
         return self._parse_result(spec, results_file, log_root, stderr, exit_code)
 
@@ -310,18 +330,31 @@ class PolyglotLiveRunner:
             test_output_tail = final_output.read_text()[-_MAX_TAIL_CHARS:]
 
         transcript_excerpt = ""
+        # Unioned across EVERY attempt, not just the latest: a component
+        # (e.g. a skill) can be injected on an earlier failed attempt whose
+        # guidance still shapes a LATER attempt's success (or a retry can
+        # simply happen not to re-trigger the same injection trigger) --
+        # using only the latest trajectory's notifications would then
+        # falsely report the component as "NOT injected" for a run it was
+        # genuinely part of. Transcript/diff stay latest-only: those describe
+        # one concrete attempt's content, not a set to union.
         notifications: list[str] = []
         diff_summary = ""
         traj_files = sorted(ex_log_dir.glob("trajectory_*.json"), key=_attempt_num)
+        for traj_file in traj_files:
+            try:
+                traj_data = json.loads(traj_file.read_text())
+                notifications.extend(
+                    f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
+                    for n in traj_data.get("notifications", [])
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
         if traj_files:
             latest = traj_files[-1]
             try:
                 traj_data = json.loads(latest.read_text())
                 transcript_excerpt = (traj_data.get("assistant_text") or "")[-_MAX_TRANSCRIPT_CHARS:]
-                notifications = [
-                    f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
-                    for n in traj_data.get("notifications", [])
-                ]
             except (json.JSONDecodeError, OSError):
                 pass
             workdir = ex_log_dir / f"workdir_{_attempt_num(latest)}"

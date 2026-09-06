@@ -46,6 +46,11 @@ def select_exercises(
         unknown = sorted(set(explicit) - set(available))
         if unknown:
             raise ValueError(f"unknown exercise(s) {unknown} -- available: {sorted(available)}")
+        if len(set(explicit)) != len(explicit):
+            raise ValueError(
+                f"duplicate exercise name(s) in --exercises: {explicit} -- "
+                "split_train_val could otherwise place the same task in both train and val"
+            )
         chosen = list(explicit)
     else:
         pool = sorted(set(available) - set(exclude))

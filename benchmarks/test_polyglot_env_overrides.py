@@ -9,7 +9,25 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(autouse=True)
+def _restore_aider_polyglot_module():
+    """Every test here replaces sys.modules["aider_polyglot"] with a fresh
+    module whose import-time constants (BENCHMARK_ROOT, RESULTS_FILE,
+    LOG_ROOT, LANG_DESCRIPTORS) are evaluated under whatever env override
+    that test set. monkeypatch only restores the environment at teardown,
+    not the module -- without this, the LAST test's override values leak
+    into every later `import aider_polyglot` for the rest of the session."""
+    original = sys.modules.get("aider_polyglot")
+    yield
+    if original is not None:
+        sys.modules["aider_polyglot"] = original
+    else:
+        sys.modules.pop("aider_polyglot", None)
 
 
 def _reload_aider_polyglot():

@@ -113,6 +113,26 @@ class ScratchWorktree:
         merged["LITTLE_CODER_PI_BIN_OVERRIDE"] = str(self.pi_bin)
         return merged
 
+    def set_active_pid(self, pid: int | None) -> None:
+        """Record (or clear) the pid of the exercise subprocess currently
+        running against this worktree, in the marker file.
+
+        Without this, gepa_scratch_gc.py can only see the ORCHESTRATOR's own
+        pid (the "pid" field, set once at creation) -- if the orchestrator is
+        SIGKILLed mid-exercise, that pid dies, but the exercise subprocess
+        (started with start_new_session=True, its OWN process group/pid --
+        see live_eval.py) does not die with it and can still be actively
+        writing into this worktree. A naive orphan check based only on the
+        orchestrator's pid would then call the worktree safe to remove while
+        real work is still in flight."""
+        marker_path = self.path / SCRATCH_MARKER_NAME
+        try:
+            marker = json.loads(marker_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            marker = {}
+        marker["active_pid"] = pid
+        marker_path.write_text(json.dumps(marker, indent=2))
+
     def reset(self) -> None:
         """Hard-reset to base_commit and remove every untracked file except
         the node_modules symlink and the scratch marker. Idempotent -- safe
@@ -187,14 +207,28 @@ def scratch_worktree(
 
     _run_git(["worktree", "add", "--detach", str(scratch_path), base_commit], cwd=source_repo_root)
 
-    marker = {
-        "little_coder_self_improve_scratch": True,
-        "pid": os.getpid(),
-        "created_at": time.time(),
-        "base_commit": base_commit,
-        "repo_root": str(source_repo_root),
-    }
-    (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker, indent=2))
+    # If anything between here and the marker write raises (disk full, an
+    # injected KeyboardInterrupt, ...), the worktree registration must not be
+    # left behind UNMARKED -- gepa_scratch_gc.py refuses to touch anything
+    # without a marker present, so an unmarked orphan needs a human to run a
+    # manual `git worktree remove` forever, defeating the whole point of the
+    # marker-gated GC. Undo the `worktree add` on any failure in this window.
+    try:
+        marker = {
+            "little_coder_self_improve_scratch": True,
+            "pid": os.getpid(),
+            "created_at": time.time(),
+            "base_commit": base_commit,
+            "repo_root": str(source_repo_root),
+        }
+        (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker, indent=2))
+    except BaseException:
+        try:
+            _run_git(["worktree", "remove", "--force", str(scratch_path)], cwd=source_repo_root)
+        except ScratchWorktreeError:
+            shutil.rmtree(scratch_path, ignore_errors=True)
+            prune_stale(source_repo_root)
+        raise
 
     worktree = ScratchWorktree(
         path=scratch_path, source_repo_root=source_repo_root,
