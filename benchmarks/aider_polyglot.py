@@ -834,7 +834,7 @@ def main():
     # Diagnostic only -- deliberately NOT part of _scoring_params/_param_mismatches,
     # same reasoning as config_label: this doesn't affect how an attempt runs,
     # so a --resume under a different sampling temperature isn't a mismatch.
-    env_snapshot = capture_environment_snapshot(model, cli_thinking=args.thinking)
+    env_snapshot = capture_environment_snapshot(model, cli_thinking=args.thinking, agent=args.agent)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -889,6 +889,11 @@ def main():
                 max_attempts=args.max_attempts,
                 thinking=args.thinking,
                 agent=args.agent,
+                # Only worth querying pi's get_state until the FIRST exercise
+                # confirms it -- config doesn't change mid-run, so the other
+                # ~224 exercises would just be redundant RPC round-trips for
+                # a value that's already known.
+                confirm_thinking=env_snapshot.get("thinking", {}).get("confirmed_live") is None,
             )
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
@@ -899,8 +904,10 @@ def main():
             # Only the first exercise to report one sets it -- config doesn't
             # change mid-run, and this keeps meta.environment_snapshot a
             # single run-invariant fact rather than the last exercise's value.
+            # env_snapshot is the same object results["meta"]["environment_snapshot"]
+            # already references (assigned once, above) -- mutating it here
+            # is what actually takes effect, no reassignment needed.
             env_snapshot["thinking"]["confirmed_live"] = confirmed_level
-            results["meta"]["environment_snapshot"] = env_snapshot
 
         r["scoring_params"] = params
         results["exercises"][key] = r

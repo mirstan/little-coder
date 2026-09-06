@@ -323,7 +323,15 @@ def main():
         except Exception:
             existing = {}
         restarts = existing.get("restarts", [])
-        restarts.append({"at": manifest["started_at"], "n_tasks": manifest["n_tasks"]})
+        # Include the freshly-captured snapshot here too -- otherwise a
+        # resumed run under changed config (thinking level, sampling params,
+        # vendor patch) recorded nothing, which is exactly the silent drift
+        # this feature exists to catch.
+        restarts.append({
+            "at": manifest["started_at"],
+            "n_tasks": manifest["n_tasks"],
+            "environment_snapshot": manifest["environment_snapshot"],
+        })
         existing["restarts"] = restarts
         manifest_path.write_text(json.dumps(existing, indent=2))
     else:
