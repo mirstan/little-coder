@@ -1,6 +1,7 @@
 import copy
 import importlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,48 @@ def _dspy_settings_snapshot_and_restore():
 @pytest.fixture(autouse=True)
 def _restore_dspy_settings():
     yield from _dspy_settings_snapshot_and_restore()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_stray_real_worktrees():
+    """Session-scoped backstop for the live-eval rewrite: scratch_worktree.py
+    creates/destroys REAL git worktrees, and this repo currently has ~10
+    other real worktrees checked out (main, dev, self-improve/gepa-loop,
+    several feature branches). Every scratch-worktree test must operate
+    against a THROWAWAY `git init` repo, never the real checkout -- this
+    snapshots `git worktree list` on the REAL repo before and after the
+    whole test session and fails loudly if it ever changes, catching any
+    test (present or future) that accidentally touches real repo state
+    instead of a fixture repo."""
+    repo_root = Path(__file__).resolve().parents[3]
+
+    def _snapshot() -> str:
+        return subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        ).stdout
+
+    before = _snapshot()
+    yield
+    after = _snapshot()
+    assert after == before, (
+        "REAL git worktree list changed during the test session -- a test "
+        "touched the real repo's worktrees instead of a throwaway fixture "
+        f"repo.\nbefore:\n{before}\nafter:\n{after}"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_pi(monkeypatch, tmp_path):
+    """Autouse default: point LITTLE_CODER_PI_BIN_OVERRIDE at a nonexistent
+    path unless a test explicitly overrides it, so any test that forgets to
+    route a live-eval subprocess through fake_pi.py fails fast with a clear
+    FileNotFoundError (from scratch_worktree.resolve_pi_bin) instead of
+    silently attempting to spawn a real pi process against a real model
+    server. Read live (not cached at import) by resolve_pi_bin(), so this
+    monkeypatch is effective even though rpc_client.py itself resolves its
+    own PI_BIN at import time."""
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(tmp_path / "no-real-pi-in-tests"))
 
 
 @pytest.fixture
