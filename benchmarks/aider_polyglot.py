@@ -34,10 +34,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import PiRpc, PromptResult  # noqa: E402
 
-BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
+# `or`, not os.environ.get(name, default): an exported-but-empty override
+# must still fall back -- Path("") normalizes to Path("."), whose .exists()
+# is True, silently pointing at the wrong directory instead of the intended
+# default (same trap documented for LITTLE_CODER_PI_BIN_OVERRIDE in
+# rpc_client.py). These three exist so a live-eval test harness can point
+# an isolated subprocess invocation of this script at a synthetic benchmark
+# root/results file/log dir, without which none of that machinery is
+# testable without a real paid model run (BENCHMARK_ROOT feeds
+# LANG_DESCRIPTORS below at IMPORT time).
+BENCHMARK_ROOT = Path(os.environ.get("POLYGLOT_BENCHMARK_ROOT") or (Path.home() / "Documents" / "polyglot-benchmark"))
 REPO_ROOT = Path(__file__).parent.parent
-RESULTS_FILE = Path(__file__).parent / "results_full_polyglot.json"
-LOG_ROOT = Path(__file__).parent / "full_polyglot_logs"
+RESULTS_FILE = Path(os.environ.get("POLYGLOT_RESULTS_FILE") or (Path(__file__).parent / "results_full_polyglot.json"))
+LOG_ROOT = Path(os.environ.get("POLYGLOT_LOG_ROOT") or (Path(__file__).parent / "full_polyglot_logs"))
 #: Identifies one invocation, so records and artifacts can be traced back to the
 #: run that produced them. RESULTS_FILE and LOG_ROOT are both deterministic and
 #: shared across runs, which has already caused artifacts from different runs to
