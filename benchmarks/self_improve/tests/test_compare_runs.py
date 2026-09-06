@@ -94,6 +94,15 @@ def test_compare_pass_rates_raises_on_duplicate_trials_in_after():
         compare_pass_rates(before, after)
 
 
+def test_compare_pass_rates_raises_mismatch_not_empty_error_for_one_sided_input():
+    """Real follow-up bug, confirmed by review: the empty-input guard fired
+    on `before` alone being empty even when `after` was NOT, misreporting a
+    genuinely one-sided input as "both empty" instead of the accurate
+    before-only/after-only mismatch diagnostic."""
+    with pytest.raises(ValueError, match="before-only|after-only"):
+        compare_pass_rates([], [_traj("a", True)])
+
+
 def test_compare_pass_rates_raises_on_empty_input_instead_of_reporting_safe():
     """Real bug, confirmed by review: with both `before` and `after` empty,
     the set-equality check passed vacuously and n=0 made both pass rates

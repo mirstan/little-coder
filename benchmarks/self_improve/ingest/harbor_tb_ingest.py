@@ -30,6 +30,8 @@ import re
 from pathlib import Path
 from typing import Literal
 
+from pydantic import ValidationError
+
 from benchmarks.self_improve.schema import NormalizedTrajectory
 
 logger = logging.getLogger(__name__)
@@ -56,17 +58,7 @@ def _load_harbor(log_root: Path) -> list[NormalizedTrajectory]:
     for trial_dir in sorted(log_root.iterdir()):
         if not trial_dir.is_dir():
             continue
-        try:
-            traj = _load_harbor_trial(trial_dir)
-        except (AttributeError, TypeError) as e:
-            # Real gap, confirmed by review: this module's own docstring
-            # promises "never raise from load() on missing/malformed data",
-            # but a result.json that's valid JSON with the WRONG TYPE at some
-            # level (e.g. verifier_result is a list/string, not an object)
-            # was only guarded against explicit null, not against a
-            # wrong-typed value -- `.get()` on a non-dict raises AttributeError.
-            logger.warning("harbor_tb_ingest: malformed structure in %s: %s", trial_dir, e)
-            continue
+        traj = _load_harbor_trial(trial_dir)
         if traj is not None:
             trajectories.append(traj)
     return trajectories
@@ -83,20 +75,41 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
         logger.warning("harbor_tb_ingest: malformed result.json at %s: %s", result_path, e)
         return None
 
-    task_id = result.get("task_name", trial_dir.name)
-    # Both .get()s guard against an explicit JSON null (not just a missing
-    # key) at each level -- an incomplete verifier write can leave
-    # verifier_result or rewards present but null, and `.get(k, {})` alone
-    # does not protect against that (only against the key being absent).
-    reward = ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    if not isinstance(result, dict):
+        # Real gap, confirmed by review: this module's own docstring promises
+        # "never raise from load() on missing/malformed data" -- valid JSON
+        # with a non-object ROOT (e.g. a bare list) made every .get() below
+        # raise AttributeError. Validated explicitly at each level instead of
+        # relying on a broad except around the whole function, which risked
+        # masking a genuine coding bug as "malformed data".
+        logger.warning("harbor_tb_ingest: result.json root is not an object in %s", result_path)
+        return None
+
+    # `or trial_dir.name`, not .get(key, default): guards against an
+    # explicit JSON null (not just a missing key) -- .get(k, default) only
+    # substitutes the default when the key is ABSENT.
+    task_id = result.get("task_name") or trial_dir.name
+
+    verifier_result = result.get("verifier_result")
+    if not isinstance(verifier_result, dict):
+        verifier_result = {}
+    rewards = verifier_result.get("rewards")
+    if not isinstance(rewards, dict):
+        rewards = {}
+    reward = rewards.get("reward")
     try:
         success = reward is not None and float(reward) > 0.0
     except (TypeError, ValueError):
         logger.warning("harbor_tb_ingest: non-numeric reward %r in %s", reward, result_path)
         success = False
 
-    metadata = (result.get("agent_result") or {}).get("metadata") or {}
-    stop_reason = metadata.get("stop_reason", "unknown")
+    agent_result = result.get("agent_result")
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+    metadata = agent_result.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    stop_reason = metadata.get("stop_reason") or "unknown"
     turn_count = metadata.get("n_turns", 0) or 0
 
     raw_paths = {"result": str(result_path)}
@@ -115,18 +128,28 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
             except (UnicodeDecodeError, OSError) as e:
                 logger.warning("harbor_tb_ingest: unreadable log %s: %s", log_paths[0], e)
 
-    return NormalizedTrajectory(
-        benchmark="harbor",
-        task_id=task_id,
-        success=success,
-        stop_reason=stop_reason,
-        turn_count=turn_count,
-        partial_score=1.0 if success else 0.0,
-        components_used=[],
-        failure_signals=[] if success else ["reward_zero"],
-        summarized_transcript=summarized,
-        raw_paths=raw_paths,
-    )
+    try:
+        return NormalizedTrajectory(
+            benchmark="harbor",
+            task_id=task_id,
+            success=success,
+            stop_reason=stop_reason,
+            turn_count=turn_count,
+            partial_score=1.0 if success else 0.0,
+            components_used=[],
+            failure_signals=[] if success else ["reward_zero"],
+            summarized_transcript=summarized,
+            raw_paths=raw_paths,
+        )
+    except ValidationError as e:
+        # Real gap, confirmed by review: a wrong-TYPED (not missing/null)
+        # value that survives the isinstance guards above (e.g. task_name is
+        # a non-string truthy value) fails NormalizedTrajectory's own field
+        # validation -- narrowly caught here, at the one place it's actually
+        # expected, rather than a broad except around the whole function
+        # that could also mask a genuine coding bug.
+        logger.warning("harbor_tb_ingest: invalid trajectory fields in %s: %s", result_path, e)
+        return None
 
 
 # ── tb (classic terminal-bench) ──────────────────────────────────────────
@@ -144,12 +167,7 @@ def _load_tb(log_root: Path, benchmark: Literal["harbor", "tb"]) -> list[Normali
         for trial_dir in sorted(task_dir.iterdir()):
             if not trial_dir.is_dir():
                 continue
-            try:
-                traj = _load_tb_trial(trial_dir, benchmark)
-            except (AttributeError, TypeError) as e:
-                # Same gap as _load_harbor -- see its comment.
-                logger.warning("harbor_tb_ingest: malformed structure in %s: %s", trial_dir, e)
-                continue
+            traj = _load_tb_trial(trial_dir, benchmark)
             if traj is not None:
                 trajectories.append(traj)
     return trajectories
@@ -166,7 +184,12 @@ def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> Norma
         logger.warning("harbor_tb_ingest: malformed results.json at %s: %s", results_path, e)
         return None
 
-    task_id = result.get("task_id", trial_dir.parent.name)
+    if not isinstance(result, dict):
+        # Same gap as _load_harbor_trial -- see its comment.
+        logger.warning("harbor_tb_ingest: results.json root is not an object in %s", results_path)
+        return None
+
+    task_id = result.get("task_id") or trial_dir.parent.name
     is_resolved = result.get("is_resolved", False)
     if not isinstance(is_resolved, bool):
         # Hardening, confirmed by review: real captured data has this as a
@@ -199,15 +222,20 @@ def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> Norma
         except (UnicodeDecodeError, OSError) as e:
             logger.warning("harbor_tb_ingest: unreadable log %s: %s", log_path, e)
 
-    return NormalizedTrajectory(
-        benchmark=benchmark,
-        task_id=task_id,
-        success=success,
-        stop_reason=stop_reason,
-        turn_count=turn_count,
-        partial_score=1.0 if success else 0.0,
-        components_used=[],
-        failure_signals=[] if success else ["is_resolved_false"],
-        summarized_transcript=summarized,
-        raw_paths=raw_paths,
-    )
+    try:
+        return NormalizedTrajectory(
+            benchmark=benchmark,
+            task_id=task_id,
+            success=success,
+            stop_reason=stop_reason,
+            turn_count=turn_count,
+            partial_score=1.0 if success else 0.0,
+            components_used=[],
+            failure_signals=[] if success else ["is_resolved_false"],
+            summarized_transcript=summarized,
+            raw_paths=raw_paths,
+        )
+    except ValidationError as e:
+        # Same gap as _load_harbor_trial -- see its comment.
+        logger.warning("harbor_tb_ingest: invalid trajectory fields in %s: %s", results_path, e)
+        return None

@@ -76,12 +76,14 @@ def _ingest_all(
     if "aider" in log_roots:
         raw = log_roots["aider"]
         log_root_str, sep, results_json_str = raw.partition(",")
-        if not sep:
+        if not sep or not log_root_str or not results_json_str:
             # Real gap, confirmed by review: Path("") normalizes to Path("."),
             # whose .exists() is True, so a missing ",<results.json>" suffix
-            # previously bypassed aider_polyglot_ingest.load()'s own
-            # FileNotFoundError guard and surfaced as an opaque
-            # IsADirectoryError instead of a clear misconfiguration message.
+            # (or an empty segment on EITHER side of a present comma, e.g.
+            # "aider=,results.json" or "aider=logs,") previously bypassed
+            # aider_polyglot_ingest.load()'s own FileNotFoundError guard and
+            # silently read "." instead of surfacing a clear misconfiguration
+            # message.
             logger.warning(
                 "aider_polyglot ingest failed: --log-roots aider=%r is missing the "
                 "required ',<results.json path>' suffix", raw,

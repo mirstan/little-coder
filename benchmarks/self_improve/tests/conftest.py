@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 from pathlib import Path
@@ -63,12 +64,27 @@ def _dspy_settings_snapshot_and_restore():
     restore state is to snapshot/restore the real module's dict directly --
     `import dspy.dsp.utils.settings as m` resolves to the singleton
     INSTANCE, not the module (the package's __init__ shadows the name), so
-    importlib.import_module() is used to reach the actual module object."""
+    importlib.import_module() is used to reach the actual module object.
+
+    Real follow-up gap, confirmed by review: a shallow dict() copy shares
+    references to nested mutable values (e.g. the list-valued "trace"
+    setting -- components.py's own HarnessProgram docstring documents GEPA
+    inspecting dspy.settings.trace after a forward pass, which DSPy mutates
+    in-place via append, not reassignment) -- clear()+update() would restore
+    the KEY to point at the SAME, already-mutated list, not undo the
+    mutation. copy.deepcopy() is used instead. Settings.__getattr__ also
+    checks thread_local_overrides (a contextvars.ContextVar for
+    dspy.context()'s temporary per-thread overrides) BEFORE main_thread_config
+    -- snapshotted/restored the same way for completeness, though nothing in
+    this codebase currently uses dspy.context() (its own context manager
+    already resets itself via a contextvars.Token on exit)."""
     settings_module = importlib.import_module("dspy.dsp.utils.settings")
-    snapshot = dict(settings_module.main_thread_config)
+    main_snapshot = copy.deepcopy(dict(settings_module.main_thread_config))
+    overrides_snapshot = copy.deepcopy(settings_module.thread_local_overrides.get())
     yield
     settings_module.main_thread_config.clear()
-    settings_module.main_thread_config.update(snapshot)
+    settings_module.main_thread_config.update(main_snapshot)
+    settings_module.thread_local_overrides.set(overrides_snapshot)
 
 
 @pytest.fixture(autouse=True)

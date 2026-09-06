@@ -33,3 +33,11 @@ build-backend = "setuptools.build_meta"
 # importing benchmarks.self_improve(.ingest) from a completely unrelated cwd.
 package-dir = {"benchmarks.self_improve" = "."}
 packages = ["benchmarks.self_improve", "benchmarks.self_improve.ingest"]
+
+[tool.setuptools.package-data]
+# Real gap, confirmed by review: a NON-editable install (`pip install .`,
+# vs. the `-e` install README.md actually documents) ships the .py modules
+# above but not config/*.yaml -- run_gepa.py's --components-config default
+# points there, so a non-editable install would fail unless every caller
+# supplies an external config path.
+"benchmarks.self_improve" = ["config/*.yaml"]

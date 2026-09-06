@@ -34,8 +34,12 @@ def compare_pass_rates(
     # made both pass rates default to 0.0 with is_regression=False --
     # reporting a Layer 5 comparison as safe when nothing was actually
     # compared (e.g. an upstream ingest failure silently produced no
-    # trajectories at all).
-    if not before_by_id:
+    # trajectories at all). Real follow-up bug, confirmed by review: the
+    # first version of this guard fired on `before` alone being empty even
+    # when `after` was NOT -- misreporting a genuinely one-sided input as
+    # "both empty" instead of letting the set-mismatch check below report
+    # the accurate before-only/after-only diagnostic.
+    if not before_by_id and not after_by_id:
         raise ValueError("compare_pass_rates: no trajectories to compare (both `before` and `after` are empty)")
 
     if set(before_by_id) != set(after_by_id):

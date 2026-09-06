@@ -192,12 +192,15 @@ def test_tb_load_handles_missing_log_root_gracefully(tmp_path):
     assert harbor_tb_ingest.load(tmp_path / "does-not-exist", benchmark="tb") == []
 
 
-def test_harbor_load_skips_trial_with_non_object_verifier_result(tmp_path):
+def test_harbor_load_degrades_gracefully_for_non_object_verifier_result(tmp_path):
     """Real bug, confirmed by review: this module's own docstring promises
     'never raise from load() on missing/malformed data', but a
     wrong-TYPED (not just null/missing) nested field -- e.g. verifier_result
     is a list, not an object -- made .get("rewards") raise AttributeError,
-    crashing the whole harbor ingest instead of skipping just this trial."""
+    crashing the whole harbor ingest. Fixed via explicit isinstance checks
+    (not a broad except) -- the malformed trial is still ingested (not
+    silently dropped from the dataset), degraded to reward=None/success=False
+    exactly like an explicit-null verifier_result already was."""
     good = tmp_path / "trial-good"
     good.mkdir()
     (good / "result.json").write_text(json.dumps({
@@ -208,8 +211,33 @@ def test_harbor_load_skips_trial_with_non_object_verifier_result(tmp_path):
     (bad / "result.json").write_text(json.dumps({
         "task_name": "x/z", "verifier_result": ["not", "an", "object"],
     }))
+    trajs = {t.task_id: t for t in harbor_tb_ingest.load(tmp_path, benchmark="harbor")}
+    assert set(trajs) == {"x/y", "x/z"}
+    assert trajs["x/y"].success is True
+    assert trajs["x/z"].success is False
+
+
+def test_harbor_load_falls_back_to_dir_name_when_task_name_is_explicit_null(tmp_path):
+    """Real bug, confirmed by review: task_id = result.get("task_name", ...)
+    only substitutes the fallback when the key is ABSENT -- an explicit
+    "task_name": null (a valid but incomplete write) passed None straight
+    into NormalizedTrajectory(task_id=...), which is a required str field,
+    raising pydantic's ValidationError uncaught."""
+    trial = tmp_path / "trial-1"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps({
+        "task_name": None, "verifier_result": {"rewards": {"reward": 1.0}},
+    }))
     trajs = harbor_tb_ingest.load(tmp_path, benchmark="harbor")
-    assert {t.task_id for t in trajs} == {"x/y"}
+    assert trajs[0].task_id == "trial-1"
+
+
+def test_tb_load_falls_back_to_dir_name_when_task_id_is_explicit_null(tmp_path):
+    task_dir = tmp_path / "some-task" / "some-task.1-of-1.ts"
+    task_dir.mkdir(parents=True)
+    (task_dir / "results.json").write_text(json.dumps({"task_id": None, "is_resolved": True}))
+    trajs = harbor_tb_ingest.load(tmp_path, benchmark="tb")
+    assert trajs[0].task_id == "some-task"
 
 
 def test_harbor_load_skips_trial_with_non_object_json_root(tmp_path):

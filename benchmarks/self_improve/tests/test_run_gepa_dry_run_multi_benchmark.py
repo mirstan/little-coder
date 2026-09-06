@@ -77,6 +77,28 @@ def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_p
     assert empty_sources == ["aider"]
 
 
+def test_ingest_all_reports_clear_error_when_aider_log_root_segment_is_empty(tmp_path):
+    """Real follow-up bug, confirmed by review: `--log-roots aider=,results.json`
+    (empty segment BEFORE a present comma) still made Path("") -> Path(".")
+    for the log_root -- the original fix only checked the comma's presence,
+    not that both sides of it were non-empty."""
+    _log_root, results_json = _make_aider_fixture(tmp_path)
+    log_roots = {"aider": f",{results_json}"}
+    trajectories, empty_sources = _ingest_all(log_roots)
+    assert trajectories == []
+    assert empty_sources == ["aider"]
+
+
+def test_ingest_all_reports_clear_error_when_aider_results_json_segment_is_empty(tmp_path):
+    """Same gap, other side: `--log-roots aider=logs,` (empty segment AFTER
+    a present comma) for the results_json path."""
+    log_root, _results_json = _make_aider_fixture(tmp_path)
+    log_roots = {"aider": f"{log_root},"}
+    trajectories, empty_sources = _ingest_all(log_roots)
+    assert trajectories == []
+    assert empty_sources == ["aider"]
+
+
 def test_ingest_all_records_empty_source_when_ingest_raises(tmp_path):
     """Same guarantee on the exception path: a malformed results.json for
     aider_polyglot raises inside ingest today (confirmed: aider_polyglot_ingest

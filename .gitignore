@@ -46,6 +46,7 @@ benchmarks/deep_research_runs/
 benchmarks/self_improve/.venv/
 benchmarks/self_improve/runs/
 benchmarks/self_improve/*.egg-info/
+benchmarks/self_improve/build/
 .pi/.system-prompt.generated.md
 .env
 
