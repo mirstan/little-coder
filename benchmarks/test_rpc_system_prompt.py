@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
@@ -78,6 +79,30 @@ def test_build_system_prompt_leaves_no_partial_file_visible_mid_write(tmp_path, 
     path = rpc_client._build_system_prompt()
     leftover_tmp_files = [p for p in path.parent.iterdir() if ".tmp-" in p.name]
     assert leftover_tmp_files == []
+
+
+def test_build_system_prompt_cleans_up_tmp_file_when_replace_fails(tmp_path, monkeypatch):
+    """Real gap, confirmed by review: if tmp.replace(generated) itself fails
+    AFTER tmp.write_text() already succeeded, the .tmp-* file was left
+    behind under .pi/ forever instead of being cleaned up before falling
+    back to AGENTS.md alone."""
+    (tmp_path / "AGENTS.md").write_text("# little-coder\n\nBody.\n")
+    (tmp_path / "PRINCIPLES.md").write_text("Be concise.\n")
+    monkeypatch.setattr(rpc_client, "REPO_ROOT", tmp_path)
+
+    original_replace = Path.replace
+
+    def failing_replace(self, target):
+        if ".tmp-" in self.name:
+            raise OSError("simulated replace failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    path = rpc_client._build_system_prompt()
+    assert path == tmp_path / "AGENTS.md"  # fell back
+    pi_dir = tmp_path / ".pi"
+    leftover = list(pi_dir.iterdir()) if pi_dir.exists() else []
+    assert leftover == []  # tmp file was cleaned up, not left behind
 
 
 def test_build_system_prompt_refreshes_on_each_call(tmp_path, monkeypatch):

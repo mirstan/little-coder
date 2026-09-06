@@ -76,6 +76,36 @@ def test_build_knowledge_topic_index_handles_missing_directories(tmp_path):
     assert build_knowledge_topic_index(tmp_path) == {}
 
 
+def test_build_knowledge_topic_index_skips_non_utf8_file(tmp_path):
+    """Real bug, confirmed by review: UnicodeDecodeError is NOT an OSError
+    subclass -- a non-UTF-8 skill file previously propagated all the way out
+    of this function, aborting the whole ingest run instead of just skipping
+    the one unreadable file."""
+    good_dir = tmp_path / "skills" / "knowledge"
+    good_dir.mkdir(parents=True)
+    _write_skill_file(good_dir / "good.md", "good-skill", topic="Good Topic")
+    (good_dir / "bad.md").write_bytes(b"---\nname: bad\ntopic: Bad\n---\n\xff\xfe not utf-8 \x80")
+    index = build_knowledge_topic_index(tmp_path)
+    assert index == {"Good Topic": "skills_knowledge_good"}
+
+
+def test_build_knowledge_topic_index_skips_non_mapping_frontmatter(tmp_path):
+    """Real bug, confirmed by review: syntactically valid YAML that isn't a
+    mapping (e.g. a bare list) made frontmatter.get() raise AttributeError,
+    aborting the whole ingest run."""
+    knowledge_dir = tmp_path / "skills" / "knowledge"
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "list_frontmatter.md").write_text("---\n- not\n- a\n- mapping\n---\nBody.\n")
+    assert build_knowledge_topic_index(tmp_path) == {}
+
+
+def test_build_knowledge_topic_index_skips_non_string_topic(tmp_path):
+    knowledge_dir = tmp_path / "skills" / "knowledge"
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "weird.md").write_text("---\nname: weird\ntopic: [not, a, string]\n---\nBody.\n")
+    assert build_knowledge_topic_index(tmp_path) == {}
+
+
 def test_build_knowledge_topic_index_against_real_repo_files():
     """End-to-end against the REAL skills/knowledge and skills/protocols
     files, not fixtures -- confirms the index actually resolves the same

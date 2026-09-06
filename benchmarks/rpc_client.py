@@ -38,10 +38,16 @@ REPO_ROOT = Path(__file__).parent.parent
 # Path("") == Path("."), whose .exists() is True, silently defeating the
 # "pi not found" FileNotFoundError check below and surfacing later as an
 # opaque Popen error instead (confirmed by review).
-PI_BIN = Path(
-    os.environ.get("LITTLE_CODER_PI_BIN_OVERRIDE")
-    or str(REPO_ROOT / "node_modules" / ".bin" / "pi")
-)
+_pi_bin_override = os.environ.get("LITTLE_CODER_PI_BIN_OVERRIDE")
+# .resolve(): real bug, confirmed by review -- on POSIX, subprocess.Popen
+# with both a RELATIVE executable path and an explicit `cwd=` resolves that
+# path against the CHILD's cwd, not the launcher's. A relative override
+# (e.g. "./fake_pi.py") would exist from the launcher's own cwd at import
+# time, then silently fail to launch once PiRpc is constructed with a
+# task-specific cwd (an aider_polyglot exercise dir, etc). Resolving once
+# here, against the launcher's actual cwd, makes the override
+# cwd-independent from then on.
+PI_BIN = Path(_pi_bin_override).resolve() if _pi_bin_override else REPO_ROOT / "node_modules" / ".bin" / "pi"
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
 
@@ -98,7 +104,15 @@ def _build_system_prompt() -> Path:
         # uncaught OSError out of PiRpc.__init__.
         tmp = generated.with_name(f"{generated.name}.tmp-{os.getpid()}-{threading.get_ident()}")
         tmp.write_text(content)
-        tmp.replace(generated)
+        try:
+            tmp.replace(generated)
+        except OSError:
+            # Real gap, confirmed by review: if replace() itself fails after
+            # write_text() already succeeded, tmp was left behind under
+            # .pi/ forever -- clean it up before falling through to the
+            # same AGENTS.md-only fallback as any other write failure here.
+            tmp.unlink(missing_ok=True)
+            raise
     except OSError:
         return agents_md
     return generated

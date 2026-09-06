@@ -66,7 +66,13 @@ def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
         for file in sorted(dir_path.glob("*.md")):
             try:
                 text = file.read_text()
-            except OSError as e:
+            except (OSError, UnicodeDecodeError) as e:
+                # Real bug, confirmed by review: UnicodeDecodeError is NOT an
+                # OSError subclass (it's a ValueError) -- a non-UTF-8 skill
+                # file previously propagated all the way out of this
+                # function, aborting the whole ingest run (gaia/aider both
+                # call this once at the top of load()) instead of just
+                # skipping the one unreadable file.
                 logger.warning("build_knowledge_topic_index: failed to read %s: %s", file, e)
                 continue
             m = _FRONTMATTER_BLOCK_RE.match(text)
@@ -77,8 +83,15 @@ def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
             except yaml.YAMLError as e:
                 logger.warning("build_knowledge_topic_index: malformed frontmatter in %s: %s", file, e)
                 continue
+            if not isinstance(frontmatter, dict):
+                # Real bug, confirmed by review: syntactically valid YAML
+                # that isn't a mapping (e.g. a bare list or scalar) made
+                # frontmatter.get() raise AttributeError, aborting the whole
+                # ingest run the same way as the read failure above.
+                logger.warning("build_knowledge_topic_index: frontmatter in %s is not a mapping", file)
+                continue
             topic = frontmatter.get("topic") or frontmatter.get("name")
-            if not topic:
+            if not isinstance(topic, str) or not topic:
                 continue
             index[topic] = f"{prefix}{file.stem}"
     return index
