@@ -444,6 +444,16 @@ class PiRpc:
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait()
+        # The process being dead doesn't mean the reader thread has finished
+        # draining its stdout pipe and appending the last few lines to
+        # self._notifications/self._responses -- readline() sees EOF only
+        # once the kernel pipe buffer is fully consumed, an independent race
+        # from _proc.wait() returning. Without this join, a caller reading
+        # notifications() immediately after close() could still miss events
+        # from the tail of the stream. In practice EOF follows process exit
+        # almost immediately, so this is normally a no-op wait.
+        self._reader.join(timeout=2)
+        self._stderr_reader.join(timeout=2)
 
     def __enter__(self):
         return self
