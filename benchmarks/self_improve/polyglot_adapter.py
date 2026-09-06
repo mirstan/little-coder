@@ -89,6 +89,27 @@ def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_i
 class PolyglotGEPAAdapter:
     """GEPAAdapter[ExerciseSpec, PolyglotTrajectory, PolyglotRolloutOutput]."""
 
+    #: Real bug, confirmed against a live run: the real GEPAAdapter Protocol
+    #: declares `propose_new_texts: ProposalFn | None = None` as a
+    #: class-level default (gepa/core/adapter.py), but this class does NOT
+    #: inherit from that Protocol (structural typing only -- see the module
+    #: docstring), so it never gets that default for free. Without declaring
+    #: it explicitly, gepa/proposer/reflective_mutation/reflective_mutation.py
+    #: does `self.adapter.propose_new_texts is not None` -- a direct
+    #: attribute access, not a defensive getattr() -- which raised
+    #: AttributeError on EVERY reflection attempt. reflective_mutation.py
+    #: catches that internally and logs "no candidate proposed this
+    #: iteration" rather than propagating it (raise_on_exception=True never
+    #: fired), so a real run just kept selecting the same seed program and
+    #: retrying reflection forever -- ~9,000 iterations in a few minutes,
+    #: 100% CPU, zero real reflection LM calls, bounded only by
+    #: --max-wall-clock-s rather than --max-metric-calls (which never grows
+    #: past the seed valset size in this failure mode, since no real
+    #: evaluate() call ever happens). gepa.optimize()'s own top-level check
+    #: (api.py) IS correctly guarded with hasattr(); only this specific
+    #: internal path was not.
+    propose_new_texts = None
+
     def __init__(
         self,
         runner: PolyglotLiveRunner,
