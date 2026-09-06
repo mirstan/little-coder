@@ -69,10 +69,15 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-#: Per-attempt RPC budget, seconds. 900 suits a fast hosted model; a local
-#: model with a large thinking budget needs more, or every hard exercise is
-#: clock-limited rather than capability-limited.
-ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 900)
+#: Per-attempt RPC budget, seconds. 900 suited a fast hosted model, but a
+#: local model with a genuine large thinking budget (PR #17 fixed
+#: omlx/rapidmlx's thinking_budget profile, previously silently stuck at
+#: 4096) needs real headroom -- wordy/transpose already hit 691-722s even
+#: at that broken smaller budget, and GAIA runs under the real 32768 budget
+#: showed single completions taking 200-900+s. Tripled to 2700, matching
+#: the same 3x used for GAIA's --timeout, so a hard multi-turn exercise is
+#: capability-limited rather than clock-limited.
+ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
 #: Per-attempt budget for `codex exec`, seconds.
 CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
