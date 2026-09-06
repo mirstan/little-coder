@@ -121,3 +121,17 @@ def test_sleep_forever_honors_a_short_configurable_duration(fake_pi, tmp_path, m
         elapsed = time.time() - t0
     assert elapsed >= 1
     assert r.stop_reason == "deadline"
+
+
+def test_non_text_deltas_are_captured_separately_from_assistant_text(fake_pi, tmp_path):
+    """Regression fixture for PromptResult.non_text_deltas: proves the
+    capture mechanism itself works (any assistantMessageEvent whose type
+    isn't "text_delta" is captured verbatim, and never contaminates
+    assistant_text) without depending on knowing pi's real event-type name
+    for reasoning/thinking content -- "thinking_delta" here is a plausible
+    stand-in for a test fixture, not a confirmed real pi event name."""
+    with fake_pi("emit_non_text_delta", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.assistant_text == "final answer"
+    assert len(r.non_text_deltas) == 1
+    assert r.non_text_deltas[0] == {"type": "thinking_delta", "delta": "reasoning about the problem..."}

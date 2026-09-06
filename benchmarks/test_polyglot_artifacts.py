@@ -207,6 +207,32 @@ def test_dump_trajectory_notifications_default_to_empty_list(tmp_path):
     AP._dump_trajectory(log_dir, "1", R())
     payload = json.loads((log_dir / "trajectory_1.json").read_text())
     assert payload["notifications"] == []
+    # Same backward-compat guarantee for non_text_deltas: R() above has no
+    # such attribute at all (an older PromptResult, or any caller that
+    # hasn't been touched by the rpc_client.py diagnostic-capture change),
+    # must not raise, payload gets [].
+    assert payload["non_text_deltas"] == []
+
+
+def test_dump_trajectory_persists_non_text_deltas_when_present(tmp_path):
+    """PromptResult.non_text_deltas (rpc_client.py) -- diagnostic capture of
+    any assistantMessageEvent whose type isn't "text_delta" (a candidate
+    reasoning/thinking-content stream) -- must survive into the persisted
+    trajectory so it can actually be inspected after a real run."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    class R:
+        agent_ended = True
+        turn_count = 1
+        compaction_events = 0
+        assistant_text = "a"
+        tool_calls = []
+        non_text_deltas = [{"type": "thinking_delta", "delta": "reasoning..."}]
+
+    AP._dump_trajectory(log_dir, "1", R())
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    assert payload["non_text_deltas"] == [{"type": "thinking_delta", "delta": "reasoning..."}]
 
 
 def test_dump_trajectory_persists_notifications_when_given(tmp_path):

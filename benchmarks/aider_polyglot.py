@@ -255,6 +255,17 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
                 {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
                 for n in (notifications or [])
             ],
+            # DIAGNOSTIC (see PromptResult.non_text_deltas' own docstring):
+            # every assistantMessageEvent delta whose type wasn't
+            # "text_delta" (e.g. a reasoning/thinking-content stream, if one
+            # exists), captured verbatim so its real shape can be read off a
+            # live run instead of guessed. Capped at 200 entries (a per-token
+            # reasoning stream could otherwise be thousands of tiny events)
+            # and TRAJECTORY_FIELD_CHARS each, same policy as tool_calls.
+            "non_text_deltas": [
+                _clip(d, TRAJECTORY_FIELD_CHARS)
+                for d in (getattr(result, "non_text_deltas", None) or [])[:200]
+            ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),

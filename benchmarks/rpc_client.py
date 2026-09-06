@@ -150,6 +150,22 @@ class PromptResult:
     #: infer this from elapsed time -- a crash burns the full budget too,
     #: because stdout EOF used not to wake the drain.
     stop_reason: str = "agent_end"
+    #: DIAGNOSTIC, not yet a real feature: every assistantMessageEvent whose
+    #: type is anything other than "text_delta" (e.g. a reasoning/thinking
+    #: delta, if pi's underlying @earendil-works/pi-ai stream emits one for
+    #: an extended-thinking model), captured verbatim. assistant_text only
+    #: ever accumulates "text_delta" content -- any reasoning/thinking-delta
+    #: stream a model like omlx/tiel-coder-oq4e produces at a high thinking
+    #: level was previously silently dropped here with zero record it even
+    #: existed. Static analysis of pi's own compiled types (ExtensionEvent
+    #: in dist/core/extensions/types.d.ts) confirmed there is no separate
+    #: top-level reasoning event -- if it streams at all, it comes through
+    #: THIS SAME channel with a different `type` value -- but the exact
+    #: value is defined in @earendil-works/pi-ai, which isn't installed as
+    #: inspectable source, so it can't be pinned without guessing. This
+    #: captures whatever actually shows up, verbatim, so the real event
+    #: shape can be read off a live run instead of assumed.
+    non_text_deltas: list[dict] = field(default_factory=list)
 
 
 class PiRpc:
@@ -461,6 +477,10 @@ class PiRpc:
                 delta = ev.get("assistantMessageEvent", {})
                 if delta.get("type") == "text_delta":
                     result.assistant_text += delta.get("delta", "")
+                else:
+                    # See PromptResult.non_text_deltas' own docstring --
+                    # diagnostic capture, not yet consumed by anything.
+                    result.non_text_deltas.append(delta)
             elif t == "tool_execution_start":
                 pending[ev.get("toolCallId", "")] = {
                     "name": ev.get("toolName", ""),

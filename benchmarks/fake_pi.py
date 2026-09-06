@@ -265,6 +265,26 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "emit_non_text_delta":
+        # Regression fixture for PromptResult.non_text_deltas (rpc_client.py):
+        # emits a message_update whose assistantMessageEvent.type is NOT
+        # "text_delta" (a plausible stand-in for a reasoning/thinking-content
+        # delta -- NOT a confirmed real pi event name; static analysis of
+        # pi's own compiled types could not pin the exact string, see
+        # PromptResult.non_text_deltas' own docstring) before the normal
+        # text_delta, proving the capture mechanism itself works end to end
+        # without depending on knowing pi's real schema.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "thinking_delta", "delta": "reasoning about the problem..."}})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "final answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "sleep_forever":
         # Like hang_after_ack, but the sleep duration is configurable so a
         # deadline/timeout test doesn't have to wait out a hardcoded 3600s.
