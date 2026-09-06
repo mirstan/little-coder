@@ -89,6 +89,9 @@ class _FakeRpc:
     def __exit__(self, *a):
         return False
 
+    def notifications(self):
+        return []
+
     def prompt_and_collect(self, message, timeout=900):
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
         self._notifications.append(
@@ -259,3 +262,50 @@ def test_run_exercise_notifications_are_isolated_per_attempt(tmp_path, monkeypat
     assert "attempt 1" in payload_1["notifications"][0]["message"]
     assert len(payload_2["notifications"]) == 1
     assert "attempt 2" in payload_2["notifications"][0]["message"]
+
+
+class _FakeRpcWithNotifications(_FakeRpc):
+    """Same as _FakeRpc, but simulates the thinking-budget extension firing --
+    the ctx.ui.notify event that was invisible in every trajectory before
+    this was wired up -- it took a live manual re-run with rpc.notifications()
+    to discover this on a real `bowling` failure."""
+
+    def notifications(self):
+        return [
+            {"message": "little-coder scaffold loaded", "notifyType": "info"},
+            {"message": "harness intervention: the model has thought long "
+                        "enough -- forcing it to start implementing.", "notifyType": "info"},
+        ]
+
+
+def test_notifications_are_persisted_in_the_trajectory(tmp_path, monkeypatch):
+    """A thinking-budget intervention (or any ctx.ui.notify event) must land
+    in trajectory_<n>.json/.txt -- previously _dump_trajectory never received
+    or wrote them at all, so an attempt that read files and stopped looked
+    identical whether the model chose to stop or the harness force-aborted
+    its thinking."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (True, "ok"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithNotifications)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=False)
+
+    log_dir = tmp_path / "logs" / "pi" / "faker" / "ex"
+    payload = json.loads((log_dir / "trajectory_1.json").read_text())
+    assert any("thought long enough" in n["message"] for n in payload["notifications"])
+    assert "harness intervention" in (log_dir / "trajectory_1.txt").read_text()

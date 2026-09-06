@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rpc_client import PiRpc, PromptResult  # noqa: E402
+from rpc_client import PiRpc, PromptResult, capture_environment_snapshot  # noqa: E402
 
 # `or`, not os.environ.get(name, default): an exported-but-empty override
 # must still fall back -- Path("") normalizes to Path("."), whose .exists()
@@ -207,7 +207,15 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     Only the final pytest output survives a run today, so a failure can be seen
     but not explained. PromptResult already carries the assistant text and every
     tool call; the work dir is a TemporaryDirectory destroyed on scope exit,
-    taking the model's actual code with it.
+    taking the model's actual code with it. `notifications` (ctx.ui.notify
+    events -- skill/knowledge injections, and critically the thinking-budget
+    extension's "the model has thought long enough" harness intervention) was
+    the other thing this dropped: an attempt that read files and stopped
+    without writing anything looked identical whether the model chose to stop
+    or the harness force-aborted its thinking, unless you happened to re-run
+    it live with rpc.notifications() to compare (this is exactly how the
+    thinking-budget intervention was first discovered, on a real `bowling`
+    failure -- nothing in the persisted trajectory said so).
 
     notifications: this attempt's OWN rpc.notifications(). Each attempt opens
     a fresh PiRpc session (see _run_exercise), so this is already scoped to
@@ -234,7 +242,14 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
                 }
                 for tc in getattr(result, "tool_calls", [])
             ],
-            "notifications": notifications or [],
+            # Same policy as tool_calls above -- extension notify text is
+            # normally short, but it's authored by extensions (including
+            # third-party ones a run may load), and this is otherwise the
+            # one field in this payload exempt from the file's own size cap.
+            "notifications": [
+                {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
+                for n in (notifications or [])
+            ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),
@@ -244,6 +259,10 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
             lines.append(f"--- [{i}] {tc.get('name')} err={tc.get('is_error')} ---")
             lines.append(f"    args: {json.dumps(tc.get('args', {}), default=str)[:1500]}")
             lines.append(f"    result: {str(tc.get('result_text', ''))[:1500]}")
+        if payload["notifications"]:
+            lines.append("=== notifications ===")
+            for n in payload["notifications"]:
+                lines.append(f"    [{n.get('notifyType')}] {str(n.get('message', ''))[:1500]}")
         lines.append("=== assistant text ===")
         lines.append(payload["assistant_text"][:20000])
         (log_dir / f"trajectory_{attempt_name}.txt").write_text(
@@ -620,6 +639,7 @@ def _run_exercise(
     max_attempts: int = 2,
     thinking: str | None = None,
     agent: str = "pi",
+    thinking_confirmation: dict | None = None,
 ):
     desc = LANG_DESCRIPTORS.get(lang)
     if desc is None:
@@ -675,24 +695,64 @@ def _run_exercise(
         current_prompt = prompt
         codex_session_id = None
         for i in range(1, effective_attempts + 1):
-            notifications: list[dict] = []
+            # Reset every iteration, not just declared once before the loop:
+            # if a future branch (or an exception) ever skipped reassigning
+            # it, this attempt would otherwise be dumped carrying the PRIOR
+            # attempt's notifications -- silently wrong forensics in exactly
+            # the artifact this exists to make trustworthy.
+            attempt_notifications: list[dict] = []
             if agent == "pi":
                 with PiRpc(model=model, cwd=str(work), allowed_tools=ALLOWED_TOOLS,
                            session_id=f"poly-{lang}-{ex_name}-attempt{i}",
                            env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
                            thinking=thinking) as rpc:
+                    if i == 1 and thinking_confirmation is not None and not thinking_confirmation["attempted"]:
+                        # Best-effort, and only once per RUN, ever -- gated on
+                        # "attempted", not "got a value back", so a FAILED
+                        # confirmation also stops later exercises from
+                        # re-probing (config doesn't change mid-run; a second,
+                        # third, ... attempt after a first failure would just
+                        # be more of the same redundant/failing RPC round-trip).
+                        # Mutates the caller's dict directly and immediately,
+                        # rather than returning through `record` below: if
+                        # prompt_and_collect() on this same attempt then
+                        # raises, the exception unwinds out of _run_exercise
+                        # before any `return` -- a value threaded through the
+                        # return dict would be lost, but this mutation already
+                        # happened and is visible to the caller regardless.
+                        thinking_confirmation["attempted"] = True
+                        try:
+                            state = rpc.get_state()
+                            level = state.get("thinkingLevel")
+                            if level:
+                                thinking_confirmation["confirmed_live"] = level
+                            else:
+                                # A successful response with no usable
+                                # thinkingLevel must not look identical to
+                                # "never attempted" -- both confirmed_live
+                                # and error staying None would be exactly
+                                # that ambiguity.
+                                thinking_confirmation["error"] = (
+                                    f"get_state succeeded but returned no thinkingLevel: {state!r}"
+                                )
+                        except Exception as exc:
+                            thinking_confirmation["error"] = f"{type(exc).__name__}: {exc}"
                     # prompt_and_collect() returns partial events *silently*
                     # when agent_end never arrives (_drain_events_until
                     # returns `collected`, it does not raise), so a
                     # budget-capped attempt is otherwise indistinguishable
                     # from a completed one.
                     r = rpc.prompt_and_collect(current_prompt, timeout=ATTEMPT_TIMEOUT_S)
-                    # A fresh PiRpc per attempt (see above) means
-                    # notifications() is already scoped to just this
-                    # attempt -- no delta-slicing needed across attempts the
-                    # way one shared session across the whole retry would
-                    # have required.
-                    notifications = rpc.notifications() if hasattr(rpc, "notifications") else []
+                # ctx.ui.notify events -- skill/knowledge injections, and
+                # critically the thinking-budget extension's "the model has
+                # thought long enough" intervention. Read AFTER the `with`
+                # block (not inside it): PiRpc.close() joins the reader
+                # thread before returning, so by the time __exit__ finishes,
+                # everything the reader ever drained is guaranteed to be in
+                # self._notifications -- reading before close() started (as
+                # an earlier version of this code did) had no such guarantee.
+                # Harmless if this list ends up empty.
+                attempt_notifications = rpc.notifications()
             elif agent == "codex":
                 # Unlike pi's fresh-session-per-attempt (see above), codex
                 # resumes its own prior session from attempt 2 onward --
@@ -712,7 +772,7 @@ def _run_exercise(
             stop_reasons.append(_stop_reason(r))
             # Snapshot BEFORE the tests run and before any retry prompt is
             # sent, so the artifact reflects what THIS attempt produced.
-            _dump_trajectory(log_dir, str(i), r, work, notifications=notifications)
+            _dump_trajectory(log_dir, str(i), r, work, notifications=attempt_notifications)
             passed, out = _score(desc, work, desc["timeout_s"])
             (log_dir / f"final_output_{i}.txt").write_text(out)
             if passed:
@@ -772,13 +832,14 @@ def _run_exercise(
         if verbose:
             print(f"[{lang}/{ex_name}] {'PASS' if passed else 'FAIL'} in {elapsed:.1f}s on {attempt or 'fail'}")
 
-        return {
+        record = {
             "run_id": RUN_ID,
             "status": _classify_status(passed, attempt, outcomes),
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
         }
+        return record
 
 
 def main():
@@ -832,6 +893,10 @@ def main():
     params = _scoring_params(model, args.language, not args.no_retry, desc,
                              max_attempts=args.max_attempts, thinking=args.thinking,
                              agent=args.agent)
+    # Diagnostic only -- deliberately NOT part of _scoring_params/_param_mismatches,
+    # same reasoning as config_label: this doesn't affect how an attempt runs,
+    # so a --resume under a different sampling temperature isn't a mismatch.
+    env_snapshot = capture_environment_snapshot(model, cli_thinking=args.thinking, agent=args.agent)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -852,9 +917,16 @@ def main():
         "run_id": RUN_ID,
         "started_at": datetime.datetime.now().isoformat(),
         "scoring_params": params,
+        "environment_snapshot": env_snapshot,
     })
     results["meta"]["scoring_params"] = params
+    results["meta"]["environment_snapshot"] = env_snapshot
     results["meta"]["run_id"] = RUN_ID
+    # Otherwise a --resume that skips every already-passed exercise (or an
+    # empty exercise set) never reaches the per-exercise _save_results()
+    # below, and this run's metadata -- including which config/environment
+    # it ran under -- is silently never persisted at all.
+    _save_results(results)
 
     practice = desc["practice_dir"]
     if args.exercise:
@@ -866,6 +938,14 @@ def main():
 
     consecutive_errors = 0
     written_this_run: dict[str, dict] = {}
+    # Owned by main(), mutated directly by _run_exercise on the first
+    # exercise's first attempt (see there for why: a dict mutation survives
+    # even if _run_exercise raises afterward, unlike a value threaded through
+    # its return dict). "attempted" gates on ATTEMPTED, not "got a value" --
+    # a failed confirmation must also stop every later exercise from
+    # re-probing and re-appending the same error, not just a successful one.
+    thinking_confirmation = {"attempted": False, "confirmed_live": None, "error": None}
+    confirmation_error_recorded = False
     for name in names:
         key = f"{args.agent}/{args.language}/{name}"
         if args.resume and str(results["exercises"].get(key, {}).get("status", "")).startswith("pass_"):
@@ -884,10 +964,28 @@ def main():
                 max_attempts=args.max_attempts,
                 thinking=args.thinking,
                 agent=args.agent,
+                thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
             r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
+
+        # Idempotent after the first exercise (thinking_confirmation stops
+        # changing once "attempted" is True), so applying it unconditionally
+        # every iteration is harmless -- simpler than trying to detect "this
+        # was the exercise that just attempted it".
+        if thinking_confirmation["confirmed_live"] is not None:
+            env_snapshot["thinking"]["confirmed_live"] = thinking_confirmation["confirmed_live"]
+        elif thinking_confirmation["error"] is not None and not confirmation_error_recorded:
+            # A failed confirmation attempt must not just vanish -- otherwise
+            # confirmed_live staying null is indistinguishable from "never
+            # tried" versus "tried and pi's get_state rejected the request".
+            # confirmation_error_recorded (a local, not part of env_snapshot
+            # itself) is the dedup flag, so this stays out of the persisted
+            # JSON -- env_snapshot only ever holds data meant to be written.
+            env_snapshot.setdefault("errors", []).append(
+                {"source": "confirmed_thinking", "error": thinking_confirmation["error"]})
+            confirmation_error_recorded = True
 
         r["scoring_params"] = params
         results["exercises"][key] = r
