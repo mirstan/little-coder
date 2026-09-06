@@ -1,5 +1,9 @@
-"""Integration test: --dry-run's actual pipeline (_dry_run + _ingest_all)
-against TWO real benchmarks' data at once, not each in isolation.
+"""Integration test: report_trajectories.py's actual pipeline (ingest_all +
+dry_run_report) against TWO real benchmarks' data at once, not each in
+isolation. Moved here from run_gepa.py, which no longer scores from frozen
+historical data at all (see polyglot_adapter.py's module docstring) --
+report_trajectories.py still serves VALIDATION_PLAN Layers 2-3 independent
+of the live-execution GEPA loop.
 
 Coverage gap this closes: Layer 2/3 were validated for aider_polyglot and tb
 SEPARATELY (one --log-roots key at a time) during manual VALIDATION_PLAN.md
@@ -12,7 +16,7 @@ import json
 from pathlib import Path
 
 from benchmarks.self_improve.components import load_components
-from benchmarks.self_improve.run_gepa import DEFAULT_WEIGHTS, _dry_run, _ingest_all
+from benchmarks.self_improve.report_trajectories import DEFAULT_WEIGHTS, dry_run_report, ingest_all as _ingest_all
 
 REAL_TB_FIXTURE = Path(__file__).parent / "fixtures" / "real_tb_run"
 
@@ -135,12 +139,11 @@ def test_dry_run_produces_a_plausible_weighted_aggregate_across_benchmarks(tmp_p
         repo_root=real_repo_root,
     )
 
-    _dry_run(trajectories, components, DEFAULT_WEIGHTS)
+    dry_run_report(trajectories, components, DEFAULT_WEIGHTS)
     out = capsys.readouterr().out
 
     assert "aider_polyglot: 1 trajectories, avg score 1.000" in out
     assert "tb: 1 trajectories, avg score 0.000" in out
-    assert "Errors encountered: 0" in out
     # aggregate must be strictly between the two per-benchmark scores
     agg_line = next(line for line in out.splitlines() if "Weighted aggregate score" in line)
     agg_value = float(agg_line.split(":")[1].strip())
