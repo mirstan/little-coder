@@ -165,3 +165,65 @@ def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False
     assert r.tool_calls == []
+
+
+class _NeverFinishingThread:
+    """Stands in for a reader thread that's still alive after join()'s
+    timeout elapses -- without actually waiting out a real timeout."""
+
+    def __init__(self, alive: bool):
+        self._alive = alive
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return self._alive
+
+
+class _AlreadyExitedProc:
+    class _Stdin:
+        closed = False
+
+        def close(self):
+            pass
+
+    def __init__(self):
+        self.stdin = self._Stdin()
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_close_warns_if_reader_thread_never_finishes(capsys):
+    """A reader thread still alive after close()'s join() timeout must not
+    be silently swallowed -- it means notifications()/responses may be
+    missing their tail, and that's surprising enough to warrant a loud
+    warning rather than just proceeding as if nothing happened."""
+    rpc = object.__new__(PiRpc)
+    rpc._closed = False
+    rpc._session_id = "wedged-session"
+    rpc._proc = _AlreadyExitedProc()
+    rpc._reader = _NeverFinishingThread(alive=True)
+    rpc._stderr_reader = _NeverFinishingThread(alive=False)
+
+    rpc.close()
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "wedged-session" in err
+    assert "reader thread" in err
+
+
+def test_close_silent_when_reader_threads_finish_in_time(capsys):
+    rpc = object.__new__(PiRpc)
+    rpc._closed = False
+    rpc._session_id = "clean-session"
+    rpc._proc = _AlreadyExitedProc()
+    rpc._reader = _NeverFinishingThread(alive=False)
+    rpc._stderr_reader = _NeverFinishingThread(alive=False)
+
+    rpc.close()
+
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
