@@ -10,12 +10,15 @@ function makeHarness() {
   const sent: { text: string; options: any }[] = [];
   const notifies: string[] = [];
   const handlers: Record<string, Handler[]> = {};
+  const state = { sendThrows: false };
   const pi = {
     handlers,
+    state,
     on(name: string, h: Handler) {
       (handlers[name] ??= []).push(h);
     },
     sendUserMessage(text: string, options: any) {
+      if (state.sendThrows) throw new Error("SDK does not support sendUserMessage");
       sent.push({ text, options });
       calls.push("send");
     },
@@ -28,7 +31,7 @@ function makeHarness() {
       },
     },
   };
-  return { pi, ctx, calls, sent, notifies };
+  return { pi, ctx, calls, sent, notifies, state };
 }
 
 async function fire(pi: any, name: string, event: any, ctx: any) {
@@ -163,7 +166,7 @@ describe("gaia-finalize-guard", () => {
       assistantTurn({ text: "Let me fetch it to get the zip codes." }),
       h.ctx,
     );
-    expect(h.calls).toEqual(["notify", "send"]);
+    expect(h.calls).toEqual(["send", "notify"]);
     expect(h.notifies[0]).toMatch(/harness intervention:.*without a tool call or an Answer/i);
     expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
     expect(h.sent[0].text).toMatch(/didn't call a tool or end with/i);
@@ -207,6 +210,57 @@ describe("gaia-finalize-guard", () => {
     await startRun(h, 10);
     await fire(h.pi, "turn_start", {}, h.ctx);
     await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("nudges when an earlier line merely looks like Answer: but real prose follows it", async () => {
+    // A mid-reasoning line that happens to match the convention (a draft, a
+    // placeholder) must not suppress the nudge when the turn actually trails
+    // off afterward — checking "any line matches" instead of "the last
+    // non-blank line matches" would wrongly treat this as finalized.
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(
+      h.pi,
+      "turn_end",
+      assistantTurn({
+        text:
+          "My plan:\nAnswer: <put final value here>\n" +
+          "But I still need to verify with a search.",
+      }),
+      h.ctx,
+    );
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("does not nudge when the Answer: line is genuinely last, even with earlier reasoning", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(
+      h.pi,
+      "turn_end",
+      assistantTurn({ text: "Some reasoning.\nMore reasoning.\nAnswer: 42" }),
+      h.ctx,
+    );
+    expect(h.calls).toEqual([]);
+  });
+
+  it("does not claim the one-shot slot or notify when sendUserMessage throws, so a later turn can still try", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    h.state.sendThrows = true;
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look into this." }), h.ctx);
+    // No notification shown for a nudge that was never actually delivered,
+    // and the one-shot slot wasn't burned on a failed attempt.
+    expect(h.notifies).toEqual([]);
+    expect(h.sent).toEqual([]);
+
+    h.state.sendThrows = false;
+    await fire(h.pi, "turn_end", assistantTurn({ text: "Let me look further." }), h.ctx);
     expect(h.sent).toHaveLength(1);
   });
 });

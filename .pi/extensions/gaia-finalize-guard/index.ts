@@ -111,13 +111,24 @@ export default function (pi: ExtensionAPI) {
     // rather than queue a second, possibly conflicting correction for the
     // same turn.
     if (!text.trim()) return;
-    if (ANSWER_LINE_RE.test(text)) return; // followed the convention — nothing to do
+    // Check only the LAST non-blank physical line, not "does any line
+    // anywhere match" — GAIA's own prompt tells the model not to append
+    // prose after its Answer: line, so a well-formed reply has it as the
+    // final line. Checking the whole blob let an earlier line that merely
+    // *looks* like the convention (a mid-reasoning draft, e.g.
+    // "Answer: <put final value here>") suppress the nudge on a turn that
+    // still trails off afterward with real unresolved prose — the exact
+    // unfinished-turn case this guard exists to catch.
+    const lines = text.split("\n");
+    let lastNonBlank = "";
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim()) {
+        lastNonBlank = lines[i];
+        break;
+      }
+    }
+    if (ANSWER_LINE_RE.test(lastNonBlank)) return; // followed the convention — nothing to do
 
-    nudgedThisRun = true;
-    harnessIntervention(
-      ctx,
-      "turn ended without a tool call or an Answer: line — asking the model to continue or finalize.",
-    );
     try {
       pi.sendUserMessage(
         "Your last reply didn't call a tool or end with `Answer: <value>`. " +
@@ -126,7 +137,20 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "steer" },
       );
     } catch {
-      // SDK without sendUserMessage — let agent_end stand rather than break the run.
+      // SDK without sendUserMessage — leave nudgedThisRun false so a later
+      // turn_end can still try; if the SDK genuinely lacks this call for
+      // the whole session, later attempts will fail identically and cost
+      // nothing extra.
+      return;
     }
+    // Only claim the one-shot slot and surface the notification once the
+    // send has actually succeeded — otherwise a failed send both burns the
+    // only nudge this run gets and shows an intervention message for
+    // something that was never delivered.
+    nudgedThisRun = true;
+    harnessIntervention(
+      ctx,
+      "turn ended without a tool call or an Answer: line — asking the model to continue or finalize.",
+    );
   });
 }
