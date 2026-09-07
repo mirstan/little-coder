@@ -256,10 +256,16 @@ def test_cap_non_text_deltas_keeps_head_and_tail_drops_middle():
 
 
 def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
+    """Real gap, confirmed by review: the original version of this test only
+    asserted isinstance(result, list) -- true even if the huge entry were
+    echoed back unbounded, so a regression that stopped capping oversized
+    entries would still pass. Assert the actual boundedness and dropping
+    behavior instead."""
     huge = {"type": "toolcall_delta", "delta": "x" * 1_000_000}
     result = AP._cap_non_text_deltas([huge, {"type": "thinking_delta", "delta": "short"}], char_budget=1_000)
-    # Doesn't raise, and still bounds the result to something sane.
-    assert isinstance(result, list)
+    assert len(json.dumps(result, default=str)) < 1_000  # nowhere near the huge entry's own size
+    assert huge not in result  # actually dropped, not just left in unbounded
+    assert any(d.get("type") == "_omitted" for d in result)
 
 
 def test_dump_trajectory_no_longer_drops_the_tail_of_a_long_but_small_reasoning_stream(tmp_path):
