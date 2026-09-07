@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from benchmarks.self_improve.ingest.common import (
@@ -47,6 +48,56 @@ def test_parse_knowledge_inject_notification_drops_unresolved_topic():
     """Without a topic index (or a topic missing from it -- e.g. a renamed
     skill file), the usage record is dropped rather than guessed at."""
     assert parse_notification_line("[info] knowledge-inject: +1 [Some Unknown Topic]") == []
+
+
+def test_parse_skill_inject_notification_new_json_format():
+    """Real notification format going forward -- both emitting TS extensions
+    now JSON.stringify() the name list instead of comma-joining it (see
+    ingest/common.py's own module docstring)."""
+    payload = json.dumps(["bash", "read"])
+    usages = parse_notification_line(f"[info] skill-inject: +2 {payload}")
+    assert usages == [
+        ComponentUsage(pred_name="skills_tools_bash", invocation_count=1),
+        ComponentUsage(pred_name="skills_tools_read", invocation_count=1),
+    ]
+
+
+def test_parse_knowledge_inject_notification_handles_a_topic_containing_a_literal_comma():
+    """The exact bug this JSON switch fixes: a knowledge-inject topic is
+    arbitrary human frontmatter text and can contain a literal comma (e.g.
+    "Error handling, retries, and backoff"). The old bare comma-join format
+    was genuinely ambiguous here; JSON.stringify()/json.loads() are not."""
+    index = {
+        "Error handling, retries, and backoff": "skills_knowledge_error_handling",
+        "Binary Search": "skills_knowledge_binary_search",
+    }
+    payload = json.dumps(["Error handling, retries, and backoff", "Binary Search"])
+    usages = parse_notification_line(
+        f"[info] knowledge-inject: +2 {payload}", knowledge_topic_index=index,
+    )
+    assert usages == [
+        ComponentUsage(pred_name="skills_knowledge_error_handling", invocation_count=1),
+        ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
+    ]
+
+
+def test_parse_knowledge_inject_notification_still_reads_old_comma_joined_format():
+    """Backward compat: real historical trajectory data written before the
+    JSON switch used a bare comma-joined bracket list and will keep showing
+    up. Must still parse (with its old, already-baked-in ambiguity for a
+    topic containing a literal comma -- that data can't be recovered after
+    the fact, only new data is fixed)."""
+    index = {
+        "Binary Search": "skills_knowledge_binary_search",
+        "Two Pointers": "skills_knowledge_two_pointers",
+    }
+    usages = parse_notification_line(
+        "[info] knowledge-inject: +2 [Binary Search,Two Pointers]", knowledge_topic_index=index,
+    )
+    assert usages == [
+        ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
+        ComponentUsage(pred_name="skills_knowledge_two_pointers", invocation_count=1),
+    ]
 
 
 def _write_skill_file(path, name, topic=None):

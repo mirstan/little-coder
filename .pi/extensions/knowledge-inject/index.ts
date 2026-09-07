@@ -153,8 +153,15 @@ export default function (pi: ExtensionAPI) {
     if (!shouldInject(block)) return;
 
     try {
+      // JSON-encoded, not comma-joined: `topic` is arbitrary human
+      // frontmatter text (e.g. "Error handling, retries, and backoff") and
+      // a bare comma-join is ambiguous whenever a topic contains a literal
+      // comma. The ingest-side parser (benchmarks/self_improve/ingest/
+      // common.py::_parse_notification_payload) tries JSON first and falls
+      // back to the old comma-split only for historical trajectory data
+      // predating this fix.
       ctx.ui.notify(
-        `knowledge-inject: +${selected.length} [${selected.map((e) => e.topic).join(",")}]`,
+        `knowledge-inject: +${selected.length} ${JSON.stringify(selected.map((e) => e.topic))}`,
         "info",
       );
     } catch {

@@ -6,12 +6,22 @@ context (capped length, error calls prioritized).
 Notification message formats are fixed by the emitting TS extensions and must
 not be re-derived from guesswork -- see TDD_SPEC.md §0 for the confirmed
 source references:
-  .pi/extensions/skill-inject/index.ts:385      "skill-inject: +N [tool1,tool2]"
-  .pi/extensions/knowledge-inject/index.ts:156   "knowledge-inject: +N [topic1,topic2]"
+  .pi/extensions/skill-inject/index.ts:~388      'skill-inject: +N ["tool1","tool2"]'
+  .pi/extensions/knowledge-inject/index.ts:~164   'knowledge-inject: +N ["topic1","topic2"]'
 
-skill-inject's bracketed names are the TOOL NAME itself (e.g. "bash"), which
-is also the file stem, so pred_name = "skills_tools_" + name works directly.
-knowledge-inject's bracketed names are each entry's `topic` FRONTMATTER FIELD
+The bracketed payload is a JSON array of strings (real bug, fixed: it used to
+be a bare comma-joined list, `[tool1,tool2]` -- ambiguous whenever a name
+itself contained a literal comma, which is a real risk for knowledge-inject's
+topic strings, arbitrary human frontmatter text like "Error handling,
+retries, and backoff"). `_parse_notification_payload()` below tries JSON
+first and falls back to the old comma-split ONLY for historical trajectory
+data written before this fix -- that data is already ambiguous and can't be
+recovered after the fact, so the fallback keeps its old (imperfect) behavior
+rather than trying to guess.
+
+skill-inject's names are the TOOL NAME itself (e.g. "bash"), which is also
+the file stem, so pred_name = "skills_tools_" + name works directly.
+knowledge-inject's names are each entry's `topic` FRONTMATTER FIELD
 (e.g. "Binary Search", "State-Space Search") -- an arbitrary human string
 independent of the file's `name`/stem (confirmed against
 .pi/extensions/knowledge-inject/index.ts:49 and real skills/knowledge/*.md,
@@ -21,6 +31,7 @@ turned into the right pred_name by string transformation alone (e.g.
 build_knowledge_topic_index() must be called against the real repo and
 threaded through to resolve it.
 """
+import json
 import logging
 import re
 from pathlib import Path
@@ -33,8 +44,29 @@ logger = logging.getLogger(__name__)
 
 _NOTIF_RE = re.compile(
     r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):"
-    r"\s+(?:\+\d+\s+\[(?P<names>[^\]]*)\])?"
+    r"\s+(?:\+\d+\s+(?P<payload>\[.*\]))?"
 )
+
+
+def _parse_notification_payload(payload: str) -> list[str]:
+    """New format: a JSON array of strings -- unambiguous even when a name
+    itself contains a comma (see this module's own docstring). Old format
+    (real historical trajectory data predates this fix and will keep
+    showing up): a bare bracketed, comma-joined list -- kept as an
+    exact-behavior fallback, including its known ambiguity for a name
+    containing a literal comma, since that data is already ambiguous and
+    can't be recovered after the fact."""
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+        return [n.strip() for n in parsed if n.strip()]
+
+    stripped = payload.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1]
+    return [n.strip() for n in stripped.split(",") if n.strip()]
 
 _SOURCE_PREFIX = {
     "skill-inject": "skills_tools_",
@@ -112,7 +144,10 @@ def parse_notification_line(
     m = _NOTIF_RE.match(line)
     if not m:
         return []
-    names = m.group("names")
+    payload = m.group("payload")
+    if not payload:
+        return []
+    names = _parse_notification_payload(payload)
     if not names:
         return []
     source = m.group("source")
@@ -120,10 +155,7 @@ def parse_notification_line(
     if source == "knowledge-inject":
         index = knowledge_topic_index or {}
         usages = []
-        for name in names.split(","):
-            name = name.strip()
-            if not name:
-                continue
+        for name in names:
             pred_name = index.get(name)
             if pred_name is None:
                 logger.warning(
@@ -135,11 +167,7 @@ def parse_notification_line(
         return usages
 
     prefix = _SOURCE_PREFIX[source]
-    return [
-        ComponentUsage(pred_name=f"{prefix}{name.strip()}", invocation_count=1)
-        for name in names.split(",")
-        if name.strip()
-    ]
+    return [ComponentUsage(pred_name=f"{prefix}{name}", invocation_count=1) for name in names]
 
 
 def merge_component_usage(

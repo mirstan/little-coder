@@ -59,20 +59,25 @@ below must match them exactly:
   reject a file that doesn't start with `---` (i.e. AGENTS.md and PRINCIPLES.md, which
   have no frontmatter, must be handled as frontmatter-less).
 
-- `skill-inject` notification message format (`.pi/extensions/skill-inject/index.ts:385`):
-  `"skill-inject: +2 [bash,read]"` — literal prefix `skill-inject: +`, digit count,
-  space, `[`, comma-joined tool names, `]`. When `selected.length === 0` the parts
-  array can still contain `+research-directive` alone with no bracket group, e.g.
-  `"skill-inject: +research-directive"` — the count/bracket segment is only present
-  when `selected.length > 0`.
+- `skill-inject` notification message format (`.pi/extensions/skill-inject/index.ts`,
+  `~L388`): `'skill-inject: +2 ["bash","read"]'` — literal prefix `skill-inject: +`,
+  digit count, space, then `JSON.stringify(names)` (a JSON array of strings — real
+  bug, fixed: this used to be a bare comma-joined `[bash,read]`, ambiguous whenever
+  a name contained a literal comma). When `selected.length === 0` the parts array
+  can still contain `+research-directive` alone with no bracket group, e.g.
+  `"skill-inject: +research-directive"` — the count/JSON-array segment is only
+  present when `selected.length > 0`.
 
-- `knowledge-inject` notification message format (`.pi/extensions/knowledge-inject/index.ts:156`):
-  `"knowledge-inject: +3 [binary_search,two_pointer]"` — same shape, topics not tools,
-  always has the count+bracket (no conditional segment).
+- `knowledge-inject` notification message format (`.pi/extensions/knowledge-inject/index.ts`,
+  `~L164`): `'knowledge-inject: +3 ["binary_search","two_pointer"]'` — same shape
+  (also a JSON array), topics not tools, always has the count+array (no conditional
+  segment). `_parse_notification_payload()` in `ingest/common.py` tries JSON first
+  and falls back to the old bare comma-split only for historical trajectory data
+  written before this fix.
 
 - gaia per-task `notifications.txt` line format (`benchmarks/gaia.py:225-226`):
   `f"[{n.get('notifyType', 'info')}] {n.get('message', '')}\n"` → literal lines like
-  `"[info] skill-inject: +2 [bash,read]"`.
+  `'[info] skill-inject: +2 ["bash","read"]'`.
 
 - gaia per-task `tool_calls.jsonl`: one JSON object per line, fields include at least
   `name`, `args`, `result_text` (truncated to 2000 chars), `result_text_len`, `is_error`.

@@ -379,7 +379,12 @@ export default function (pi: ExtensionAPI) {
     try {
       const parts: string[] = [];
       if (selected.length > 0) {
-        parts.push(`+${selected.length} [${selected.map((s) => s.targetTool).join(",")}]`);
+        // JSON-encoded for the same reason knowledge-inject's notify is --
+        // see that extension's own comment. targetTool names are unlikely
+        // to contain a comma in practice, but the ingest-side parser
+        // handles both sources identically, so both emitters stay
+        // consistent with each other.
+        parts.push(`+${selected.length} ${JSON.stringify(selected.map((s) => s.targetTool))}`);
       }
       if (researchTask) parts.push("+research-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
