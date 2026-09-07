@@ -128,6 +128,57 @@ def _run_python(work: Path, timeout: int):
         return False, f"timed out after {timeout}s"
 
 
+# Exercism's JS fixtures ship with only the first test case active per file;
+# the rest are disabled via Jest's xtest()/xit()/.skip() ("unlock more tests
+# as you pass" -- an interactive-workflow convention, not a runtime gate).
+# Un-skip them all before running, or scoring only checks 1 of up to ~49
+# cases per exercise. Same defect independently found and fixed in Harbor's
+# packaged aider-polyglot verifier (harness/patch_aider_polyglot_xitstrip.py
+# in the qwen36-aa repo) -- confirmed here directly against the raw upstream
+# exercise fixtures (Aider-AI/polyglot-benchmark), not just Harbor's copy.
+_JS_UNSKIP_PATTERNS = [
+    (re.compile(r"\bxtest\("), "test("),
+    (re.compile(r"\bxit\("), "it("),
+    (re.compile(r"\btest\.skip\("), "test("),
+    (re.compile(r"\bit\.skip\("), "it("),
+]
+
+# All Exercism JS exercises share an identical devDependencies set (babel +
+# jest), so `npm install` is done once into this shared dir and symlinked
+# into each exercise's work dir, instead of a slow per-exercise reinstall.
+_JS_SHARED_NODE_MODULES = (
+    BENCHMARK_ROOT / "javascript" / ".shared-npm" / "node_modules"
+)
+
+
+def _prepare_javascript(src: Path, work: Path):
+    _copy_exercise(src, work)
+    tests = list(work.glob("*.spec.js")) + list(work.glob("*.test.js"))
+    for t in tests:
+        content = t.read_text()
+        for pattern, repl in _JS_UNSKIP_PATTERNS:
+            content = pattern.sub(repl, content)
+        t.write_text(content)
+    if _JS_SHARED_NODE_MODULES.is_dir():
+        (work / "node_modules").symlink_to(_JS_SHARED_NODE_MODULES)
+    stubs = [
+        p for p in work.glob("*.js")
+        if p not in tests and p.name != "babel.config.js"
+    ]
+    return stubs, tests
+
+
+def _run_javascript(work: Path, timeout: int):
+    try:
+        r = subprocess.run(
+            ["npm", "test", "--silent"],
+            cwd=work, capture_output=True, text=True, timeout=timeout,
+        )
+        return r.returncode == 0, (r.stdout + r.stderr)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+
+
 LANG_DESCRIPTORS = {
     "python": {
         "score_in_copy": True,
@@ -137,13 +188,19 @@ LANG_DESCRIPTORS = {
         "syntax_hint": "Use Python 3. Run tests with `python -m pytest -x -q`.",
         "timeout_s": 90,
     },
-    # go/rust/cpp/javascript/java descriptors omitted from this scaffold;
-    # copy them verbatim from the Python repo's aider_polyglot.py when
-    # running the full benchmark. Stub:
+    "javascript": {
+        "score_in_copy": True,
+        "practice_dir": BENCHMARK_ROOT / "javascript" / "exercises" / "practice",
+        "prepare": _prepare_javascript,
+        "run_tests": _run_javascript,
+        "syntax_hint": "Use Node.js (CommonJS/ES modules as the stub already uses). Run tests with `npm test`.",
+        "timeout_s": 90,
+    },
+    # go/rust/cpp/java descriptors omitted from this scaffold; port them the
+    # same way javascript was ported above when running those languages.
     # "rust":      {..., "prepare": _prepare_rust, ...},
     # "go":        {..., "prepare": _prepare_go, ...},
     # "cpp":       {..., "prepare": _prepare_cpp, ...},
-    # "javascript": {..., "prepare": _prepare_js, ...},
     # "java":      {..., "prepare": _prepare_java, ...},
 }
 
