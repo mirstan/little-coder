@@ -118,7 +118,21 @@ export default function (pi: ExtensionAPI) {
           }
           const offender =
             splitCommandChain(cmd).find((s) => !isSafeBash(s)) ?? cmd;
-          const binary = offender.split(/\s+/)[0];
+          const offenderWords = offender.trim().split(/\s+/);
+          // Name the subcommand, not just the binary, when there is one.
+          // A bare-binary message ("git" is not in SAFE_PREFIXES) looks
+          // identical whether the call was a permanently-blocked write op
+          // (`git merge`) or a borderline read op (`git reflog`) — observed
+          // live, a model that saw `git log`/`git show` succeed and then hit
+          // this same undifferentiated message on `git merge` concluded the
+          // whitelist was "flaky" and retried the identical merge call three
+          // times instead of recognizing a fixed, principled block. Two
+          // words is enough to disambiguate without echoing a long/sensitive
+          // command line into the reason string.
+          const offenderLabel =
+            offenderWords.length > 1
+              ? `${offenderWords[0]} ${offenderWords[1]}`
+              : offenderWords[0];
           // Say what to do next, not just what was refused.
           //
           // The bare "not in SAFE_PREFIXES" line sent models hunting: observed
@@ -132,13 +146,13 @@ export default function (pi: ExtensionAPI) {
           return {
             block: true,
             reason:
-              `shell whitelist: "${binary}" is not in SAFE_PREFIXES, so this command was refused.\n` +
+              `shell whitelist: "${offenderLabel}" is not in SAFE_PREFIXES, so this command was refused.\n` +
               `Do NOT try to reach the same effect another way — re-running it through ` +
               `python3 -c, node -e, env, sh, or an -exec flag defeats a limit the user set on ` +
               `purpose, and wastes your budget.\n` +
               `If a file needs changing, use edit/write, which do not need a shell. ` +
               `Otherwise tell the user this command was refused and that they can allow it with ` +
-              `LITTLE_CODER_BASH_ALLOW="${binary}" (or set LITTLE_CODER_PERMISSION_MODE=accept-all), ` +
+              `LITTLE_CODER_BASH_ALLOW="${offenderLabel}" (or set LITTLE_CODER_PERMISSION_MODE=accept-all), ` +
               `then continue with the rest of the task.`,
           };
         }
