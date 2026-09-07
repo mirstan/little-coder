@@ -363,6 +363,11 @@ class PolyglotLiveRunner:
                 effective_timeout = max(1.0, remaining)
                 budget_clamped = True
 
+        # Written BEFORE Popen() -- see mark_spawn_pending()'s own docstring
+        # for the TOCTOU gap this closes (a SIGKILL between Popen() returning
+        # and set_active_pid(proc.pid) below would otherwise leave no marker
+        # evidence that a subprocess was ever started).
+        self.worktree.mark_spawn_pending()
         proc = subprocess.Popen(
             cmd, cwd=str(self.worktree.path), env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

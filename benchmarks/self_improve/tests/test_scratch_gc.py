@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -84,7 +85,13 @@ def test_find_never_touches_a_branch_worktree_even_with_marker_content_inside(so
     assert "branch" in matching[0]["reason"]
 
 
-def test_find_marks_prunable_gone_worktree_as_removable(source_repo, tmp_path):
+def test_find_marks_prunable_gone_worktree_as_removable_when_scoped_and_name_matches(
+    source_repo, tmp_path,
+):
+    """A directory-gone-but-prunable entry, under a correctly-configured
+    --scratch-root AND named per our own scratch-worktree convention
+    (gepa-scratch-<pid>-<hex8>) -- the tool's actual, common purpose:
+    cleaning up its own crashed scratch checkouts."""
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
         scratch_path = wt.path
     shutil.rmtree(scratch_path)  # simulate a SIGKILL: dir gone, registration remains
@@ -108,6 +115,32 @@ def test_find_does_not_auto_remove_prunable_gone_worktree_without_scratch_root(s
     matching = [e for e in entries if e["path"] == scratch_path]
     assert len(matching) == 1
     assert matching[0]["removable"] is False
+
+    subprocess.run(["git", "worktree", "prune"], cwd=source_repo, check=True)
+
+
+def test_find_does_not_auto_remove_prunable_gone_worktree_with_a_mismatched_name(
+    source_repo, tmp_path,
+):
+    """Real gap, confirmed by review: path containment under a caller-given
+    --scratch-root is NOT ownership evidence on its own -- an unrelated
+    tool's own detached worktree could happen to live under the same
+    directory (a shared tmp root, say). Simulate that by creating a
+    worktree directly (not via scratch_worktree(), so it has no marker and
+    a name that doesn't match our naming convention) under the configured
+    scratch root, then removing its directory -- must stay non-removable
+    even though it's "detached + prunable + under --scratch-root", since
+    the one remaining signal (name) doesn't match either."""
+    foreign_path = tmp_path / "not-ours-at-all"
+    subprocess.run(["git", "worktree", "add", "--detach", str(foreign_path)],
+                    cwd=source_repo, check=True, capture_output=True)
+    shutil.rmtree(foreign_path)
+
+    entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
+    matching = [e for e in entries if e["path"] == foreign_path]
+    assert len(matching) == 1
+    assert matching[0]["removable"] is False
+    assert "no marker" in matching[0]["reason"]
 
     subprocess.run(["git", "worktree", "prune"], cwd=source_repo, check=True)
 
@@ -139,6 +172,48 @@ def test_find_marks_worktree_removable_when_both_pid_and_active_pid_dead(source_
     marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
     marker["pid"] = 999999999
     marker["active_pid"] = 999999998
+    (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker))
+
+    entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
+    matching = [e for e in entries if e["path"] == scratch_path]
+    assert matching[0]["removable"] is True
+
+    subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
+
+
+def test_find_withholds_removal_during_the_spawn_grace_window(source_repo, tmp_path):
+    """Real TOCTOU gap, confirmed by review: PolyglotLiveRunner writes
+    spawn_pending_at (via mark_spawn_pending()) BEFORE subprocess.Popen(),
+    then set_active_pid(proc.pid) only AFTER Popen() returns. A SIGKILL in
+    that exact window leaves pid/active_pid both dead but spawn_pending_at
+    recent -- must NOT be treated as orphaned, since a subprocess may be
+    mid-spawn (or have just started) and still alive."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
+        scratch_path = wt.path
+    marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
+    marker["pid"] = 999999999  # dead
+    marker.pop("active_pid", None)  # never got written -- the exact gap
+    marker["spawn_pending_at"] = time.time()  # just now
+    (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker))
+
+    entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
+    matching = [e for e in entries if e["path"] == scratch_path]
+    assert matching[0]["removable"] is False
+    assert "grace window" in matching[0]["reason"]
+
+    subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
+
+
+def test_find_allows_removal_once_the_spawn_grace_window_has_elapsed(source_repo, tmp_path):
+    """The grace window must not block genuine cleanup forever -- once
+    spawn_pending_at is old enough, a dead pid/active_pid pair with no
+    other evidence of life is trusted as truly orphaned again."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
+        scratch_path = wt.path
+    marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
+    marker["pid"] = 999999999
+    marker.pop("active_pid", None)
+    marker["spawn_pending_at"] = time.time() - 999999  # long ago
     (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker))
 
     entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
@@ -250,16 +325,20 @@ def test_cli_clean_does_not_prune_prunable_entries_outside_its_own_scratch_root(
     shutil.rmtree(untouched_path)  # prunable, but under a DIFFERENT scratch root
     shutil.rmtree(target_path)
 
-    code = main(["--repo-root", str(source_repo), "--scratch-root", str(tmp_path), "--clean", "--yes"])
-    assert code == 0
+    try:
+        code = main(["--repo-root", str(source_repo), "--scratch-root", str(tmp_path), "--clean", "--yes"])
+        assert code == 0
 
-    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=source_repo,
-                             capture_output=True, text=True, check=True)
-    assert str(target_path) not in result.stdout  # the one we asked to clean
-    assert str(untouched_path) in result.stdout  # outside scope -- must survive
-
-    subprocess.run(["git", "worktree", "prune"], cwd=source_repo, check=True)
-    shutil.rmtree(other_root, ignore_errors=True)
+        result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=source_repo,
+                                 capture_output=True, text=True, check=True)
+        assert str(target_path) not in result.stdout  # the one we asked to clean
+        assert str(untouched_path) in result.stdout  # outside scope -- must survive
+    finally:
+        # Real leak, confirmed by review: an assertion failure above used to
+        # skip this cleanup entirely, leaking other_root (a sibling of the
+        # pytest-managed tmp_path, so not auto-removed by pytest itself).
+        subprocess.run(["git", "worktree", "prune"], cwd=source_repo, check=True)
+        shutil.rmtree(other_root, ignore_errors=True)
 
 
 def test_cli_list_prints_something_for_every_worktree(source_repo, tmp_path, capsys):

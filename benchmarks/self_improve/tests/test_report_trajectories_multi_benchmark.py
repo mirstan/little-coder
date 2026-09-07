@@ -68,7 +68,18 @@ def test_ingest_all_records_empty_source_when_a_requested_root_yields_nothing(tm
     assert empty_sources == ["gaia"]
 
 
-def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_path):
+#: The guard branch and the generic `except Exception` branch in
+#: ingest_all() both produce the same observable (trajectories == [],
+#: empty_sources == ["aider"]) -- so asserting only on those, as the three
+#: tests below used to, can't tell "the comma/empty-segment guard fired"
+#: apart from "load() was reached and failed for some unrelated reason"
+#: (real gap, confirmed by review). Each test below additionally asserts
+#: the guard's OWN distinct log message via caplog, which only the guard
+#: branch emits.
+_MISSING_SUFFIX_LOG_FRAGMENT = "required ',<results.json path>' suffix"
+
+
+def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_path, caplog):
     """Real gap, confirmed by review: `--log-roots aider=<dir>` with no
     ',<results.json>' suffix used to make Path("") -> Path(".") -- whose
     .exists() is True -- silently bypass aider_polyglot_ingest.load()'s own
@@ -76,31 +87,37 @@ def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_p
     inside json.loads(). Must be caught before ever calling load()."""
     log_root, _results_json = _make_aider_fixture(tmp_path)
     log_roots = {"aider": str(log_root)}  # no comma, no results.json path
-    trajectories, empty_sources = _ingest_all(log_roots)
+    with caplog.at_level("WARNING"):
+        trajectories, empty_sources = _ingest_all(log_roots)
     assert trajectories == []
     assert empty_sources == ["aider"]
+    assert _MISSING_SUFFIX_LOG_FRAGMENT in caplog.text
 
 
-def test_ingest_all_reports_clear_error_when_aider_log_root_segment_is_empty(tmp_path):
+def test_ingest_all_reports_clear_error_when_aider_log_root_segment_is_empty(tmp_path, caplog):
     """Real follow-up bug, confirmed by review: `--log-roots aider=,results.json`
     (empty segment BEFORE a present comma) still made Path("") -> Path(".")
     for the log_root -- the original fix only checked the comma's presence,
     not that both sides of it were non-empty."""
     _log_root, results_json = _make_aider_fixture(tmp_path)
     log_roots = {"aider": f",{results_json}"}
-    trajectories, empty_sources = _ingest_all(log_roots)
+    with caplog.at_level("WARNING"):
+        trajectories, empty_sources = _ingest_all(log_roots)
     assert trajectories == []
     assert empty_sources == ["aider"]
+    assert _MISSING_SUFFIX_LOG_FRAGMENT in caplog.text
 
 
-def test_ingest_all_reports_clear_error_when_aider_results_json_segment_is_empty(tmp_path):
+def test_ingest_all_reports_clear_error_when_aider_results_json_segment_is_empty(tmp_path, caplog):
     """Same gap, other side: `--log-roots aider=logs,` (empty segment AFTER
     a present comma) for the results_json path."""
     log_root, _results_json = _make_aider_fixture(tmp_path)
     log_roots = {"aider": f"{log_root},"}
-    trajectories, empty_sources = _ingest_all(log_roots)
+    with caplog.at_level("WARNING"):
+        trajectories, empty_sources = _ingest_all(log_roots)
     assert trajectories == []
     assert empty_sources == ["aider"]
+    assert _MISSING_SUFFIX_LOG_FRAGMENT in caplog.text
 
 
 def test_ingest_all_records_empty_source_when_ingest_raises(tmp_path):

@@ -7,7 +7,29 @@ import importlib
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(autouse=True)
+def _restore_top_level_rpc_client_module():
+    """Real leak, confirmed by review: _reload_rpc_client() below replaces
+    sys.modules["rpc_client"] with a fresh top-level module object -- a
+    DIFFERENT identity than benchmarks.rpc_client (this file's sys.path
+    insertion above makes benchmarks/ importable as a top-level location
+    too). Left in place for the rest of the pytest session, a later test
+    anywhere else that happens to `import rpc_client` as a top-level name
+    would get this file's env-var-driven reload rather than the real
+    module, and any isinstance/identity check against benchmarks.rpc_client
+    classes would silently fail. Restore whatever (if anything) occupied
+    that slot before this test ran."""
+    before = sys.modules.get("rpc_client")
+    yield
+    if before is None:
+        sys.modules.pop("rpc_client", None)
+    else:
+        sys.modules["rpc_client"] = before
 
 
 def _reload_rpc_client():

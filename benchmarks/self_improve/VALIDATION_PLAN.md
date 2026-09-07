@@ -70,10 +70,15 @@ get confirmed against reality rather than assumed from reading source.
    printed sample record's fields against the actual files on disk (open the
    trajectory JSON / result.json / log file directly and compare).
 4. Confirm explicitly:
-   - aider_polyglot trajectories show `components_used == []` for all records (the
-     documented gap) — if any record unexpectedly has non-empty `components_used`,
-     that means the assumption in `TDD_SPEC.md` §0 is stale and needs re-checking
-     against the current `_dump_trajectory` implementation before proceeding.
+   - aider_polyglot trajectories can have non-empty `components_used` (this gap
+     was CLOSED — `aider_polyglot_ingest.py` now extracts `components_used` from
+     `_dump_trajectory`'s persisted notifications the same way `gaia_ingest.py`
+     already did; see `TDD_SPEC.md` §0's "Gap CLOSED" note). A trajectory from
+     an OLDER run predating that fix still degrades gracefully to
+     `components_used == []` (no notifications were ever recorded for it), so
+     seeing an empty list on old data is expected too — the thing to actually
+     verify here is that a FRESH run's trajectories are attributed correctly,
+     not that they're empty.
    - gaia trajectories' `stop_reason` fallback behavior matches what's actually in
      the manifest vs. defaulted.
    - No ingestion module raises on any real file in the sample set.
@@ -110,8 +115,11 @@ spending anything on Layer 4.
    - The weighted aggregate is a plausible number in `[0, 1]`.
    - Per-component usage counts look sane — e.g. `skills_tools_bash` should have a
      nonzero count of attributed trajectories for gaia (since gaia does capture
-     notifications) but zero for aider_polyglot (per the confirmed gap) — an
-     unexpected mismatch here means Layer 2's confirmation was wrong or
+     notifications), and for aider_polyglot too on trajectories from a fresh run
+     (notification-based attribution was later extended to aider_polyglot — see
+     `TDD_SPEC.md` §0's "Gap CLOSED" note; only OLDER aider_polyglot trajectories
+     predating that fix are expected to show zero) — an unexpected mismatch on
+     fresh data means Layer 2's confirmation was wrong or
      `merge_component_usage`'s attribution logic has a bug.
 
 **Pass criterion**: report completes without exceptions, produces a plausible
@@ -127,12 +135,17 @@ are involved. `run_gepa.py`'s `gepa.optimize()` call always scores candidates by
 actually running them — there is no cheaper offline substitute for this layer
 anymore, so scope tightly (one component, a small exercise set,
 `--max-metric-calls` set low) to bound cost and make the output easy to judge by
-eye. `--max-metric-calls` is not itself the hard live-run ceiling: real live
-rollouts run up to `--max-metric-calls` **plus** the `2*reflection_minibatch_size
-+ valset_size` overshoot allowance (`run_gepa.py --estimate-only` prints the
-actual number as "LIVE exercise executions"). Budget for that printed number,
-not the raw `--max-metric-calls` value, when deciding what a real invocation
-could cost.
+eye. For a `gepa.optimize()` run (i.e. NOT `--baseline-only`), `--max-metric-calls`
+is not itself the hard live-run ceiling: real live rollouts run up to
+`--max-metric-calls` **plus** the `2*reflection_minibatch_size + valset_size`
+overshoot allowance (`run_gepa.py --estimate-only` prints the actual number as
+"LIVE exercise executions"). Budget for that printed number, not the raw
+`--max-metric-calls` value, when deciding what a real invocation could cost.
+`--baseline-only` is a separate, tighter case (see Layer 3.5-equivalent smoke
+test below and `run_gepa.py`'s own `max_live_runs=args.max_metric_calls if
+args.baseline_only else est.max_live_runs`): it never touches `gepa.optimize()`'s
+own iteration loop, so live executions are capped at exactly `--max-metric-calls`
+— no overshoot allowance applies there.
 
 **Procedure**:
 1. Use the existing scoped config,

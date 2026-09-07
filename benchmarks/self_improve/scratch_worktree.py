@@ -143,6 +143,29 @@ class ScratchWorktree:
         merged["LITTLE_CODER_PI_BIN_OVERRIDE"] = str(self.pi_bin)
         return merged
 
+    def mark_spawn_pending(self) -> None:
+        """Record, BEFORE subprocess.Popen() is even called, that a new
+        exercise subprocess is about to start against this worktree.
+
+        Closes a real TOCTOU gap: set_active_pid(proc.pid) can only run
+        AFTER Popen() returns a pid, so if the orchestrator is SIGKILLed in
+        the (normally tiny, but non-zero) window between Popen() returning
+        and set_active_pid() actually writing the marker, gepa_scratch_gc.py
+        would see no active_pid at all and could wrongly call the worktree
+        orphaned while the just-spawned subprocess is still alive and
+        writing into it. gepa_scratch_gc.py treats a recent
+        spawn_pending_at as reason enough to withhold removal for a grace
+        window, regardless of what active_pid looks like."""
+        marker_path = self.path / SCRATCH_MARKER_NAME
+        try:
+            marker = json.loads(marker_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            marker = {}
+        if not isinstance(marker, dict):
+            marker = {}
+        marker["spawn_pending_at"] = time.time()
+        _write_marker_atomic(marker_path, marker)
+
     def set_active_pid(self, pid: int | None) -> None:
         """Record (or clear) the pid of the exercise subprocess currently
         running against this worktree, in the marker file.

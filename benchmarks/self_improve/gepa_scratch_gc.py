@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,27 @@ from pathlib import Path
 from typing import Optional
 
 from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, prune_stale
+
+#: scratch_worktree.py's own real naming scheme: f"gepa-scratch-{pid}-{uuid4().hex[:8]}".
+#: Used as a second piece of evidence (alongside --scratch-root containment)
+#: before trusting a directory-gone-but-prunable entry as ours -- containment
+#: under a caller-given --scratch-root is not ownership proof by itself (an
+#: unrelated tool's own detached worktree could happen to live under the same
+#: shared directory), but the two together make a coincidental match
+#: practically impossible, while still letting the tool's actual, common
+#: purpose -- cleaning up ITS OWN crashed scratch checkouts -- keep working.
+_SCRATCH_DIR_NAME_RE = re.compile(r"^gepa-scratch-\d+-[0-9a-f]{8}$")
+
+#: Grace window after PolyglotLiveRunner.mark_spawn_pending() (written just
+#: before subprocess.Popen()) before a worktree with no live active_pid is
+#: trusted as truly orphaned. Closes a real TOCTOU gap, confirmed by review:
+#: set_active_pid(proc.pid) can only run AFTER Popen() returns, so a SIGKILL
+#: in that window would otherwise leave no marker evidence a subprocess was
+#: ever started, and this tool would wrongly call the worktree removable
+#: while that just-spawned subprocess is still alive and writing into it.
+#: Generous on purpose -- worst case of setting this too high is a stale
+#: worktree lingering a few extra minutes before the next --clean run.
+_SPAWN_GRACE_SECONDS = 120.0
 
 
 def _pid_alive(pid: object) -> bool:
@@ -94,20 +116,31 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
 
         if not path.exists():
             # The marker lived INSIDE this now-gone directory, so it can
-            # never be checked here -- only remove automatically when the
-            # caller explicitly scoped us to a known scratch root (verified
-            # above via relative_to), which is real evidence this was ours.
-            # Without that, honor the stated "never touch without a marker"
+            # never be checked here -- only remove automatically when BOTH
+            # the caller explicitly scoped us to a known scratch root
+            # (verified above via relative_to) AND the directory's own name
+            # matches our exact naming scheme (_SCRATCH_DIR_NAME_RE): path
+            # containment alone is NOT real ownership evidence (an unrelated
+            # tool's own detached worktree could happen to live under the
+            # same --scratch-root, e.g. a shared tmp directory -- real gap,
+            # confirmed by review), but containment PLUS an exact name match
+            # makes a coincidental false positive practically impossible.
+            # Without both, honor the stated "never touch without a marker"
             # invariant literally and leave it for a plain `git worktree
-            # prune` (safe regardless, since the directory is already gone)
-            # rather than silently trusting "detached + prunable" alone.
-            if entry.get("prunable") and scratch_root_resolved is not None:
+            # prune` (safe regardless, since the directory is already gone).
+            name_matches = _SCRATCH_DIR_NAME_RE.match(path.name) is not None
+            if entry.get("prunable") and scratch_root_resolved is not None and name_matches:
                 info["removable"] = True
-                info["reason"] = "directory gone, git already marks it prunable, under configured scratch root"
+                info["reason"] = (
+                    "directory gone, git already marks it prunable, under configured scratch "
+                    "root, and its name matches our own scratch-worktree naming scheme"
+                )
             elif entry.get("prunable"):
                 info["reason"] = (
-                    "directory gone, git marks it prunable, but no marker to verify and no "
-                    "--scratch-root given -- run `git worktree prune` directly if this is safe"
+                    "directory gone, git marks it prunable, but no marker to verify (and either "
+                    "no --scratch-root was given, or the directory name doesn't match our own "
+                    "scratch-worktree naming scheme) -- run `git worktree prune` directly if "
+                    "this is safe"
                 )
             else:
                 info["reason"] = "directory gone but git does not mark it prunable -- leave to `git worktree prune`"
@@ -146,6 +179,18 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
             info["reason"] = f"owning process is gone, but an exercise subprocess is still running (pid {marker.get('active_pid')})"
             results.append(info)
             continue
+
+        spawn_pending_at = marker.get("spawn_pending_at")
+        if isinstance(spawn_pending_at, (int, float)):
+            age_s = time.time() - spawn_pending_at
+            if age_s < _SPAWN_GRACE_SECONDS:
+                info["reason"] = (
+                    f"a subprocess started spawning {age_s:.0f}s ago (active_pid not yet "
+                    f"recorded) -- within the {_SPAWN_GRACE_SECONDS:.0f}s spawn grace window, "
+                    "not yet safe to remove"
+                )
+                results.append(info)
+                continue
 
         info["removable"] = True
         info["reason"] = "orphaned scratch worktree (owning process is gone), safe to remove"

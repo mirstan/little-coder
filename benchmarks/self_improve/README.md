@@ -112,11 +112,18 @@ rewrite) AND every live rollout can cost real API dollars — a live rollout is
 a real coding-agent run against a real exercise using whatever `--model` you
 configure as the model under test, and if that's a hosted provider, each
 rollout consumes real provider tokens on top of the real compute and
-wall-clock time it takes. Rollout spend is capped hard by `--max-metric-calls`
+wall-clock time it takes. Rollout spend is bounded by `--max-metric-calls`
 (never GEPA's `auto=` presets — confirmed to over-provision by orders of
-magnitude relative to a hand-picked minibatch size); reflection spend has no
-equivalent per-call cap beyond `--reflection-minibatch-size` and how many
-iterations the rollout budget allows.
+magnitude relative to a hand-picked minibatch size) — but for a real
+`gepa.optimize()` run (not `--baseline-only`), `--max-metric-calls` is not
+itself the hard ceiling: live rollouts can run up to `--max-metric-calls`
+**plus** a `2*reflection_minibatch_size + valset_size` overshoot allowance
+(`--estimate-only` prints the real number as "LIVE exercise executions" —
+budget for that, not the raw flag value). `--baseline-only` has no such
+overshoot: it never touches `gepa.optimize()`'s own iteration loop, so its
+live executions are capped at exactly `--max-metric-calls`. Reflection spend
+has no equivalent per-call cap beyond `--reflection-minibatch-size` and how
+many iterations the rollout budget allows.
 
 **Cost/runtime expectation**: depends entirely on `--max-metric-calls`,
 `--reflection-minibatch-size`, and how many exercises/components are in scope
