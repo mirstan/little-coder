@@ -39,9 +39,11 @@ async function runTurns(h: ReturnType<typeof makeHarness>, n: number) {
 describe("finalize-warn", () => {
   afterEach(() => {
     delete process.env.LITTLE_CODER_MAX_TURNS;
+    delete process.env.LITTLE_CODER_BENCHMARK;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
   });
 
-  it("does nothing when no cap is configured", async () => {
+  it("does nothing when no cap or deadline is configured", async () => {
     const h = makeHarness();
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", {}, h.ctx);
@@ -58,8 +60,9 @@ describe("finalize-warn", () => {
     expect(h.sent).toEqual([]);
   });
 
-  it("warns once, exactly WARN_REMAINING (5) turns before the cap", async () => {
+  it("warns once, exactly WARN_REMAINING (5) turns before the cap, with the GAIA message when benchmark=gaia", async () => {
     process.env.LITTLE_CODER_MAX_TURNS = "40";
+    process.env.LITTLE_CODER_BENCHMARK = "gaia";
     const h = makeHarness();
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", {}, h.ctx);
@@ -73,8 +76,32 @@ describe("finalize-warn", () => {
     expect(h.sent).toHaveLength(1);
   });
 
+  it("uses the generic fallback message when no benchmark is set", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 36);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].text).not.toMatch(/Answer:/);
+    expect(h.sent[0].text).not.toMatch(/ShellSession/);
+  });
+
+  it("uses the terminal_bench-specific message when LITTLE_CODER_BENCHMARK=terminal_bench", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    process.env.LITTLE_CODER_BENCHMARK = "terminal_bench";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 36);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].text).toMatch(/ShellSession/);
+    expect(h.sent[0].text).not.toMatch(/Answer:/);
+  });
+
   it("resets per agent run", async () => {
     process.env.LITTLE_CODER_MAX_TURNS = "40";
+    process.env.LITTLE_CODER_BENCHMARK = "gaia";
     const h = makeHarness();
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", {}, h.ctx);
@@ -84,5 +111,37 @@ describe("finalize-warn", () => {
     await fire(h.pi, "before_agent_start", {}, h.ctx); // new run
     await runTurns(h, 36);
     expect(h.sent).toHaveLength(2);
+  });
+
+  it("fires on wall-clock deadline even when turn count is nowhere near the cap", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "80";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 60_000); // 60s out, under the 5-min threshold
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 1);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("does not fire on wall-clock grounds when plenty of time remains", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "80";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 3_600_000); // 1h out
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 10);
+    expect(h.sent).toEqual([]);
+  });
+
+  it("does not double-fire when both the turn-count and wall-clock triggers are true on the same turn", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 60_000);
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 36); // also the turn-count trigger point
+    expect(h.sent).toHaveLength(1);
+    await runTurns(h, 10);
+    expect(h.sent).toHaveLength(1);
   });
 });
