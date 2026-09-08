@@ -319,6 +319,14 @@ class PiRpc:
         same reader thread services), and a callback that reached back into
         PiRpc -- notifications(), stderr(), another prompt -- would deadlock
         outright on the non-reentrant lock.
+
+        Events are popped one at a time (not batch-snapshotted) specifically
+        for exception safety: if on_event/predicate raises, only the single
+        event already popped is lost -- everything else, including a possible
+        agent_end, is untouched in self._event_q for the next call to see. An
+        earlier batch-snapshot version cleared the whole queue up front and
+        only requeued the unconsumed remainder on the predicate-match path,
+        so a mid-batch exception silently dropped every later event instead.
         """
         start = time.time()
         collected: list[dict] = []
@@ -331,22 +339,12 @@ class PiRpc:
                     if remaining <= 0:
                         return collected
                     self._cv.wait(timeout=remaining)
-                batch = self._event_q[:]
-                del self._event_q[:]
-            for i, ev in enumerate(batch):
-                collected.append(ev)
-                if on_event is not None:
-                    on_event(ev)
-                if predicate(ev):
-                    # Anything after the matching event stays queued for the
-                    # next drain, exactly as when events were popped one at a
-                    # time. It predates whatever the reader appended while the
-                    # callbacks ran, so it goes back at the FRONT of the queue.
-                    rest = batch[i + 1:]
-                    if rest:
-                        with self._cv:
-                            self._event_q[:0] = rest
-                    return collected
+                ev = self._event_q.pop(0)
+            collected.append(ev)
+            if on_event is not None:
+                on_event(ev)
+            if predicate(ev):
+                return collected
 
     # ── Public API ───────────────────────────────────────────────────────
     def prompt_and_collect(

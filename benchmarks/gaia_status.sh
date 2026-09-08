@@ -16,9 +16,23 @@ RUNS_DIR="$REPO_ROOT/benchmarks/gaia_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  RUN_ID=$(find "$RUNS_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %f\n' 2>/dev/null \
-           | grep -vE ' (_pilot_picks\.json)$' \
-           | sort -nr | awk 'NR==1{print $2}')
+  # Portable, no find/printf: -printf is GNU-only, so this was a silent
+  # no-op on macOS's real BSD find (same bug diagnosed and fixed in
+  # harbor_status.sh's identical run-dir-autodetection). `[ -nt ]` gives
+  # mtime-newest-wins without needing stat/printf on either platform.
+  NEWEST=""
+  for d in "$RUNS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    base="${d%/}"; base="${base##*/}"
+    case "$base" in
+      *_pilot_picks.json) continue ;;
+    esac
+    if [ -z "$NEWEST" ] || [ "$d" -nt "$NEWEST" ]; then
+      NEWEST="$d"
+    fi
+  done
+  RUN_ID="${NEWEST%/}"
+  RUN_ID="${RUN_ID##*/}"
 fi
 if [ -z "$RUN_ID" ] || [ ! -d "$RUNS_DIR/$RUN_ID" ]; then
   echo "No run dir found (looked in $RUNS_DIR)." >&2
@@ -27,7 +41,7 @@ fi
 
 DIR="$RUNS_DIR/$RUN_ID"
 
-/home/itay-inbar/miniforge3/envs/local-coder/bin/python - "$RUN_ID" "$DIR" <<'PY'
+python3 - "$RUN_ID" "$DIR" <<'PY'
 import json, os, sys, time, subprocess, statistics, datetime
 from pathlib import Path
 

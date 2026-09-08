@@ -1030,7 +1030,12 @@ def main():
                 thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
-            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
+            # 1000, not 400: some exceptions (e.g. the JS shared-deps
+            # RuntimeError in _prepare_javascript) are deliberately raised
+            # with a full remediation command in the message -- truncating
+            # too tightly cuts off the actual fix instruction the hard
+            # failure exists to surface.
+            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:1000]}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
         # Idempotent after the first exercise (thinking_confirmation stops
