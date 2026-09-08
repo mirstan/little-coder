@@ -321,16 +321,25 @@ class PiRpc:
         outright on the non-reentrant lock.
 
         Events are popped one at a time (not batch-snapshotted) specifically
-        for exception safety: if on_event/predicate raises, only the single
-        event already popped is lost -- everything else, including a possible
-        agent_end, is untouched in self._event_q for the next call to see. An
-        earlier batch-snapshot version cleared the whole queue up front and
-        only requeued the unconsumed remainder on the predicate-match path,
-        so a mid-batch exception silently dropped every later event instead.
+        for exception safety: if on_event/predicate raises, `collected` (and
+        with it every event from this call, including ones already handed to
+        on_event) is discarded along with the exception -- but everything
+        still sitting in self._event_q, including a possible agent_end, is
+        untouched and available to the next call. An earlier batch-snapshot
+        version cleared the whole queue up front and only requeued the
+        unconsumed remainder on the predicate-match path, so a mid-batch
+        exception silently dropped even the events that hadn't been through
+        on_event yet.
         """
         start = time.time()
         collected: list[dict] = []
         while True:
+            # Rechecked every iteration, not just while _event_q is empty --
+            # if on_event is slow and the reader keeps appending faster than
+            # we drain, _event_q could stay nonempty indefinitely and this
+            # loop would never otherwise notice the deadline passed.
+            if timeout - (time.time() - start) <= 0:
+                return collected
             with self._cv:
                 while not self._event_q:
                     if self._eof:

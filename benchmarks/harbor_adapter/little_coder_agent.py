@@ -410,5 +410,13 @@ class LittleCoderAgent(BaseAgent):
                 log_fh.flush()
                 log_fh.close()
             if live_log_fh:
+                # pending_text is only flushed inline on tool_execution_start
+                # / agent_end. A trial that ends on "deadline" or
+                # "process_exit" (no agent_end event -- routine: finalize-warn
+                # itself notes trials regularly end this way) would otherwise
+                # lose whatever trailing assistant text was still buffered.
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
                 live_log_fh.flush()
                 live_log_fh.close()

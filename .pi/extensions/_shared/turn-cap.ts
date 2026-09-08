@@ -10,9 +10,13 @@
 export function resolveTurnCap(event: unknown): number {
   const opts: any = (event as any)?.systemPromptOptions ?? {};
   const lcCap = Number(opts?.littleCoder?.maxTurns);
-  if (Number.isFinite(lcCap) && lcCap > 0) return lcCap;
+  if (Number.isInteger(lcCap) && lcCap > 0) return lcCap;
   const raw = process.env.LITTLE_CODER_MAX_TURNS;
   if (!raw) return 0;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  // Number(), not parseInt(): parseInt truncates at the first non-numeric
+  // character ("40abc" -> 40, "3.7" -> 3) instead of rejecting the whole
+  // malformed value, and a fractional cap would make the turn-count and
+  // wall-clock triggers compare against inconsistent integer boundaries.
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : 0;
 }

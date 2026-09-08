@@ -72,8 +72,10 @@ def test_on_event_exception_does_not_drop_later_events(fake_pi, tmp_path):
     _drain_events_until cleared the whole queue up front and only requeued
     the unconsumed remainder on the predicate-match path, so a callback
     raising mid-batch silently dropped every event after it -- including a
-    possible agent_end. Events must now be popped one at a time so only the
-    single event whose callback raised is ever at risk."""
+    possible agent_end. Events are now popped one at a time, so a raising
+    callback only ever discards this call's own `collected` (the events it
+    already handed to on_event) -- everything still sitting in the queue,
+    including agent_end, survives untouched for the next call to see."""
     def flaky_on_event(ev):
         if ev["type"] == "tool_execution_start":
             raise RuntimeError("simulated live-log write failure")

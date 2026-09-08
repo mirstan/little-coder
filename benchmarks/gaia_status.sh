@@ -21,11 +21,19 @@ if [ -z "$RUN_ID" ]; then
   # harbor_status.sh's identical run-dir-autodetection). `[ -nt ]` gives
   # mtime-newest-wins without needing stat/printf on either platform.
   NEWEST=""
-  for d in "$RUNS_DIR"/*/; do
+  # Bare */ skips dot-prefixed dirs (a --run-name can create one); .*/ picks
+  # those up too, at the cost of also matching the literal "." and ".."
+  # entries every glob-of-dotfiles produces, filtered below.
+  for d in "$RUNS_DIR"/*/ "$RUNS_DIR"/.*/; do
     [ -d "$d" ] || continue
     base="${d%/}"; base="${base##*/}"
     case "$base" in
-      *_pilot_picks.json) continue ;;
+      .|..) continue ;;
+      # Exact filename only, matching the original regex's literal
+      # ' _pilot_picks.json$' anchor -- a glob prefix (*_pilot_picks.json)
+      # would also wrongly exclude a real run legitimately named e.g.
+      # foo_pilot_picks.json.
+      _pilot_picks.json) continue ;;
     esac
     if [ -z "$NEWEST" ] || [ "$d" -nt "$NEWEST" ]; then
       NEWEST="$d"
