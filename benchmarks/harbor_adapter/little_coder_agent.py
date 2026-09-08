@@ -275,6 +275,47 @@ class LittleCoderAgent(BaseAgent):
         log_path = self.logs_dir / "little_coder.log"
         log_fh = log_path.open("w") if self.logs_dir else None
 
+        # little_coder.log (above) is only written once prompt_and_collect
+        # finally returns, so `tail -f` on it shows nothing for the whole
+        # trial. This second file is flushed turn-by-turn via PiRpc's
+        # on_event callback (see rpc_client.py's prompt_and_collect) so a
+        # trial can actually be watched live, not just post-mortemed.
+        live_log_path = self.logs_dir / "little_coder.live.log"
+        live_log_fh = live_log_path.open("w") if self.logs_dir else None
+        pending_text: list[str] = []
+
+        def on_event(ev: dict) -> None:
+            if live_log_fh is None:
+                return
+            t = ev.get("type")
+            if t == "message_update":
+                delta = ev.get("assistantMessageEvent", {})
+                if delta.get("type") == "text_delta":
+                    pending_text.append(delta.get("delta", ""))
+                return
+            if t == "tool_execution_start":
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
+                live_log_fh.write(
+                    f">> {ev.get('toolName', '')}({ev.get('args', {})})\n"
+                )
+                live_log_fh.flush()
+            elif t == "tool_execution_end":
+                res = ev.get("result", {})
+                content = res.get("content", [])
+                text = "\n".join(
+                    c.get("text", "") for c in content if c.get("type") == "text"
+                )
+                live_log_fh.write(f"<< {text[:400]}\n")
+                live_log_fh.flush()
+            elif t == "agent_end":
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
+                live_log_fh.write("=== agent_end ===\n")
+                live_log_fh.flush()
+
         effective_timeout_sec = _resolve_trial_timeout_sec(self.logs_dir)
         self.logger.info(
             f"LittleCoderAgent: effective trial timeout={effective_timeout_sec:.0f}s"
@@ -323,7 +364,10 @@ class LittleCoderAgent(BaseAgent):
             )
             try:
                 result = await asyncio.to_thread(
-                    rpc.prompt_and_collect, prompt, effective_timeout_sec
+                    rpc.prompt_and_collect,
+                    prompt,
+                    effective_timeout_sec,
+                    on_event,
                 )
                 stop_reason = getattr(result, "stop_reason", "unknown")
                 if log_fh:
@@ -365,3 +409,6 @@ class LittleCoderAgent(BaseAgent):
             if log_fh:
                 log_fh.flush()
                 log_fh.close()
+            if live_log_fh:
+                live_log_fh.flush()
+                live_log_fh.close()

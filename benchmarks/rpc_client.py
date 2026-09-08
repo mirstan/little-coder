@@ -298,8 +298,20 @@ class PiRpc:
             f"pi exited before acknowledging request {rid}; stderr:\n{self.stderr()}"
         )
 
-    def _drain_events_until(self, predicate, timeout: float) -> list[dict]:
-        """Drain events until `predicate(event)` returns True or timeout."""
+    def _drain_events_until(
+        self,
+        predicate,
+        timeout: float,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> list[dict]:
+        """Drain events until `predicate(event)` returns True or timeout.
+
+        `on_event`, if given, is called synchronously for each event the
+        instant it's popped off the queue -- i.e. in real time as pi emits
+        them, not after the whole call returns. This is what lets a caller
+        (e.g. the Harbor adapter) stream a live trajectory log instead of
+        only writing a summary once prompt_and_collect finally returns.
+        """
         start = time.time()
         collected: list[dict] = []
         with self._cv:
@@ -307,6 +319,8 @@ class PiRpc:
                 while self._event_q:
                     ev = self._event_q.pop(0)
                     collected.append(ev)
+                    if on_event is not None:
+                        on_event(ev)
                     if predicate(ev):
                         return collected
                 if self._eof:
@@ -317,7 +331,12 @@ class PiRpc:
                 self._cv.wait(timeout=remaining)
 
     # ── Public API ───────────────────────────────────────────────────────
-    def prompt_and_collect(self, message: str, timeout: float = 900) -> PromptResult:
+    def prompt_and_collect(
+        self,
+        message: str,
+        timeout: float = 900,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> PromptResult:
         """Send a prompt, drain events until agent_end, return summary.
 
         Retries the SEND (not the whole turn) a few times on "Agent is already
@@ -328,6 +347,11 @@ class PiRpc:
         caller correctly waited for agent_end. Not observed at pi's default
         thinking level; higher effort apparently widens whatever internal
         window this races on.
+
+        `on_event`: optional callback invoked in real time as each RPC event
+        arrives (see _drain_events_until) -- lets a caller stream a live
+        trajectory log instead of only seeing the aggregated PromptResult
+        once this call finally returns.
         """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
@@ -372,6 +396,7 @@ class PiRpc:
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",
             timeout=timeout,
+            on_event=on_event,
         )
 
         result = PromptResult()
