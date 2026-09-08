@@ -69,7 +69,13 @@ HB_CMD=(harbor run
   # and cached, so it's a one-time build per task, not per-trial.
   --force-build)
 
-if groups | grep -q '\bdocker\b'; then
+# `sg` (group-switch) is a Linux-only workaround for a user who isn't in the
+# `docker` group; it doesn't exist on macOS, and Docker Desktop grants socket
+# access without that unix-group mechanism at all, so `groups` never contains
+# "docker" there either -- unconditionally falling into the sg branch on
+# macOS failed outright with "sg: command not found". Only use it where it
+# can actually exist.
+if ! command -v sg >/dev/null 2>&1 || groups | grep -q '\bdocker\b'; then
   cd "$REPO_ROOT" && "${HB_CMD[@]}"
 else
   printf -v CMD_STR '%q ' "${HB_CMD[@]}"
