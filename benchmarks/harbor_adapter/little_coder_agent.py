@@ -30,6 +30,8 @@ import json
 import logging
 import re
 import sys
+import time
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -62,6 +64,46 @@ from rpc_client import PiRpc  # noqa: E402
 
 DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
+
+# Fallback when the real per-task timeout can't be derived (see
+# _resolve_trial_timeout_sec) -- e.g. a manual/local run with no Harbor
+# trial_dir, or a future Harbor version with a different cache layout.
+DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
+# Safety margin below Harbor's own enforced timeout: leaves headroom for
+# our own graceful cutoff (and finalize-warn's wall-clock nudge) to land
+# before Harbor's external asyncio.wait_for kills the process outright.
+DEADLINE_SAFETY_MARGIN = 0.9
+HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
+
+
+def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
+    """Best-effort derivation of this trial's real Harbor-enforced timeout
+    (task.toml's [agent].timeout_sec x the job's timeout_multiplier), so our
+    internal deadline tracks Harbor's actual budget instead of a blind guess.
+
+    Harbor gives a custom agent no direct/supported way to read this value --
+    it's a private Trial attribute enforced purely via an external
+    asyncio.wait_for() one level above the agent call. Every step here
+    opportunistically reads files Harbor already writes/caches for other
+    reasons (the trial's own config.json, and its local task-download cache).
+    Falls back to DEFAULT_PROMPT_TIMEOUT_SEC on any failure -- missing files,
+    unexpected shape, ambiguous cache match, etc. -- rather than raising.
+    """
+    try:
+        if logs_dir is None:
+            return DEFAULT_PROMPT_TIMEOUT_SEC
+        trial_dir = logs_dir.parent
+        config = json.loads((trial_dir / "config.json").read_text())
+        multiplier = float(config["timeout_multiplier"])
+        task_name = config["task"]["path"]
+        matches = list(HARBOR_TASK_CACHE.glob(f"*/{task_name}/task.toml"))
+        if not matches:
+            return DEFAULT_PROMPT_TIMEOUT_SEC
+        toml_data = tomllib.loads(matches[0].read_text())
+        base_timeout_sec = float(toml_data["agent"]["timeout_sec"])
+        return base_timeout_sec * multiplier * DEADLINE_SAFETY_MARGIN
+    except Exception:
+        return DEFAULT_PROMPT_TIMEOUT_SEC
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
@@ -200,16 +242,44 @@ class LittleCoderAgent(BaseAgent):
         prompt = (
             "You are solving a Terminal-Bench 2.0 task inside a Linux container.\n"
             "The ONLY way to interact with the container is the ShellSession tool; "
-            "its cwd persists between calls (tracked by the adapter).\n"
-            "Default working directory is /app.\n"
+            "its cwd persists between calls (tracked by the adapter). Any shell "
+            "command is available — no command whitelist applies in this benchmark "
+            "(Docker is the isolation boundary, not a shell filter), so use `cd`, "
+            "compilers, daemonizing tools (setsid/nohup), package managers, etc. "
+            "directly as needed, the same as any other terminal session.\n"
+            "Default working directory is /app. `cd <path>` (standalone or as the "
+            "first part of a `&&` chain) persists across every subsequent "
+            "ShellSession call.\n"
             "File tools like Read/Write/Edit are NOT available — use shell commands "
             "(cat, sed -i, heredoc 'cat > file <<EOF') through ShellSession instead.\n\n"
+            "Approach: briefly research the task first (inspect the relevant files, "
+            "commands, or error output to understand what's actually being asked), "
+            "form a short plan, then implement a quick first-pass solution rather "
+            "than exhaustively enumerating options before writing anything. Get a "
+            "working attempt in place early, verify it, and refine from there if "
+            "time remains.\n\n"
+            "Verification: when the instructions describe a specific client-side "
+            "interface (e.g. `ssh`/`git clone user@host:...`, a particular port, "
+            "protocol, or auth method), test through that exact path rather than a "
+            "simplified local substitute — a substitute that skips part of the real "
+            "flow (e.g. a local clone instead of an SSH one) can falsely appear to "
+            "pass while the actual grading exercises a code path you never tested. "
+            "If the instructions say you don't need to worry about some part of the "
+            "setup (like login credentials), that usually still means the server "
+            "side of it must be functional and reachable, just that you're not "
+            "responsible for the client's half.\n\n"
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
 
         log_path = self.logs_dir / "little_coder.log"
         log_fh = log_path.open("w") if self.logs_dir else None
+
+        effective_timeout_sec = _resolve_trial_timeout_sec(self.logs_dir)
+        self.logger.info(
+            f"LittleCoderAgent: effective trial timeout={effective_timeout_sec:.0f}s"
+        )
+        deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
 
         try:
             # PiRpc spawns pi --mode rpc and wires the shell proxy. The reader
@@ -223,11 +293,38 @@ class LittleCoderAgent(BaseAgent):
                 allowed_tools=DEFAULT_ALLOWED_TOOLS,
                 session_id=session_id,
                 tb_mode=True,
-                max_turns=40,
+                # 40 was too tight for tasks needing several iterative
+                # debug-retrain cycles (e.g. train-fasttext hit 41/40 turns
+                # one call away from its correct final fix -- confirmed via
+                # agent_result.metadata.n_turns in the trial's result.json).
+                max_turns=80,
                 tb_shell_handler=tb_shell_handler,
+                # permission-gate's SAFE_PREFIXES whitelist is meant to guard
+                # a real user's own machine during interactive use; its own
+                # header comment already documents the opt-out for exactly
+                # this context: "'accept-all' mode all commands pass
+                # (benchmark runs set this explicitly)". Docker is the actual
+                # isolation boundary for a TB trial, not the whitelist, and
+                # every other TB agent (bare pi, codex) already runs here
+                # with unrestricted tool access -- so withholding it only
+                # from little-coder was an unfair, unintentional handicap,
+                # not a deliberate safety choice. Observed directly: fix-git
+                # blocked on `cd`/`git -C` (no way to work outside /app),
+                # prove-plus-comm blocked on `coqc` (wrote a correct proof,
+                # couldn't compile it), configure-git-webserver blocked on
+                # `setsid`/`nc`/`socat`/`crontab` (no way to daemonize the
+                # server the task needed running) -- three different tools
+                # across three unrelated tasks, not a pattern fixable by
+                # allow-listing one command at a time.
+                env={
+                    "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+                    "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+                },
             )
             try:
-                result = await asyncio.to_thread(rpc.prompt_and_collect, prompt, 3600)
+                result = await asyncio.to_thread(
+                    rpc.prompt_and_collect, prompt, effective_timeout_sec
+                )
                 stop_reason = getattr(result, "stop_reason", "unknown")
                 if log_fh:
                     # Distinguishes a crashed pi from a model that ran long;
