@@ -13,13 +13,15 @@
 export function resolveFinalizeMessage(benchmark: string | undefined): string {
   if (benchmark === "terminal_bench") {
     return (
-      "Wrap up now: use the ShellSession tool to write your current " +
-      "best-effort result to whatever file(s) or state the task expects " +
-      "(the task is graded by inspecting the container's files/state " +
-      "afterward, not by this chat reply), then stop calling tools. Do not " +
-      "start new tool chains or open-ended investigation — if something is " +
-      "incomplete, save your best partial attempt rather than leaving " +
-      "nothing in place."
+      "You have very little time left — stop investigating or verifying " +
+      "and save what you have right now. Re-check the task instructions " +
+      "above for the exact file path(s), format, or state they specify, " +
+      "then use the ShellSession tool to write your current best-effort " +
+      "result there immediately (the task is graded by inspecting the " +
+      "container's files/state afterward, not by this chat reply). Do not " +
+      "run further checks, tests, or verification first — if your answer " +
+      "is incomplete or uncertain, save it anyway: a rough answer on disk " +
+      "beats a correct one that never got written. Then stop calling tools."
     );
   }
   if (benchmark === "gaia") {

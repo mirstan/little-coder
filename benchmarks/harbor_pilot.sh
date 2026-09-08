@@ -14,10 +14,13 @@
 #                             fixes configure-git-webserver's SSH username/
 #                             auth-method mismatch against the instructions,
 #                             which 2.0 never did)
-#   TB_TIMEOUT_MULTIPLIER   — per-task timeout multiplier (default: 3; found
-#                             necessary this session -- at n-concurrent 1,
-#                             concurrency-inflated per-turn latency still blew
-#                             the 1x default on otherwise-trivial tasks)
+#   TB_TIMEOUT_MULTIPLIER   — per-task timeout multiplier (default: 15, raised
+#                             5x from the original 3 -- Qwen's own published
+#                             Terminal-Bench 2.0 methodology uses a flat 3h
+#                             per-task timeout; at task.toml's typical
+#                             ~750s base, 15x lands close to that, vs. the
+#                             prior 3x which gave the model only ~20-35% of
+#                             the vendor's reference wall-clock budget)
 #
 # Requires:
 #   - harbor installed (uv tool install harbor)
@@ -30,7 +33,7 @@ set -euo pipefail
 
 MODEL="${TB_LITTLE_CODER_MODEL:-llamacpp/qwen3.6-35b-a3b}"
 DATASET="${TB_DATASET:-terminal-bench/terminal-bench-2-1}"
-TIMEOUT_MULTIPLIER="${TB_TIMEOUT_MULTIPLIER:-3}"
+TIMEOUT_MULTIPLIER="${TB_TIMEOUT_MULTIPLIER:-15}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$REPO_ROOT/benchmarks/harbor_runs"
 

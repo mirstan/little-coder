@@ -14,6 +14,10 @@ describe("resolveFinalizeMessage", () => {
     expect(msg).toMatch(/ShellSession/);
     expect(msg).not.toMatch(/Answer:/);
     expect(msg).not.toMatch(/EvidenceList/);
+    // Directive about saving immediately instead of continuing to verify --
+    // targets the observed failure mode of having a working answer ready but
+    // never persisting it before the deadline hit (e.g. raman-fitting).
+    expect(msg).toMatch(/do not run further|stop investigating/i);
   });
 
   it("returns a generic fallback for undefined or any other benchmark", () => {

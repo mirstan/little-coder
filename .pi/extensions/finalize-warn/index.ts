@@ -15,7 +15,15 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 //     confirmed directly: a Terminal-Bench trial hit n_turns=74/80 with
 //     stop_reason "deadline", meaning the model had turns to spare but ran
 //     out of wall-clock time. The turn-count trigger alone structurally
-//     cannot catch that case.
+//     cannot catch that case. Raised from 5 to 10 minutes after trajectory
+//     review found trials that were close to a working answer when the
+//     deadline hit but never persisted it -- raman-fitting's last logged
+//     action computed valid curve fits, but the trial ended before
+//     /app/results.json was ever written. 5 minutes wasn't reliably enough
+//     wall-clock headroom to go from "have the answer" to "answer is on
+//     disk," especially once resolveFinalizeMessage's terminal_bench text
+//     also got more directive about saving immediately instead of verifying
+//     further -- the model needs actual time to act on that instruction.
 //
 // Why this exists (turn-count side): a recurring small-model failure mode
 // is "ran out of turns mid-thought, never produced a final answer, output
@@ -33,7 +41,7 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 // to 5 so the message lands ~4 turns before cap, giving the model real room.
 
 const WARN_REMAINING = 5; // turns
-const WARN_REMAINING_MS = 5 * 60 * 1000; // wall-clock headroom before deadline
+const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
 
 let turnsThisRun = 0;
 let capForRun = 0;
