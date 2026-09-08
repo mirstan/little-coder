@@ -81,7 +81,17 @@ below must match them exactly:
   topic is literally `Binary Search`, `bfs_state_space.md`'s is `State-Space
   Search`) -- resolving a topic to the right pred_name requires
   `build_knowledge_topic_index()` against the real repo, threaded through to
-  `parse_notification_line()`; see §2's implementation notes below.
+  `parse_notification_line()`; see §2's implementation notes below. Real gap,
+  confirmed by review (second round): `fm.topic` itself falls back to `fm.name`
+  at the emitting extension (`index.ts:49-50`) when a file has no `topic:` field
+  at all -- confirmed against every real `skills/protocols/*.md` file, none of
+  which declare `topic:`, only `name:` (e.g. `cite_before_answer.md`'s `name:
+  cite-before-answer`). A real `knowledge-inject: +1 ["cite-before-answer"]` line
+  is therefore just as likely for a protocol as a human-text topic string for a
+  knowledge entry -- `build_knowledge_topic_index()` already implements this same
+  `topic or name` fallback (§2's implementation notes), any fixture/test exercising
+  protocol resolution must use the file's `name`, not invent a `topic` protocol
+  files don't have.
   `_parse_notification_payload()` in `ingest/common.py` tries JSON first
   and falls back to the old bare comma-split only for historical trajectory data
   written before this fix.
@@ -439,7 +449,7 @@ above — build it programmatically in a `conftest.py` helper `make_gaia_run(tmp
 <tmp_path>/task-001/
   result.json          {"model_answer": "42", "gold": "42", "correct": true, "elapsed_s": 12.3}
   tool_calls.jsonl      one line: {"name": "bash", "args": {}, "result_text": "ok", "is_error": false}
-  notifications.txt     "[info] skill-inject: +1 [bash]\n"
+  notifications.txt     '[info] skill-inject: +1 ["bash"]\n'
   transcript.txt        "final answer: 42"
   prompt.txt            "..."
 <tmp_path>/task-002/

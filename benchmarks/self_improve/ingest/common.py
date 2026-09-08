@@ -88,11 +88,33 @@ _FRONTMATTER_BLOCK_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 # a notification line (skill-inject emits target_tool; knowledge-inject
 # emits topic, falling back to name) -- see build_knowledge_topic_index()'s
 # own docstring for the real bug this fixes.
+#: Namespace prefix for each directory's index keys -- the `source` value
+#: _NOTIF_RE itself captures ("skill-inject" for tools; knowledge and
+#: protocols share "knowledge-inject", exactly matching how
+#: knowledge-inject/index.ts's own dirs() feeds both into ONE registry).
+#: Real gap, confirmed by review: an earlier version of this index used
+#: bare, unnamespaced keys shared across all three directories -- if a
+#: tool's target_tool ever happened to equal a knowledge/protocol
+#: topic/name (plausible: both are short human-ish strings drawn from
+#: independent vocabularies with no coordination), one entry would
+#: silently overwrite the other and parse_notification_line (which looks
+#: up by name only, without checking `source`) could misattribute usage
+#: to the wrong component. `_index_key()` below scopes every lookup/store
+#: to its own source, so the two vocabularies can never collide even if
+#: their raw strings do.
 _INDEXED_DIRS = (
-    ("tools", "skills_tools_", "target_tool"),
-    ("knowledge", "skills_knowledge_", "topic"),
-    ("protocols", "skills_protocols_", "topic"),
+    ("tools", "skills_tools_", "target_tool", "skill-inject"),
+    ("knowledge", "skills_knowledge_", "topic", "knowledge-inject"),
+    ("protocols", "skills_protocols_", "topic", "knowledge-inject"),
 )
+
+
+def _index_key(source: str, name: str) -> str:
+    """Namespaces an index key by notification source -- see _INDEXED_DIRS'
+    own comment for why. NUL is not valid in YAML frontmatter scalar text
+    (and not realistically typeable into a `name`/`topic`/`target_tool`
+    field), so it can't collide with either vocabulary's own content."""
+    return f"{source}\x00{name}"
 
 
 def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
@@ -122,7 +144,7 @@ def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
     comes back partial or empty."""
     repo_root = Path(repo_root)
     index: dict[str, str] = {}
-    for subdir, prefix, field in _INDEXED_DIRS:
+    for subdir, prefix, field, source in _INDEXED_DIRS:
         dir_path = repo_root / "skills" / subdir
         if not dir_path.is_dir():
             continue
@@ -158,7 +180,7 @@ def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
                 key = key or frontmatter.get("name")
             if not isinstance(key, str) or not key:
                 continue
-            index[key] = f"{prefix}{file.stem}"
+            index[_index_key(source, key)] = f"{prefix}{file.stem}"
     return index
 
 
@@ -189,7 +211,16 @@ def parse_notification_line(
     fallback is kept only so a caller that doesn't build/pass an index at
     all (every unit test in this module, and any future caller not yet
     updated) keeps its old, still-usually-correct behavior instead of
-    losing every skill-inject usage record outright."""
+    losing every skill-inject usage record outright -- but the fallback
+    now always logs a warning when it fires (real gap, confirmed by review:
+    an earlier version warned only on the knowledge-inject drop path, so a
+    skill-inject name silently missing from a REAL, present index -- e.g.
+    a renamed/deleted tool skill -- corrupted usage signal with no trace,
+    indistinguishable in the logs from the expected no-index-passed case).
+
+    Index keys are namespaced by source (see _index_key()) so a tool's
+    target_tool can never collide with an unrelated knowledge/protocol
+    topic or name that happens to share the same raw string."""
     m = _NOTIF_RE.match(line)
     if not m:
         return []
@@ -204,9 +235,15 @@ def parse_notification_line(
     index = knowledge_topic_index or {}
     usages = []
     for name in names:
-        pred_name = index.get(name)
+        pred_name = index.get(_index_key(source, name))
         if pred_name is None:
             if source == "skill-inject":
+                logger.warning(
+                    "parse_notification_line: skill-inject target_tool %r not found in "
+                    "the tool-skill index -- falling back to a blind name->pred_name "
+                    "guess (skills_tools_%s), which is wrong whenever target_tool "
+                    "differs from the file stem", name, name,
+                )
                 pred_name = f"skills_tools_{name}"
             else:
                 logger.warning(

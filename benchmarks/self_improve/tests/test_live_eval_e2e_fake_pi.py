@@ -539,24 +539,36 @@ def test_per_exercise_timeout_default_uses_the_worktrees_own_pinned_copy(
     WORKTREE's pinned copy after checkout (as if it were pinned to an
     older/different commit) and confirm the runner picks up THAT value,
     not the source checkout's."""
+    import benchmarks.aider_polyglot as aider_polyglot
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
+
+    # Real gap, confirmed by review: an earlier version of this test
+    # hardcoded the bare 2700 literal in both this guard and the replace()
+    # call below -- the exact duplication the whole change exists to
+    # eliminate. Ground truth comes from aider_polyglot.py itself, same as
+    # the sibling env-var test above.
+    real_default = aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT
+    pinned_default = real_default - 2640  # deliberately different from real_default
 
     monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
         pinned_file = wt.path / "benchmarks" / "aider_polyglot.py"
         text = pinned_file.read_text()
-        assert "_ATTEMPT_TIMEOUT_S_DEFAULT = 2700" in text
+        assert f"_ATTEMPT_TIMEOUT_S_DEFAULT = {real_default}" in text
         pinned_file.write_text(
-            text.replace("_ATTEMPT_TIMEOUT_S_DEFAULT = 2700", "_ATTEMPT_TIMEOUT_S_DEFAULT = 60")
+            text.replace(
+                f"_ATTEMPT_TIMEOUT_S_DEFAULT = {real_default}",
+                f"_ATTEMPT_TIMEOUT_S_DEFAULT = {pinned_default}",
+            )
         )
 
         runner = PolyglotLiveRunner(
             worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
             model="fake/model", max_attempts=2, benchmark_root=fake_practice,
         )
-        # Reflects the WORKTREE's pinned 60, not the source checkout's 2700.
-        assert runner.per_exercise_timeout_s == 2 * (60 + 90) + 180
+        # Reflects the WORKTREE's pinned value, not the source checkout's.
+        assert runner.per_exercise_timeout_s == 2 * (pinned_default + 90) + 180
 
 
 @pytest.mark.parametrize("bad_value", ["not-a-number", "0", "-5"])
@@ -573,3 +585,37 @@ def test_attempt_timeout_s_raises_on_malformed_or_non_positive_value(bad_value, 
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", bad_value)
     with pytest.raises(SystemExit):
         _attempt_timeout_s()
+
+
+def test_attempt_timeout_default_from_source_warns_when_regex_does_not_match(tmp_path, caplog):
+    """Real gap, confirmed by review: a benign reformat of aider_polyglot.py
+    (a type annotation, `= 2_700` with an underscore, a trailing comment,
+    changed spacing) makes the regex stop matching -- must not silently
+    degrade to the hardcoded fallback with no signal, or a real default
+    change hidden behind a reformat goes completely undetected."""
+    from benchmarks.self_improve.live_eval import (
+        _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK,
+        _attempt_timeout_default_from_source,
+    )
+
+    reformatted = tmp_path / "aider_polyglot.py"
+    reformatted.write_text("_ATTEMPT_TIMEOUT_S_DEFAULT: int = 3000  # reformatted\n")
+
+    with caplog.at_level("WARNING"):
+        value = _attempt_timeout_default_from_source(reformatted)
+
+    assert value == _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    assert "not found" in caplog.text
+
+
+def test_attempt_timeout_default_from_source_warns_when_file_missing(tmp_path, caplog):
+    from benchmarks.self_improve.live_eval import (
+        _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK,
+        _attempt_timeout_default_from_source,
+    )
+
+    with caplog.at_level("WARNING"):
+        value = _attempt_timeout_default_from_source(tmp_path / "does_not_exist.py")
+
+    assert value == _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    assert "could not read" in caplog.text

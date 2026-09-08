@@ -83,13 +83,38 @@ _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK = 2700
 def _attempt_timeout_default_from_source(aider_polyglot_py_path: Path) -> int:
     """Regex-extract aider_polyglot.py's _ATTEMPT_TIMEOUT_S_DEFAULT
     constant from the given copy's file TEXT -- never imports/executes it
-    (see the module-level comment above for why). Never raises."""
+    (see the module-level comment above for why). Never raises.
+
+    Real gap, confirmed by review: an earlier version fell back to
+    _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK with NO warning whenever the
+    regex failed to match -- e.g. a benign reformat of aider_polyglot.py
+    (a type annotation, `= 2_700` with an underscore, a trailing comment,
+    changed spacing) would silently stop matching and this would keep
+    returning 2700 with no signal anything had gone wrong, reintroducing
+    exactly the silent-drift failure this whole mechanism exists to
+    prevent. Still never RAISES (this is a budget estimate, not a
+    correctness-critical read -- see the module-level comment), but now
+    always logs so a real drift is at least detectable instead of silent."""
     try:
         text = aider_polyglot_py_path.read_text()
-    except OSError:
+    except OSError as e:
+        logger.warning(
+            "_attempt_timeout_default_from_source: could not read %s (%s) -- "
+            "using hardcoded fallback %d", aider_polyglot_py_path, e,
+            _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK,
+        )
         return _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
     m = _ATTEMPT_TIMEOUT_S_DEFAULT_RE.search(text)
-    return int(m.group(1)) if m else _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    if m is None:
+        logger.warning(
+            "_attempt_timeout_default_from_source: _ATTEMPT_TIMEOUT_S_DEFAULT not "
+            "found (or reformatted past what this regex matches) in %s -- using "
+            "hardcoded fallback %d; the outer per-exercise timeout estimate may now "
+            "be computed against a stale default", aider_polyglot_py_path,
+            _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK,
+        )
+        return _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    return int(m.group(1))
 
 
 _ATTEMPT_TIMEOUT_S_DEFAULT = _attempt_timeout_default_from_source(

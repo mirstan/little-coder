@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from benchmarks.self_improve.ingest.common import (
+    _index_key,
     build_knowledge_topic_index,
     merge_component_usage,
     parse_notification_line,
@@ -34,9 +35,10 @@ def test_parse_skill_inject_notification_resolves_camelcase_target_tool_via_inde
     nothing in config/components.yaml. With an index available (built from
     the real skills/tools/*.md files), it must resolve correctly instead
     of falling back to the blind (wrong) guess."""
-    index = {"BrowserClick": "skills_tools_browser_click"}
+    index = {_index_key("skill-inject", "BrowserClick"): "skills_tools_browser_click"}
+    payload = json.dumps(["BrowserClick"])
     usages = parse_notification_line(
-        "[info] skill-inject: +1 [BrowserClick]", knowledge_topic_index=index,
+        f"[info] skill-inject: +1 {payload}", knowledge_topic_index=index,
     )
     assert usages == [ComponentUsage(pred_name="skills_tools_browser_click", invocation_count=1)]
 
@@ -49,8 +51,10 @@ def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_fro
     pred_name), skill-inject's blind prefix is at least USUALLY correct,
     so keeping it as a fallback (rather than always dropping) avoids
     regressing every caller that hasn't been updated to pass an index."""
+    payload = json.dumps(["bash"])
     usages = parse_notification_line(
-        "[info] skill-inject: +1 [bash]", knowledge_topic_index={"BrowserClick": "skills_tools_browser_click"},
+        f"[info] skill-inject: +1 {payload}",
+        knowledge_topic_index={_index_key("skill-inject", "BrowserClick"): "skills_tools_browser_click"},
     )
     assert usages == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
 
@@ -69,11 +73,12 @@ def test_parse_knowledge_inject_notification_resolves_via_topic_index():
     from the real skill files (build_knowledge_topic_index()), never by
     string transformation of the topic itself."""
     index = {
-        "Binary Search": "skills_knowledge_binary_search",
-        "Two Pointers": "skills_knowledge_two_pointers",
+        _index_key("knowledge-inject", "Binary Search"): "skills_knowledge_binary_search",
+        _index_key("knowledge-inject", "Two Pointers"): "skills_knowledge_two_pointers",
     }
+    payload = json.dumps(["Binary Search", "Two Pointers"])
     usages = parse_notification_line(
-        "[info] knowledge-inject: +2 [Binary Search,Two Pointers]", knowledge_topic_index=index,
+        f"[info] knowledge-inject: +2 {payload}", knowledge_topic_index=index,
     )
     assert usages == [
         ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
@@ -85,6 +90,25 @@ def test_parse_knowledge_inject_notification_drops_unresolved_topic():
     """Without a topic index (or a topic missing from it -- e.g. a renamed
     skill file), the usage record is dropped rather than guessed at."""
     assert parse_notification_line("[info] knowledge-inject: +1 [Some Unknown Topic]") == []
+
+
+def test_parse_knowledge_inject_notification_resolves_a_protocol_via_its_name_fallback():
+    """Real gap, confirmed by review: `fm.topic` itself falls back to
+    `fm.name` at the emitting extension (knowledge-inject/index.ts:49-50)
+    for a file with no `topic:` field -- confirmed against every real
+    skills/protocols/*.md file, none of which declare `topic:`, only
+    `name:`. A real knowledge-inject notification for a protocol therefore
+    carries the file's `name` (e.g. "cite-before-answer"), not a
+    topic-shaped human sentence -- must resolve via the SAME index
+    (build_knowledge_topic_index() already applies this same `topic or
+    name` fallback when building it), not be treated as an unresolvable
+    topic."""
+    index = {_index_key("knowledge-inject", "cite-before-answer"): "skills_protocols_cite_before_answer"}
+    payload = json.dumps(["cite-before-answer"])
+    usages = parse_notification_line(
+        f"[info] knowledge-inject: +1 {payload}", knowledge_topic_index=index,
+    )
+    assert usages == [ComponentUsage(pred_name="skills_protocols_cite_before_answer", invocation_count=1)]
 
 
 def test_parse_skill_inject_notification_new_json_format():
@@ -105,8 +129,8 @@ def test_parse_knowledge_inject_notification_handles_a_topic_containing_a_litera
     "Error handling, retries, and backoff"). The old bare comma-join format
     was genuinely ambiguous here; JSON.stringify()/json.loads() are not."""
     index = {
-        "Error handling, retries, and backoff": "skills_knowledge_error_handling",
-        "Binary Search": "skills_knowledge_binary_search",
+        _index_key("knowledge-inject", "Error handling, retries, and backoff"): "skills_knowledge_error_handling",
+        _index_key("knowledge-inject", "Binary Search"): "skills_knowledge_binary_search",
     }
     payload = json.dumps(["Error handling, retries, and backoff", "Binary Search"])
     usages = parse_notification_line(
@@ -125,8 +149,8 @@ def test_parse_knowledge_inject_notification_still_reads_old_comma_joined_format
     topic containing a literal comma -- that data can't be recovered after
     the fact, only new data is fixed)."""
     index = {
-        "Binary Search": "skills_knowledge_binary_search",
-        "Two Pointers": "skills_knowledge_two_pointers",
+        _index_key("knowledge-inject", "Binary Search"): "skills_knowledge_binary_search",
+        _index_key("knowledge-inject", "Two Pointers"): "skills_knowledge_two_pointers",
     }
     usages = parse_notification_line(
         "[info] knowledge-inject: +2 [Binary Search,Two Pointers]", knowledge_topic_index=index,
@@ -157,14 +181,14 @@ def test_build_knowledge_topic_index_maps_target_tool_field_to_pred_name(tmp_pat
     _write_tool_skill_file(tmp_path / "skills" / "tools" / "browser_click.md",
                             "browser-click-guidance", target_tool="BrowserClick")
     index = build_knowledge_topic_index(tmp_path)
-    assert index == {"BrowserClick": "skills_tools_browser_click"}
+    assert index == {_index_key("skill-inject", "BrowserClick"): "skills_tools_browser_click"}
 
 
 def test_build_knowledge_topic_index_maps_topic_field_to_pred_name(tmp_path):
     _write_skill_file(tmp_path / "skills" / "knowledge" / "binary_search.md",
                        "binary-search", topic="Binary Search")
     index = build_knowledge_topic_index(tmp_path)
-    assert index == {"Binary Search": "skills_knowledge_binary_search"}
+    assert index == {_index_key("knowledge-inject", "Binary Search"): "skills_knowledge_binary_search"}
 
 
 def test_build_knowledge_topic_index_falls_back_to_name_field_when_no_topic(tmp_path):
@@ -174,7 +198,7 @@ def test_build_knowledge_topic_index_falls_back_to_name_field_when_no_topic(tmp_
     _write_skill_file(tmp_path / "skills" / "protocols" / "cite_before_answer.md",
                        "cite-before-answer")
     index = build_knowledge_topic_index(tmp_path)
-    assert index == {"cite-before-answer": "skills_protocols_cite_before_answer"}
+    assert index == {_index_key("knowledge-inject", "cite-before-answer"): "skills_protocols_cite_before_answer"}
 
 
 def test_build_knowledge_topic_index_handles_missing_directories(tmp_path):
@@ -191,7 +215,7 @@ def test_build_knowledge_topic_index_skips_non_utf8_file(tmp_path):
     _write_skill_file(good_dir / "good.md", "good-skill", topic="Good Topic")
     (good_dir / "bad.md").write_bytes(b"---\nname: bad\ntopic: Bad\n---\n\xff\xfe not utf-8 \x80")
     index = build_knowledge_topic_index(tmp_path)
-    assert index == {"Good Topic": "skills_knowledge_good"}
+    assert index == {_index_key("knowledge-inject", "Good Topic"): "skills_knowledge_good"}
 
 
 def test_build_knowledge_topic_index_skips_non_mapping_frontmatter(tmp_path):
@@ -211,6 +235,32 @@ def test_build_knowledge_topic_index_skips_non_string_topic(tmp_path):
     assert build_knowledge_topic_index(tmp_path) == {}
 
 
+def test_build_knowledge_topic_index_namespaces_keys_by_source_to_avoid_collision(tmp_path):
+    """Real gap, confirmed by review: a tool's target_tool and a
+    knowledge/protocol topic/name are independent human-ish vocabularies
+    with no coordination -- if they ever happened to share a raw string
+    (constructed here as "Shared" for both), unnamespaced keys would let
+    one silently overwrite the other, and parse_notification_line (which
+    doesn't check `source` when looking up a bare name) could misattribute
+    usage to the wrong component. Namespacing by source keeps both
+    resolvable independently."""
+    _write_tool_skill_file(tmp_path / "skills" / "tools" / "shared_tool.md", "shared-tool", target_tool="Shared")
+    _write_skill_file(tmp_path / "skills" / "knowledge" / "shared_topic.md", "shared-topic", topic="Shared")
+    index = build_knowledge_topic_index(tmp_path)
+    assert index[_index_key("skill-inject", "Shared")] == "skills_tools_shared_tool"
+    assert index[_index_key("knowledge-inject", "Shared")] == "skills_knowledge_shared_topic"
+
+    tool_usages = parse_notification_line(
+        f'[info] skill-inject: +1 {json.dumps(["Shared"])}', knowledge_topic_index=index,
+    )
+    assert tool_usages == [ComponentUsage(pred_name="skills_tools_shared_tool", invocation_count=1)]
+
+    knowledge_usages = parse_notification_line(
+        f'[info] knowledge-inject: +1 {json.dumps(["Shared"])}', knowledge_topic_index=index,
+    )
+    assert knowledge_usages == [ComponentUsage(pred_name="skills_knowledge_shared_topic", invocation_count=1)]
+
+
 def test_build_knowledge_topic_index_against_real_repo_files():
     """End-to-end against the REAL skills/knowledge, skills/protocols, and
     skills/tools files, not fixtures -- confirms the index actually
@@ -218,16 +268,16 @@ def test_build_knowledge_topic_index_against_real_repo_files():
     carry."""
     real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
     index = build_knowledge_topic_index(real_repo_root)
-    assert index["Binary Search"] == "skills_knowledge_binary_search"
-    assert index["cite-before-answer"] == "skills_protocols_cite_before_answer"
+    assert index[_index_key("knowledge-inject", "Binary Search")] == "skills_knowledge_binary_search"
+    assert index[_index_key("knowledge-inject", "cite-before-answer")] == "skills_protocols_cite_before_answer"
     # The real bug this index exists to fix for skill-inject: several real
     # tool skills declare a CamelCase target_tool that does NOT match their
     # snake_case file stem/pred_name.
-    assert index["BrowserClick"] == "skills_tools_browser_click"
-    assert index["ShellSession"] == "skills_tools_shell_session"
+    assert index[_index_key("skill-inject", "BrowserClick")] == "skills_tools_browser_click"
+    assert index[_index_key("skill-inject", "ShellSession")] == "skills_tools_shell_session"
     # And the common case (target_tool already equals the stem) resolves
     # the same way, via the same index.
-    assert index["bash"] == "skills_tools_bash"
+    assert index[_index_key("skill-inject", "bash")] == "skills_tools_bash"
 
 
 def test_parse_notification_line_ignores_unrelated_lines():
