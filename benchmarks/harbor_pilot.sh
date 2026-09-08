@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pilot runner for Terminal-Bench 2.0 via harbor.
+# Pilot runner for Terminal-Bench 2.1 via harbor.
 #
 # Usage:
 #   benchmarks/harbor_pilot.sh hello-world
@@ -7,6 +7,13 @@
 #
 # Env:
 #   TB_LITTLE_CODER_MODEL   — model override (default: llamacpp/qwen3.6-35b-a3b)
+#   TB_DATASET              — dataset override (default:
+#                             terminal-bench/terminal-bench-2-1, resolved via
+#                             harbor's newer org/name package registry, NOT
+#                             the legacy name@version one -- confirmed 2.1
+#                             fixes configure-git-webserver's SSH username/
+#                             auth-method mismatch against the instructions,
+#                             which 2.0 never did)
 #   TB_TIMEOUT_MULTIPLIER   — per-task timeout multiplier (default: 3; found
 #                             necessary this session -- at n-concurrent 1,
 #                             concurrency-inflated per-turn latency still blew
@@ -22,6 +29,7 @@
 set -euo pipefail
 
 MODEL="${TB_LITTLE_CODER_MODEL:-llamacpp/qwen3.6-35b-a3b}"
+DATASET="${TB_DATASET:-terminal-bench/terminal-bench-2-1}"
 TIMEOUT_MULTIPLIER="${TB_TIMEOUT_MULTIPLIER:-3}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$REPO_ROOT/benchmarks/harbor_runs"
@@ -46,13 +54,13 @@ export OLLAMA_API_KEY="${OLLAMA_API_KEY:-noop}"
 export PYTHONPATH="$REPO_ROOT"
 
 echo "model:   $MODEL"
-echo "dataset: terminal-bench@2.0"
+echo "dataset: $DATASET"
 echo "tasks:   $*"
 echo "output:  $OUT"
 echo
 
 HB_CMD=(harbor run
-  --dataset terminal-bench@2.0
+  --dataset "$DATASET"
   "${TASK_FLAGS[@]}"
   --agent benchmarks.harbor_adapter.little_coder_agent:LittleCoderAgent
   --model "$MODEL"

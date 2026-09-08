@@ -96,9 +96,21 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
         config = json.loads((trial_dir / "config.json").read_text())
         multiplier = float(config["timeout_multiplier"])
         task_name = config["task"]["path"]
+        # Harbor caches a task's files differently depending on which
+        # registry resolved the dataset: a legacy name@version dataset (e.g.
+        # "terminal-bench@2.0") caches at <hash>/<task_name>/task.toml, while
+        # a newer org/name package dataset (e.g. "terminal-bench/terminal-
+        # bench-2-1") caches one level deeper, at
+        # packages/<org>/<task_name>/<content-hash>/task.toml. Try both --
+        # confirmed by inspecting both live on disk, not assumed.
         matches = list(HARBOR_TASK_CACHE.glob(f"*/{task_name}/task.toml"))
+        matches += list(HARBOR_TASK_CACHE.glob(f"packages/*/{task_name}/*/task.toml"))
         if not matches:
             return DEFAULT_PROMPT_TIMEOUT_SEC
+        # Ambiguous match (e.g. both an old and a new cache exist for the
+        # same task name, as happens right after switching dataset versions)
+        # -- prefer the most recently written one over an arbitrary pick.
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         toml_data = tomllib.loads(matches[0].read_text())
         base_timeout_sec = float(toml_data["agent"]["timeout_sec"])
         return base_timeout_sec * multiplier * DEADLINE_SAFETY_MARGIN
