@@ -311,24 +311,42 @@ class PiRpc:
         them, not after the whole call returns. This is what lets a caller
         (e.g. the Harbor adapter) stream a live trajectory log instead of
         only writing a summary once prompt_and_collect finally returns.
+
+        Caller-supplied code (`on_event` and `predicate`) runs OUTSIDE
+        self._cv, deliberately: while this thread holds that lock the reader
+        thread cannot queue anything, so a callback doing slow file I/O would
+        stall event demultiplexing (and with it the tb_shell proxy, which the
+        same reader thread services), and a callback that reached back into
+        PiRpc -- notifications(), stderr(), another prompt -- would deadlock
+        outright on the non-reentrant lock.
         """
         start = time.time()
         collected: list[dict] = []
-        with self._cv:
-            while True:
-                while self._event_q:
-                    ev = self._event_q.pop(0)
-                    collected.append(ev)
-                    if on_event is not None:
-                        on_event(ev)
-                    if predicate(ev):
+        while True:
+            with self._cv:
+                while not self._event_q:
+                    if self._eof:
+                        return collected      # queue drained above; pi is gone
+                    remaining = timeout - (time.time() - start)
+                    if remaining <= 0:
                         return collected
-                if self._eof:
-                    return collected      # queue drained above; pi is gone
-                remaining = timeout - (time.time() - start)
-                if remaining <= 0:
+                    self._cv.wait(timeout=remaining)
+                batch = self._event_q[:]
+                del self._event_q[:]
+            for i, ev in enumerate(batch):
+                collected.append(ev)
+                if on_event is not None:
+                    on_event(ev)
+                if predicate(ev):
+                    # Anything after the matching event stays queued for the
+                    # next drain, exactly as when events were popped one at a
+                    # time. It predates whatever the reader appended while the
+                    # callbacks ran, so it goes back at the FRONT of the queue.
+                    rest = batch[i + 1:]
+                    if rest:
+                        with self._cv:
+                            self._event_q[:0] = rest
                     return collected
-                self._cv.wait(timeout=remaining)
 
     # ── Public API ───────────────────────────────────────────────────────
     def prompt_and_collect(

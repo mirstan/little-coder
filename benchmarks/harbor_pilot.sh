@@ -78,6 +78,9 @@ HB_CMD=(harbor run
 if ! command -v sg >/dev/null 2>&1 || groups | grep -q '\bdocker\b'; then
   cd "$REPO_ROOT" && "${HB_CMD[@]}"
 else
+  # %q for the path too: hand-quoting it as '$REPO_ROOT' breaks (and would
+  # let the path inject shell) if any parent directory contains a quote.
   printf -v CMD_STR '%q ' "${HB_CMD[@]}"
-  sg docker -c "cd '$REPO_ROOT' && $CMD_STR"
+  printf -v ROOT_Q '%q' "$REPO_ROOT"
+  sg docker -c "cd $ROOT_Q && $CMD_STR"
 fi
