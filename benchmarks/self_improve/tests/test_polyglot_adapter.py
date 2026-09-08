@@ -178,6 +178,39 @@ def test_reflective_dataset_feedback_omits_per_run_compaction_note_when_zero():
     assert "occurred during this run" not in feedback
 
 
+def test_reflective_dataset_generated_outputs_includes_self_reported_lessons():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", self_reported_lessons=["needed better docs"])})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    record = adapter.make_reflective_dataset({"skills_tools_bash": "text"}, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert record["Generated Outputs"]["self_reported_lessons"] == ["needed better docs"]
+
+
+def test_reflective_dataset_feedback_labels_lessons_as_unverified_when_present():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", self_reported_lessons=["needed better docs"])})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    feedback = adapter.make_reflective_dataset(
+        {"skills_tools_bash": "text"}, batch, ["skills_tools_bash"],
+    )["skills_tools_bash"][0]["Feedback"]
+    assert "needed better docs" in feedback
+    assert "unverified" in feedback
+    assert "not independently verified" in feedback
+
+
+def test_reflective_dataset_feedback_omits_lessons_disclaimer_when_none_reported():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})  # self_reported_lessons defaults to []
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    feedback = adapter.make_reflective_dataset(
+        {"skills_tools_bash": "text"}, batch, ["skills_tools_bash"],
+    )["skills_tools_bash"][0]["Feedback"]
+    assert "unverified" not in feedback
+
+
 def test_reflective_dataset_generated_outputs_includes_token_cost_for_a_tool_skill():
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a")})

@@ -231,6 +231,28 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "fail_then_report_lesson_then_solve":
+        # Attempt 1: fails (writes nothing). Attempt 2: emits a LESSON: line
+        # via text_delta (mirroring a real model following aider_polyglot.py's
+        # retry-prompt LESSON: instruction), then solves for real. Same
+        # cross-process attempt tracking as noop_then_solve -- see its own
+        # comment for why an in-memory counter can't work here.
+        state_file = os.environ["FAKE_PI_STATE_FILE"]
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if os.path.exists(state_file):
+            emit({"type": "message_update",
+                  "assistantMessageEvent": {"type": "text_delta",
+                                             "delta": "LESSON: needed clearer guidance\n"}})
+            _write_solution_files()
+        else:
+            with open(state_file, "w") as fh:
+                fh.write("attempt-1-done\n")
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "read_system_prompt_echo":
         # Copies the system-prompt file's content to FAKE_PI_ECHO_FILE, so a
         # test can assert a candidate's proposed text actually reached the

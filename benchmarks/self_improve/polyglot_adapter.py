@@ -110,6 +110,13 @@ def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_i
         if result.diff_summary:
             parts.append(f"The agent's actual code changes:\n```diff\n{result.diff_summary}\n```")
 
+    if result.self_reported_lessons:
+        parts.append(
+            "The agent's own unverified claim(s) about what would have helped "
+            "(not independently verified -- treat as a hint, not ground truth): "
+            + " | ".join(result.self_reported_lessons) + "."
+        )
+
     parts.append(_SCORING_RULE)
     return " ".join(parts)
 
@@ -210,6 +217,7 @@ class PolyglotGEPAAdapter:
                         "transcript_excerpt": result.transcript_excerpt,
                         "reasoning_excerpt": result.reasoning_excerpt,
                         "summarized_transcript": result.summarized_transcript,
+                        "self_reported_lessons": result.self_reported_lessons,
                         **token_cost_info,
                     },
                     "Feedback": _component_feedback(component, result, self.knowledge_topic_index),

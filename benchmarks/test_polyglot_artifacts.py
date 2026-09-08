@@ -233,6 +233,105 @@ def test_run_exercise_sums_compaction_events_across_every_attempt(tmp_path, monk
     assert record["compaction_total"] == 1 + 2  # attempt 1's 1 + attempt 2's 2
 
 
+class _FakeRpcWithLessons(_FakeRpc):
+    """Same as _FakeRpc, but attempt 2+ includes a LESSON: line in its
+    prose (mirroring a real model following the retry prompt's new
+    instruction) -- attempt 1 never gets asked, so it has none, matching
+    real behavior."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+
+        lesson_line = f"\nLESSON: needed guidance {self.n}\n" if self.n > 1 else ""
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = f"Some prose about attempt {self.n}.{lesson_line}More prose."
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_captures_lesson_from_a_retried_attempts_response(tmp_path, monkeypatch):
+    """Real gap this closes: aider_polyglot.py's retry loop fed the next
+    attempt raw test output but never solicited or captured an explicit
+    self-reflection -- Reflexion's actual validated technique (verbal
+    self-reflection between retry attempts) was unavailable here."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),  # always fail -> retry
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithLessons)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    # Attempt 1 was never asked (no retry prompt exists for the first
+    # attempt), so only attempt 2's lesson is captured.
+    assert record["lessons"] == ["needed guidance 2"]
+
+
+def test_run_exercise_lessons_is_empty_when_no_lesson_line_present(tmp_path, monkeypatch):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpc)  # never emits a LESSON: line
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert record["lessons"] == []
+
+
+def test_run_exercise_captures_one_lesson_per_retried_attempt(tmp_path, monkeypatch):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithLessons)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True,
+                               max_attempts=3)
+    assert record["lessons"] == ["needed guidance 2", "needed guidance 3"]
+
+
 def test_run_id_is_stable_within_a_process():
     assert AP.RUN_ID and AP.RUN_ID == AP.RUN_ID
 

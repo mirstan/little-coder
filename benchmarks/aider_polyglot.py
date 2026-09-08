@@ -62,6 +62,14 @@ TRAJECTORY_NON_TEXT_DELTA_CHARS = 200_000
 #: Give up if this many exercises fail in a row -- a broken environment,
 #: not broken exercises.
 MAX_CONSECUTIVE_ERRORS = 3
+#: Retry-prompt convention for a between-attempt self-reflection (Reflexion-
+#: style: the agent reflects on why THIS attempt failed before the next one
+#: begins). Mirrors gaia_scorer.py's own proven `Answer:` line convention
+#: (re.match(r"(?i)^(?:final\s+answer|answer)\s*[:\-]\s*(.+)$", s)) rather
+#: than inventing a new extraction style. Deliberately supplementary, not
+#: required -- a missing LESSON: line just means no lesson was captured for
+#: that attempt, never a harness error.
+_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\s*(.+)$")
 def _positive_int_env(name: str, default: int) -> int:
     """Parse a positive-integer env var, failing with a readable message.
 
@@ -818,6 +826,7 @@ def _run_exercise(
         stop_reasons: list[str] = []
         turn_total = 0
         compaction_total = 0
+        lessons: list[str] = []
         current_prompt = prompt
         codex_session_id = None
         for i in range(1, effective_attempts + 1):
@@ -894,6 +903,16 @@ def _run_exercise(
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
             compaction_total += getattr(r, "compaction_events", 0) or 0
+            # Only an attempt whose retry prompt actually asked for one (see
+            # below) can have a LESSON: line -- i.e. every attempt except
+            # possibly the last, a natural consequence of where the ask
+            # lives, not a special case here. First match only -- one lesson
+            # per attempt, not one per mention.
+            for line in (getattr(r, "assistant_text", "") or "").splitlines():
+                m = _LESSON_RE.match(line.strip())
+                if m:
+                    lessons.append(m.group(1).strip())
+                    break
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
             stop_reasons.append(_stop_reason(r))
@@ -936,7 +955,10 @@ def _run_exercise(
                       "your previous attempt's code (read the current state "
                       "before editing). The tests failed with this output:\n\n```\n"
                     + out[-4000:]
-                    + "\n```\n\nFix the implementation and try again."
+                    + "\n```\n\nBefore continuing: on a single line starting with "
+                      "'LESSON:', state in one sentence what tool, skill, or "
+                      "information would have most helped you get here faster or "
+                      "more reliably. Then fix the implementation and try again."
                 )
             else:
                 # codex resumes its own session (see above), so it already
@@ -951,7 +973,11 @@ def _run_exercise(
                     "The tests failed. Output:\n\n```\n"
                     + out[-4000:]
                     + "\n```\n\nThe test file(s) are for reference only -- "
-                      "do not edit them. Fix the implementation and try again."
+                      "do not edit them. Before continuing: on a single line "
+                      "starting with 'LESSON:', state in one sentence what tool, "
+                      "skill, or information would have most helped you get here "
+                      "faster or more reliably. Then fix the implementation and "
+                      "try again."
                 )
 
         elapsed = time.time() - t0
@@ -966,6 +992,7 @@ def _run_exercise(
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
             "compaction_total": compaction_total,
+            "lessons": lessons,
         }
         return record
 

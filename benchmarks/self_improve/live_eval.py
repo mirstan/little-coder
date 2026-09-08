@@ -143,6 +143,12 @@ class LiveRunResult:
     #: injected text is large enough to force a mid-run context compaction
     #: is exhibiting real prompt bloat, factored into pass_n_score() above.
     compaction_total: int = 0
+    #: One entry per attempt that had a retry (Reflexion-style: the agent
+    #: reflects on why THAT attempt failed as part of its own next retry
+    #: prompt -- see aider_polyglot.py's LESSON: convention). Unverified --
+    #: the agent's own claim, never independently checked, never affects
+    #: score. See polyglot_adapter.py's disclaimer text when this is surfaced.
+    self_reported_lessons: list = field(default_factory=list)
     #: Error tool calls first ("[ERROR] name(args) -> result_text"), then a
     #: backfill of assistant_text's tail -- see
     #: ingest/common.py::summarize_for_reflection, reused verbatim here so a
@@ -493,6 +499,7 @@ class PolyglotLiveRunner:
         compaction_total = record.get("compaction_total", 0) or 0
         success, score = pass_n_score(status, compaction_events=compaction_total) or (False, 0.0)
         stop_reasons = record.get("stop_reasons") or []
+        self_reported_lessons = record.get("lessons") or []
 
         ex_log_dir = log_root / "pi" / spec.language / spec.exercise
         test_output_tail = ""
@@ -544,6 +551,7 @@ class PolyglotLiveRunner:
             attempts=len(stop_reasons) if stop_reasons else (1 if status != "error" else 0),
             stop_reasons=stop_reasons, elapsed_s=record.get("elapsed_s", 0.0) or 0.0,
             turn_count=record.get("turn_count", 0) or 0, compaction_total=compaction_total,
+            self_reported_lessons=self_reported_lessons,
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
             reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
             diff_summary=diff_summary, notifications=notifications,

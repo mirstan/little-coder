@@ -196,6 +196,23 @@ def test_pipeline_scores_a_second_attempt_pass_as_partial_credit(runner_factory,
     assert results[0].score == 0.7
 
 
+def test_self_reported_lesson_is_captured_end_to_end(runner_factory, tmp_path, monkeypatch):
+    """Real gap this closes: the retry loop fed the next attempt raw test
+    output but never solicited or captured an explicit self-reflection --
+    Reflexion's actual validated technique (verbal self-reflection between
+    retry attempts) was unavailable. Attempt 1 fails, attempt 2 states a
+    LESSON: line then solves -- proves it's captured through the real
+    subprocess/trajectory pipeline, not just the in-process unit tests."""
+    monkeypatch.setenv("FAKE_PI_MODE", "fail_then_report_lesson_then_solve")
+    monkeypatch.setenv("FAKE_PI_STATE_FILE", str(tmp_path / "attempt_state.txt"))
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    result = results[0]
+    assert result.status == "pass_2"
+    assert result.self_reported_lessons == ["needed clearer guidance"]
+
+
 def test_materialize_writes_candidate_text_preserving_frontmatter(runner_factory):
     for runner in runner_factory():
         runner.materialize({"skills_tools_bash": "Brand new guidance body.\n"})
