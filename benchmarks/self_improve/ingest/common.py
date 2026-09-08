@@ -212,17 +212,21 @@ def parse_notification_line(
     all (every unit test in this module, and any future caller not yet
     updated) keeps its old, still-usually-correct behavior instead of
     losing every skill-inject usage record outright -- and now logs a
-    warning whenever it fires WITH a real (non-None) index that just
-    doesn't contain this name (real gap, confirmed by review, twice: an
-    earlier version warned only on the knowledge-inject drop path, so a
-    skill-inject name silently missing from a REAL, present index -- e.g.
-    a renamed/deleted tool skill -- corrupted usage signal with no trace;
-    the very next fix then warned UNCONDITIONALLY, which collapsed right
+    warning whenever it fires WITH a real, non-empty index that just
+    doesn't contain this name (real gap, confirmed by review, three
+    rounds: an earlier version warned only on the knowledge-inject drop
+    path, so a skill-inject name silently missing from a REAL, present
+    index -- e.g. a renamed/deleted tool skill -- corrupted usage signal
+    with no trace; the next fix warned UNCONDITIONALLY, collapsing right
     back into being indistinguishable from -- and noisy for -- the
-    expected no-index-passed case, since `knowledge_topic_index or {}`
-    can't tell "wasn't given one" from "given one that's missing this
-    name" apart. Only the caller's ORIGINAL argument being non-None
-    distinguishes them).
+    expected no-index-passed case; the fix after THAT checked the
+    caller's argument for `is not None`, which still miscounted an
+    intentionally-EMPTY dict (aider_polyglot_ingest.py's/gaia_ingest.py's
+    own `build_knowledge_topic_index(repo_root) if repo_root else {}`
+    no-repo_root sentinel) as "a real index was provided". Truthiness
+    (an empty dict is falsy, same as None) is what actually distinguishes
+    "no resolution possible at all" from "resolution possible but this
+    specific name is missing").
 
     Index keys are namespaced by source (see _index_key()) so a tool's
     target_tool can never collide with an unrelated knowledge/protocol
@@ -247,7 +251,18 @@ def parse_notification_line(
     # be indistinguishable in the logs (defeating the point) AND spam every
     # no-index caller. Keep the distinction: only warn when the caller
     # actually opted into indexed resolution.
-    index_was_provided = knowledge_topic_index is not None
+    #
+    # Real gap, confirmed by review (second round): `is not None` isn't
+    # enough either -- aider_polyglot_ingest.py's and gaia_ingest.py's own
+    # `build_knowledge_topic_index(repo_root) if repo_root else {}` pass a
+    # genuinely EMPTY dict (not None) as their own "no repo_root given, no
+    # resolution possible" sentinel, which `is not None` wrongly counted
+    # as "a real index was provided", spamming a warning for every
+    # skill-inject usage record in that (common, legitimate) no-repo_root
+    # case. An index that resolves nothing at all is just as much "no
+    # index" as one that was never passed -- truthiness (empty dict is
+    # falsy) treats both sentinels the same way.
+    index_was_provided = bool(knowledge_topic_index)
     index = knowledge_topic_index or {}
     usages = []
     for name in names:

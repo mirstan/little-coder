@@ -79,6 +79,22 @@ def test_parse_skill_inject_notification_fallback_is_silent_when_no_index_passed
     assert caplog.text == ""
 
 
+def test_parse_skill_inject_notification_fallback_is_silent_for_the_empty_dict_no_repo_root_sentinel(caplog):
+    """Real gap, confirmed by review: aider_polyglot_ingest.py's and
+    gaia_ingest.py's own `build_knowledge_topic_index(repo_root) if
+    repo_root else {}` pass a genuinely EMPTY dict (not None) as their
+    "no repo_root given, no resolution possible" sentinel -- a prior fix
+    here checked `is not None`, which wrongly counted that empty-dict
+    sentinel as "a real index was provided", spamming a warning for every
+    skill-inject usage record in that common, legitimate no-repo_root
+    case. An index that resolves nothing at all is just as much "no
+    index" as one that was never passed."""
+    with caplog.at_level("WARNING"):
+        usages = parse_notification_line("[info] skill-inject: +1 [bash]", knowledge_topic_index={})
+    assert usages == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
+    assert caplog.text == ""
+
+
 def test_parse_skill_inject_notification_research_directive_only():
     """selected.length === 0 case: no bracket group present at all."""
     usages = parse_notification_line("[info] skill-inject: +research-directive")
