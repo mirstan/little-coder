@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 def load(log_root: Path, repo_root: Path | None = None) -> list[NormalizedTrajectory]:
-    """repo_root, if given, resolves knowledge-inject component usage against
-    the real skills/knowledge and skills/protocols files (see
-    build_knowledge_topic_index()). Without it, knowledge-inject usage is
-    dropped (skill-inject usage is unaffected either way)."""
+    """repo_root, if given, resolves skill-inject AND knowledge-inject
+    component usage against the real skills/tools, skills/knowledge, and
+    skills/protocols files (see build_knowledge_topic_index()). Without
+    it, knowledge-inject usage is dropped, and skill-inject usage falls
+    back to a blind name->pred_name guess that's wrong for any tool whose
+    target_tool differs from its file stem."""
     log_root = Path(log_root)
     if not log_root.is_dir():
         logger.warning("gaia_ingest: log_root does not exist or is not a directory: %s", log_root)

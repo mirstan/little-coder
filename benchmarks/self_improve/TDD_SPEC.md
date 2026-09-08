@@ -69,9 +69,20 @@ below must match them exactly:
   present when `selected.length > 0`.
 
 - `knowledge-inject` notification message format (`.pi/extensions/knowledge-inject/index.ts`,
-  `~L164`): `'knowledge-inject: +3 ["binary_search","two_pointer"]'` — same shape
-  (also a JSON array), topics not tools, always has the count+array (no conditional
-  segment). `_parse_notification_payload()` in `ingest/common.py` tries JSON first
+  `~L164`): `'knowledge-inject: +2 ["Binary Search","State-Space Search"]'` — same
+  shape (also a JSON array), always has the count+array (no conditional segment).
+  Real gap, confirmed by review: an earlier version of this fixture showed
+  `["binary_search","two_pointer"]` -- lowercase-underscore slugs that look like
+  pred_name fragments, implying a topic can be turned into a pred_name by simple
+  prefixing. It can't: the entries are each skill file's own `topic` FRONTMATTER
+  FIELD (`fm.topic` at index.ts's own line ~49), an arbitrary human string with NO
+  textual relation to the file stem (confirmed against real
+  `skills/knowledge/*.md`/`skills/protocols/*.md` frontmatter: `binary_search.md`'s
+  topic is literally `Binary Search`, `bfs_state_space.md`'s is `State-Space
+  Search`) -- resolving a topic to the right pred_name requires
+  `build_knowledge_topic_index()` against the real repo, threaded through to
+  `parse_notification_line()`; see §2's implementation notes below.
+  `_parse_notification_payload()` in `ingest/common.py` tries JSON first
   and falls back to the old bare comma-split only for historical trajectory data
   written before this fix.
 
@@ -389,15 +400,24 @@ def test_summarize_for_reflection_handles_empty_input():
   array, e.g. `["bash","read"]`) and only on failure fall back to stripping
   the brackets and comma-splitting (`payload.strip("[]").split(",")`,
   stripped) for historical trajectory data written before the JSON-array
-  fix. Map `source == "skill-inject"` names to `skills_tools_{name}`
-  directly (the tool name IS the file stem). `knowledge-inject` names are
-  each entry's `topic` FRONTMATTER FIELD -- an arbitrary human string with
-  no textual relation to the file stem (e.g. "State-Space Search" ->
-  `bfs_state_space.md`) -- so they can only be resolved via
-  `knowledge_topic_index` (built by `build_knowledge_topic_index()` against
-  the real repo and threaded through by the caller); a topic missing from
-  the index is dropped with a warning, never guessed at by string
-  transformation. No match → `[]`, never raise.
+  fix. Real gap, confirmed by review: an earlier version of this note
+  claimed `source == "skill-inject"` names map to `skills_tools_{name}`
+  directly because "the tool name IS the file stem" -- false for several
+  real tool skills (`.pi/extensions/skill-inject/index.ts:387` emits each
+  card's `target_tool` frontmatter field, not the stem; e.g.
+  `skills/tools/browser_click.md` declares `target_tool: BrowserClick`,
+  CamelCase, while its stem/pred_name is snake_case). Both sources need
+  the SAME resolution: `knowledge_topic_index` (built by
+  `build_knowledge_topic_index()` against the real repo and threaded
+  through by the caller -- despite its name, it indexes skills/tools/*.md
+  by `target_tool` too, not just knowledge/protocols by `topic`) resolves
+  either. A `knowledge-inject` name missing from the index is dropped with
+  a warning, never guessed at by string transformation (a topic has no
+  textual relation to its pred_name at all). A `skill-inject` name missing
+  from the index instead falls back to the blind `skills_tools_{name}`
+  guess -- usually correct, and kept so a caller that hasn't built/passed
+  an index at all doesn't lose every skill-inject usage record outright.
+  No match → `[]`, never raise.
 - `merge_component_usage(lines, follows_error=False)`: groups by `pred_name`,
   sums counts, propagates `was_error_context` per-name (True if ANY contributing
   line was error-adjacent).

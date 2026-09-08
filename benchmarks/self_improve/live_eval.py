@@ -23,7 +23,6 @@ from typing import Mapping, Sequence
 
 import yaml
 
-import benchmarks.aider_polyglot as _aider_polyglot_module
 import benchmarks.self_improve.components as _components_module
 import benchmarks.self_improve.ingest.aider_polyglot_ingest as _aider_polyglot_ingest_module
 from benchmarks.self_improve.components import split_frontmatter, write_components_back
@@ -36,27 +35,69 @@ from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
 
-#: Mirrors aider_polyglot.py's own ATTEMPT_TIMEOUT_S default -- imported
-#: directly from that module's own named constant, not a duplicated bare
-#: literal, so the two can never silently drift apart the way this
-#: harness-level default already did once: it was still 900 when
-#: aider_polyglot.py's own default was tripled to 2700 for a local
+#: Mirrors aider_polyglot.py's own _ATTEMPT_TIMEOUT_S_DEFAULT -- read
+#: directly out of THAT module's own source text via regex, not a
+#: duplicated bare literal here, so the two can never silently drift apart
+#: the way this harness-level default already did once: it was still 900
+#: when aider_polyglot.py's own default was tripled to 2700 for a local
 #: reasoning model, meaning the OUTER subprocess timeout below would have
 #: fired and killed the exercise via SIGTERM/SIGKILL before even ONE inner
 #: attempt's own (now longer) budget had a chance to time out gracefully --
 #: turning a clean, correctly-classified fail_timeout into an abrupt
-#: harness_error instead. Real gap, confirmed by review: an earlier version
-#: of this fix kept the literal duplicated and only added a test asserting
-#: `_attempt_timeout_s() == aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S",
-#: 2700)` -- but with the env var unset that call just returns the SAME
-#: 2700 passed in as its own default argument, a tautology that could never
-#: detect aider_polyglot.py's default actually changing. Importing the
-#: module's own constant directly removes the duplication (and the
-#: tautological test) instead of trying to test around it.
-_ATTEMPT_TIMEOUT_S_DEFAULT = _aider_polyglot_module._ATTEMPT_TIMEOUT_S_DEFAULT
+#: harness_error instead.
+#:
+#: Regex-extracted rather than imported -- two real gaps, confirmed by
+#: review, with an actual `import benchmarks.aider_polyglot`:
+#: 1. A plain `import` executes that module's ENTIRE top level, including
+#:    `CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)` --
+#:    which raises SystemExit on a malformed CODEX_TIMEOUT_S even though
+#:    this module never uses CODEX_TIMEOUT_S at all, crashing e.g. the
+#:    free --estimate-only path (which spawns no subprocess) over an
+#:    unrelated, unused env var.
+#: 2. It reads the SOURCE checkout's copy at THIS process' import time --
+#:    but a PolyglotLiveRunner's actual subprocess runs the WORKTREE's
+#:    pinned base_commit copy, which can differ (an uncommitted local edit
+#:    to aider_polyglot.py itself, mid-development on the harness while a
+#:    live run is in progress). Computing the outer per-exercise timeout
+#:    from the wrong copy's default could make it shorter than the pinned
+#:    copy's actual per-attempt budget, killing the child before its own
+#:    (longer) timeout fires gracefully.
+#: One regex-based reader (_attempt_timeout_default_from_source) fixes
+#: both: it never executes the file (no CODEX_TIMEOUT_S side effect), and
+#: PolyglotLiveRunner.__init__ below calls it against `worktree.path`
+#: specifically, not the source checkout, so the value actually used
+#: always matches what will actually execute. `_ATTEMPT_TIMEOUT_S_DEFAULT`
+#: itself (the source-checkout read, computed once below) remains only as
+#: the --estimate-only / no-worktree fallback and this function's own
+#: default argument. Mirrors components.py's own _TOKEN_COST_LINE_RE
+#: precedent for reading a single declared value out of a companion file
+#: without executing it.
+_ATTEMPT_TIMEOUT_S_DEFAULT_RE = re.compile(r"(?m)^_ATTEMPT_TIMEOUT_S_DEFAULT = (\d+)$")
+#: Last-resort fallback if even the source checkout's own aider_polyglot.py
+#: can't be read/parsed (should not happen in a working checkout) -- a
+#: budget ESTIMATE, not a correctness-critical read, so degrading to a
+#: hardcoded value here is preferable to crashing an otherwise-healthy run.
+_ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK = 2700
 
 
-def _attempt_timeout_s() -> int:
+def _attempt_timeout_default_from_source(aider_polyglot_py_path: Path) -> int:
+    """Regex-extract aider_polyglot.py's _ATTEMPT_TIMEOUT_S_DEFAULT
+    constant from the given copy's file TEXT -- never imports/executes it
+    (see the module-level comment above for why). Never raises."""
+    try:
+        text = aider_polyglot_py_path.read_text()
+    except OSError:
+        return _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    m = _ATTEMPT_TIMEOUT_S_DEFAULT_RE.search(text)
+    return int(m.group(1)) if m else _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+
+
+_ATTEMPT_TIMEOUT_S_DEFAULT = _attempt_timeout_default_from_source(
+    Path(__file__).resolve().parent.parent / "aider_polyglot.py"
+)
+
+
+def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
     """Real gap, confirmed by review: a malformed or non-positive
     ATTEMPT_TIMEOUT_S used to be silently swallowed here and replaced with
     the default, computing a per_exercise_timeout_s estimate as if the run
@@ -66,10 +107,14 @@ def _attempt_timeout_s() -> int:
     time instead. Mirror that same validate-and-raise contract here so an
     orchestrator-side budget estimate can never be computed against a
     value that's actually going to blow up the exercise it's estimating
-    for."""
+    for.
+
+    `default` lets a caller with a specific worktree in hand (see
+    _attempt_timeout_default_from_source()) pass that worktree's own
+    pinned default instead of the source checkout's."""
     raw = os.environ.get("ATTEMPT_TIMEOUT_S")
     if raw is None or not raw.strip():
-        return _ATTEMPT_TIMEOUT_S_DEFAULT
+        return default
     try:
         value = int(raw)
     except ValueError:
@@ -235,8 +280,18 @@ class PolyglotLiveRunner:
         # _attempt_timeout_s() above) + 90s test budget, times max_attempts,
         # plus headroom -- a belt-and-braces ceiling ABOVE aider_polyglot's
         # own per-attempt budget so a wedged pi session can't stall a run
-        # indefinitely.
-        self.per_exercise_timeout_s = per_exercise_timeout_s or (max_attempts * (_attempt_timeout_s() + 90) + 180)
+        # indefinitely. Default sourced from THIS worktree's own pinned
+        # copy (_attempt_timeout_default_from_source), not the source
+        # checkout's -- real gap, confirmed by review: the two can diverge
+        # under an uncommitted local edit to aider_polyglot.py itself, and
+        # using the wrong one here could compute an outer timeout shorter
+        # than the pinned copy's actual per-attempt budget.
+        worktree_default = _attempt_timeout_default_from_source(
+            worktree.path / "benchmarks" / "aider_polyglot.py"
+        )
+        self.per_exercise_timeout_s = per_exercise_timeout_s or (
+            max_attempts * (_attempt_timeout_s(default=worktree_default) + 90) + 180
+        )
         self.python_executable = python_executable
         #: Optional callable(LiveRunResult) -- invoked as EACH result becomes
         #: available inside run_batch() (cache hits included), not after the

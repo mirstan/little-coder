@@ -60,8 +60,8 @@ def ingest_all(
     log_roots: dict[str, str], repo_root: Path | None = None,
 ) -> tuple[list[NormalizedTrajectory], list[str]]:
     """log_roots keys: 'aider' (value: 'log_root,results_json'), 'gaia', 'harbor', 'tb'.
-    repo_root resolves knowledge-inject component usage for aider/gaia (see
-    ingest.common.build_knowledge_topic_index()).
+    repo_root resolves skill-inject AND knowledge-inject component usage
+    for aider/gaia (see ingest.common.build_knowledge_topic_index()).
 
     Returns (trajectories, empty_sources) -- empty_sources lists every
     REQUESTED key that yielded zero trajectories, whether because ingest

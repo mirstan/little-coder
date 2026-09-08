@@ -487,18 +487,22 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
-    # Real gap, confirmed by review (twice): the first fix here still kept
-    # a duplicated literal in live_eval.py and asserted against
-    # aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700) -- but
-    # with the env var unset that call just returns the SAME 2700 passed
-    # in as ITS OWN default argument, a tautology that could never detect
-    # aider_polyglot.py's real default actually changing. live_eval.py now
-    # imports aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT directly instead of
-    # duplicating it, so the identity check below (not just an equality
-    # check, which a coincidentally-matching duplicate could still pass)
-    # is a structural guarantee, not a test that has to re-detect drift.
-    assert live_eval._ATTEMPT_TIMEOUT_S_DEFAULT is aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT
+    # Real gap, confirmed by review (twice, then a third round): the first
+    # fix here kept a duplicated literal and asserted against
+    # aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700) -- a
+    # tautology, since with the env var unset that just returns the SAME
+    # 2700 passed in as ITS OWN default argument. The second fix imported
+    # aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT directly -- structurally
+    # sound, but importing the WHOLE module also runs its
+    # CODEX_TIMEOUT_S = _positive_int_env(...) validation as a side
+    # effect, which could crash this process over an unrelated, unused env
+    # var. live_eval.py now regex-extracts the constant from
+    # aider_polyglot.py's own file TEXT instead (see
+    # _attempt_timeout_default_from_source()'s own docstring) -- this test
+    # imports aider_polyglot directly ONLY here, as ground truth for
+    # comparison, which live_eval.py itself deliberately avoids.
     real_default = aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT
+    assert live_eval._ATTEMPT_TIMEOUT_S_DEFAULT == real_default
     monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
     assert _attempt_timeout_s() == real_default
 
@@ -517,6 +521,42 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
             model="fake/model", max_attempts=2, benchmark_root=fake_practice,
         )
         assert runner.per_exercise_timeout_s == 2 * (30 + 90) + 180
+
+
+def test_per_exercise_timeout_default_uses_the_worktrees_own_pinned_copy(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real gap, confirmed by review: the outer per-exercise timeout
+    default used to be read from the SOURCE checkout (this process' own
+    aider_polyglot.py, at import time) -- but the subprocess that actually
+    RUNS an exercise executes the scratch worktree's PINNED base_commit
+    copy, which can diverge from the source checkout (an uncommitted local
+    edit to aider_polyglot.py itself, mid-development on the harness while
+    a live run is in progress). Using the wrong copy's default here could
+    compute an outer timeout shorter than the pinned copy's actual
+    per-attempt budget, killing the child before its own (longer) timeout
+    fires gracefully. Simulates that divergence directly: edit the
+    WORKTREE's pinned copy after checkout (as if it were pinned to an
+    older/different commit) and confirm the runner picks up THAT value,
+    not the source checkout's."""
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+    from benchmarks.self_improve.scratch_worktree import scratch_worktree
+
+    monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+        pinned_file = wt.path / "benchmarks" / "aider_polyglot.py"
+        text = pinned_file.read_text()
+        assert "_ATTEMPT_TIMEOUT_S_DEFAULT = 2700" in text
+        pinned_file.write_text(
+            text.replace("_ATTEMPT_TIMEOUT_S_DEFAULT = 2700", "_ATTEMPT_TIMEOUT_S_DEFAULT = 60")
+        )
+
+        runner = PolyglotLiveRunner(
+            worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+            model="fake/model", max_attempts=2, benchmark_root=fake_practice,
+        )
+        # Reflects the WORKTREE's pinned 60, not the source checkout's 2700.
+        assert runner.per_exercise_timeout_s == 2 * (60 + 90) + 180
 
 
 @pytest.mark.parametrize("bad_value", ["not-a-number", "0", "-5"])

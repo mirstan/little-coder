@@ -11,11 +11,48 @@ from benchmarks.self_improve.schema import ComponentUsage
 
 
 def test_parse_skill_inject_notification_with_tools():
+    """No index passed -- falls back to the pre-fix blind-prefix guess,
+    which happens to be correct here since "bash"/"read" are also their
+    own file stems. See test_parse_skill_inject_notification_resolves_camelcase_target_tool_via_index
+    below for the real bug this index exists to fix."""
     usages = parse_notification_line("[info] skill-inject: +2 [bash,read]")
     assert usages == [
         ComponentUsage(pred_name="skills_tools_bash", invocation_count=1),
         ComponentUsage(pred_name="skills_tools_read", invocation_count=1),
     ]
+
+
+def test_parse_skill_inject_notification_resolves_camelcase_target_tool_via_index():
+    """Real bug, confirmed by review: skill-inject notifications report
+    each card's `target_tool` frontmatter field (.pi/extensions/skill-inject/index.ts:387),
+    NOT the file stem -- an earlier version resolved it by blindly
+    prefixing the emitted name, correct only when target_tool happens to
+    equal the file stem. Several real tool skills declare a CamelCase
+    target_tool (e.g. skills/tools/browser_click.md's `target_tool:
+    BrowserClick`) while the file stem/pred_name is snake_case, so real
+    usage for those tools was silently attributed to a pred_name matching
+    nothing in config/components.yaml. With an index available (built from
+    the real skills/tools/*.md files), it must resolve correctly instead
+    of falling back to the blind (wrong) guess."""
+    index = {"BrowserClick": "skills_tools_browser_click"}
+    usages = parse_notification_line(
+        "[info] skill-inject: +1 [BrowserClick]", knowledge_topic_index=index,
+    )
+    assert usages == [ComponentUsage(pred_name="skills_tools_browser_click", invocation_count=1)]
+
+
+def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_from_index():
+    """A target_tool not in the index (e.g. no index passed at all, or a
+    renamed/deleted tool skill) degrades to the old blind-prefix guess
+    rather than dropping the record -- unlike knowledge-inject, which has
+    no reasonable fallback at all (a topic has no textual relation to its
+    pred_name), skill-inject's blind prefix is at least USUALLY correct,
+    so keeping it as a fallback (rather than always dropping) avoids
+    regressing every caller that hasn't been updated to pass an index."""
+    usages = parse_notification_line(
+        "[info] skill-inject: +1 [bash]", knowledge_topic_index={"BrowserClick": "skills_tools_browser_click"},
+    )
+    assert usages == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
 
 
 def test_parse_skill_inject_notification_research_directive_only():
@@ -106,6 +143,23 @@ def _write_skill_file(path, name, topic=None):
     path.write_text(f"---\n{fm}---\nBody text.\n")
 
 
+def _write_tool_skill_file(path, name, target_tool):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nname: {name}\ntarget_tool: {target_tool}\n---\nBody text.\n")
+
+
+def test_build_knowledge_topic_index_maps_target_tool_field_to_pred_name(tmp_path):
+    """Real bug, confirmed by review: this index (despite its name) must
+    also cover skills/tools/*.md, keyed by target_tool -- not just
+    skills/knowledge and skills/protocols -- since skill-inject
+    notifications need the SAME target_tool->pred_name resolution
+    knowledge-inject's topic already required."""
+    _write_tool_skill_file(tmp_path / "skills" / "tools" / "browser_click.md",
+                            "browser-click-guidance", target_tool="BrowserClick")
+    index = build_knowledge_topic_index(tmp_path)
+    assert index == {"BrowserClick": "skills_tools_browser_click"}
+
+
 def test_build_knowledge_topic_index_maps_topic_field_to_pred_name(tmp_path):
     _write_skill_file(tmp_path / "skills" / "knowledge" / "binary_search.md",
                        "binary-search", topic="Binary Search")
@@ -158,13 +212,22 @@ def test_build_knowledge_topic_index_skips_non_string_topic(tmp_path):
 
 
 def test_build_knowledge_topic_index_against_real_repo_files():
-    """End-to-end against the REAL skills/knowledge and skills/protocols
-    files, not fixtures -- confirms the index actually resolves the same
-    topic strings real notification lines carry."""
+    """End-to-end against the REAL skills/knowledge, skills/protocols, and
+    skills/tools files, not fixtures -- confirms the index actually
+    resolves the same topic/target_tool strings real notification lines
+    carry."""
     real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
     index = build_knowledge_topic_index(real_repo_root)
     assert index["Binary Search"] == "skills_knowledge_binary_search"
     assert index["cite-before-answer"] == "skills_protocols_cite_before_answer"
+    # The real bug this index exists to fix for skill-inject: several real
+    # tool skills declare a CamelCase target_tool that does NOT match their
+    # snake_case file stem/pred_name.
+    assert index["BrowserClick"] == "skills_tools_browser_click"
+    assert index["ShellSession"] == "skills_tools_shell_session"
+    # And the common case (target_tool already equals the stem) resolves
+    # the same way, via the same index.
+    assert index["bash"] == "skills_tools_bash"
 
 
 def test_parse_notification_line_ignores_unrelated_lines():

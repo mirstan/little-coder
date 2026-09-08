@@ -83,10 +83,12 @@ pass_n_score = _pass_n_score
 def load(
     log_root: Path, results_json_path: Path, repo_root: Path | None = None
 ) -> list[NormalizedTrajectory]:
-    """repo_root, if given, resolves knowledge-inject component usage against
-    the real skills/knowledge and skills/protocols files (see
-    ingest.common.build_knowledge_topic_index()). Without it, knowledge-inject
-    usage is dropped (skill-inject usage is unaffected either way)."""
+    """repo_root, if given, resolves skill-inject AND knowledge-inject
+    component usage against the real skills/tools, skills/knowledge, and
+    skills/protocols files (see ingest.common.build_knowledge_topic_index()).
+    Without it, knowledge-inject usage is dropped, and skill-inject usage
+    falls back to a blind name->pred_name guess that's wrong for any tool
+    whose target_tool differs from its file stem."""
     results_json_path = Path(results_json_path)
     if not results_json_path.exists():
         raise FileNotFoundError(f"results_full_polyglot.json not found: {results_json_path}")

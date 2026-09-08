@@ -19,17 +19,27 @@ data written before this fix -- that data is already ambiguous and can't be
 recovered after the fact, so the fallback keeps its old (imperfect) behavior
 rather than trying to guess.
 
-skill-inject's names are the TOOL NAME itself (e.g. "bash"), which is also
-the file stem, so pred_name = "skills_tools_" + name works directly.
-knowledge-inject's names are each entry's `topic` FRONTMATTER FIELD
-(e.g. "Binary Search", "State-Space Search") -- an arbitrary human string
-independent of the file's `name`/stem (confirmed against
-.pi/extensions/knowledge-inject/index.ts:49 and real skills/knowledge/*.md,
-skills/protocols/*.md frontmatter by review). A topic string can NEVER be
-turned into the right pred_name by string transformation alone (e.g.
-"State-Space Search" -> file bfs_state_space.md, no textual relation) --
-build_knowledge_topic_index() must be called against the real repo and
-threaded through to resolve it.
+Real bug, confirmed by review: skill-inject's names are each card's
+`target_tool` FRONTMATTER FIELD (.pi/extensions/skill-inject/index.ts:387,
+`selected.map((s) => s.targetTool)`), NOT the file stem -- they only
+coincide for tools whose target_tool happens to already be snake_case
+(e.g. "bash" -> skills/tools/bash.md). For several real tool skills,
+target_tool is CamelCase while the file stem (and config/components.yaml's
+pred_name) is snake_case -- e.g. skills/tools/browser_click.md declares
+`target_tool: BrowserClick`, so blindly prefixing the emitted name
+("skills_tools_" + "BrowserClick") produced a pred_name that matches
+nothing in config/components.yaml, silently dropping real usage signal for
+every such tool. knowledge-inject's names are each entry's `topic`
+FRONTMATTER FIELD (e.g. "Binary Search", "State-Space Search") -- an
+arbitrary human string independent of the file's `name`/stem (confirmed
+against .pi/extensions/knowledge-inject/index.ts:49 and real
+skills/knowledge/*.md, skills/protocols/*.md frontmatter by review). Both
+cases need the SAME fix: neither an emitted name can be turned into the
+right pred_name by string transformation alone -- build_knowledge_topic_index()
+(despite its name, predating this fix -- it indexes BOTH skills/tools/*.md's
+target_tool and skills/knowledge|protocols/*.md's topic into one
+name->pred_name map) must be called against the real repo and threaded
+through to resolve either.
 """
 import json
 import logging
@@ -68,30 +78,51 @@ def _parse_notification_payload(payload: str) -> list[str]:
         stripped = stripped[1:-1]
     return [n.strip() for n in stripped.split(",") if n.strip()]
 
-_SOURCE_PREFIX = {
-    "skill-inject": "skills_tools_",
-    "knowledge-inject": "skills_knowledge_",
-}
-
 _FRONTMATTER_BLOCK_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
 # Mirrors .pi/extensions/knowledge-inject/index.ts's dirs(): both directories
 # feed the SAME topic->entry registry there, so both must feed the same
 # lookup index here. Later directories win on a topic collision, exactly
-# matching the TS Map's insertion-order-overwrite semantics.
-_KNOWLEDGE_DIRS = (("knowledge", "skills_knowledge_"), ("protocols", "skills_protocols_"))
+# matching the TS Map's insertion-order-overwrite semantics. `field` names
+# which frontmatter key holds the string the TS extension actually emits in
+# a notification line (skill-inject emits target_tool; knowledge-inject
+# emits topic, falling back to name) -- see build_knowledge_topic_index()'s
+# own docstring for the real bug this fixes.
+_INDEXED_DIRS = (
+    ("tools", "skills_tools_", "target_tool"),
+    ("knowledge", "skills_knowledge_", "topic"),
+    ("protocols", "skills_protocols_", "topic"),
+)
 
 
 def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
-    """Scan skills/knowledge/*.md and skills/protocols/*.md frontmatter,
-    exactly as knowledge-inject's loadEntries() does (topic = fm.topic or
-    fm.name), and map each real topic string to the pred_name
-    parse_notification_line needs. Missing/malformed files are skipped, not
-    raised -- ingest must still work for skill-inject-only data even if this
-    index comes back partial or empty."""
+    """Despite its name (predates this fix, kept to avoid an unnecessary
+    rename across every call site), this indexes THREE directories, not
+    just knowledge/protocols: skills/tools/*.md too, keyed by each card's
+    `target_tool` frontmatter field.
+
+    Real bug, confirmed by review: skill-inject notifications report each
+    card's `target_tool` (.pi/extensions/skill-inject/index.ts:387,
+    `s.targetTool`), which parse_notification_line used to resolve to a
+    pred_name by blindly prefixing it ("skills_tools_" + target_tool) --
+    correct only when target_tool happens to already equal the file stem
+    (true for e.g. "bash"). Several real tool skills declare a CamelCase
+    target_tool while the file stem (and config/components.yaml's
+    pred_name) is snake_case -- e.g. skills/tools/browser_click.md declares
+    `target_tool: BrowserClick` -- so the blind-prefix pred_name matched
+    nothing in components.yaml and real usage signal for those tools was
+    silently dropped. Exactly the same class of bug knowledge-inject's
+    topic already needed this index for; skill-inject needed it too.
+
+    Scans frontmatter exactly as the corresponding TS loader does for each
+    directory (skill-inject's cards, knowledge-inject's loadEntries():
+    topic = fm.topic or fm.name) and maps each real emitted-name string to
+    the pred_name parse_notification_line needs. Missing/malformed files
+    are skipped, not raised -- ingest must still work even if this index
+    comes back partial or empty."""
     repo_root = Path(repo_root)
     index: dict[str, str] = {}
-    for subdir, prefix in _KNOWLEDGE_DIRS:
+    for subdir, prefix, field in _INDEXED_DIRS:
         dir_path = repo_root / "skills" / subdir
         if not dir_path.is_dir():
             continue
@@ -122,10 +153,12 @@ def build_knowledge_topic_index(repo_root: Path) -> dict[str, str]:
                 # ingest run the same way as the read failure above.
                 logger.warning("build_knowledge_topic_index: frontmatter in %s is not a mapping", file)
                 continue
-            topic = frontmatter.get("topic") or frontmatter.get("name")
-            if not isinstance(topic, str) or not topic:
+            key = frontmatter.get(field)
+            if field == "topic":
+                key = key or frontmatter.get("name")
+            if not isinstance(key, str) or not key:
                 continue
-            index[topic] = f"{prefix}{file.stem}"
+            index[key] = f"{prefix}{file.stem}"
     return index
 
 
@@ -137,10 +170,26 @@ def parse_notification_line(
     merge_component_usage). Never raises; unrelated/unparseable lines
     (quality-monitor, thinking-budget, garbage) return [].
 
-    knowledge_topic_index (from build_knowledge_topic_index()) is REQUIRED to
-    resolve knowledge-inject entries to a real pred_name -- without it (or
-    for a topic missing from it, e.g. a renamed/deleted skill file), those
-    entries are dropped with a warning rather than guessed at."""
+    knowledge_topic_index (from build_knowledge_topic_index(), despite its
+    name -- see that function's own docstring) resolves BOTH skill-inject
+    (target_tool) and knowledge-inject (topic) entries to a real pred_name.
+    knowledge-inject entries missing from it (e.g. a renamed/deleted skill
+    file, or no index passed at all) are dropped with a warning rather
+    than guessed at -- a topic has no textual relation to its pred_name,
+    so there is no reasonable fallback. skill-inject entries missing from
+    it instead fall back to the pre-fix blind-prefix guess
+    ("skills_tools_" + name): real bug, confirmed by review, an earlier
+    version used that blind prefix UNCONDITIONALLY, correct only for tools
+    whose target_tool happens to equal the file stem -- several real tool
+    skills declare a CamelCase target_tool (e.g. "BrowserClick") while the
+    file stem/pred_name is snake_case, so real skill-inject usage for
+    those tools was silently attributed to a pred_name matching nothing in
+    config/components.yaml. The index (built from real
+    skills/tools/*.md target_tool fields) fixes exactly that case; the
+    fallback is kept only so a caller that doesn't build/pass an index at
+    all (every unit test in this module, and any future caller not yet
+    updated) keeps its old, still-usually-correct behavior instead of
+    losing every skill-inject usage record outright."""
     m = _NOTIF_RE.match(line)
     if not m:
         return []
@@ -152,22 +201,21 @@ def parse_notification_line(
         return []
     source = m.group("source")
 
-    if source == "knowledge-inject":
-        index = knowledge_topic_index or {}
-        usages = []
-        for name in names:
-            pred_name = index.get(name)
-            if pred_name is None:
+    index = knowledge_topic_index or {}
+    usages = []
+    for name in names:
+        pred_name = index.get(name)
+        if pred_name is None:
+            if source == "skill-inject":
+                pred_name = f"skills_tools_{name}"
+            else:
                 logger.warning(
                     "parse_notification_line: knowledge-inject topic %r not found in "
                     "skills/knowledge or skills/protocols -- dropping usage record", name,
                 )
                 continue
-            usages.append(ComponentUsage(pred_name=pred_name, invocation_count=1))
-        return usages
-
-    prefix = _SOURCE_PREFIX[source]
-    return [ComponentUsage(pred_name=f"{prefix}{name}", invocation_count=1) for name in names]
+        usages.append(ComponentUsage(pred_name=pred_name, invocation_count=1))
+    return usages
 
 
 def merge_component_usage(
