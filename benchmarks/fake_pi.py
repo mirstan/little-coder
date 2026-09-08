@@ -307,6 +307,21 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "emit_more_than_max_non_text_deltas":
+        # Regression fixture for rpc_client.py's _MAX_NON_TEXT_DELTAS
+        # backstop: a pathological reasoning stream emitting more than the
+        # cap must not grow PromptResult.non_text_deltas past it.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        count = int(os.environ.get("FAKE_PI_NON_TEXT_DELTA_COUNT", "1"))
+        for i in range(count):
+            emit({"type": "message_update",
+                  "assistantMessageEvent": {"type": "thinking_delta", "delta": f"chunk {i}"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "emit_multi_thinking_delta":
         # Regression fixture for live_eval.py's
         # _reasoning_excerpt_from_trajectory(): emits several thinking_delta

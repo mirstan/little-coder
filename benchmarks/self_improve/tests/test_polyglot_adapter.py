@@ -279,6 +279,28 @@ def test_reflective_dataset_generated_outputs_uses_knowledge_budget_for_a_knowle
     assert record["Generated Outputs"]["per_entry_cap"] == 150
 
 
+def test_reflective_dataset_generated_outputs_caps_knowledge_token_cost_at_per_entry_cap():
+    """Real gap, confirmed by review: knowledge-inject's PER_ENTRY_CAP (150)
+    silently discards everything past it for a single entry, no matter how
+    much of the shared 200 total remains. Reporting the raw, uncapped
+    estimate (e.g. 180) would mislead reflection about the actual selection
+    cost -- it's really only ever charged min(180, 150) = 150."""
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(
+        runner, component_paths={"skills_knowledge_binary_search": "skills/knowledge/binary_search.md"},
+        seed_bodies={"skills_knowledge_binary_search": "x" * 100},
+        seed_token_costs={"skills_knowledge_binary_search": 90},
+    )
+    candidate = {"skills_knowledge_binary_search": "x" * 200}  # rescales 90 -> 180, over the 150 cap
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(
+        candidate, batch, ["skills_knowledge_binary_search"],
+    )["skills_knowledge_binary_search"][0]
+    assert record["Generated Outputs"]["token_cost"] == 150
+    assert record["Generated Outputs"]["per_entry_cap"] == 150
+
+
 def test_reflective_dataset_generated_outputs_omits_token_cost_for_agents_md():
     """agents_md is always injected -- never competes for a selection slot,
     so there's no budget to surface, even with a seed baseline available."""

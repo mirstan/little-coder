@@ -23,6 +23,8 @@ from typing import Mapping, Sequence
 
 import yaml
 
+import benchmarks.self_improve.components as _components_module
+import benchmarks.self_improve.ingest.aider_polyglot_ingest as _aider_polyglot_ingest_module
 from benchmarks.self_improve.components import split_frontmatter, write_components_back
 from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
@@ -46,13 +48,26 @@ _ATTEMPT_TIMEOUT_S_DEFAULT = 2700
 
 
 def _attempt_timeout_s() -> int:
+    """Real gap, confirmed by review: a malformed or non-positive
+    ATTEMPT_TIMEOUT_S used to be silently swallowed here and replaced with
+    the default, computing a per_exercise_timeout_s estimate as if the run
+    would proceed normally -- but aider_polyglot.py's own
+    _positive_int_env() raises SystemExit on the exact same malformed/
+    non-positive value, so the actual subprocess would crash at import
+    time instead. Mirror that same validate-and-raise contract here so an
+    orchestrator-side budget estimate can never be computed against a
+    value that's actually going to blow up the exercise it's estimating
+    for."""
     raw = os.environ.get("ATTEMPT_TIMEOUT_S")
-    if raw and raw.strip():
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-    return _ATTEMPT_TIMEOUT_S_DEFAULT
+    if raw is None or not raw.strip():
+        return _ATTEMPT_TIMEOUT_S_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"ATTEMPT_TIMEOUT_S: expected a positive integer (seconds), got {raw!r}")
+    if value <= 0:
+        raise SystemExit(f"ATTEMPT_TIMEOUT_S: must be > 0, got {value}")
+    return value
 
 
 _MAX_TAIL_CHARS = 4_000
@@ -227,26 +242,39 @@ class PolyglotLiveRunner:
         """Everything besides the candidate text that changes what a score
         means. Includes the harness files' own sha256 so a mid-project
         harness bugfix can't let a stale cache entry poison a later
-        comparison. Hashed from the WORKTREE copy (pinned at base_commit,
-        which is itself already part of this config), not the source repo --
-        hashing the source would make an uncommitted debug edit or a branch
-        switch in the source checkout change the cache key without changing
-        a single byte of what actually executes, causing spurious re-runs of
-        already-cached (and possibly still in-flight) work."""
-        harness_files = [
+        comparison.
+
+        aider_polyglot.py/rpc_client.py are hashed from the WORKTREE copy
+        (pinned at base_commit, which is itself already part of this
+        config), not the source repo -- they run as a SUBPROCESS inside the
+        scratch worktree (see this module's own docstring), so that copy is
+        exactly what executes; hashing the source would make an uncommitted
+        debug edit or a branch switch in the source checkout change the
+        cache key without changing a single byte of what actually executes,
+        causing spurious re-runs of already-cached (and possibly still
+        in-flight) work.
+
+        aider_polyglot_ingest.py/components.py are the OPPOSITE case, hashed
+        from the module `__file__` this SAME (parent, orchestrator) process
+        actually imported -- confirmed real gap by review: pass_n_score()
+        and write_components_back() run here, in the parent process
+        (imported at the top of this module), never inside the scratch
+        worktree at all, so hashing the worktree's copy of them (as an
+        earlier version of this property did) couldn't detect an
+        uncommitted retune of e.g. _COMPACTION_PENALTY or
+        _estimate_token_cost -- LiveResultCache would keep serving scores
+        computed under the old formula even though the orchestrator's own
+        process had already picked up the edit."""
+        worktree_executed_files = [
             self.worktree.path / "benchmarks" / "aider_polyglot.py",
             self.worktree.path / "benchmarks" / "rpc_client.py",
-            # Real gap, confirmed by review: the graded score has depended on
-            # these two files too since the compaction penalty / token_cost
-            # estimator landed -- without them here, an uncommitted retune of
-            # e.g. _COMPACTION_PENALTY wouldn't change the cache key, so
-            # LiveResultCache would keep serving scores computed under the
-            # old formula.
-            self.worktree.path / "benchmarks" / "self_improve" / "ingest" / "aider_polyglot_ingest.py",
-            self.worktree.path / "benchmarks" / "self_improve" / "components.py",
+        ]
+        parent_imported_files = [
+            Path(_aider_polyglot_ingest_module.__file__),
+            Path(_components_module.__file__),
         ]
         hasher = hashlib.sha256()
-        for f in harness_files:
+        for f in worktree_executed_files + parent_imported_files:
             if f.exists():
                 hasher.update(f.read_bytes())
         pi_bin = Path(self.worktree.pi_bin)
@@ -507,7 +535,24 @@ class PolyglotLiveRunner:
         compaction_total = record.get("compaction_total", 0) or 0
         success, score = pass_n_score(status, compaction_events=compaction_total) or (False, 0.0)
         stop_reasons = record.get("stop_reasons") or []
-        self_reported_lessons = record.get("lessons") or []
+        # aider_polyglot.py caps each individual LESSON: line at
+        # LESSON_MAX_CHARS (500) when extracting it, but that's per-attempt --
+        # with --max-attempts set high, the cumulative joined text this
+        # adapter later inserts into GEPA reflection feedback (see
+        # polyglot_adapter.py) had no overall cap. Real gap, confirmed by
+        # review: one evaluated agent's chain of long lessons could still
+        # overflow reflection context or inflate cost. Capped here at the
+        # same budget other reflection-bound fields already use.
+        raw_lessons = record.get("lessons")
+        self_reported_lessons: list = []
+        if isinstance(raw_lessons, list):
+            remaining = _MAX_TRANSCRIPT_CHARS
+            for lesson in raw_lessons:
+                if not isinstance(lesson, str) or remaining <= 0:
+                    continue
+                clipped = lesson[:remaining]
+                self_reported_lessons.append(clipped)
+                remaining -= len(clipped)
 
         ex_log_dir = log_root / "pi" / spec.language / spec.exercise
         test_output_tail = ""

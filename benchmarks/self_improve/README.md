@@ -153,7 +153,9 @@ A real `run_gepa.py` run writes `<out-dir>/optimized_components.yaml`
 files directly (the scratch worktree it ran in is destroyed on exit unless
 `--keep-scratch` was passed). Use `apply_results.py`'s `apply_and_open_pr()` (or its
 lower-level `create_branch_and_commit()`) to write the optimized text back
-into the real files, preserving each skill file's YAML frontmatter untouched.
+into the real files, preserving each skill file's YAML frontmatter untouched
+except for a possible `token_cost:` update when the rewritten body's estimated
+cost differs from what's currently recorded (see `TDD_SPEC.md` §7.2).
 `push_and_open_pr=True` on `apply_and_open_pr()` is the one call in this
 codebase that pushes a branch and opens a real GitHub PR — it defaults to
 `False` and is never invoked by any test; run it deliberately, once you've
@@ -197,12 +199,13 @@ reviewed the local commit.
 
 1. ~~`aider_polyglot.py`'s `_dump_trajectory()` doesn't capture
    `rpc.notifications()`~~ **Closed**: `_dump_trajectory()` now takes a
-   `notifications=` kwarg (delta-sliced per attempt, since `PiRpc.notifications()`
-   accumulates for the whole session, not per-prompt), and
-   `aider_polyglot_ingest.py` extracts `components_used` from it the same way
-   `gaia_ingest.py` already did. Older `trajectory_*.json` files written
-   before this change have no `"notifications"` key and degrade gracefully
-   to `components_used=[]`.
+   `notifications=` kwarg, populated with that attempt's own
+   `rpc.notifications()`. Each attempt opens a fresh `PiRpc` session, so
+   `notifications()` is already scoped to just that one attempt — no
+   delta-slicing across attempts is needed or possible. `aider_polyglot_ingest.py`
+   extracts `components_used` from it the same way `gaia_ingest.py` already
+   did. Older `trajectory_*.json` files written before this change have no
+   `"notifications"` key and degrade gracefully to `components_used=[]`.
 2. gaia dataset access needs to be requested on HuggingFace before gaia can
    feed the training signal.
 3. ~~harbor's real output format should be captured~~ **Closed**: captured

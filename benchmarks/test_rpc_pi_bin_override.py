@@ -20,10 +20,9 @@ def _restore_top_level_rpc_client_module():
     insertion above makes benchmarks/ importable as a top-level location
     too). Left in place for the rest of the pytest session, a later test
     anywhere else that happens to `import rpc_client` as a top-level name
-    would get this file's env-var-driven reload rather than the real
-    module, and any isinstance/identity check against benchmarks.rpc_client
-    classes would silently fail. Restore whatever (if anything) occupied
-    that slot before this test ran."""
+    would silently receive this file's env-var-driven reload state (e.g.
+    PI_BIN pointing at fake_pi.py) instead of the real module. Restore
+    whatever (if anything) occupied that slot before this test ran."""
     before = sys.modules.get("rpc_client")
     yield
     if before is None:

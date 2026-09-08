@@ -171,6 +171,33 @@ def test_mark_spawn_pending_records_a_recent_timestamp_without_clobbering_other_
         assert abs(after["spawn_pending_at"] - time.time()) < 5
 
 
+def test_set_active_pid_clears_spawn_pending_at_on_both_the_pid_and_none_paths(source_repo, tmp_path):
+    """Real gap, confirmed by review: set_active_pid() never cleared
+    spawn_pending_at, so it stayed set from the very first exercise a
+    worktree ever ran and just kept aging -- gepa_scratch_gc.py's
+    spawn-pending check has no way to tell "still mid-spawn" apart from
+    "ran an exercise once, a while back" unless this call clears it every
+    time, on every path (both when a real pid gets recorded, and when it's
+    cleared back to None in live_eval.py's `finally` block)."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        marker_path = wt.path / SCRATCH_MARKER_NAME
+        wt.mark_spawn_pending()
+        assert "spawn_pending_at" in json.loads(marker_path.read_text())
+
+        wt.set_active_pid(12345)
+        after_pid = json.loads(marker_path.read_text())
+        assert "spawn_pending_at" not in after_pid
+        assert after_pid["active_pid"] == 12345
+
+        wt.mark_spawn_pending()
+        assert "spawn_pending_at" in json.loads(marker_path.read_text())
+
+        wt.set_active_pid(None)
+        after_none = json.loads(marker_path.read_text())
+        assert "spawn_pending_at" not in after_none
+        assert after_none["active_pid"] is None
+
+
 def test_set_active_pid_does_not_follow_a_symlink_planted_at_the_marker_path(source_repo, tmp_path):
     """Real security-relevant bug, confirmed by review: the marker file
     lives INSIDE the scratch worktree, which a live exercise subprocess (a

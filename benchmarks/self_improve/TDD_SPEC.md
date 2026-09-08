@@ -278,7 +278,11 @@ the "unknown extra field" behavior for free — no custom validators needed beyo
 
 ```python
 def test_parse_skill_inject_notification_with_tools():
-    usages = parse_notification_line("[info] skill-inject: +2 [bash,read]")
+    """Real format (`.pi/extensions/skill-inject/index.ts`, ~L388):
+    'skill-inject: +2 ["bash","read"]' -- a JSON array, not a bare
+    comma-joined list (that was an earlier, ambiguous-on-commas-in-names
+    format; see the legacy-fallback test below for it)."""
+    usages = parse_notification_line('[info] skill-inject: +2 ["bash","read"]')
     assert usages == [
         ComponentUsage(pred_name="skills_tools_bash", invocation_count=1),
         ComponentUsage(pred_name="skills_tools_read", invocation_count=1),
@@ -290,10 +294,22 @@ def test_parse_skill_inject_notification_research_directive_only():
     assert usages == []
 
 def test_parse_knowledge_inject_notification():
-    usages = parse_notification_line("[info] knowledge-inject: +2 [binary_search,two_pointer]")
+    usages = parse_notification_line('[info] knowledge-inject: +2 ["binary_search","two_pointer"]')
     assert usages == [
         ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
         ComponentUsage(pred_name="skills_knowledge_two_pointer", invocation_count=1),
+    ]
+
+def test_parse_notification_line_falls_back_to_legacy_bare_comma_list():
+    """Historical trajectory data written before the JSON-array fix used a
+    bare comma-joined list ('[bash,read]', ambiguous whenever a name itself
+    contained a literal comma). Real historical data in this shape will
+    keep showing up, so parsing must still degrade gracefully to it when
+    the JSON parse fails, not raise or silently drop the line."""
+    usages = parse_notification_line("[info] skill-inject: +2 [bash,read]")
+    assert usages == [
+        ComponentUsage(pred_name="skills_tools_bash", invocation_count=1),
+        ComponentUsage(pred_name="skills_tools_read", invocation_count=1),
     ]
 
 def test_parse_notification_line_ignores_unrelated_lines():
@@ -307,9 +323,9 @@ def test_merge_component_usage_sums_counts_across_lines():
     aggregate into ONE ComponentUsage with invocation_count=3, not three
     separate entries."""
     lines = [
-        "[info] skill-inject: +1 [bash]",
-        "[info] skill-inject: +1 [bash]",
-        "[info] skill-inject: +1 [read]",
+        '[info] skill-inject: +1 ["bash"]',
+        '[info] skill-inject: +1 ["bash"]',
+        '[info] skill-inject: +1 ["read"]',
     ]
     merged = merge_component_usage(lines)
     by_name = {u.pred_name: u.invocation_count for u in merged}
@@ -320,7 +336,7 @@ def test_mark_error_context_flags_usage_immediately_after_tool_error():
     immediately follows a tool_calls entry with is_error=True, within the
     same trajectory's ordered event stream."""
     tool_calls = [{"name": "bash", "is_error": True}, {"name": "bash", "is_error": False}]
-    notif_lines = ["[info] skill-inject: +1 [bash]"]
+    notif_lines = ['[info] skill-inject: +1 ["bash"]']
     # notif attributed to the turn right after the FIRST (erroring) call
     merged = merge_component_usage(notif_lines, follows_error=True)
     assert merged[0].was_error_context is True
@@ -349,9 +365,14 @@ def test_summarize_for_reflection_handles_empty_input():
 ### 2.2 Implementation notes for `common.py`
 
 - `parse_notification_line(line: str) -> list[ComponentUsage]`: regex
-  `r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):\s+(?:\+\d+\s+\[(?P<names>[^\]]*)\])?"`.
-  Map `source == "skill-inject"` names to `skills_tools_{name}`, `knowledge-inject`
-  names to `skills_knowledge_{name}` (matches `config/components.yaml` pred_name
+  `r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):\s+(?:\+\d+\s+\[(?P<names>[^\]]*)\])?"`
+  extracts the `names` group as raw text, same as before; what changes is how
+  that text is parsed. Try `json.loads(f"[{names}]")` first (the current real
+  format is a JSON array, e.g. `["bash","read"]`) and only on failure fall back
+  to a bare comma-split (`names.split(",")`, stripped) for historical
+  trajectory data written before the JSON-array fix. Map `source ==
+  "skill-inject"` names to `skills_tools_{name}`, `knowledge-inject` names to
+  `skills_knowledge_{name}` (matches `config/components.yaml` pred_name
   convention from the plan). No match → `[]`, never raise.
 - `merge_component_usage(lines, follows_error=False)`: groups by `pred_name`,
   sums counts, propagates `was_error_context` per-name (True if ANY contributing

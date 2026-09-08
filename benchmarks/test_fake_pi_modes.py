@@ -135,3 +135,20 @@ def test_non_text_deltas_are_captured_separately_from_assistant_text(fake_pi, tm
     assert r.assistant_text == "final answer"
     assert len(r.non_text_deltas) == 1
     assert r.non_text_deltas[0] == {"type": "thinking_delta", "delta": "reasoning about the problem..."}
+
+
+def test_non_text_deltas_are_bounded_during_collection(fake_pi, tmp_path, monkeypatch):
+    """Real gap, confirmed by review: PromptResult.non_text_deltas grew
+    unbounded in memory for the entire attempt -- only ever capped AFTER
+    the fact, at persist time, by aider_polyglot.py's own
+    _cap_non_text_deltas(). A pathological reasoning stream emitting more
+    than rpc_client._MAX_NON_TEXT_DELTAS events must not grow the
+    in-memory list past that backstop."""
+    monkeypatch.setenv("FAKE_PI_NON_TEXT_DELTA_COUNT", str(rpc_client._MAX_NON_TEXT_DELTAS + 50))
+    with fake_pi("emit_more_than_max_non_text_deltas", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert len(r.non_text_deltas) == rpc_client._MAX_NON_TEXT_DELTAS
+    # The FIRST entries survive (a pure safety backstop, not the real
+    # trimming policy -- that stays downstream in _cap_non_text_deltas,
+    # which needs head+tail retention not knowable mid-stream).
+    assert r.non_text_deltas[0]["delta"] == "chunk 0"

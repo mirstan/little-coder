@@ -69,10 +69,17 @@ MAX_CONSECUTIVE_ERRORS = 3
 #: than inventing a new extraction style. Deliberately supplementary, not
 #: required -- a missing LESSON: line just means no lesson was captured for
 #: that attempt, never a harness error.
-#: \**\s* after the colon absorbs a closing bold marker directly after it
-#: (e.g. "**LESSON:** text") -- the leading strip below handles decoration
-#: BEFORE "lesson", this handles decoration immediately after the colon.
-_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\s*\**\s*(.+)$")
+#: \** immediately after the colon (no \s* before it) absorbs a closing
+#: bold marker directly wrapping the label (e.g. "**LESSON:** text") --
+#: the leading strip below handles decoration BEFORE "lesson", this
+#: handles decoration immediately after the colon. Real gap, confirmed by
+#: review (cubic): a \s* between the colon and \** would ALSO swallow the
+#: content's own opening bold if the lesson text itself starts with one
+#: (e.g. "LESSON: **Refactor X** now" -> captured "Refactor X** now",
+#: losing the opening marker) -- anchoring \** immediately post-colon
+#: only matches when there's no space before it, i.e. only the label's
+#: own wrapper, never the content's.
+_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\**\s*(.+)$")
 #: Real gap, confirmed by review: every other free-text field on this path
 #: is capped (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpt truncations)
 #: except this one -- r.assistant_text is raw model output (on the codex
@@ -287,8 +294,12 @@ def _clip(value, limit: int):
 
 
 def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DELTA_CHARS) -> list:
-    """Keep a HEAD slice and a TAIL slice of `deltas`, dropping only the
-    middle, splitting char_budget evenly between the two ends.
+    """Keep a HEAD slice and a TAIL region of `deltas`, dropping the
+    middle, splitting char_budget evenly between the two ends. The tail
+    region is budget-fit, not necessarily contiguous with the true end --
+    an oversized entry within it (e.g. one huge toolcall_delta) is skipped
+    rather than truncating the whole tail at that point, so smaller,
+    genuinely-recent entries on either side of it still survive.
 
     The previous policy -- keep the first 200 entries, full stop -- silently
     dropped the END of a long reasoning stream. Confirmed against a real
@@ -322,16 +333,25 @@ def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DE
         used += sizes[head_end]
         head_end += 1
 
-    tail_start = len(deltas)
+    # Real gap, confirmed by review: walking backward and stopping at the
+    # FIRST entry that doesn't fit (e.g. a toolcall_delta carrying a full
+    # "partial" state dump, dwarfing the small thinking_delta chunks around
+    # it) discarded every smaller, budget-fitting entry further back too --
+    # even genuinely recent reasoning sitting right before it. Skip an
+    # entry that doesn't fit and keep scanning backward instead of giving
+    # up on the whole tail.
+    tail = []
     used = 0
-    while tail_start - 1 >= head_end and used + sizes[tail_start - 1] <= tail_budget:
-        tail_start -= 1
-        used += sizes[tail_start]
+    for i in range(len(deltas) - 1, head_end - 1, -1):
+        if used + sizes[i] <= tail_budget:
+            tail.append(deltas[i])
+            used += sizes[i]
+    tail.reverse()
 
-    omitted = tail_start - head_end
+    omitted = len(deltas) - head_end - len(tail)
     if omitted <= 0:
         return deltas
-    return deltas[:head_end] + [{"type": "_omitted", "omitted_count": omitted}] + deltas[tail_start:]
+    return deltas[:head_end] + [{"type": "_omitted", "omitted_count": omitted}] + tail
 
 
 def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
@@ -917,15 +937,22 @@ def _run_exercise(
             # Only an attempt whose prompt actually asked for one can have a
             # LESSON: line, and the ask lives in the retry prompt built at the
             # BOTTOM of this loop -- so it reaches attempts 2..N and never
-            # attempt 1. A natural consequence of where the ask lives, not a
-            # special case here. First match only -- one lesson per attempt,
+            # attempt 1. Real gap, confirmed by review: that was previously
+            # just a consequence of where the ask lives, not an enforced
+            # guarantee -- assistant_text on attempt 1 includes ALL of the
+            # model's text, so an unrelated but coincidentally-matching line
+            # (e.g. a `# LESSON: ...` code comment) would still get picked
+            # up and fed into reflection as if it were a genuine
+            # self-reflection. Gate extraction to i > 1 explicitly rather
+            # than relying on the model never happening to emit a matching
+            # line unprompted. First match only -- one lesson per attempt,
             # not one per mention.
             for line in (getattr(r, "assistant_text", "") or "").splitlines():
                 # Strip common markdown decoration (bullets, headings, bold,
                 # blockquote) a model might wrap the line in -- real gap,
                 # confirmed by review: "**LESSON:** ...", "- LESSON: ...",
                 # "## LESSON: ..." all silently matched nothing before this.
-                stripped = re.sub(r"^[\s>#*\-]+", "", line.strip())
+                stripped = re.sub(r"^[\s>#*\-]+", "", line.strip()) if i > 1 else ""
                 m = _LESSON_RE.match(stripped)
                 if m:
                     lessons.append(m.group(1).strip()[:LESSON_MAX_CHARS])

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import benchmarks.self_improve.live_eval as live_eval
 from benchmarks.self_improve.exercises import ExerciseSpec
 from benchmarks.self_improve.live_cache import LiveResultCache
 from benchmarks.self_improve.live_eval import PolyglotLiveRunner
@@ -321,16 +322,81 @@ def test_run_config_pi_bin_changes_with_a_different_binary(runner_factory, tmp_p
     assert config_a["pi_bin"] != config_b["pi_bin"]
 
 
-def test_run_config_harness_hash_changes_when_the_scoring_files_change(
+def test_run_config_harness_hash_changes_when_the_worktree_executed_files_change(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real gap, confirmed by review: the graded score has depended on
-    ingest/aider_polyglot_ingest.py (the compaction penalty formula) and
-    components.py (the token_cost estimator) since this PR, but
-    harness_hash only ever covered aider_polyglot.py/rpc_client.py -- an
-    uncommitted retune of either wouldn't change the cache key, so
-    LiveResultCache would keep serving scores computed under the old
-    formula."""
+    """aider_polyglot.py/rpc_client.py run as a SUBPROCESS inside the
+    scratch worktree, so the worktree's own (pinned-commit) copy is exactly
+    what executes -- committing a change to them in source_repo, which the
+    NEXT scratch_worktree checkout picks up, must change the cache key."""
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
+
+    def _hash():
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+            runner = PolyglotLiveRunner(
+                worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+                model="fake/model", max_attempts=1, benchmark_root=fake_practice,
+            )
+            return runner.run_config["harness_hash"]
+
+    hash_before = _hash()
+
+    (source_repo / "benchmarks" / "rpc_client.py").write_text("SUBPROCESS_V2 = 2\n")
+    subprocess.run(["git", "add", "-A"], cwd=source_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "retune rpc_client"], cwd=source_repo, check=True)
+
+    hash_after = _hash()
+    assert hash_before != hash_after
+
+
+def test_run_config_harness_hash_changes_when_the_parent_processs_own_scoring_module_changes(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real gap, confirmed by review: pass_n_score() (aider_polyglot_ingest.py,
+    the compaction penalty formula) and write_components_back() (components.py,
+    the token_cost estimator) run in the PARENT (orchestrator) process --
+    imported once at the top of live_eval.py -- never inside the scratch
+    worktree at all. An earlier version of run_config hashed the WORKTREE's
+    copy of these two files, which meant an uncommitted retune in the real
+    checkout the orchestrator actually imports from wouldn't change the
+    cache key, even though the orchestrator's own process had already
+    picked up the edit -- LiveResultCache would keep serving scores computed
+    under the old formula. Hashing the module's own `__file__` (simulated
+    here via monkeypatch, since editing this repo's real components.py
+    mid-test would be its own kind of chaos) is what actually tracks that."""
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
+
+    fake_components_file = tmp_path / "fake_components.py"
+    fake_components_file.write_text("SCORING_V1 = 1\n")
+    monkeypatch.setattr(live_eval._components_module, "__file__", str(fake_components_file))
+
+    def _hash():
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+            runner = PolyglotLiveRunner(
+                worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+                model="fake/model", max_attempts=1, benchmark_root=fake_practice,
+            )
+            return runner.run_config["harness_hash"]
+
+    hash_before = _hash()
+
+    fake_components_file.write_text("SCORING_V2 = 2\n")  # no git commit -- exactly the uncommitted-retune case
+
+    hash_after = _hash()
+    assert hash_before != hash_after
+
+
+def test_run_config_harness_hash_is_unaffected_by_editing_the_worktree_copy_of_the_scoring_files(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """The flip side of the fix above: aider_polyglot_ingest.py/components.py
+    never execute from inside the scratch worktree, so committing an edit to
+    the WORKTREE's copy of them (without touching what the parent process
+    itself imports) must NOT spuriously change the cache key -- that would
+    just cause needless re-runs of already-cached work for a file whose
+    content never actually influenced the score."""
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
     monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
 
@@ -346,10 +412,10 @@ def test_run_config_harness_hash_changes_when_the_scoring_files_change(
 
     (source_repo / "benchmarks" / "self_improve" / "components.py").write_text("SCORING_V2 = 2\n")
     subprocess.run(["git", "add", "-A"], cwd=source_repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "retune scoring"], cwd=source_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "retune scoring (worktree copy only)"], cwd=source_repo, check=True)
 
     hash_after = _hash()
-    assert hash_before != hash_after
+    assert hash_before == hash_after
 
 
 def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, monkeypatch, tmp_path):
@@ -416,18 +482,28 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
     now-too-short value -- the OUTER subprocess timeout would fire and kill
     an exercise via SIGTERM before even one INNER attempt's own (longer)
     budget had a chance to time out gracefully."""
+    import benchmarks.aider_polyglot as aider_polyglot
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
+    # Real gap, confirmed by review: asserting against a bare 2700 literal
+    # only re-checks the very constant this test guards -- if
+    # aider_polyglot.py's own default is ever changed without updating
+    # live_eval.py's copy (the original regression), this would still
+    # pass. Call the real _positive_int_env() function directly (not the
+    # module-level ATTEMPT_TIMEOUT_S constant, which is cached at import
+    # time and wouldn't re-resolve under this test's monkeypatched env)
+    # so drift is actually detected.
     monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
-    assert _attempt_timeout_s() == 2700  # matches aider_polyglot.py's own current default
+    real_default = aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
+    assert _attempt_timeout_s() == real_default
 
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
         runner = PolyglotLiveRunner(
             worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
             model="fake/model", max_attempts=2, benchmark_root=fake_practice,
         )
-        assert runner.per_exercise_timeout_s == 2 * (2700 + 90) + 180
+        assert runner.per_exercise_timeout_s == 2 * (real_default + 90) + 180
 
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
     assert _attempt_timeout_s() == 30
@@ -437,3 +513,19 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
             model="fake/model", max_attempts=2, benchmark_root=fake_practice,
         )
         assert runner.per_exercise_timeout_s == 2 * (30 + 90) + 180
+
+
+@pytest.mark.parametrize("bad_value", ["not-a-number", "0", "-5"])
+def test_attempt_timeout_s_raises_on_malformed_or_non_positive_value(bad_value, monkeypatch):
+    """Real gap, confirmed by review: a malformed/non-positive
+    ATTEMPT_TIMEOUT_S used to be silently swallowed and replaced with the
+    default here, computing a per_exercise_timeout_s estimate as if the
+    run would proceed normally -- but aider_polyglot.py's own
+    _positive_int_env() raises SystemExit on the exact same value, so the
+    actual subprocess crashes at import time instead. Must fail the same
+    way, not silently substitute a misleading default."""
+    from benchmarks.self_improve.live_eval import _attempt_timeout_s
+
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", bad_value)
+    with pytest.raises(SystemExit):
+        _attempt_timeout_s()

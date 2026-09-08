@@ -181,12 +181,12 @@ def test_find_marks_worktree_removable_when_both_pid_and_active_pid_dead(source_
     subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
 
 
-def test_find_withholds_removal_during_the_spawn_grace_window(source_repo, tmp_path):
+def test_find_withholds_removal_while_spawn_pending_at_is_present(source_repo, tmp_path):
     """Real TOCTOU gap, confirmed by review: PolyglotLiveRunner writes
     spawn_pending_at (via mark_spawn_pending()) BEFORE subprocess.Popen(),
     then set_active_pid(proc.pid) only AFTER Popen() returns. A SIGKILL in
     that exact window leaves pid/active_pid both dead but spawn_pending_at
-    recent -- must NOT be treated as orphaned, since a subprocess may be
+    present -- must NOT be treated as orphaned, since a subprocess may be
     mid-spawn (or have just started) and still alive."""
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
         scratch_path = wt.path
@@ -199,15 +199,19 @@ def test_find_withholds_removal_during_the_spawn_grace_window(source_repo, tmp_p
     entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
     matching = [e for e in entries if e["path"] == scratch_path]
     assert matching[0]["removable"] is False
-    assert "grace window" in matching[0]["reason"]
+    assert "crashed mid-spawn" in matching[0]["reason"]
 
     subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
 
 
-def test_find_allows_removal_once_the_spawn_grace_window_has_elapsed(source_repo, tmp_path):
-    """The grace window must not block genuine cleanup forever -- once
-    spawn_pending_at is old enough, a dead pid/active_pid pair with no
-    other evidence of life is trusted as truly orphaned again."""
+def test_find_withholds_removal_even_when_spawn_pending_at_is_very_old(source_repo, tmp_path):
+    """set_active_pid() (called from both the pid-recorded and the
+    finally-clause None-cleared path in PolyglotLiveRunner) now always
+    clears spawn_pending_at -- so a spawn_pending_at that is still present,
+    no matter how old, can only mean the orchestrator crashed before ever
+    reaching that call. There is no time-based expiry back to "orphaned":
+    real gap, confirmed by review, in a previous version of this check that
+    trusted mere elapsed time as evidence of nothing having gone wrong."""
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
         scratch_path = wt.path
     marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
@@ -218,7 +222,8 @@ def test_find_allows_removal_once_the_spawn_grace_window_has_elapsed(source_repo
 
     entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
     matching = [e for e in entries if e["path"] == scratch_path]
-    assert matching[0]["removable"] is True
+    assert matching[0]["removable"] is False
+    assert "crashed mid-spawn" in matching[0]["reason"]
 
     subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
 

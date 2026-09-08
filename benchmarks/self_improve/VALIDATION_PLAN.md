@@ -141,8 +141,8 @@ is not itself the hard live-run ceiling: real live rollouts run up to
 overshoot allowance (`run_gepa.py --estimate-only` prints the actual number as
 "LIVE exercise executions"). Budget for that printed number, not the raw
 `--max-metric-calls` value, when deciding what a real invocation could cost.
-`--baseline-only` is a separate, tighter case (see Layer 3.5-equivalent smoke
-test below and `run_gepa.py`'s own `max_live_runs=args.max_metric_calls if
+`--baseline-only` is a separate, tighter case (see Procedure step 3 below and
+`run_gepa.py`'s own `max_live_runs=args.max_metric_calls if
 args.baseline_only else est.max_live_runs`): it never touches `gepa.optimize()`'s
 own iteration loop, so live executions are capped at exactly `--max-metric-calls`
 — no overshoot allowance applies there.
@@ -165,11 +165,14 @@ own iteration loop, so live executions are capped at exactly `--max-metric-calls
    record that too. `spend_log.jsonl` (append-only, flushed per line) is the
    authoritative record of what actually ran, regardless of how the process exited.
 6. Read the resulting `apply_results.py`-produced diff for `skills/tools/bash.md`:
-   - Frontmatter block is byte-identical to before (this is the one thing Layer 1's
+   - Frontmatter block is byte-identical to before, except its `token_cost:` line
+     (the one deliberate exception `write_components_back` makes -- see
+     `TDD_SPEC.md` §7.2's "Contract update" -- when the rewritten body's estimated
+     cost differs from what's currently recorded). This is the one thing Layer 1's
      roundtrip unit test already gives strong confidence on, but confirming it
      against a real GEPA-produced body — not a hand-typed test string — is the
      actual validation of the full pipeline, not just the string-manipulation
-     function in isolation).
+     function in isolation.
    - The rewritten body text is coherent, on-topic guidance for the `bash` tool,
      not degenerate output (e.g. not truncated mid-sentence, not repeating the
      original verbatim if a change was expected, not introducing formatting the
@@ -182,8 +185,8 @@ own iteration loop, so live executions are capped at exactly `--max-metric-calls
      frozen dataset.
 
 **Pass criterion**: run completes within a documented cost/time budget, PR diff is
-human-legible and correct (frontmatter untouched, body coherent), reported score
-delta matches `spend_log.jsonl`.
+human-legible and correct (frontmatter untouched except for a possible `token_cost:`
+update, body coherent), reported score delta matches `spend_log.jsonl`.
 
 **If this layer fails** (e.g. degenerate output, cost wildly over budget, score
 delta doesn't reproduce): do not proceed to Layer 5 or 6's full-scope work. Fix the
@@ -269,7 +272,7 @@ when `PRINCIPLES.md` is absent; observably-effective prompt content when present
 | 1 | Unit-level correctness | Free | Nothing — first gate |
 | 2 | Ingestion vs. real log shapes | Free | Layer 1 green |
 | 3 | Ingestion + component loading, no API spend | Free | Layer 2 confirmed (per-benchmark) |
-| 4 | Real live GEPA output quality, single component | $ + compute (bounded by `--max-metric-calls`) | Layer 3 clean |
+| 4 | Real live GEPA output quality, single component | $ + compute (bounded by `--estimate-only`'s printed "LIVE exercise executions" count, not raw `--max-metric-calls`) | Layer 3 clean |
 | 5 | Live regression check, held-out set | Compute (benchmark re-runs) | Layer 4 pass |
 | 6 | Runtime backward-compatibility | Free/cheap | Independent — can run parallel to 2-5 |
 

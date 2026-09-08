@@ -145,10 +145,15 @@ def test_write_components_back_token_cost_rewrite_touches_only_that_one_line(tmp
     written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
     written_frontmatter, written_body = split_frontmatter(written)
     original_frontmatter, _ = split_frontmatter(FRONTMATTER_FIXTURE)
-    for line in original_frontmatter.splitlines():
-        if line.startswith("token_cost:"):
-            continue
-        assert line in written_frontmatter.splitlines()
+    # Order-sensitive comparison (not membership) -- catches reordering, a
+    # duplicated line, an appended extra field, or a YAML re-dump reformatting
+    # keys/quotes, none of which a plain "each line is somewhere in there"
+    # membership check would notice. Real gap, confirmed by review: this was
+    # the only test covering the token_cost rewrite path, so any of those
+    # would have gone unflagged.
+    written_lines = [line for line in written_frontmatter.splitlines() if not line.startswith("token_cost:")]
+    original_lines = [line for line in original_frontmatter.splitlines() if not line.startswith("token_cost:")]
+    assert written_lines == original_lines
     assert written_body == new_body
 
 

@@ -283,6 +283,55 @@ def test_run_exercise_captures_lesson_from_a_retried_attempts_response(tmp_path,
     assert record["lessons"] == ["needed guidance 2"]
 
 
+class _FakeRpcWithLessonOnAttemptOneOnly(_FakeRpc):
+    """Simulates a model emitting an unrelated but coincidentally
+    LESSON:-matching line on attempt 1 (e.g. a `# LESSON: ...` code
+    comment) even though attempt 1's prompt never asks for one."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+
+        lesson_line = "\nLESSON: unrelated coincidental match\n" if self.n == 1 else ""
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = f"Some prose about attempt {self.n}.{lesson_line}More prose."
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_never_captures_a_lesson_from_attempt_one_even_if_a_line_matches(tmp_path, monkeypatch):
+    """Real gap, confirmed by review: extraction previously relied on
+    attempt 1's prompt simply never ASKING for a LESSON: line as its only
+    guarantee that attempt 1 wouldn't contribute one -- but assistant_text
+    includes ALL of the model's text on every attempt, so a coincidentally
+    matching line (e.g. a code comment) would still get picked up. Gating
+    extraction to i > 1 explicitly closes that."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),  # always fail -> retry
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithLessonOnAttemptOneOnly)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert record["lessons"] == []
+
+
 def test_run_exercise_lessons_is_empty_when_no_lesson_line_present(tmp_path, monkeypatch):
     src = tmp_path / "practice" / "ex"
     src.mkdir(parents=True)
@@ -372,6 +421,49 @@ def test_run_exercise_captures_a_lesson_wrapped_in_markdown_decoration(tmp_path,
 
     record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
     assert record["lessons"] == ["needed guidance 2"]
+
+
+class _FakeRpcWithLessonContentStartingBold(_FakeRpc):
+    """Attempt 2's LESSON content itself starts with its own bold markup
+    (not the label wrapper) -- real gap, confirmed by review (cubic): an
+    earlier version of _LESSON_RE also swallowed the CONTENT's own opening
+    bold marker here, not just a label wrapper's closing one."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+        lesson_line = f"\nLESSON: **Refactor X** now\n" if self.n > 1 else ""
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = f"Some prose about attempt {self.n}.{lesson_line}More prose."
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_preserves_the_lessons_own_opening_bold_markup(tmp_path, monkeypatch):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithLessonContentStartingBold)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert record["lessons"] == ["**Refactor X** now"]
 
 
 class _FakeRpcWithHugeLesson(_FakeRpc):
@@ -473,8 +565,10 @@ def test_cap_non_text_deltas_returns_input_unchanged_when_under_budget():
 
 
 def test_cap_non_text_deltas_keeps_head_and_tail_drops_middle():
-    # Each entry ~40 raw JSON chars; budget 400 splits to 200 head/200 tail,
-    # i.e. ~5 entries survive on each end out of 100.
+    # Each entry serializes to ~55 raw JSON chars (verified:
+    # json.dumps({"type": "thinking_delta", "delta": "chunk number 000"})
+    # == 55); budget 400 splits to 200 head/200 tail, i.e. ~3 entries
+    # survive on each end out of 100.
     deltas = [{"type": "thinking_delta", "delta": f"chunk number {i:03d}"} for i in range(100)]
     result = AP._cap_non_text_deltas(deltas, char_budget=400)
     assert result[0] == deltas[0]
@@ -498,6 +592,28 @@ def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
     assert len(json.dumps(result, default=str)) < 1_000  # nowhere near the huge entry's own size
     assert huge not in result  # actually dropped, not just left in unbounded
     assert any(d.get("type") == "_omitted" for d in result)
+
+
+def test_cap_non_text_deltas_skips_an_oversized_tail_entry_instead_of_stopping():
+    """Real gap, confirmed by review: the old backward-walk stopped at the
+    FIRST tail entry that didn't fit (e.g. a huge toolcall_delta), silently
+    discarding every smaller, budget-fitting entry further back too --
+    including genuinely recent reasoning sitting right before it. Padded so
+    NEITHER small entry is claimed by the head slice -- the only way either
+    survives is via the tail walk actually skipping past huge_middle."""
+    huge_at_start = {"type": "toolcall_delta", "delta": "x" * 500_010}  # too big for head_budget alone
+    small_before = {"type": "thinking_delta", "delta": "recent reasoning before the huge entry"}
+    huge_middle = {"type": "toolcall_delta", "delta": "y" * 500_020}
+    small_after = {"type": "thinking_delta", "delta": "final reasoning at the true end"}
+    result = AP._cap_non_text_deltas(
+        [huge_at_start, small_before, huge_middle, small_after], char_budget=1_000,
+    )
+    assert small_before in result  # would have been dropped by the old stop-at-first-miss logic
+    assert small_after in result
+    assert huge_at_start not in result
+    assert huge_middle not in result
+    # Order preserved despite the internal skip.
+    assert result.index(small_before) < result.index(small_after)
 
 
 def test_dump_trajectory_no_longer_drops_the_tail_of_a_long_but_small_reasoning_stream(tmp_path):

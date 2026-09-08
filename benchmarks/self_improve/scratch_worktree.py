@@ -168,16 +168,28 @@ class ScratchWorktree:
 
     def set_active_pid(self, pid: int | None) -> None:
         """Record (or clear) the pid of the exercise subprocess currently
-        running against this worktree, in the marker file.
+        running against this worktree, in the marker file. Also clears
+        spawn_pending_at (see mark_spawn_pending()) -- real gap, confirmed
+        by review: it never did, so every worktree that had ever run even
+        one exercise carried a permanently stale spawn_pending_at for the
+        rest of its life. That's what let gepa_scratch_gc.py's grace-window
+        check silently do the wrong thing (see _SPAWN_GRACE_SECONDS's own
+        comment): the window it actually needs to protect is "between
+        mark_spawn_pending() and this call finishing", not "since the very
+        first exercise this worktree ever ran". Called from every reachable
+        path after mark_spawn_pending() (a `finally`, per live_eval.py), so
+        after this fix spawn_pending_at can only still be set if the
+        orchestrator died before ever reaching here at all -- exactly the
+        crash window this mechanism exists to protect.
 
-        Without this, gepa_scratch_gc.py can only see the ORCHESTRATOR's own
-        pid (the "pid" field, set once at creation) -- if the orchestrator is
-        SIGKILLed mid-exercise, that pid dies, but the exercise subprocess
-        (started with start_new_session=True, its OWN process group/pid --
-        see live_eval.py) does not die with it and can still be actively
-        writing into this worktree. A naive orphan check based only on the
-        orchestrator's pid would then call the worktree safe to remove while
-        real work is still in flight."""
+        Without active_pid tracking at all, gepa_scratch_gc.py can only see
+        the ORCHESTRATOR's own pid (the "pid" field, set once at creation)
+        -- if the orchestrator is SIGKILLed mid-exercise, that pid dies, but
+        the exercise subprocess (started with start_new_session=True, its
+        OWN process group/pid -- see live_eval.py) does not die with it and
+        can still be actively writing into this worktree. A naive orphan
+        check based only on the orchestrator's pid would then call the
+        worktree safe to remove while real work is still in flight."""
         marker_path = self.path / SCRATCH_MARKER_NAME
         try:
             marker = json.loads(marker_path.read_text())
@@ -186,6 +198,7 @@ class ScratchWorktree:
         if not isinstance(marker, dict):
             marker = {}
         marker["active_pid"] = pid
+        marker.pop("spawn_pending_at", None)
         _write_marker_atomic(marker_path, marker)
 
     def reset(self) -> None:

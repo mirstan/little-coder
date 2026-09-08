@@ -137,6 +137,17 @@ class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
 
 
+#: Real gap, confirmed by review: PromptResult.non_text_deltas grew
+#: unbounded in memory for the ENTIRE attempt (a live model streaming
+#: heavy reasoning can emit thousands of events) -- only ever capped
+#: AFTER the fact, at persist time, by aider_polyglot.py's own
+#: _cap_non_text_deltas(). This is a pure memory-safety backstop for a
+#: pathological run, not the real trimming policy (which stays downstream,
+#: since it needs head+tail retention that isn't knowable mid-stream) --
+#: generous enough that no normal attempt gets anywhere near it.
+_MAX_NON_TEXT_DELTAS = 5_000
+
+
 @dataclass
 class PromptResult:
     """Outcome of a single prompt_and_collect() call."""
@@ -163,6 +174,8 @@ class PromptResult:
     #: assistant_text is built above. Other observed types this run:
     #: thinking_start/thinking_end (bracket a reasoning block),
     #: toolcall_start/toolcall_delta/toolcall_end, text_start/text_end.
+    #: Bounded to _MAX_NON_TEXT_DELTAS entries during collection (pure
+    #: memory-safety backstop -- see that constant's own comment).
     non_text_deltas: list[dict] = field(default_factory=list)
 
 
@@ -475,9 +488,11 @@ class PiRpc:
                 delta = ev.get("assistantMessageEvent", {})
                 if delta.get("type") == "text_delta":
                     result.assistant_text += delta.get("delta", "")
-                else:
+                elif len(result.non_text_deltas) < _MAX_NON_TEXT_DELTAS:
                     # See PromptResult.non_text_deltas' own docstring --
-                    # diagnostic capture, not yet consumed by anything.
+                    # bounded here as a pure memory-safety backstop; the
+                    # real head+tail trimming policy lives downstream in
+                    # aider_polyglot.py's _cap_non_text_deltas().
                     result.non_text_deltas.append(delta)
             elif t == "tool_execution_start":
                 pending[ev.get("toolCallId", "")] = {

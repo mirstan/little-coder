@@ -37,16 +37,25 @@ from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, prune_
 #: purpose -- cleaning up ITS OWN crashed scratch checkouts -- keep working.
 _SCRATCH_DIR_NAME_RE = re.compile(r"^gepa-scratch-\d+-[0-9a-f]{8}$")
 
-#: Grace window after PolyglotLiveRunner.mark_spawn_pending() (written just
-#: before subprocess.Popen()) before a worktree with no live active_pid is
-#: trusted as truly orphaned. Closes a real TOCTOU gap, confirmed by review:
-#: set_active_pid(proc.pid) can only run AFTER Popen() returns, so a SIGKILL
-#: in that window would otherwise leave no marker evidence a subprocess was
-#: ever started, and this tool would wrongly call the worktree removable
-#: while that just-spawned subprocess is still alive and writing into it.
-#: Generous on purpose -- worst case of setting this too high is a stale
-#: worktree lingering a few extra minutes before the next --clean run.
-_SPAWN_GRACE_SECONDS = 120.0
+#: A lingering spawn_pending_at (written by PolyglotLiveRunner.mark_spawn_pending()
+#: just before subprocess.Popen()) closes a real TOCTOU gap, confirmed by
+#: review: set_active_pid(proc.pid) can only run AFTER Popen() returns, so a
+#: SIGKILL in that window would otherwise leave no marker evidence a
+#: subprocess was ever started, and this tool would wrongly call the
+#: worktree removable while that just-spawned subprocess is still alive and
+#: writing into it. Originally this was a time-based grace window (a
+#: worktree was trusted as orphaned again once spawn_pending_at was old
+#: enough) -- but that was itself a real bug, confirmed by review:
+#: set_active_pid() never cleared spawn_pending_at, so EVERY worktree that
+#: had ever run even a single exercise carried a permanently stale
+#: spawn_pending_at, and once it aged past the window it went right back to
+#: being treated as orphaned by mere elapsed time, with no actual evidence
+#: of anything. Now that set_active_pid() clears spawn_pending_at on every
+#: call (both the pid-recorded and the finally-clause None-cleared path),
+#: its mere presence here can only mean the orchestrator died before ever
+#: reaching that call -- i.e. a genuine crash mid-spawn -- so it is treated
+#: as permanently non-removable, the same as a live pid, rather than on any
+#: time-based expiry.
 
 
 def _pid_alive(pid: object) -> bool:
@@ -183,14 +192,13 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
         spawn_pending_at = marker.get("spawn_pending_at")
         if isinstance(spawn_pending_at, (int, float)):
             age_s = time.time() - spawn_pending_at
-            if age_s < _SPAWN_GRACE_SECONDS:
-                info["reason"] = (
-                    f"a subprocess started spawning {age_s:.0f}s ago (active_pid not yet "
-                    f"recorded) -- within the {_SPAWN_GRACE_SECONDS:.0f}s spawn grace window, "
-                    "not yet safe to remove"
-                )
-                results.append(info)
-                continue
+            info["reason"] = (
+                f"a subprocess started spawning {age_s:.0f}s ago and neither pid nor "
+                "active_pid is alive -- set_active_pid() never ran to clear spawn_pending_at, "
+                "so the orchestrator crashed mid-spawn; not safe to remove"
+            )
+            results.append(info)
+            continue
 
         info["removable"] = True
         info["reason"] = "orphaned scratch worktree (owning process is gone), safe to remove"
