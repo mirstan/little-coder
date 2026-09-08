@@ -2,6 +2,7 @@ import pytest
 import yaml
 
 from benchmarks.self_improve.components import (
+    _estimate_token_cost,
     load_components,
     reattach_frontmatter,
     split_frontmatter,
@@ -109,6 +110,55 @@ def test_write_components_back_reports_changed_files(tmp_path):
     written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
     assert "target_tool: bash" in written  # frontmatter still present
     assert "v2" in written
+
+
+def test_write_components_back_recomputes_token_cost_when_body_changes(tmp_path):
+    """Real gap, confirmed by review: skill-inject's real per-turn injection
+    budget selects entries against each file's DECLARED token_cost -- a
+    GEPA-grown body left the old, understated number in place forever,
+    silently letting a candidate exceed the real budget with no guardrail
+    catching it."""
+    components_yaml = _make_repo(tmp_path)
+    new_body = "## `bash` Tool (v2)\nA much longer revised body than before, with more guidance text.\n"
+    write_components_back(components_yaml, repo_root=tmp_path, optimized={"skills_tools_bash": new_body})
+
+    written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
+    expected_cost = _estimate_token_cost(new_body)
+    assert f"token_cost: {expected_cost}" in written
+    assert "token_cost: 120" not in written  # the stale original value is gone
+
+
+def test_write_components_back_token_cost_rewrite_touches_only_that_one_line(tmp_path):
+    """Real invariant, from split_frontmatter/reattach_frontmatter's own
+    contract (this module's docstring, TDD_SPEC.md §7.2): string
+    concatenation only, never a YAML re-dump. Every OTHER frontmatter
+    field/line/ordering must survive byte-for-byte -- only token_cost and
+    the body change."""
+    components_yaml = _make_repo(tmp_path)
+    new_body = "## `bash` Tool (v2)\nRevised.\n"
+    write_components_back(components_yaml, repo_root=tmp_path, optimized={"skills_tools_bash": new_body})
+
+    written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
+    written_frontmatter, written_body = split_frontmatter(written)
+    original_frontmatter, _ = split_frontmatter(FRONTMATTER_FIXTURE)
+    for line in original_frontmatter.splitlines():
+        if line.startswith("token_cost:"):
+            continue
+        assert line in written_frontmatter.splitlines()
+    assert written_body == new_body
+
+
+def test_write_components_back_leaves_agents_md_frontmatter_untouched(tmp_path):
+    """agents_md (AGENTS.md/PRINCIPLES.md) has no frontmatter at all --
+    split_frontmatter returns (None, text) for it, so the token_cost rewrite
+    path must not fire and must not invent a frontmatter block."""
+    components_yaml = _make_repo(tmp_path)
+    new_body = "# little-coder\n\nRevised body text.\n"
+    write_components_back(components_yaml, repo_root=tmp_path, optimized={"agents_md": new_body})
+
+    written = (tmp_path / "AGENTS.md").read_text()
+    assert written == new_body
+    assert "token_cost" not in written
 
 
 def _make_repo_with_escaping_entry(tmp_path, rel_path):

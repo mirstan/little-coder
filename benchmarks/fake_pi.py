@@ -325,6 +325,21 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "emit_compactions_then_solve":
+        # Regression fixture for aider_polyglot.py's compaction_total
+        # accumulator and live_eval.py's compaction-aware scoring: emits two
+        # compaction_end events (rpc_client.py's PromptResult.compaction_events
+        # increments on this exact event type), then solves for real.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "compaction_end"})
+        emit({"type": "compaction_end"})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "sleep_forever":
         # Like hang_after_ack, but the sleep duration is configurable so a
         # deadline/timeout test doesn't have to wait out a hardcoded 3600s.

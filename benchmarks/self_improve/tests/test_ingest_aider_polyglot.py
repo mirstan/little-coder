@@ -6,6 +6,34 @@ import pytest
 from benchmarks.self_improve.ingest import aider_polyglot_ingest
 
 
+def test_pass_n_score_with_no_compaction_events_is_byte_identical_to_before():
+    """Backward compat: compaction_events defaults to 0, so every existing
+    caller (including the historical/frozen-data ingest path, which has no
+    reliable per-exercise compaction count) must see the exact same scores
+    as before this parameter existed."""
+    assert aider_polyglot_ingest.pass_n_score("pass_1") == (True, 1.0)
+    assert aider_polyglot_ingest.pass_n_score("pass_2") == (True, 0.7)
+    assert aider_polyglot_ingest.pass_n_score("pass_3") == (True, 0.4)
+    assert aider_polyglot_ingest.pass_n_score("fail") is None
+
+
+def test_pass_n_score_compaction_penalty_decreases_score_monotonically():
+    scores = [
+        aider_polyglot_ingest.pass_n_score("pass_1", compaction_events=n)[1]
+        for n in range(6)
+    ]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] == 1.0  # 0 compactions: unpenalized
+
+
+def test_pass_n_score_compaction_penalty_never_drops_below_the_shared_floor():
+    # Absurdly high compaction count -- must still floor at _PASS_N_FLOOR,
+    # not go negative or below the floor a genuine multi-attempt pass shares.
+    success, score = aider_polyglot_ingest.pass_n_score("pass_1", compaction_events=1000)
+    assert success is True
+    assert score == 0.4
+
+
 def _write_trajectory(path, **fields):
     base = {
         "attempt": "1", "agent_ended": True, "turn_count": 1,

@@ -47,16 +47,30 @@ _PASS_N_RE = re.compile(r"^pass_(\d+)$")
 #: preserved for backward compat), pass_3+=0.4.
 _PASS_N_FLOOR = 0.4
 _PASS_N_DECAY = 0.3
+#: Secondary, softer signal than attempt count: a candidate whose injected
+#: text is large enough to force a mid-run context compaction is exhibiting
+#: real prompt bloat, even on a pass_1. Reuses _PASS_N_FLOOR as the combined
+#: floor rather than a second magic number -- a heavily-compacted pass_1
+#: converges toward the same floor as a genuine multi-attempt pass, which is
+#: the right signal ("needed heavy compaction to pass first try" isn't much
+#: better than "needed 3 attempts"). Starting point, easy to retune via this
+#: one constant -- not claimed to be precisely calibrated.
+_COMPACTION_PENALTY = 0.05
 
 
-def _pass_n_score(status: str) -> tuple[bool, float] | None:
+def _pass_n_score(status: str, compaction_events: int = 0) -> tuple[bool, float] | None:
     """Return (success, partial_score) for any "pass_N" status, or None if
-    status doesn't match that pattern at all (a real failure/error status)."""
+    status doesn't match that pattern at all (a real failure/error status).
+
+    compaction_events defaults to 0, so every existing caller (including the
+    historical/frozen-data ingest path, which has no reliable per-exercise
+    compaction count) is byte-identical to before this parameter existed."""
     m = _PASS_N_RE.match(status)
     if not m:
         return None
     n = int(m.group(1))
-    score = max(_PASS_N_FLOOR, 1.0 - _PASS_N_DECAY * (n - 1))
+    base = 1.0 - _PASS_N_DECAY * (n - 1)
+    score = max(_PASS_N_FLOOR, base - _COMPACTION_PENALTY * compaction_events)
     return True, score
 
 

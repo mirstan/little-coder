@@ -158,6 +158,21 @@ def test_summarized_transcript_surfaces_a_recoverable_tool_error(runner_factory,
     assert "Permission denied" in result.summarized_transcript
 
 
+def test_compaction_total_is_captured_and_lowers_the_score(runner_factory, monkeypatch):
+    """Real gap, confirmed by review: compaction_events was discarded
+    entirely between aider_polyglot.py and the live GEPA loop -- a
+    candidate whose injected text forces context compaction (real prompt
+    bloat) never affected its score or reflection feedback at all."""
+    monkeypatch.setenv("FAKE_PI_MODE", "emit_compactions_then_solve")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    result = results[0]
+    assert result.status == "pass_1"
+    assert result.compaction_total == 2
+    assert result.score == 1.0 - 0.05 * 2  # pass_1's 1.00 minus the 2-compaction penalty
+
+
 def test_pipeline_scores_a_genuine_failure_as_zero(runner_factory, monkeypatch):
     monkeypatch.setenv("FAKE_PI_MODE", "clean")  # writes nothing relevant
     for runner in runner_factory():

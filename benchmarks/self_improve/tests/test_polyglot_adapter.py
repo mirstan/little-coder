@@ -153,6 +153,67 @@ def test_reflective_dataset_generated_outputs_includes_summarized_transcript():
     assert record["Generated Outputs"]["summarized_transcript"] == "[ERROR] bash(...) -> boom"
 
 
+def test_reflective_dataset_feedback_mentions_compaction_count_when_nonzero():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", compaction_total=2)})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    feedback = adapter.make_reflective_dataset(
+        {"skills_tools_bash": "text"}, batch, ["skills_tools_bash"],
+    )["skills_tools_bash"][0]["Feedback"]
+    assert "2 context compaction(s)" in feedback
+
+
+def test_reflective_dataset_feedback_omits_per_run_compaction_note_when_zero():
+    """_SCORING_RULE always mentions compaction (it's stating the general
+    rule) -- what must NOT appear when compaction_total is 0 is the
+    per-run note claiming compactions actually occurred."""
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})  # compaction_total defaults to 0
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    feedback = adapter.make_reflective_dataset(
+        {"skills_tools_bash": "text"}, batch, ["skills_tools_bash"],
+    )["skills_tools_bash"][0]["Feedback"]
+    assert "occurred during this run" not in feedback
+
+
+def test_reflective_dataset_generated_outputs_includes_token_cost_for_a_tool_skill():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(runner, component_paths={"skills_tools_bash": "skills/tools/bash.md"})
+    candidate = {"skills_tools_bash": "x" * 35}  # 35 chars -> ceil(35/3.5) = 10 tokens
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(candidate, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert record["Generated Outputs"]["token_cost"] == 10
+    assert record["Generated Outputs"]["token_budget"] == 300
+
+
+def test_reflective_dataset_generated_outputs_uses_knowledge_budget_for_a_knowledge_skill():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(runner, component_paths={"skills_knowledge_binary_search": "skills/knowledge/binary_search.md"})
+    candidate = {"skills_knowledge_binary_search": "text"}
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(
+        candidate, batch, ["skills_knowledge_binary_search"],
+    )["skills_knowledge_binary_search"][0]
+    assert record["Generated Outputs"]["token_budget"] == 200
+
+
+def test_reflective_dataset_generated_outputs_omits_token_cost_for_agents_md():
+    """agents_md is always injected -- never competes for a selection slot,
+    so there's no budget to surface."""
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(runner, component_paths={"agents_md": "AGENTS.md"})
+    candidate = {"agents_md": "text"}
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(candidate, batch, ["agents_md"])["agents_md"][0]
+    assert "token_cost" not in record["Generated Outputs"]
+    assert "token_budget" not in record["Generated Outputs"]
+
+
 def test_reflective_dataset_says_not_injected_when_component_absent_from_notifications():
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a", notifications=[])})

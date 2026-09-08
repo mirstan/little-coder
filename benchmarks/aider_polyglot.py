@@ -817,6 +817,7 @@ def _run_exercise(
         outcomes: list[str] = []
         stop_reasons: list[str] = []
         turn_total = 0
+        compaction_total = 0
         current_prompt = prompt
         codex_session_id = None
         for i in range(1, effective_attempts + 1):
@@ -892,6 +893,7 @@ def _run_exercise(
             else:
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
+            compaction_total += getattr(r, "compaction_events", 0) or 0
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
             stop_reasons.append(_stop_reason(r))
@@ -963,6 +965,7 @@ def _run_exercise(
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
+            "compaction_total": compaction_total,
         }
         return record
 

@@ -187,6 +187,52 @@ def test_log_dir_namespaced_by_agent(tmp_path, monkeypatch):
     assert "codex did it" in codex_traj.read_text()
 
 
+class _FakeRpcWithCompactions(_FakeRpc):
+    """Same as _FakeRpc, but reports a nonzero, attempt-dependent
+    compaction_events count -- lets a test observe compaction_total actually
+    summing across every attempt, the same way turn_total already does."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = self.n  # attempt 1 -> 1, attempt 2 -> 2, ...
+            assistant_text = f"attempt {self.n}"
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_sums_compaction_events_across_every_attempt(tmp_path, monkeypatch):
+    """Real gap, confirmed by review: compaction_events was discarded
+    entirely -- turn_total accumulates across attempts (turn_total +=
+    r.turn_count) but there was no compaction_total equivalent, so a
+    candidate's context-bloat symptom never reached the results record at
+    all, let alone the live GEPA loop reading it."""
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),  # always fail -> retry
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithCompactions)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert record["compaction_total"] == 1 + 2  # attempt 1's 1 + attempt 2's 2
+
+
 def test_run_id_is_stable_within_a_process():
     assert AP.RUN_ID and AP.RUN_ID == AP.RUN_ID
 

@@ -21,13 +21,37 @@ from typing import Any, Mapping, Sequence
 
 from gepa.core.adapter import EvaluationBatch
 
+from benchmarks.self_improve.components import _estimate_token_cost
 from benchmarks.self_improve.exercises import ExerciseSpec, describe_exercise
 from benchmarks.self_improve.ingest.common import merge_component_usage
 from benchmarks.self_improve.live_eval import LiveRunResult, PolyglotLiveRunner
 
+#: skill-inject's/knowledge-inject's real per-turn injection budgets
+#: (skillTokenBudget ?? 300, knowledgeTokenBudget ?? 200 -- .pi/extensions/
+#: skill-inject/index.ts, knowledge-inject/index.ts). Hardcoded to match the
+#: CURRENT real configuration (confirmed no override present in
+#: .pi/settings.json) -- a known simplification, not a settings-file parser,
+#: unwarranted until someone actually configures an override.
+_TOOL_SKILL_TOKEN_BUDGET = 300
+_KNOWLEDGE_TOKEN_BUDGET = 200
+
+
+def _token_budget_for(pred_name: str) -> int | None:
+    """None means "not subject to a selection budget" (agents_md -- always
+    injected, never competes for a slot)."""
+    if pred_name == "agents_md":
+        return None
+    if pred_name.startswith("skills_tools_"):
+        return _TOOL_SKILL_TOKEN_BUDGET
+    return _KNOWLEDGE_TOKEN_BUDGET
+
 _SCORING_RULE = (
     "Scoring: pass on attempt 1 = 1.00, attempt 2 = 0.70, attempt 3+ = 0.40, "
-    "any failure/timeout/error = 0.00. Fewer attempts is strictly better."
+    "any failure/timeout/error = 0.00. Fewer attempts is strictly better. "
+    "Each context compaction forced during the run (a symptom of injected "
+    "text being too large) subtracts 0.05 from that score, floored at 0.40 -- "
+    "shorter, more efficient instructions score better even at the same "
+    "pass/fail outcome."
 )
 
 
@@ -51,10 +75,14 @@ def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_i
     grounded in a real measurement instead of a guess about frozen data),
     test/diff evidence, and the scoring rule stated explicitly so the
     reflection LM optimizes the right objective."""
+    compaction_note = (
+        f" {result.compaction_total} context compaction(s) occurred during this run."
+        if result.compaction_total > 0 else ""
+    )
     parts = [
         f"{result.task_id} scored {result.score:.2f} (status={result.status}, "
         f"{result.attempts} attempt(s), stop_reasons={result.stop_reasons}, "
-        f"{result.elapsed_s:.1f}s, {result.turn_count} agent turns)."
+        f"{result.elapsed_s:.1f}s, {result.turn_count} agent turns).{compaction_note}"
     ]
 
     if pred_name == "agents_md":
@@ -156,6 +184,16 @@ class PolyglotGEPAAdapter:
         dataset: dict[str, list[dict[str, Any]]] = {}
         trajectories = eval_batch.trajectories or []
         for component in components_to_update:
+            # Computed directly from the live candidate body (not read back
+            # from a possibly-stale on-disk frontmatter value) -- always
+            # accurate regardless of whether write_components_back has run
+            # yet. None budget (agents_md) omits both keys entirely: there's
+            # no selection budget to optimize against.
+            budget = _token_budget_for(component)
+            token_cost_info = (
+                {"token_cost": _estimate_token_cost(candidate.get(component, "")), "token_budget": budget}
+                if budget is not None else {}
+            )
             records = []
             for traj in trajectories:
                 spec, result = traj.spec, traj.result
@@ -172,6 +210,7 @@ class PolyglotGEPAAdapter:
                         "transcript_excerpt": result.transcript_excerpt,
                         "reasoning_excerpt": result.reasoning_excerpt,
                         "summarized_transcript": result.summarized_transcript,
+                        **token_cost_info,
                     },
                     "Feedback": _component_feedback(component, result, self.knowledge_topic_index),
                     "score": result.score,
