@@ -18,7 +18,7 @@ HB_RUNS="$REPO_ROOT/benchmarks/harbor_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  RUN_ID=$(find "$HB_RUNS" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex '.*/(tb2|leaderboard|full|harbor)-.*' -printf '%f\n' 2>/dev/null | sort | tail -1)
+  RUN_ID=$(find -E "$HB_RUNS" -maxdepth 1 -mindepth 1 -type d -regex '.*/(tb2|leaderboard|full|harbor)-.*' 2>/dev/null | xargs -n1 -I{} stat -f '%m %N' {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- | xargs -n1 basename 2>/dev/null)
 fi
 if [ -z "$RUN_ID" ] || [ ! -d "$HB_RUNS/$RUN_ID" ]; then
   echo "No harbor run dir found (looked in $HB_RUNS)." >&2
