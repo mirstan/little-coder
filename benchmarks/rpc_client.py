@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import subprocess
@@ -145,7 +146,24 @@ class PiProcessExited(RuntimeError):
 #: pathological run, not the real trimming policy (which stays downstream,
 #: since it needs head+tail retention that isn't knowable mid-stream) --
 #: generous enough that no normal attempt gets anywhere near it.
+#:
+#: Split into a fixed HEAD (_NON_TEXT_DELTA_HEAD_KEEP) plus a rolling TAIL
+#: (the remainder) rather than a single head-only cap -- second real gap,
+#: confirmed by review: a naive "stop appending past _MAX_NON_TEXT_DELTAS"
+#: silently dropped every delta past the cap forever, including the true
+#: end of the stream. That defeated the exact backstop this constant exists
+#: for: aider_polyglot.py's own _cap_non_text_deltas() and
+#: live_eval.py's _reasoning_excerpt_from_trajectory() both specifically
+#: need the LATEST reasoning, and a pathological run long enough to hit
+#: this backstop is precisely the run whose true tail would otherwise be
+#: silently lost. Keeping a rolling tail preserves the most recent entries
+#: at all times, so downstream head+tail trimming still has a genuine tail
+#: to work with even when the raw stream blows past this cap.
 _MAX_NON_TEXT_DELTAS = 5_000
+#: Fixed prefix retained even once the rolling tail below is full --
+#: mirrors aider_polyglot.py's own _cap_non_text_deltas() head+tail split
+#: philosophy (never drop ALL early context, even under a hard budget).
+_NON_TEXT_DELTA_HEAD_KEEP = 500
 
 
 @dataclass
@@ -482,18 +500,27 @@ class PiRpc:
         else:
             result.stop_reason = "deadline"
         pending: dict[str, dict] = {}
+        # See PromptResult.non_text_deltas' own docstring and
+        # _MAX_NON_TEXT_DELTAS' -- a fixed head plus a bounded ROLLING tail
+        # (evicts its own oldest entry once full, O(1) amortized) rather
+        # than a single head-only cap, so a pathological run long past this
+        # backstop still keeps its true tail, not just its opening. Local
+        # to this call (not on `result` itself) so PromptResult.non_text_deltas
+        # stays a plain list for every other caller/consumer.
+        non_text_delta_head: list[dict] = []
+        non_text_delta_tail: collections.deque = collections.deque(
+            maxlen=_MAX_NON_TEXT_DELTAS - _NON_TEXT_DELTA_HEAD_KEEP
+        )
         for ev in events:
             t = ev.get("type")
             if t == "message_update":
                 delta = ev.get("assistantMessageEvent", {})
                 if delta.get("type") == "text_delta":
                     result.assistant_text += delta.get("delta", "")
-                elif len(result.non_text_deltas) < _MAX_NON_TEXT_DELTAS:
-                    # See PromptResult.non_text_deltas' own docstring --
-                    # bounded here as a pure memory-safety backstop; the
-                    # real head+tail trimming policy lives downstream in
-                    # aider_polyglot.py's _cap_non_text_deltas().
-                    result.non_text_deltas.append(delta)
+                elif len(non_text_delta_head) < _NON_TEXT_DELTA_HEAD_KEEP:
+                    non_text_delta_head.append(delta)
+                else:
+                    non_text_delta_tail.append(delta)
             elif t == "tool_execution_start":
                 pending[ev.get("toolCallId", "")] = {
                     "name": ev.get("toolName", ""),
@@ -515,6 +542,7 @@ class PiRpc:
                 result.compaction_events += 1
             elif t == "agent_end":
                 result.agent_ended = True
+        result.non_text_deltas = non_text_delta_head + list(non_text_delta_tail)
         return result
 
     def new_session(self):

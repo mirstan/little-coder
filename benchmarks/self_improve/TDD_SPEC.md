@@ -294,10 +294,27 @@ def test_parse_skill_inject_notification_research_directive_only():
     assert usages == []
 
 def test_parse_knowledge_inject_notification():
-    usages = parse_notification_line('[info] knowledge-inject: +2 ["binary_search","two_pointer"]')
+    """Real gap, confirmed by review: an earlier version of this example
+    passed no knowledge_topic_index at all and used topic strings
+    ("binary_search") that were really just the pred_name with the prefix
+    stripped -- implying pred_name is derived by prefixing the topic text.
+    It isn't: knowledge-inject's names are the entry's arbitrary human
+    `topic` FRONTMATTER FIELD (e.g. "Binary Search", with no textual
+    relation to the file stem -- see this section's own implementation
+    notes below), resolved ONLY via a topic->pred_name index built by
+    build_knowledge_topic_index(). Without that index this example would
+    actually return [] against the real parser (unresolved topics are
+    dropped with a warning, never guessed at)."""
+    usages = parse_notification_line(
+        '[info] knowledge-inject: +2 ["Binary Search","State-Space Search"]',
+        knowledge_topic_index={
+            "Binary Search": "skills_knowledge_binary_search",
+            "State-Space Search": "skills_knowledge_bfs_state_space",
+        },
+    )
     assert usages == [
         ComponentUsage(pred_name="skills_knowledge_binary_search", invocation_count=1),
-        ComponentUsage(pred_name="skills_knowledge_two_pointer", invocation_count=1),
+        ComponentUsage(pred_name="skills_knowledge_bfs_state_space", invocation_count=1),
     ]
 
 def test_parse_notification_line_falls_back_to_legacy_bare_comma_list():
@@ -364,16 +381,23 @@ def test_summarize_for_reflection_handles_empty_input():
 
 ### 2.2 Implementation notes for `common.py`
 
-- `parse_notification_line(line: str) -> list[ComponentUsage]`: regex
-  `r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):\s+(?:\+\d+\s+\[(?P<names>[^\]]*)\])?"`
-  extracts the `names` group as raw text, same as before; what changes is how
-  that text is parsed. Try `json.loads(f"[{names}]")` first (the current real
-  format is a JSON array, e.g. `["bash","read"]`) and only on failure fall back
-  to a bare comma-split (`names.split(",")`, stripped) for historical
-  trajectory data written before the JSON-array fix. Map `source ==
-  "skill-inject"` names to `skills_tools_{name}`, `knowledge-inject` names to
-  `skills_knowledge_{name}` (matches `config/components.yaml` pred_name
-  convention from the plan). No match → `[]`, never raise.
+- `parse_notification_line(line: str, knowledge_topic_index: dict[str, str] | None = None) -> list[ComponentUsage]`:
+  regex `r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):\s+(?:\+\d+\s+(?P<payload>\[.*\]))?"`
+  -- the `payload` group captures the WHOLE bracketed array text, brackets
+  included (not just the inner names), so it can be handed straight to
+  `json.loads(payload)`. Try that first (the current real format is a JSON
+  array, e.g. `["bash","read"]`) and only on failure fall back to stripping
+  the brackets and comma-splitting (`payload.strip("[]").split(",")`,
+  stripped) for historical trajectory data written before the JSON-array
+  fix. Map `source == "skill-inject"` names to `skills_tools_{name}`
+  directly (the tool name IS the file stem). `knowledge-inject` names are
+  each entry's `topic` FRONTMATTER FIELD -- an arbitrary human string with
+  no textual relation to the file stem (e.g. "State-Space Search" ->
+  `bfs_state_space.md`) -- so they can only be resolved via
+  `knowledge_topic_index` (built by `build_knowledge_topic_index()` against
+  the real repo and threaded through by the caller); a topic missing from
+  the index is dropped with a warning, never guessed at by string
+  transformation. No match → `[]`, never raise.
 - `merge_component_usage(lines, follows_error=False)`: groups by `pred_name`,
   sums counts, propagates `was_error_context` per-name (True if ANY contributing
   line was error-adjacent).

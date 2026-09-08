@@ -116,7 +116,18 @@ def _positive_int_env(name: str, default: int) -> int:
 #: showed single completions taking 200-900+s. Tripled to 2700, matching
 #: the same 3x used for GAIA's --timeout, so a hard multi-turn exercise is
 #: capability-limited rather than clock-limited.
-ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
+#: A NAMED constant (not inlined into the _positive_int_env() call below),
+#: importable on its own -- real gap, confirmed by review: live_eval.py's
+#: own per-exercise timeout estimate used to duplicate this as a bare 2700
+#: literal, and the regression test guarding against drift compared that
+#: literal against `_positive_int_env("ATTEMPT_TIMEOUT_S", 2700)` -- i.e.
+#: the SAME hardcoded 2700 passed right back in as the function's default
+#: argument, a tautology that could never detect a real change here.
+#: live_eval.py now imports this constant directly, so the two can never
+#: diverge by construction rather than by a test that re-asserts the
+#: duplicate.
+_ATTEMPT_TIMEOUT_S_DEFAULT = 2700
+ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", _ATTEMPT_TIMEOUT_S_DEFAULT)
 #: Per-attempt budget for `codex exec`, seconds.
 CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"

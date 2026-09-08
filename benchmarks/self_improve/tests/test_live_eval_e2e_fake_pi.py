@@ -483,19 +483,23 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
     an exercise via SIGTERM before even one INNER attempt's own (longer)
     budget had a chance to time out gracefully."""
     import benchmarks.aider_polyglot as aider_polyglot
+    import benchmarks.self_improve.live_eval as live_eval
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
-    # Real gap, confirmed by review: asserting against a bare 2700 literal
-    # only re-checks the very constant this test guards -- if
-    # aider_polyglot.py's own default is ever changed without updating
-    # live_eval.py's copy (the original regression), this would still
-    # pass. Call the real _positive_int_env() function directly (not the
-    # module-level ATTEMPT_TIMEOUT_S constant, which is cached at import
-    # time and wouldn't re-resolve under this test's monkeypatched env)
-    # so drift is actually detected.
+    # Real gap, confirmed by review (twice): the first fix here still kept
+    # a duplicated literal in live_eval.py and asserted against
+    # aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700) -- but
+    # with the env var unset that call just returns the SAME 2700 passed
+    # in as ITS OWN default argument, a tautology that could never detect
+    # aider_polyglot.py's real default actually changing. live_eval.py now
+    # imports aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT directly instead of
+    # duplicating it, so the identity check below (not just an equality
+    # check, which a coincidentally-matching duplicate could still pass)
+    # is a structural guarantee, not a test that has to re-detect drift.
+    assert live_eval._ATTEMPT_TIMEOUT_S_DEFAULT is aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT
+    real_default = aider_polyglot._ATTEMPT_TIMEOUT_S_DEFAULT
     monkeypatch.delenv("ATTEMPT_TIMEOUT_S", raising=False)
-    real_default = aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
     assert _attempt_timeout_s() == real_default
 
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:

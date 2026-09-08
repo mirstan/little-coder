@@ -23,6 +23,7 @@ from typing import Mapping, Sequence
 
 import yaml
 
+import benchmarks.aider_polyglot as _aider_polyglot_module
 import benchmarks.self_improve.components as _components_module
 import benchmarks.self_improve.ingest.aider_polyglot_ingest as _aider_polyglot_ingest_module
 from benchmarks.self_improve.components import split_frontmatter, write_components_back
@@ -35,16 +36,24 @@ from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
 
-#: Mirrors aider_polyglot.py's own ATTEMPT_TIMEOUT_S default. Read from the
-#: SAME env var that module reads (not hardcoded), so the two can never
-#: silently drift apart the way a bare literal here already did once: this
-#: harness-level default was still 900 when aider_polyglot.py's own default
-#: was tripled to 2700 for a local reasoning model, meaning the OUTER
-#: subprocess timeout below would have fired and killed the exercise via
-#: SIGTERM/SIGKILL before even ONE inner attempt's own (now longer) budget
-#: had a chance to time out gracefully -- turning a clean, correctly-
-#: classified fail_timeout into an abrupt harness_error instead.
-_ATTEMPT_TIMEOUT_S_DEFAULT = 2700
+#: Mirrors aider_polyglot.py's own ATTEMPT_TIMEOUT_S default -- imported
+#: directly from that module's own named constant, not a duplicated bare
+#: literal, so the two can never silently drift apart the way this
+#: harness-level default already did once: it was still 900 when
+#: aider_polyglot.py's own default was tripled to 2700 for a local
+#: reasoning model, meaning the OUTER subprocess timeout below would have
+#: fired and killed the exercise via SIGTERM/SIGKILL before even ONE inner
+#: attempt's own (now longer) budget had a chance to time out gracefully --
+#: turning a clean, correctly-classified fail_timeout into an abrupt
+#: harness_error instead. Real gap, confirmed by review: an earlier version
+#: of this fix kept the literal duplicated and only added a test asserting
+#: `_attempt_timeout_s() == aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S",
+#: 2700)` -- but with the env var unset that call just returns the SAME
+#: 2700 passed in as its own default argument, a tautology that could never
+#: detect aider_polyglot.py's default actually changing. Importing the
+#: module's own constant directly removes the duplication (and the
+#: tautological test) instead of trying to test around it.
+_ATTEMPT_TIMEOUT_S_DEFAULT = _aider_polyglot_module._ATTEMPT_TIMEOUT_S_DEFAULT
 
 
 def _attempt_timeout_s() -> int:
@@ -254,17 +263,24 @@ class PolyglotLiveRunner:
         causing spurious re-runs of already-cached (and possibly still
         in-flight) work.
 
-        aider_polyglot_ingest.py/components.py are the OPPOSITE case, hashed
-        from the module `__file__` this SAME (parent, orchestrator) process
-        actually imported -- confirmed real gap by review: pass_n_score()
-        and write_components_back() run here, in the parent process
-        (imported at the top of this module), never inside the scratch
-        worktree at all, so hashing the worktree's copy of them (as an
-        earlier version of this property did) couldn't detect an
+        aider_polyglot_ingest.py/components.py/this module itself are the
+        OPPOSITE case, hashed from the module `__file__` this SAME (parent,
+        orchestrator) process actually imported -- confirmed real gap by
+        review: pass_n_score() and write_components_back() run here, in the
+        parent process (imported at the top of this module), never inside
+        the scratch worktree at all, so hashing the worktree's copy of them
+        (as an earlier version of this property did) couldn't detect an
         uncommitted retune of e.g. _COMPACTION_PENALTY or
         _estimate_token_cost -- LiveResultCache would keep serving scores
         computed under the old formula even though the orchestrator's own
-        process had already picked up the edit."""
+        process had already picked up the edit. This module's own
+        `__file__` is included for the identical reason, confirmed real
+        gap by a second review round: _parse_result() below (the
+        self_reported_lessons cap, pass_n_score() call site, etc.) also
+        runs here in the parent process -- an uncommitted edit to this
+        module's own processing logic used to leave a persistent cache
+        entry computed under the OLD logic being served forever, since
+        nothing in run_config depended on this file's own content."""
         worktree_executed_files = [
             self.worktree.path / "benchmarks" / "aider_polyglot.py",
             self.worktree.path / "benchmarks" / "rpc_client.py",
@@ -272,6 +288,7 @@ class PolyglotLiveRunner:
         parent_imported_files = [
             Path(_aider_polyglot_ingest_module.__file__),
             Path(_components_module.__file__),
+            Path(__file__),
         ]
         hasher = hashlib.sha256()
         for f in worktree_executed_files + parent_imported_files:

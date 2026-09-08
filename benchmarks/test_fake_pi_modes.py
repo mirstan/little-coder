@@ -143,12 +143,26 @@ def test_non_text_deltas_are_bounded_during_collection(fake_pi, tmp_path, monkey
     the fact, at persist time, by aider_polyglot.py's own
     _cap_non_text_deltas(). A pathological reasoning stream emitting more
     than rpc_client._MAX_NON_TEXT_DELTAS events must not grow the
-    in-memory list past that backstop."""
-    monkeypatch.setenv("FAKE_PI_NON_TEXT_DELTA_COUNT", str(rpc_client._MAX_NON_TEXT_DELTAS + 50))
+    in-memory list past that backstop.
+
+    Second real gap, confirmed by review: a naive head-only cap ("stop
+    appending past the limit") silently discarded every delta past the
+    cap forever, including the true END of the stream -- exactly what
+    downstream head+tail trimming (aider_polyglot.py's
+    _cap_non_text_deltas(), live_eval.py's reasoning excerpt) needs most
+    from a pathological run long enough to hit this backstop. The fixed
+    head (_NON_TEXT_DELTA_HEAD_KEEP) plus rolling tail must retain BOTH
+    the opening and the true end, not just the opening."""
+    count = rpc_client._MAX_NON_TEXT_DELTAS + 50
+    monkeypatch.setenv("FAKE_PI_NON_TEXT_DELTA_COUNT", str(count))
     with fake_pi("emit_more_than_max_non_text_deltas", tmp_path) as rpc:
         r = rpc.prompt_and_collect("go", timeout=30)
     assert len(r.non_text_deltas) == rpc_client._MAX_NON_TEXT_DELTAS
-    # The FIRST entries survive (a pure safety backstop, not the real
-    # trimming policy -- that stays downstream in _cap_non_text_deltas,
-    # which needs head+tail retention not knowable mid-stream).
+    # Fixed head: the earliest entries always survive.
     assert r.non_text_deltas[0]["delta"] == "chunk 0"
+    assert r.non_text_deltas[rpc_client._NON_TEXT_DELTA_HEAD_KEEP - 1]["delta"] == (
+        f"chunk {rpc_client._NON_TEXT_DELTA_HEAD_KEEP - 1}"
+    )
+    # Rolling tail: the TRUE end of the stream survives too, not just
+    # whatever was most recent at the moment the head filled up.
+    assert r.non_text_deltas[-1]["delta"] == f"chunk {count - 1}"
