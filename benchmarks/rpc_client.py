@@ -413,26 +413,70 @@ class PiRpc:
             f"pi exited before acknowledging request {rid}; stderr:\n{self.stderr()}"
         )
 
-    def _drain_events_until(self, predicate, timeout: float) -> list[dict]:
-        """Drain events until `predicate(event)` returns True or timeout."""
+    def _drain_events_until(
+        self,
+        predicate,
+        timeout: float,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> list[dict]:
+        """Drain events until `predicate(event)` returns True or timeout.
+
+        `on_event`, if given, is called synchronously for each event the
+        instant it's popped off the queue -- i.e. in real time as pi emits
+        them, not after the whole call returns. This is what lets a caller
+        (e.g. the Harbor adapter) stream a live trajectory log instead of
+        only writing a summary once prompt_and_collect finally returns.
+
+        Caller-supplied code (`on_event` and `predicate`) runs OUTSIDE
+        self._cv, deliberately: while this thread holds that lock the reader
+        thread cannot queue anything, so a callback doing slow file I/O would
+        stall event demultiplexing (and with it the tb_shell proxy, which the
+        same reader thread services), and a callback that reached back into
+        PiRpc -- notifications(), stderr(), another prompt -- would deadlock
+        outright on the non-reentrant lock.
+
+        Events are popped one at a time (not batch-snapshotted) specifically
+        for exception safety: if on_event/predicate raises, `collected` (and
+        with it every event from this call, including ones already handed to
+        on_event) is discarded along with the exception -- but everything
+        still sitting in self._event_q, including a possible agent_end, is
+        untouched and available to the next call. An earlier batch-snapshot
+        version cleared the whole queue up front and only requeued the
+        unconsumed remainder on the predicate-match path, so a mid-batch
+        exception silently dropped even the events that hadn't been through
+        on_event yet.
+        """
         start = time.time()
         collected: list[dict] = []
-        with self._cv:
-            while True:
-                while self._event_q:
-                    ev = self._event_q.pop(0)
-                    collected.append(ev)
-                    if predicate(ev):
+        while True:
+            # Rechecked every iteration, not just while _event_q is empty --
+            # if on_event is slow and the reader keeps appending faster than
+            # we drain, _event_q could stay nonempty indefinitely and this
+            # loop would never otherwise notice the deadline passed.
+            if timeout - (time.time() - start) <= 0:
+                return collected
+            with self._cv:
+                while not self._event_q:
+                    if self._eof:
+                        return collected      # queue drained above; pi is gone
+                    remaining = timeout - (time.time() - start)
+                    if remaining <= 0:
                         return collected
-                if self._eof:
-                    return collected      # queue drained above; pi is gone
-                remaining = timeout - (time.time() - start)
-                if remaining <= 0:
-                    return collected
-                self._cv.wait(timeout=remaining)
+                    self._cv.wait(timeout=remaining)
+                ev = self._event_q.pop(0)
+            collected.append(ev)
+            if on_event is not None:
+                on_event(ev)
+            if predicate(ev):
+                return collected
 
     # ── Public API ───────────────────────────────────────────────────────
-    def prompt_and_collect(self, message: str, timeout: float = 900) -> PromptResult:
+    def prompt_and_collect(
+        self,
+        message: str,
+        timeout: float = 900,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> PromptResult:
         """Send a prompt, drain events until agent_end, return summary.
 
         Retries the SEND (not the whole turn) a few times on "Agent is already
@@ -443,6 +487,11 @@ class PiRpc:
         caller correctly waited for agent_end. Not observed at pi's default
         thinking level; higher effort apparently widens whatever internal
         window this races on.
+
+        `on_event`: optional callback invoked in real time as each RPC event
+        arrives (see _drain_events_until) -- lets a caller stream a live
+        trajectory log instead of only seeing the aggregated PromptResult
+        once this call finally returns.
         """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
@@ -487,6 +536,7 @@ class PiRpc:
         events = self._drain_events_until(
             lambda ev: ev.get("type") == "agent_end",
             timeout=timeout,
+            on_event=on_event,
         )
 
         result = PromptResult()

@@ -209,8 +209,19 @@ def _prepare_javascript(src: Path, work: Path):
         for pattern, repl in _JS_UNSKIP_PATTERNS:
             content = pattern.sub(repl, content)
         t.write_text(content)
-    if _JS_SHARED_NODE_MODULES.is_dir():
-        (work / "node_modules").symlink_to(_JS_SHARED_NODE_MODULES)
+    if not _JS_SHARED_NODE_MODULES.is_dir():
+        # Hard failure, not a silent skip. Nothing in this repo creates the
+        # shared install, so on any machine where it hasn't been set up by
+        # hand every exercise would run `npm test` with zero dependencies
+        # installed, fail every test, and be recorded as a run of genuine
+        # model failures instead of the harness setup gap it actually is.
+        raise RuntimeError(
+            f"shared JS deps missing at {_JS_SHARED_NODE_MODULES}; create them "
+            f"once with: mkdir -p '{_JS_SHARED_NODE_MODULES.parent}' && cp "
+            f"'{src / 'package.json'}' '{_JS_SHARED_NODE_MODULES.parent}/' && "
+            f"(cd '{_JS_SHARED_NODE_MODULES.parent}' && npm install)"
+        )
+    (work / "node_modules").symlink_to(_JS_SHARED_NODE_MODULES)
     stubs = [
         p for p in work.glob("*.js")
         if p not in tests and p.name != "babel.config.js"
@@ -283,7 +294,8 @@ def _purge_log_dir(log_dir: Path):
     next to a fresh trajectory_1. Those pairs look like one run and are not:
     comparing them produced a confident, wrong conclusion during review.
     """
-    for pattern in ("trajectory_*", "workdir_*", "final_output*"):
+    for pattern in ("trajectory_*", "workdir_*", "final_output*",
+                    "codex_last_message_*", "codex_stderr_*"):
         for path in log_dir.glob(pattern):
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
@@ -636,7 +648,11 @@ def _score(desc, work: Path, timeout: int):
         return desc["run_tests"](work, timeout)
     with tempfile.TemporaryDirectory() as scratch:
         target = Path(scratch) / work.name
-        shutil.copytree(work, target)
+        # symlinks=True: JS work dirs contain a `node_modules` symlink to the
+        # shared install. Dereferencing it copies the whole dependency tree
+        # (hundreds of MB) on every scoring pass of every attempt; preserving
+        # the (absolute) symlink still resolves from the copy.
+        shutil.copytree(work, target, symlinks=True)
         return desc["run_tests"](target, timeout)
 
 
@@ -1177,7 +1193,12 @@ def main():
                 thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
-            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
+            # 1000, not 400: some exceptions (e.g. the JS shared-deps
+            # RuntimeError in _prepare_javascript) are deliberately raised
+            # with a full remediation command in the message -- truncating
+            # too tightly cuts off the actual fix instruction the hard
+            # failure exists to surface.
+            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:1000]}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
         # Idempotent after the first exercise (thinking_confirmation stops

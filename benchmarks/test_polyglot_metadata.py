@@ -62,11 +62,23 @@ def test_exit_code_ignores_records_this_run_did_not_write():
 def test_missing_exercise_dir_makes_the_process_exit_nonzero(tmp_path):
     """End-to-end: a broken environment must not look like a finished 0% run."""
     env = dict(os.environ, PYTHONPATH=str(HARNESS.parent))
-    r = subprocess.run(
-        [sys.executable, str(HARNESS), "--language", "python",
-         "--exercise", "definitely-not-an-exercise", "--model", "fake/model"],
-        capture_output=True, text=True, env=env, timeout=120,
-    )
+    # main() rewrites AP.RESULTS_FILE unconditionally at startup, and this is a
+    # real subprocess, so nothing here can monkeypatch it: save and restore the
+    # file, or running the test suite silently destroys the results of whatever
+    # real benchmark run last wrote it.
+    results_file = AP.RESULTS_FILE
+    saved = results_file.read_bytes() if results_file.exists() else None
+    try:
+        r = subprocess.run(
+            [sys.executable, str(HARNESS), "--language", "python",
+             "--exercise", "definitely-not-an-exercise", "--model", "fake/model"],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+    finally:
+        if saved is None:
+            results_file.unlink(missing_ok=True)
+        else:
+            results_file.write_bytes(saved)
     assert r.returncode != 0, f"exited 0 despite a harness error\n{r.stdout}\n{r.stderr}"
     assert "error" in (r.stdout + r.stderr).lower()
 

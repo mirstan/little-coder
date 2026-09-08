@@ -74,6 +74,12 @@ export function isSafeBash(command: string, prefixes: readonly string[] = getSaf
 // Which tools count as "hands a string to a shell" lives in _shared, so this
 // gate and write-guard can never disagree about it again (issue #70).
 
+// A plain subcommand word: `merge`, `install`, `compose`, `run-tests`, `3.11`.
+// Deliberately excludes anything with a scheme/userinfo (`:`, `/`, `@`), an
+// `=`, a leading `-`, or shell metacharacters — see the offenderLabel comment
+// below for why that matters.
+const SUBCOMMAND_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 function getPermissionMode(): "auto" | "accept-all" | "manual" {
   const v = process.env.LITTLE_CODER_PERMISSION_MODE;
   if (v === "accept-all" || v === "manual") return v;
@@ -129,10 +135,32 @@ export default function (pi: ExtensionAPI) {
           // times instead of recognizing a fixed, principled block. Two
           // words is enough to disambiguate without echoing a long/sensitive
           // command line into the reason string.
-          const offenderLabel =
-            offenderWords.length > 1
-              ? `${offenderWords[0]} ${offenderWords[1]}`
-              : offenderWords[0];
+          //
+          // The second word is only borrowed when it is SUBCOMMAND-SHAPED
+          // (SUBCOMMAND_RE below). Everything else — flags, URLs, key=value
+          // args, paths, quoted strings — falls back to the bare binary, for
+          // two reasons:
+          //   1. Secrets. The reason string is model-visible and ends up in
+          //      transcripts and benchmark logs, and a refused command's
+          //      second token is exactly where a credential tends to sit
+          //      (`curl https://user:token@host`, `psql postgres://u:p@h`).
+          //      A bare `[a-z]`-ish word can't carry a URL userinfo, a
+          //      `KEY=secret`, or a quoted header value.
+          //   2. The suggestion has to survive a copy-paste. It is
+          //      interpolated into LITTLE_CODER_BASH_ALLOW="<label>", so a
+          //      token containing `"`, `$`, or a backtick would either break
+          //      the quoting or introduce shell expansion in the line we are
+          //      telling the user to run, and a `,` would be split into two
+          //      prefixes by parseExtraPrefixes.
+          // `git merge`, `npm install`, `docker run` — the cases that
+          // motivated this — all still get their two-word label.
+          const subcommand =
+            offenderWords.length > 1 && SUBCOMMAND_RE.test(offenderWords[1])
+              ? offenderWords[1]
+              : undefined;
+          const offenderLabel = subcommand
+            ? `${offenderWords[0]} ${subcommand}`
+            : offenderWords[0];
           // Say what to do next, not just what was refused.
           //
           // The bare "not in SAFE_PREFIXES" line sent models hunting: observed

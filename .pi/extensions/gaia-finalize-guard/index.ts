@@ -24,10 +24,22 @@ import { resolveTurnCap } from "../_shared/turn-cap.ts";
 // call once the implementation is already written and tested in an earlier
 // turn — this guard would misfire there.
 //
-// Fires at most once per task (reset on session_start, matching
-// thinking-budget/finalize-warn's own convention) — a single nudge, not an
-// open-ended retry loop. If the model still doesn't finalize, the run ends
-// on whatever it says next, same as before this extension existed.
+// Fires at most once per SESSION, not once per agent run — a single nudge,
+// not an open-ended retry loop. If the model still doesn't finalize, the run
+// ends on whatever it says next, same as before this extension existed.
+//
+// The latch is deliberately session-scoped (reset on session_start, like
+// thinking-budget's session state) rather than run-scoped the way
+// finalize-warn resets `warnedThisRun` on before_agent_start. A GAIA task is
+// one session, and pi may start a fresh low-level agent run inside that
+// session to deliver queued messages or to auto-retry (docs/extensions.md:
+// "agent_end fires when that run ends, but Pi may still auto-retry,
+// auto-compact and retry, or continue with queued follow-up messages"), so
+// re-arming on before_agent_start could let this guard nudge the same
+// trailing-off model repeatedly. The cost is that a genuine second agent run
+// in one session (e.g. after a retry) gets no nudge — accepted, since the
+// alternative risks a nudge loop. The counters below ARE run-scoped, because
+// they only describe the current run's position against the turn cap.
 
 // A close mirror of gaia_scorer.py's extract_final_answer() regex, applied
 // per physical line like the Python version (splitlines() + line.strip()) —
@@ -51,7 +63,7 @@ import { resolveTurnCap } from "../_shared/turn-cap.ts";
 //     unfinished reply this guard exists to catch).
 const ANSWER_LINE_RE = /^\s*(?:final\s+answer|answer)\s*[:\-][ \t]*(\S.*)$/im;
 
-let nudgedThisRun = false;
+let nudgedThisSession = false;
 // Mirrors turn-cap's own turn counting: the cap VALUE comes from the shared
 // resolveTurnCap() (same resolution turn-cap and finalize-warn use), but the
 // turnsThisRun counter itself stays local — it's per-extension mutable
@@ -67,7 +79,7 @@ let capForRun = 0;
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
-    nudgedThisRun = false;
+    nudgedThisSession = false;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -81,7 +93,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (event, ctx) => {
     if (process.env.LITTLE_CODER_BENCHMARK !== "gaia") return;
-    if (nudgedThisRun) return;
+    if (nudgedThisSession) return;
     // A nudge queued now would become the prompt for turnsThisRun + 1;
     // if that exceeds the cap, turn-cap aborts before the model sees it.
     if (capForRun > 0 && turnsThisRun >= capForRun) return;
@@ -133,7 +145,7 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "steer" },
       );
     } catch {
-      // SDK without sendUserMessage — leave nudgedThisRun false so a later
+      // SDK without sendUserMessage — leave nudgedThisSession false so a later
       // turn_end can still try; if the SDK genuinely lacks this call for
       // the whole session, later attempts will fail identically and cost
       // nothing extra.
@@ -147,7 +159,7 @@ export default function (pi: ExtensionAPI) {
     // missing entirely, or a stale ctx) can't burn the one-shot slot or show
     // a misleading "asking the model to..." notification for a call that
     // never happened at all.
-    nudgedThisRun = true;
+    nudgedThisSession = true;
     harnessIntervention(
       ctx,
       "turn ended without a tool call or an Answer: line — asking the model to continue or finalize.",
