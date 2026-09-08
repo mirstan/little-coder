@@ -47,7 +47,15 @@ HB_CMD=(harbor run
   --agent-import-path benchmarks.harbor_adapter.little_coder_agent:LittleCoderAgent
   --model "$MODEL"
   --jobs-dir "$OUT"
-  --n-concurrent 1)
+  --n-concurrent 1
+  # TB2.0 tasks pin an amd64-only prebuilt image per task; on arm64 Docker
+  # hosts this silently falls back to Rosetta/QEMU emulation (confirmed:
+  # overfull-hbox's perl/pdflatex search loop ran under rosetta, contributing
+  # to it hitting its deadline). --force-build makes harbor build each task's
+  # own environment/Dockerfile locally instead of pulling the pinned image,
+  # targeting the local Docker daemon's native platform -- content-addressed
+  # and cached, so it's a one-time build per task, not per-trial.
+  --force-build)
 
 if groups | grep -q '\bdocker\b'; then
   cd "$REPO_ROOT" && "${HB_CMD[@]}"
