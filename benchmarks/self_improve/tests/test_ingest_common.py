@@ -43,20 +43,40 @@ def test_parse_skill_inject_notification_resolves_camelcase_target_tool_via_inde
     assert usages == [ComponentUsage(pred_name="skills_tools_browser_click", invocation_count=1)]
 
 
-def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_from_index():
+def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_from_index(caplog):
     """A target_tool not in the index (e.g. no index passed at all, or a
     renamed/deleted tool skill) degrades to the old blind-prefix guess
     rather than dropping the record -- unlike knowledge-inject, which has
     no reasonable fallback at all (a topic has no textual relation to its
     pred_name), skill-inject's blind prefix is at least USUALLY correct,
     so keeping it as a fallback (rather than always dropping) avoids
-    regressing every caller that hasn't been updated to pass an index."""
+    regressing every caller that hasn't been updated to pass an index.
+
+    A REAL (non-None) index that just doesn't contain this name -- as
+    opposed to no index at all -- must log a warning: real gap, confirmed
+    by review, this is the actually-concerning case (e.g. a
+    renamed/deleted tool skill silently corrupting usage signal)."""
     payload = json.dumps(["bash"])
-    usages = parse_notification_line(
-        f"[info] skill-inject: +1 {payload}",
-        knowledge_topic_index={_index_key("skill-inject", "BrowserClick"): "skills_tools_browser_click"},
-    )
+    with caplog.at_level("WARNING"):
+        usages = parse_notification_line(
+            f"[info] skill-inject: +1 {payload}",
+            knowledge_topic_index={_index_key("skill-inject", "BrowserClick"): "skills_tools_browser_click"},
+        )
     assert usages == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
+    assert "not found in the provided tool-skill index" in caplog.text
+
+
+def test_parse_skill_inject_notification_fallback_is_silent_when_no_index_passed_at_all(caplog):
+    """Real gap, confirmed by review: an earlier fix warned on EVERY
+    fallback unconditionally, which made "no index passed" (every caller
+    not yet updated, every test above) indistinguishable in the logs from
+    -- and just as noisy as -- the actually-concerning "index passed but
+    missing this name" case. No index at all is the expected, benign
+    case this fallback exists for; it must not warn."""
+    with caplog.at_level("WARNING"):
+        usages = parse_notification_line("[info] skill-inject: +1 [bash]")
+    assert usages == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
+    assert caplog.text == ""
 
 
 def test_parse_skill_inject_notification_research_directive_only():

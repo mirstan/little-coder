@@ -619,3 +619,24 @@ def test_attempt_timeout_default_from_source_warns_when_file_missing(tmp_path, c
 
     assert value == _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
     assert "could not read" in caplog.text
+
+
+def test_attempt_timeout_default_from_source_warns_on_non_utf8_file(tmp_path, caplog):
+    """Real gap, confirmed by review: UnicodeDecodeError is NOT an OSError
+    subclass (it's a ValueError) -- a bare `except OSError` let it
+    propagate straight out of this function, aborting live_eval's own
+    module import (this function runs once at module level) on a
+    non-UTF-8 locale/file, before even --estimate-only could run."""
+    from benchmarks.self_improve.live_eval import (
+        _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK,
+        _attempt_timeout_default_from_source,
+    )
+
+    non_utf8 = tmp_path / "aider_polyglot.py"
+    non_utf8.write_bytes(b"_ATTEMPT_TIMEOUT_S_DEFAULT = 2700\n\xff\xfe not utf-8 \x80")
+
+    with caplog.at_level("WARNING"):
+        value = _attempt_timeout_default_from_source(non_utf8)
+
+    assert value == _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
+    assert "could not read" in caplog.text

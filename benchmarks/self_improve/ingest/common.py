@@ -211,12 +211,18 @@ def parse_notification_line(
     fallback is kept only so a caller that doesn't build/pass an index at
     all (every unit test in this module, and any future caller not yet
     updated) keeps its old, still-usually-correct behavior instead of
-    losing every skill-inject usage record outright -- but the fallback
-    now always logs a warning when it fires (real gap, confirmed by review:
-    an earlier version warned only on the knowledge-inject drop path, so a
+    losing every skill-inject usage record outright -- and now logs a
+    warning whenever it fires WITH a real (non-None) index that just
+    doesn't contain this name (real gap, confirmed by review, twice: an
+    earlier version warned only on the knowledge-inject drop path, so a
     skill-inject name silently missing from a REAL, present index -- e.g.
-    a renamed/deleted tool skill -- corrupted usage signal with no trace,
-    indistinguishable in the logs from the expected no-index-passed case).
+    a renamed/deleted tool skill -- corrupted usage signal with no trace;
+    the very next fix then warned UNCONDITIONALLY, which collapsed right
+    back into being indistinguishable from -- and noisy for -- the
+    expected no-index-passed case, since `knowledge_topic_index or {}`
+    can't tell "wasn't given one" from "given one that's missing this
+    name" apart. Only the caller's ORIGINAL argument being non-None
+    distinguishes them).
 
     Index keys are namespaced by source (see _index_key()) so a tool's
     target_tool can never collide with an unrelated knowledge/protocol
@@ -232,18 +238,30 @@ def parse_notification_line(
         return []
     source = m.group("source")
 
+    # Real gap, confirmed by review: `knowledge_topic_index or {}` collapses
+    # "no index passed at all" (every unit test in this module; the
+    # expected, benign case the fallback exists FOR) and "a real index was
+    # passed but doesn't contain this name" (the actually-concerning case
+    # -- a renamed/deleted tool skill silently corrupting usage signal)
+    # into the exact same `index = {}` -- a warning fired for both would
+    # be indistinguishable in the logs (defeating the point) AND spam every
+    # no-index caller. Keep the distinction: only warn when the caller
+    # actually opted into indexed resolution.
+    index_was_provided = knowledge_topic_index is not None
     index = knowledge_topic_index or {}
     usages = []
     for name in names:
         pred_name = index.get(_index_key(source, name))
         if pred_name is None:
             if source == "skill-inject":
-                logger.warning(
-                    "parse_notification_line: skill-inject target_tool %r not found in "
-                    "the tool-skill index -- falling back to a blind name->pred_name "
-                    "guess (skills_tools_%s), which is wrong whenever target_tool "
-                    "differs from the file stem", name, name,
-                )
+                if index_was_provided:
+                    logger.warning(
+                        "parse_notification_line: skill-inject target_tool %r not found "
+                        "in the provided tool-skill index (e.g. a renamed/deleted tool "
+                        "skill) -- falling back to a blind name->pred_name guess "
+                        "(skills_tools_%s), which is wrong whenever target_tool differs "
+                        "from the file stem", name, name,
+                    )
                 pred_name = f"skills_tools_{name}"
             else:
                 logger.warning(

@@ -94,10 +94,18 @@ def _attempt_timeout_default_from_source(aider_polyglot_py_path: Path) -> int:
     exactly the silent-drift failure this whole mechanism exists to
     prevent. Still never RAISES (this is a budget estimate, not a
     correctness-critical read -- see the module-level comment), but now
-    always logs so a real drift is at least detectable instead of silent."""
+    always logs so a real drift is at least detectable instead of silent.
+
+    Real gap, confirmed by review: UnicodeDecodeError is NOT an OSError
+    subclass (it's a ValueError) -- on a non-UTF-8 locale/file, a bare
+    `except OSError` would let it propagate straight out of this function,
+    aborting live_eval's own module import (this function is called once
+    at module level to compute _ATTEMPT_TIMEOUT_S_DEFAULT) before even
+    --estimate-only could run. Same class of bug build_knowledge_topic_index
+    already guards against for the same reason."""
     try:
         text = aider_polyglot_py_path.read_text()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         logger.warning(
             "_attempt_timeout_default_from_source: could not read %s (%s) -- "
             "using hardcoded fallback %d", aider_polyglot_py_path, e,
