@@ -95,7 +95,22 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
         trial_dir = logs_dir.parent
         config = json.loads((trial_dir / "config.json").read_text())
         multiplier = float(config["timeout_multiplier"])
-        task_name = config["task"]["path"]
+        # A legacy name@version trial config's task dict has "path" (a bare
+        # task name, e.g. "configure-git-webserver"); a newer org/name
+        # package dataset's has "name" instead (namespaced, e.g.
+        # "terminal-bench/overfull-hbox") and no "path" key at all -- using
+        # the wrong key unconditionally raised KeyError, silently swallowed
+        # by this function's own broad except-fallback, so every trial under
+        # a package dataset silently used DEFAULT_PROMPT_TIMEOUT_SEC instead
+        # of its real per-task budget (confirmed: caused overfull-hbox to be
+        # hard-killed by Harbor's own 2250s enforcement while this function
+        # still thought it had 3600s left). Confirmed both shapes live on
+        # disk, not assumed.
+        task_name = config["task"].get("name") or config["task"]["path"]
+        # Strip any "<org>/" namespace prefix -- both cache layouts key their
+        # task directory by the bare name only (see the two glob patterns
+        # below), never the namespaced form.
+        task_name = task_name.rsplit("/", 1)[-1]
         # Harbor caches a task's files differently depending on which
         # registry resolved the dataset: a legacy name@version dataset (e.g.
         # "terminal-bench@2.0") caches at <hash>/<task_name>/task.toml, while

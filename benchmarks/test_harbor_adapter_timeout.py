@@ -25,10 +25,23 @@ def _write_task_toml(path: Path, timeout_sec: float):
 
 
 def _write_trial_config(trial_dir: Path, task_name: str, multiplier: float = 3.0):
+    """Legacy name@version trial config shape: task.path is a bare name."""
     trial_dir.mkdir(parents=True, exist_ok=True)
     (trial_dir / "config.json").write_text(json.dumps({
         "timeout_multiplier": multiplier,
         "task": {"path": task_name},
+    }))
+
+
+def _write_trial_config_v21(trial_dir: Path, task_name: str, multiplier: float = 3.0):
+    """Newer org/name package dataset trial config shape: task.name is
+    namespaced (e.g. "terminal-bench/overfull-hbox"), and there is no "path"
+    key at all -- confirmed against a real terminal-bench/terminal-bench-2-1
+    run's on-disk config.json, not assumed."""
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    (trial_dir / "config.json").write_text(json.dumps({
+        "timeout_multiplier": multiplier,
+        "task": {"name": task_name, "ref": "sha256:deadbeef", "source": "terminal-bench/terminal-bench-2-1"},
     }))
 
 
@@ -65,6 +78,30 @@ def test_org_name_package_layout(tmp_path, monkeypatch):
     logs_dir.mkdir()
 
     assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(1200.0 * 3.0 * 0.9)
+
+
+def test_v21_config_shape_with_namespaced_task_name(tmp_path, monkeypatch):
+    """Regression test: a real terminal-bench/terminal-bench-2-1 trial's
+    config.json has task.name (namespaced), not task.path -- using the wrong
+    key raised KeyError, silently swallowed by the function's own broad
+    except-fallback, so every trial under a package dataset silently used
+    DEFAULT_PROMPT_TIMEOUT_SEC instead of its real per-task budget. Confirmed
+    directly: this caused overfull-hbox to be hard-killed by Harbor's own
+    2250s enforcement while the agent's internal deadline tracking still
+    thought it had 3600s left."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(lca, "HARBOR_TASK_CACHE", cache)
+    _write_task_toml(
+        cache / "packages" / "terminal-bench" / "overfull-hbox" / "contenthash789" / "task.toml",
+        750.0,
+    )
+
+    trial_dir = tmp_path / "trial"
+    _write_trial_config_v21(trial_dir, "terminal-bench/overfull-hbox")
+    logs_dir = trial_dir / "agent"
+    logs_dir.mkdir()
+
+    assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(750.0 * 3.0 * 0.9)
 
 
 def test_both_layouts_present_prefers_newest(tmp_path, monkeypatch):
