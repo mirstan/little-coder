@@ -38,7 +38,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from benchmarks.self_improve.components import load_components
+from benchmarks.self_improve.components import load_component_token_costs, load_components
 from benchmarks.self_improve.exercises import discover_exercises, practice_dir, select_exercises, split_train_val
 from benchmarks.self_improve.live_budget import (
     LiveBudget,
@@ -264,6 +264,14 @@ def _run_live(args: argparse.Namespace) -> int:
 
     component_paths = _load_component_paths(components_yaml)
     seed_candidate = load_components(components_yaml, repo_root=repo_root)
+    # The stable rescale baseline PolyglotGEPAAdapter needs to report an
+    # accurate live token_cost estimate to reflection (see
+    # components.py::_estimate_token_cost's own docstring for why an
+    # absolute chars/token estimate doesn't work for this corpus). Computed
+    # once, up front, from the real pristine files -- --only-components
+    # filtering below narrows seed_candidate but this can stay unfiltered,
+    # since it's looked up by pred_name, not iterated wholesale.
+    seed_token_costs = load_component_token_costs(components_yaml, repo_root=repo_root)
     if args.only_components:
         only = set(c.strip() for c in args.only_components.split(","))
         unknown = only - set(seed_candidate)
@@ -437,6 +445,7 @@ def _run_live(args: argparse.Namespace) -> int:
         adapter = PolyglotGEPAAdapter(
             runner, component_paths=component_paths, practice_dir_path=pdir,
             knowledge_topic_index=knowledge_topic_index,
+            seed_bodies=seed_candidate, seed_token_costs=seed_token_costs,
         )
 
         import gepa

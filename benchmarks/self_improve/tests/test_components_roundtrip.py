@@ -119,11 +119,15 @@ def test_write_components_back_recomputes_token_cost_when_body_changes(tmp_path)
     silently letting a candidate exceed the real budget with no guardrail
     catching it."""
     components_yaml = _make_repo(tmp_path)
+    _original_frontmatter, original_body = split_frontmatter(FRONTMATTER_FIXTURE)
     new_body = "## `bash` Tool (v2)\nA much longer revised body than before, with more guidance text.\n"
     write_components_back(components_yaml, repo_root=tmp_path, optimized={"skills_tools_bash": new_body})
 
     written = (tmp_path / "skills" / "tools" / "bash.md").read_text()
-    expected_cost = _estimate_token_cost(new_body)
+    # Rescaled from the original hand-authored cost (120) proportionally to
+    # the body's length change, not derived from an absolute chars/token
+    # ratio -- see _estimate_token_cost's own docstring for why.
+    expected_cost = _estimate_token_cost(120, original_body, new_body)
     assert f"token_cost: {expected_cost}" in written
     assert "token_cost: 120" not in written  # the stale original value is gone
 

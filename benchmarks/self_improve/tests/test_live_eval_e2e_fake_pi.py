@@ -70,6 +70,12 @@ def source_repo(tmp_path):
     (repo / "benchmarks").mkdir()
     shutil.copy(REAL_REPO_ROOT / "benchmarks" / "aider_polyglot.py", repo / "benchmarks" / "aider_polyglot.py")
     shutil.copy(REAL_REPO_ROOT / "benchmarks" / "rpc_client.py", repo / "benchmarks" / "rpc_client.py")
+    # Also hashed into run_config's harness_hash (the graded score has
+    # depended on these two since the compaction penalty / token_cost
+    # estimator landed) -- present here so a test can confirm that.
+    (repo / "benchmarks" / "self_improve" / "ingest").mkdir(parents=True)
+    (repo / "benchmarks" / "self_improve" / "ingest" / "aider_polyglot_ingest.py").write_text("SCORING_V1 = 1\n")
+    (repo / "benchmarks" / "self_improve" / "components.py").write_text("SCORING_V1 = 1\n")
 
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=repo, check=True)
@@ -313,6 +319,37 @@ def test_run_config_pi_bin_changes_with_a_different_binary(runner_factory, tmp_p
     for runner in runner_factory(pi_bin=other_pi):
         config_b = runner.run_config
     assert config_a["pi_bin"] != config_b["pi_bin"]
+
+
+def test_run_config_harness_hash_changes_when_the_scoring_files_change(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """Real gap, confirmed by review: the graded score has depended on
+    ingest/aider_polyglot_ingest.py (the compaction penalty formula) and
+    components.py (the token_cost estimator) since this PR, but
+    harness_hash only ever covered aider_polyglot.py/rpc_client.py -- an
+    uncommitted retune of either wouldn't change the cache key, so
+    LiveResultCache would keep serving scores computed under the old
+    formula."""
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
+
+    def _hash():
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+            runner = PolyglotLiveRunner(
+                worktree=wt, components_yaml=source_repo / "config" / "components.yaml",
+                model="fake/model", max_attempts=1, benchmark_root=fake_practice,
+            )
+            return runner.run_config["harness_hash"]
+
+    hash_before = _hash()
+
+    (source_repo / "benchmarks" / "self_improve" / "components.py").write_text("SCORING_V2 = 2\n")
+    subprocess.run(["git", "add", "-A"], cwd=source_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "retune scoring"], cwd=source_repo, check=True)
+
+    hash_after = _hash()
+    assert hash_before != hash_after
 
 
 def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, monkeypatch, tmp_path):

@@ -834,6 +834,17 @@ ordering and defeat the byte-for-byte guarantee the tests above pin down).
 `load_components`/`write_components_back` both take this same mapping so there is
 exactly one place a new skill file is registered.
 
+**Contract update** (later pass): `write_components_back` now makes ONE
+targeted exception to "frontmatter untouched" -- its `token_cost:` line is
+rewritten (still via a plain regex substitution on the raw frontmatter
+string, never a YAML parse+dump, so the byte-for-byte guarantee above still
+holds for every other line) whenever the body actually changes, so
+skill-inject/knowledge-inject's real per-turn injection budget isn't
+selecting against a stale, understated cost. See
+`components.py::_estimate_token_cost`'s own docstring for why this
+rescales from the file's own hand-authored cost rather than deriving an
+absolute chars/token estimate.
+
 ---
 
 ## 8. `rpc_client.py::_build_system_prompt()` change

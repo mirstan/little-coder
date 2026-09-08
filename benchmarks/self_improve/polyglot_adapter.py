@@ -31,9 +31,19 @@ from benchmarks.self_improve.live_eval import LiveRunResult, PolyglotLiveRunner
 #: skill-inject/index.ts, knowledge-inject/index.ts). Hardcoded to match the
 #: CURRENT real configuration (confirmed no override present in
 #: .pi/settings.json) -- a known simplification, not a settings-file parser,
-#: unwarranted until someone actually configures an override.
+#: unwarranted until someone actually configures an override. These are
+#: SHARED totals across every component selected in one turn, not a
+#: per-component allowance -- reported to reflection as "shared_token_budget"
+#: (not "token_budget") to avoid inviting one component to grow toward the
+#: whole shared total (real gap, confirmed by review).
 _TOOL_SKILL_TOKEN_BUDGET = 300
 _KNOWLEDGE_TOKEN_BUDGET = 200
+#: knowledge-inject/index.ts's PER_ENTRY_CAP -- a tighter, per-ENTRY hard
+#: reject that binds before the shared 200 total does. Real gap, confirmed
+#: by review: reporting only the shared budget invited growing a single
+#: knowledge/protocol entry into the 150-200 range, where the excess is
+#: silently discarded and a second entry gets crowded out of that turn.
+_KNOWLEDGE_PER_ENTRY_CAP = 150
 
 
 def _token_budget_for(pred_name: str) -> int | None:
@@ -152,11 +162,31 @@ class PolyglotGEPAAdapter:
         component_paths: Mapping[str, str],
         practice_dir_path: Path,
         knowledge_topic_index: Mapping[str, str] | None = None,
+        seed_bodies: Mapping[str, str] | None = None,
+        seed_token_costs: Mapping[str, int] | None = None,
     ):
         self.runner = runner
         self.component_paths = dict(component_paths)
         self.practice_dir_path = Path(practice_dir_path)
         self.knowledge_topic_index = dict(knowledge_topic_index or {})
+        # The stable, immutable rescale baseline for reporting a live
+        # token_cost estimate to reflection (see _current_token_cost_estimate)
+        # -- deliberately NOT read from the scratch worktree at
+        # make_reflective_dataset time, since a cache hit can skip
+        # materializing the current candidate there at all, leaving it
+        # stale or mid-candidate. Both optional (default {}): a component
+        # missing from either just omits token_cost/shared_token_budget from
+        # its Generated Outputs, the same way a None budget already does
+        # for agents_md.
+        self.seed_bodies = dict(seed_bodies or {})
+        self.seed_token_costs = dict(seed_token_costs or {})
+
+    def _current_token_cost_estimate(self, component: str, current_text: str) -> int | None:
+        old_cost = self.seed_token_costs.get(component)
+        old_body = self.seed_bodies.get(component)
+        if old_cost is None or not old_body:
+            return None
+        return _estimate_token_cost(old_cost, old_body, current_text)
 
     def evaluate(
         self, batch: Sequence[ExerciseSpec], candidate: dict[str, str], capture_traces: bool = False,
@@ -191,16 +221,23 @@ class PolyglotGEPAAdapter:
         dataset: dict[str, list[dict[str, Any]]] = {}
         trajectories = eval_batch.trajectories or []
         for component in components_to_update:
-            # Computed directly from the live candidate body (not read back
-            # from a possibly-stale on-disk frontmatter value) -- always
-            # accurate regardless of whether write_components_back has run
-            # yet. None budget (agents_md) omits both keys entirely: there's
-            # no selection budget to optimize against.
+            # Rescaled from the seed's own hand-calibrated cost (see
+            # _current_token_cost_estimate) -- not an absolute chars/token
+            # estimate, which review + real measurement confirmed has no
+            # single reliable ratio across this corpus (3.59-11.16
+            # chars/token). None omits token_cost/shared_token_budget
+            # entirely: either there's no selection budget to optimize
+            # against (agents_md) or no seed baseline is known for this
+            # component (adapter constructed without seed_bodies/
+            # seed_token_costs, e.g. in a unit test).
             budget = _token_budget_for(component)
-            token_cost_info = (
-                {"token_cost": _estimate_token_cost(candidate.get(component, "")), "token_budget": budget}
-                if budget is not None else {}
-            )
+            current_cost = self._current_token_cost_estimate(component, candidate.get(component, ""))
+            token_cost_info: dict[str, Any] = {}
+            if budget is not None and current_cost is not None:
+                token_cost_info["token_cost"] = current_cost
+                token_cost_info["shared_token_budget"] = budget
+                if not component.startswith("skills_tools_"):
+                    token_cost_info["per_entry_cap"] = _KNOWLEDGE_PER_ENTRY_CAP
             records = []
             for traj in trajectories:
                 spec, result = traj.spec, traj.result

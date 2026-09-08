@@ -236,6 +236,14 @@ class PolyglotLiveRunner:
         harness_files = [
             self.worktree.path / "benchmarks" / "aider_polyglot.py",
             self.worktree.path / "benchmarks" / "rpc_client.py",
+            # Real gap, confirmed by review: the graded score has depended on
+            # these two files too since the compaction penalty / token_cost
+            # estimator landed -- without them here, an uncommitted retune of
+            # e.g. _COMPACTION_PENALTY wouldn't change the cache key, so
+            # LiveResultCache would keep serving scores computed under the
+            # old formula.
+            self.worktree.path / "benchmarks" / "self_improve" / "ingest" / "aider_polyglot_ingest.py",
+            self.worktree.path / "benchmarks" / "self_improve" / "components.py",
         ]
         hasher = hashlib.sha256()
         for f in harness_files:

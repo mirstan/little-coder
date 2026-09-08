@@ -332,6 +332,93 @@ def test_run_exercise_captures_one_lesson_per_retried_attempt(tmp_path, monkeypa
     assert record["lessons"] == ["needed guidance 2", "needed guidance 3"]
 
 
+class _FakeRpcWithDecoratedLesson(_FakeRpc):
+    """Attempt 2's LESSON: line is wrapped in common markdown decoration a
+    model might reasonably use -- real gap, confirmed by review: a bullet,
+    heading, or leading bold wrapper used to silently match nothing."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+        lesson_line = f"\n- **LESSON:** needed guidance {self.n}\n" if self.n > 1 else ""
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = f"Some prose about attempt {self.n}.{lesson_line}More prose."
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_captures_a_lesson_wrapped_in_markdown_decoration(tmp_path, monkeypatch):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithDecoratedLesson)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert record["lessons"] == ["needed guidance 2"]
+
+
+class _FakeRpcWithHugeLesson(_FakeRpc):
+    """Same as _FakeRpc, but attempt 2's LESSON: line is far longer than any
+    real one-sentence answer should be -- every other free-text field on
+    this path is capped (out[-4000:], TRAJECTORY_TEXT_CHARS); this one used
+    to be the exception."""
+
+    def prompt_and_collect(self, message, timeout=900):
+        (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
+        huge = "x" * 10_000
+        lesson_line = f"\nLESSON: {huge}\n" if self.n > 1 else ""
+
+        class R:
+            agent_ended = True
+            turn_count = 1
+            compaction_events = 0
+            assistant_text = f"Some prose about attempt {self.n}.{lesson_line}More prose."
+            tool_calls = []
+        return R()
+
+
+def test_run_exercise_caps_an_unreasonably_long_lesson(tmp_path, monkeypatch):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    (src / "ex_test.py").write_text("test")
+
+    def prepare(s, w):
+        AP._copy_exercise(s, w)
+        return [w / "ex.py"], [w / "ex_test.py"]
+
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": prepare,
+        "run_tests": lambda work, timeout: (False, "boom"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", _FakeRpcWithHugeLesson)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+    record = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert len(record["lessons"]) == 1
+    assert len(record["lessons"][0]) == AP.LESSON_MAX_CHARS
+
+
 def test_run_id_is_stable_within_a_process():
     assert AP.RUN_ID and AP.RUN_ID == AP.RUN_ID
 

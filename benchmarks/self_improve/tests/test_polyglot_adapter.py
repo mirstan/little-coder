@@ -29,10 +29,11 @@ def _result(task_id, exercise, *, status="pass_1", score=1.0, success=True, **kw
                           status=status, score=score, success=success, **kw)
 
 
-def _adapter(runner, component_paths=None, practice_dir_path="."):
+def _adapter(runner, component_paths=None, practice_dir_path=".", seed_bodies=None, seed_token_costs=None):
     return PolyglotGEPAAdapter(
         runner, component_paths=component_paths or {"skills_tools_bash": "skills/tools/bash.md"},
         practice_dir_path=practice_dir_path,
+        seed_bodies=seed_bodies, seed_token_costs=seed_token_costs,
     )
 
 
@@ -212,39 +213,86 @@ def test_reflective_dataset_feedback_omits_lessons_disclaimer_when_none_reported
 
 
 def test_reflective_dataset_generated_outputs_includes_token_cost_for_a_tool_skill():
+    """Rescaled from the seed's own hand-calibrated cost (20) proportionally
+    to the body's length change (2x, 100 chars -> 200), not derived from an
+    absolute chars/token ratio -- real bug, confirmed by review: no single
+    ratio is reliable across the real skills/ corpus (3.59-11.16 chars/token)."""
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a")})
-    adapter = _adapter(runner, component_paths={"skills_tools_bash": "skills/tools/bash.md"})
-    candidate = {"skills_tools_bash": "x" * 35}  # 35 chars -> ceil(35/3.5) = 10 tokens
+    adapter = _adapter(
+        runner, component_paths={"skills_tools_bash": "skills/tools/bash.md"},
+        seed_bodies={"skills_tools_bash": "x" * 100}, seed_token_costs={"skills_tools_bash": 20},
+    )
+    candidate = {"skills_tools_bash": "x" * 200}
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(candidate, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert record["Generated Outputs"]["token_cost"] == 40
+    assert record["Generated Outputs"]["shared_token_budget"] == 300
+
+
+def test_reflective_dataset_generated_outputs_token_cost_unchanged_when_body_unchanged():
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(
+        runner, component_paths={"skills_tools_bash": "skills/tools/bash.md"},
+        seed_bodies={"skills_tools_bash": "x" * 35}, seed_token_costs={"skills_tools_bash": 10},
+    )
+    candidate = {"skills_tools_bash": "x" * 35}  # identical to the seed body
     batch = adapter.evaluate(specs, candidate, capture_traces=True)
     record = adapter.make_reflective_dataset(candidate, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
     assert record["Generated Outputs"]["token_cost"] == 10
-    assert record["Generated Outputs"]["token_budget"] == 300
+
+
+def test_reflective_dataset_generated_outputs_omits_token_cost_without_a_seed_baseline():
+    """Every other adapter test in this file constructs the adapter without
+    seed_bodies/seed_token_costs -- must degrade gracefully (omit, not
+    crash or report a wrong number) rather than require every caller to
+    supply seed data."""
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a")})
+    adapter = _adapter(runner, component_paths={"skills_tools_bash": "skills/tools/bash.md"})
+    candidate = {"skills_tools_bash": "some text"}
+    batch = adapter.evaluate(specs, candidate, capture_traces=True)
+    record = adapter.make_reflective_dataset(candidate, batch, ["skills_tools_bash"])["skills_tools_bash"][0]
+    assert "token_cost" not in record["Generated Outputs"]
+    assert "shared_token_budget" not in record["Generated Outputs"]
 
 
 def test_reflective_dataset_generated_outputs_uses_knowledge_budget_for_a_knowledge_skill():
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a")})
-    adapter = _adapter(runner, component_paths={"skills_knowledge_binary_search": "skills/knowledge/binary_search.md"})
+    adapter = _adapter(
+        runner, component_paths={"skills_knowledge_binary_search": "skills/knowledge/binary_search.md"},
+        seed_bodies={"skills_knowledge_binary_search": "text"},
+        seed_token_costs={"skills_knowledge_binary_search": 90},
+    )
     candidate = {"skills_knowledge_binary_search": "text"}
     batch = adapter.evaluate(specs, candidate, capture_traces=True)
     record = adapter.make_reflective_dataset(
         candidate, batch, ["skills_knowledge_binary_search"],
     )["skills_knowledge_binary_search"][0]
-    assert record["Generated Outputs"]["token_budget"] == 200
+    assert record["Generated Outputs"]["shared_token_budget"] == 200
+    # Real gap, confirmed by review: knowledge-inject's PER_ENTRY_CAP (150)
+    # binds before the shared 200 total does -- reporting only the shared
+    # budget invited growing a single entry into the 150-200 range, where
+    # the excess is silently discarded.
+    assert record["Generated Outputs"]["per_entry_cap"] == 150
 
 
 def test_reflective_dataset_generated_outputs_omits_token_cost_for_agents_md():
     """agents_md is always injected -- never competes for a selection slot,
-    so there's no budget to surface."""
+    so there's no budget to surface, even with a seed baseline available."""
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a")})
-    adapter = _adapter(runner, component_paths={"agents_md": "AGENTS.md"})
+    adapter = _adapter(
+        runner, component_paths={"agents_md": "AGENTS.md"},
+        seed_bodies={"agents_md": "text"}, seed_token_costs={"agents_md": 999},
+    )
     candidate = {"agents_md": "text"}
     batch = adapter.evaluate(specs, candidate, capture_traces=True)
     record = adapter.make_reflective_dataset(candidate, batch, ["agents_md"])["agents_md"][0]
     assert "token_cost" not in record["Generated Outputs"]
-    assert "token_budget" not in record["Generated Outputs"]
+    assert "shared_token_budget" not in record["Generated Outputs"]
 
 
 def test_reflective_dataset_says_not_injected_when_component_absent_from_notifications():

@@ -69,7 +69,18 @@ MAX_CONSECUTIVE_ERRORS = 3
 #: than inventing a new extraction style. Deliberately supplementary, not
 #: required -- a missing LESSON: line just means no lesson was captured for
 #: that attempt, never a harness error.
-_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\s*(.+)$")
+#: \**\s* after the colon absorbs a closing bold marker directly after it
+#: (e.g. "**LESSON:** text") -- the leading strip below handles decoration
+#: BEFORE "lesson", this handles decoration immediately after the colon.
+_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\s*\**\s*(.+)$")
+#: Real gap, confirmed by review: every other free-text field on this path
+#: is capped (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpt truncations)
+#: except this one -- r.assistant_text is raw model output (on the codex
+#: path, the entire stdout file), and the matched line was stored verbatim
+#: into results.json and joined verbatim into the reflection LM prompt.
+LESSON_MAX_CHARS = 500
+
+
 def _positive_int_env(name: str, default: int) -> int:
     """Parse a positive-integer env var, failing with a readable message.
 
@@ -903,15 +914,21 @@ def _run_exercise(
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
             compaction_total += getattr(r, "compaction_events", 0) or 0
-            # Only an attempt whose retry prompt actually asked for one (see
-            # below) can have a LESSON: line -- i.e. every attempt except
-            # possibly the last, a natural consequence of where the ask
-            # lives, not a special case here. First match only -- one lesson
-            # per attempt, not one per mention.
+            # Only an attempt whose prompt actually asked for one can have a
+            # LESSON: line, and the ask lives in the retry prompt built at the
+            # BOTTOM of this loop -- so it reaches attempts 2..N and never
+            # attempt 1. A natural consequence of where the ask lives, not a
+            # special case here. First match only -- one lesson per attempt,
+            # not one per mention.
             for line in (getattr(r, "assistant_text", "") or "").splitlines():
-                m = _LESSON_RE.match(line.strip())
+                # Strip common markdown decoration (bullets, headings, bold,
+                # blockquote) a model might wrap the line in -- real gap,
+                # confirmed by review: "**LESSON:** ...", "- LESSON: ...",
+                # "## LESSON: ..." all silently matched nothing before this.
+                stripped = re.sub(r"^[\s>#*\-]+", "", line.strip())
+                m = _LESSON_RE.match(stripped)
                 if m:
-                    lessons.append(m.group(1).strip())
+                    lessons.append(m.group(1).strip()[:LESSON_MAX_CHARS])
                     break
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
