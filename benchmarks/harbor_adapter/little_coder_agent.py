@@ -28,12 +28,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import subprocess
 import sys
 import time
 import tomllib
 import uuid
 from pathlib import Path
+
+# Repo root, derived the same way _read_version_from_package_json() finds
+# package.json -- benchmarks/harbor_adapter/little_coder_agent.py is two
+# levels below it.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _read_version_from_package_json() -> str:
@@ -44,13 +51,42 @@ def _read_version_from_package_json() -> str:
     missing or malformed.
     """
     try:
-        pkg = Path(__file__).resolve().parents[2] / "package.json"
+        pkg = _REPO_ROOT / "package.json"
         return json.load(open(pkg)).get("version", "unknown")
     except Exception:
         return "unknown"
 
 
+def _read_code_sha() -> str:
+    """Best-effort short git SHA of this repo's HEAD, computed once at
+    module IMPORT time -- not per-trial. Import time is exactly when this
+    process's copy of the adapter code was frozen, so a Harbor job that has
+    been running for hours on stale code still reports its OWN stale SHA
+    here, unaffected by anything landing on disk afterward. That's the
+    missing positive signal from the stale-code incident (dfa706b's
+    max_turns fix landed mid-job at 2026-09-08 22:26, but the already-running
+    job kept enforcing the pre-fix behavior for hours with nothing recording
+    which code was actually active). Falls back to "unknown" for a non-git
+    checkout or missing git binary, mirroring
+    _read_version_from_package_json()'s fallback.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        sha = out.stdout.strip()
+        return sha or "unknown"
+    except Exception:
+        return "unknown"
+
+
 _AGENT_VERSION = _read_version_from_package_json()
+_CODE_SHA = _read_code_sha()
+try:
+    _ADAPTER_MTIME = Path(__file__).resolve().stat().st_mtime
+except Exception:
+    _ADAPTER_MTIME = None
 
 
 from harbor.agents.base import BaseAgent
@@ -59,7 +95,7 @@ from harbor.models.agent.context import AgentContext
 
 # benchmarks/ isn't a package — let the importer resolve by sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rpc_client import PiRpc  # noqa: E402
+from rpc_client import PiRpc, capture_environment_snapshot  # noqa: E402
 
 
 DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
@@ -204,6 +240,80 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
     """Thin wrapper around _resolve_trial_timeout_info for callers that only
     need the effective timeout float."""
     return _resolve_trial_timeout_info(logs_dir)["effective_timeout_sec"]
+
+
+def _derive_benchmark_label(logs_dir: Path | None) -> str:
+    """Best-effort derivation of this trial's own dataset identity, for
+    context.metadata["benchmark"] -- replacing the hardcoded
+    "terminal_bench_2.0" (wrong now that harbor_pilot.sh defaults to TB2.1;
+    Codex finding [medium]).
+
+    Reads the same trial config.json _resolve_trial_timeout_info reads
+    (confirmed on disk: both the package shape -- task.name/ref/source --
+    and the legacy shape -- task.path/git_url/git_commit_id/source -- carry
+    a "source" key giving the dataset identity directly, e.g.
+    "terminal-bench/terminal-bench-2-1"). Legacy datasets can be re-pinned to
+    different commits under the same name@version string, so a short
+    git_commit_id is appended when present to disambiguate; package datasets
+    are already uniquely identified by "source" alone (the content-hash
+    "ref" is a task-cache lookup key, not part of the dataset's own
+    identity).
+
+    Never raises -- a label derivation failure must not fail a trial; falls
+    back to "terminal_bench_unknown". This only changes what's reported in
+    Harbor's own result metadata; the LITTLE_CODER_BENCHMARK env var
+    (consumed by benchmark-profiles for model-profile selection) is a
+    separate, unaffected mechanism and always stays "terminal_bench".
+    """
+    try:
+        if logs_dir is None:
+            return "terminal_bench_unknown"
+        trial_dir = logs_dir.parent
+        config = json.loads((trial_dir / "config.json").read_text())
+        task = config["task"]
+        source = task.get("source")
+        if not source:
+            return "terminal_bench_unknown"
+        if task.get("name") is not None:
+            # Package shape -- source alone is the dataset identity.
+            return source
+        # Legacy shape -- append a short commit id when present.
+        commit = task.get("git_commit_id")
+        if commit:
+            return f"{source}@{commit[:12]}"
+        return source
+    except Exception:
+        return "terminal_bench_unknown"
+
+
+def _build_environment_snapshot(
+    model: str,
+    *,
+    max_turns: int,
+    ambient_max_turns_env: str | None,
+    timeout_info: dict,
+) -> dict:
+    """Assemble the per-trial environment_snapshot.json payload (Plan 5,
+    fix D): rpc_client.capture_environment_snapshot()'s existing pi-config
+    introspection, plus the config values this adapter itself resolved --
+    the active turn cap, the ambient env var seen at process entry, this
+    process's own code identity, and the FULL timeout-provenance dict from
+    _resolve_trial_timeout_info() (not just the effective float) so a
+    reader can tell exactly which task.toml/cache-layout produced it.
+
+    Split out from run() so it's unit-testable without spinning up a real
+    PiRpc/environment. Never raises on its own logic; capture_environment_
+    snapshot() already guarantees no-raise for its half.
+    """
+    snapshot = capture_environment_snapshot(model)
+    snapshot["max_turns"] = max_turns
+    snapshot["ambient_max_turns_env"] = ambient_max_turns_env
+    snapshot["little_coder_version"] = _AGENT_VERSION
+    snapshot["code_sha"] = _CODE_SHA
+    snapshot["adapter_file"] = str(Path(__file__).resolve())
+    snapshot["adapter_mtime"] = _ADAPTER_MTIME
+    snapshot["timeout_provenance"] = timeout_info
+    return snapshot
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
@@ -433,6 +543,60 @@ class LittleCoderAgent(BaseAgent):
             )
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
 
+        # No turn cap: 40 was too tight (train-fasttext hit 41/40, one call
+        # from its correct final fix), so it was raised to 80 -- which
+        # mteb-leaderboard then hit at 80/80, again one investigation away
+        # from a real answer (it had already built a correct top-30
+        # leaderboard table and was fetching the required historical
+        # snapshot when the cap fired). Any fixed N is a guess at how many
+        # turns a task needs, and task difficulty varies enormously -- this
+        # is whack-a-mole, not a fix. Wall-clock (finalize-warn's deadline
+        # trigger, _resolve_trial_timeout_sec above) is the more principled
+        # boundary: it's what Harbor itself actually enforces as the grading
+        # limit, and matches the vendor's own published Terminal-Bench
+        # methodology (flat 3h timeout, no turn limit at all). Local
+        # inference has no per-token cost, so the downside of no cap -- a
+        # genuinely stuck trial burning its full wall-clock budget instead
+        # of aborting early and cheaply -- is an acceptable trade against
+        # truncating trials that are still making real progress. Explicit 0
+        # rather than leaving it unset, so the "no cap" choice reads as
+        # deliberate, not an oversight -- and, since rpc_client.py now
+        # writes the env var on `is not None` rather than truthiness (Plan
+        # 5, fix A1), this 0 is guaranteed to actually reach the subprocess
+        # rather than being silently skipped.
+        #
+        # Hoisted to a named local (rather than inlined as the kwarg below)
+        # so this log line and the PiRpc kwarg read the exact same value and
+        # can never diverge (Plan 5, fix C).
+        max_turns = 0
+        ambient_max_turns_env = os.environ.get("LITTLE_CODER_MAX_TURNS")
+        self.logger.info(
+            "LittleCoderAgent: config provenance "
+            f"max_turns={max_turns} "
+            f"ambient_LITTLE_CODER_MAX_TURNS={ambient_max_turns_env!r} "
+            f"code_sha={_CODE_SHA} "
+            f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
+        )
+
+        # Per-trial environment_snapshot.json (Plan 5, fix D): best-effort,
+        # must never fail a trial. Executes before the PiRpc-construction
+        # try/except below so it (and the config-provenance log line above)
+        # still land even if PiRpc itself fails to construct (e.g. PI_BIN
+        # missing) -- exactly the diagnostics that failure needs most.
+        if self.logs_dir:
+            try:
+                snapshot = _build_environment_snapshot(
+                    model,
+                    max_turns=max_turns,
+                    ambient_max_turns_env=ambient_max_turns_env,
+                    timeout_info=timeout_info,
+                )
+                (self.logs_dir / "environment_snapshot.json").write_text(
+                    json.dumps(snapshot, indent=2, default=str)
+                )
+            except Exception as e:
+                self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
+
         try:
             # PiRpc spawns pi --mode rpc and wires the shell proxy. The reader
             # thread invokes tb_shell_handler synchronously; the handler
@@ -445,28 +609,7 @@ class LittleCoderAgent(BaseAgent):
                 allowed_tools=DEFAULT_ALLOWED_TOOLS,
                 session_id=session_id,
                 tb_mode=True,
-                # No turn cap: 40 was too tight (train-fasttext hit 41/40,
-                # one call from its correct final fix), so it was raised to
-                # 80 -- which mteb-leaderboard then hit at 80/80, again one
-                # investigation away from a real answer (it had already built
-                # a correct top-30 leaderboard table and was fetching the
-                # required historical snapshot when the cap fired). Any fixed
-                # N is a guess at how many turns a task needs, and task
-                # difficulty varies enormously -- this is whack-a-mole, not a
-                # fix. Wall-clock (finalize-warn's deadline trigger,
-                # _resolve_trial_timeout_sec above) is the more principled
-                # boundary: it's what Harbor itself actually enforces as the
-                # grading limit, and matches the vendor's own published
-                # Terminal-Bench methodology (flat 3h timeout, no turn limit
-                # at all). Local inference has no per-token cost, so the
-                # downside of no cap -- a genuinely stuck trial burning its
-                # full wall-clock budget instead of aborting early and
-                # cheaply -- is an acceptable trade against truncating
-                # trials that are still making real progress. Explicit 0
-                # (falsy, same as omitting the kwarg -- see rpc_client.py's
-                # `if max_turns:` check) rather than leaving it unset, so the
-                # "no cap" choice reads as deliberate, not an oversight.
-                max_turns=0,
+                max_turns=max_turns,
                 tb_shell_handler=tb_shell_handler,
                 # permission-gate's SAFE_PREFIXES whitelist is meant to guard
                 # a real user's own machine during interactive use; its own
@@ -524,7 +667,11 @@ class LittleCoderAgent(BaseAgent):
                     "n_compactions": result.compaction_events,
                     "n_notifications": len(rpc.notifications()) if hasattr(rpc, "notifications") else 0,
                     "little_coder_version": self.version(),
-                    "benchmark": "terminal_bench_2.0",
+                    # Derived from the trial's own config.json rather than
+                    # hardcoded (Plan 5, fix E) -- the pilot's default
+                    # dataset moved to TB2.1 (see harbor_pilot.sh) and the
+                    # old literal no longer matched reality.
+                    "benchmark": _derive_benchmark_label(self.logs_dir),
                 }
             finally:
                 await asyncio.to_thread(rpc.close, 3)

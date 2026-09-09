@@ -60,8 +60,24 @@ describe("turn-cap", () => {
     expect(h.notifies[0]).toMatch(/turn limit \(3\)/);
   });
 
-  it("systemPromptOptions.littleCoder.maxTurns overrides the env var", async () => {
-    process.env.LITTLE_CODER_MAX_TURNS = "40";
+  it("an explicitly-set env var overrides systemPromptOptions.littleCoder.maxTurns", async () => {
+    // Plan 5 / Codex finding [high]: the env var (set by the harness
+    // constructing PiRpc) is now the authoritative source -- a benchmark
+    // profile's maxTurns only applies when the env var is absent. Here the
+    // env var's cap of 2 wins over the profile's 40.
+    process.env.LITTLE_CODER_MAX_TURNS = "2";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", { systemPromptOptions: { littleCoder: { maxTurns: 40 } } }, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx); // 1
+    await fire(h.pi, "turn_start", {}, h.ctx); // 2
+    expect(h.aborted).toEqual([]);
+    await fire(h.pi, "turn_start", {}, h.ctx); // 3 > cap of 2
+    expect(h.aborted).toEqual([true]);
+  });
+
+  it("falls back to systemPromptOptions.littleCoder.maxTurns when the env var is absent", async () => {
+    delete process.env.LITTLE_CODER_MAX_TURNS;
     const h = makeHarness();
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", { systemPromptOptions: { littleCoder: { maxTurns: 2 } } }, h.ctx);

@@ -25,16 +25,27 @@ describe("resolveTurnCap", () => {
     expect(resolveTurnCap({})).toBe(0);
   });
 
-  it("systemPromptOptions.littleCoder.maxTurns wins over the env var", () => {
+  it("an explicitly-set env var wins over systemPromptOptions.littleCoder.maxTurns", () => {
     process.env.LITTLE_CODER_MAX_TURNS = "40";
     const event = { systemPromptOptions: { littleCoder: { maxTurns: 10 } } };
-    expect(resolveTurnCap(event)).toBe(10);
+    expect(resolveTurnCap(event)).toBe(40);
   });
 
-  it("falls back to the env var when maxTurns is not a positive number", () => {
-    process.env.LITTLE_CODER_MAX_TURNS = "40";
-    expect(resolveTurnCap({ systemPromptOptions: { littleCoder: { maxTurns: 0 } } })).toBe(40);
-    expect(resolveTurnCap({ systemPromptOptions: { littleCoder: {} } })).toBe(40);
-    expect(resolveTurnCap({ systemPromptOptions: {} })).toBe(40);
+  it("an explicit env var of \"0\" wins over a positive profile maxTurns", () => {
+    // Plan 5 / Codex finding [high]: little_coder_agent.py passes max_turns=0
+    // (no cap) but a model's benchmark_overrides.terminal_bench.max_turns
+    // profile still published 40 -- the explicit "0" must win so the harness
+    // kwarg is the deliberate per-run authority, not the profile.
+    process.env.LITTLE_CODER_MAX_TURNS = "0";
+    const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
+    expect(resolveTurnCap(event)).toBe(0);
+  });
+
+  it("falls back to systemPromptOptions.littleCoder.maxTurns when the env var is absent", () => {
+    delete process.env.LITTLE_CODER_MAX_TURNS;
+    expect(resolveTurnCap({ systemPromptOptions: { littleCoder: { maxTurns: 40 } } })).toBe(40);
+    expect(resolveTurnCap({ systemPromptOptions: { littleCoder: { maxTurns: 0 } } })).toBe(0);
+    expect(resolveTurnCap({ systemPromptOptions: { littleCoder: {} } })).toBe(0);
+    expect(resolveTurnCap({ systemPromptOptions: {} })).toBe(0);
   });
 });

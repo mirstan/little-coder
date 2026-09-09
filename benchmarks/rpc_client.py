@@ -125,7 +125,14 @@ class PiRpc:
             full_env["LITTLE_CODER_SESSION_ID"] = session_id
         if tb_mode:
             full_env["LITTLE_CODER_TB_MODE"] = "1"
-        if max_turns:
+        if max_turns is not None:
+            # `is not None`, not truthiness: an explicit max_turns=0 (deliberate
+            # "no cap") must still WRITE the env var so it clobbers any ambient
+            # LITTLE_CODER_MAX_TURNS inherited from the caller's own environment
+            # (full_env starts as a copy of os.environ, above) -- otherwise a
+            # leaked wrapper-script value would silently survive an explicit
+            # "no cap" request. turn-cap.ts's resolveTurnCap already handles the
+            # string "0" correctly: Number("0") == 0, so a cap of 0 is applied.
             full_env["LITTLE_CODER_MAX_TURNS"] = str(max_turns)
 
         cmd = [str(PI_BIN), "--mode", "rpc", "--no-session", "--model", model]

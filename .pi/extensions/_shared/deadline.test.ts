@@ -25,20 +25,19 @@ describe("resolveDeadlineEpochMs", () => {
     expect(resolveDeadlineEpochMs({})).toBe(0);
   });
 
-  it("systemPromptOptions.littleCoder.deadlineEpochMs wins over the env var", () => {
+  it("an explicitly-set env var wins over systemPromptOptions.littleCoder.deadlineEpochMs", () => {
     process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "1700000000000";
     const event = { systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } };
-    expect(resolveDeadlineEpochMs(event)).toBe(1234567890);
+    expect(resolveDeadlineEpochMs(event)).toBe(1700000000000);
   });
 
-  it("falls back to the env var when deadlineEpochMs is not a positive number", () => {
-    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "1700000000000";
+  it("falls back to systemPromptOptions.littleCoder.deadlineEpochMs when the env var is absent", () => {
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
     expect(
-      resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: { deadlineEpochMs: 0 } } }),
-    ).toBe(1700000000000);
-    expect(resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: {} } })).toBe(
-      1700000000000,
-    );
-    expect(resolveDeadlineEpochMs({ systemPromptOptions: {} })).toBe(1700000000000);
+      resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } }),
+    ).toBe(1234567890);
+    expect(resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: { deadlineEpochMs: 0 } } })).toBe(0);
+    expect(resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: {} } })).toBe(0);
+    expect(resolveDeadlineEpochMs({ systemPromptOptions: {} })).toBe(0);
   });
 });
