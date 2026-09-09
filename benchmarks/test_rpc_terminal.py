@@ -63,7 +63,7 @@ def test_on_event_fires_for_every_event_in_order(fake_pi, tmp_path):
         rpc.prompt_and_collect("go", timeout=30, on_event=lambda ev: seen.append(ev["type"]))
     assert seen == [
         "agent_start", "message_update", "tool_execution_start",
-        "tool_execution_end", "turn_end", "agent_end",
+        "tool_execution_end", "turn_end", "agent_end", "agent_settled",
     ]
 
 
@@ -120,6 +120,41 @@ def test_agent_end_and_eof_together_still_agent_end(fake_pi, tmp_path):
         r = rpc.prompt_and_collect("go", timeout=30)
     assert r.agent_ended is True
     assert r.stop_reason == "agent_end"
+
+
+def test_abort_then_followup_returns_recovered_answer(fake_pi, tmp_path):
+    """Reproduces the thinking-budget-abort bug directly: an extension's
+    ctx.abort() makes pi emit agent_end mid-thought, but a queued follow-up
+    survives the abort and pi immediately runs a second, real turn on the
+    same connection. Draining only to the first agent_end (the old
+    behaviour) would return here with empty/partial assistant_text and miss
+    the recovery turn entirely, because the caller would treat the abort's
+    agent_end as the whole run finishing. This test fails on the old
+    single-phase drain and passes once the drain continues through to
+    agent_settled."""
+    with fake_pi("abort_then_followup", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert "recovered answer" in r.assistant_text
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert r.turn_count == 1
+
+
+def test_end_never_settles_falls_back_after_grace(fake_pi, tmp_path, capsys):
+    """Defensive fallback: a pi that emits agent_end but never agent_settled
+    (and never exits) must not hang the caller forever -- settle_grace
+    bounds the wait, stop_reason still reports agent_end, and a warning is
+    logged since this means the caller fell back to the weaker signal."""
+    with fake_pi("end_never_settles", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed < 10, f"took {elapsed:.1f}s -- settle_grace did not bound the wait"
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "agent_settled" in err
 
 
 def test_exit_before_ack_raises_with_stderr(fake_pi, tmp_path):
