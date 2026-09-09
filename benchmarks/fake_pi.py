@@ -62,6 +62,37 @@ def main():
         emit({"type": "agent_end"})
         os._exit(0)
 
+    if mode == "abort_then_followup":
+        # Simulates a thinking-budget breach: the extension's ctx.abort()
+        # makes pi emit agent_end mid-thought, but the follow-up nudge
+        # message it queued survives the abort and pi immediately runs a
+        # second, real turn on the same connection -- only settling (no
+        # more continuations queued) once that second turn finishes.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "thinking too long..."}})
+        emit({"type": "agent_end"})  # abort mid-thought, no turn_end
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "recovered answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "end_never_settles":
+        # agent_end fires but pi never follows up with agent_settled and
+        # never exits either -- pins the bounded settle_grace fallback so a
+        # caller can't hang forever waiting for a settle signal that will
+        # never come (e.g. an older pi build without agent_settled at all).
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        time.sleep(3600)
+        return
+
     if mode == "end_then_write":
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "turn_end"})

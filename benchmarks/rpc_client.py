@@ -361,8 +361,9 @@ class PiRpc:
         message: str,
         timeout: float = 900,
         on_event: Optional[Callable[[dict], None]] = None,
+        settle_grace: float = 20.0,
     ) -> PromptResult:
-        """Send a prompt, drain events until agent_end, return summary.
+        """Send a prompt, drain events through pi's own idle signal, return summary.
 
         Retries the SEND (not the whole turn) a few times on "Agent is already
         processing" -- a real, reproducible race under higher --thinking
@@ -371,12 +372,45 @@ class PiRpc:
         previous prompt_and_collect() returns can be rejected even though the
         caller correctly waited for agent_end. Not observed at pi's default
         thinking level; higher effort apparently widens whatever internal
-        window this races on.
+        window this races on. Returning at agent_settled (see below) instead
+        of at the first agent_end largely defuses this race too, since
+        agent_settled means pi is genuinely idle -- but the retry stays as
+        defense in depth.
 
         `on_event`: optional callback invoked in real time as each RPC event
         arrives (see _drain_events_until) -- lets a caller stream a live
         trajectory log instead of only seeing the aggregated PromptResult
         once this call finally returns.
+
+        Two-phase drain, because `agent_end` is not always the end of the
+        turn: an extension can react to an `agent_end` (e.g. the
+        thinking-budget extension aborting a runaway thinking stream) by
+        queuing a follow-up message and letting pi continue processing in
+        the same run. pi's queued-follow-up continuation (and auto-retry /
+        auto-compaction continuations) runs to completion and only then
+        emits `agent_settled` -- pi's own purpose-built "nothing left
+        queued, truly idle" signal. Draining only to the first `agent_end`
+        (the old behaviour) returns before that continuation starts, which
+        for a Harbor trial means the caller treats the abort as the whole
+        run finishing and tears the process down mid-recovery.
+
+        Phase 1 drains until `agent_end` (or timeout/EOF), exactly as
+        before. If an `agent_end` was seen and pi hasn't exited, Phase 2
+        drains for up to `min(settle_grace, remaining)` waiting for the
+        very next event:
+          - `agent_settled` -> pi is genuinely idle; done.
+          - anything else -> a continuation turn started; append it and
+            loop back to Phase 1 to drain it out too.
+          - nothing arrives (grace expires) or EOF -> return anyway. This
+            is a defensive fallback for a pi build that never emits
+            agent_settled; it logs a warning since it means this function
+            is falling back to the old, weaker termination signal.
+
+        All phases append into one `events` list, so tool calls / text /
+        turn_count from a continuation turn are aggregated into the same
+        PromptResult as the initial turn. `stop_reason`/`agent_ended` stay
+        keyed on whether any `agent_end` was seen across all phases, so
+        that semantics for existing callers is unchanged.
         """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
@@ -418,16 +452,63 @@ class PiRpc:
         with self._cv:
             del self._event_q[:watermark]
 
-        events = self._drain_events_until(
-            lambda ev: ev.get("type") == "agent_end",
-            timeout=timeout,
-            on_event=on_event,
-        )
+        start = time.time()
+        events: list[dict] = []
+        saw_agent_end = False
+        while True:
+            remaining = timeout - (time.time() - start)
+            if remaining <= 0:
+                break
+            phase1_events = self._drain_events_until(
+                lambda ev: ev.get("type") == "agent_end",
+                timeout=remaining,
+                on_event=on_event,
+            )
+            events.extend(phase1_events)
+            if not any(ev.get("type") == "agent_end" for ev in phase1_events):
+                # Deadline or EOF, no agent_end this phase -- nothing left to
+                # settle-wait for.
+                break
+            saw_agent_end = True
+
+            if self._eof:
+                break
+
+            remaining = timeout - (time.time() - start)
+            grace = min(settle_grace, remaining)
+            if grace <= 0:
+                break
+
+            # Phase 2: wait for the very next event, bounded by the settle
+            # grace window. `_drain_events_until` with an always-true
+            # predicate returns as soon as exactly one event arrives (or
+            # empty on timeout/EOF).
+            settle_events = self._drain_events_until(
+                lambda ev: True,
+                timeout=grace,
+                on_event=on_event,
+            )
+            if not settle_events:
+                if not self._eof:
+                    print(
+                        f"WARNING: pi did not emit agent_settled within "
+                        f"{settle_grace}s of agent_end (session "
+                        f"{self._session_id!r}); falling back to agent_end "
+                        f"as the terminal signal for this prompt",
+                        file=sys.stderr,
+                    )
+                break
+            events.extend(settle_events)
+            if settle_events[-1].get("type") == "agent_settled":
+                break
+            if self._eof:
+                break
+            # Renewed activity (e.g. a queued follow-up's own agent_start) --
+            # loop back to Phase 1 and drain the continuation turn too.
 
         result = PromptResult()
         # Derived from what was observed, not from how long it took: a crash
         # burns the same wall-clock as a deadline.
-        saw_agent_end = any(ev.get("type") == "agent_end" for ev in events)
         if saw_agent_end:
             result.stop_reason = "agent_end"
         elif self._eof or self._proc.poll() is not None:
