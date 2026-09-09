@@ -352,7 +352,7 @@ class LittleCoderAgent(BaseAgent):
             "ShellSession call.\n"
             "File tools like Read/Write/Edit are NOT available — use shell commands "
             "(cat, sed -i, heredoc 'cat > file <<EOF') through ShellSession instead.\n\n"
-            "Approach: briefly research the task first (inspect the relevant files, "
+            "Approach: briefly investigate the task first (inspect the relevant files, "
             "commands, or error output to understand what's actually being asked), "
             "form a short plan, then implement a quick first-pass solution rather "
             "than exhaustively enumerating options before writing anything. Get a "
