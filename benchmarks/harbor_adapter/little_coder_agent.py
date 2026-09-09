@@ -75,6 +75,119 @@ DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 DEADLINE_SAFETY_MARGIN = 0.9
 HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 
+# Plan 4b (shell-proxy-snapshot): a deadline snapshot of files the model
+# changed since trial start, staged under /tmp/.lc-snapshot in the container.
+# Insurance/recovery only -- grading reads the live container files, never
+# this snapshot; it's useful only via the finalize-message pointer telling
+# the model it exists, for the case where a late mistake destroys earlier
+# good state (the motivating trial: overfull-hbox, where a debug script
+# clobbered a graded file that had already reached the goal state).
+#
+# Fires SNAPSHOT_LEAD_SEC before the trial's own effective_timeout_sec --
+# deliberately mirrors finalize-warn's own WARN_REMAINING_MS (see
+# .pi/extensions/finalize-warn/index.ts) so the snapshot and the "you're
+# running low" nudge land around the same moment; if either constant is
+# ever changed there, consider changing it here too (no shared import --
+# this is Python, that's TypeScript -- so the two are only in comment-level
+# lockstep, same as tb-finalize-guard's own WARN_REMAINING_MS is with
+# finalize-warn's).
+SNAPSHOT_LEAD_SEC = 600.0
+# Below this total trial budget, skip the snapshot entirely: the computed
+# delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would already be clamped
+# to 0 (snapshotting almost immediately at trial start), and for a trial this
+# short there's nothing meaningful yet to recover that the model couldn't
+# just redo from scratch.
+SNAPSHOT_MIN_BUDGET_SEC = 300.0
+SNAPSHOT_START_MARKER = "/tmp/.lc-start"
+SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-snapshot"
+SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
+
+# Bounded, atomically-staged snapshot of files modified under /app since
+# SNAPSHOT_START_MARKER was touched. Every cap here answers a specific
+# Codex review finding (see Plan 4b's "Chosen fix" #2 for the full writeup):
+#   - per-file size cap (-size -10M) and an aggregate file-count cap
+#     (head -z -n 500) and an aggregate byte cap (209715200 = 200MB, via the
+#     `du --files0-from` sum) together bound total copy volume regardless of
+#     how many small files changed -- a per-file cap alone was found
+#     insufficient (thousands of small files could still copy gigabytes).
+#   - a free-space reserve check (FREE >= TOTAL + 524288000, i.e. 500MB)
+#     protects storage_mb-tight task containers (10240MB typical in TB2.1
+#     task.tomls) from being pushed over their quota by the snapshot itself.
+#   - staging into $STAGE and only `mv`-ing it to SNAPSHOT_PUBLISH_PATH once
+#     fully populated means a half-copied snapshot is never visible at the
+#     published path (atomic publish).
+#   - the whole body runs under an internal `timeout 20`, and the trailing
+#     `rm -rf SNAPSHOT_STAGE_GLOB` (outside that timeout) reaps a stage dir
+#     orphaned if the 20s kill lands mid-copy.
+#   - `set -e` plus every failure being swallowed by the caller means this
+#     command degrades to "no snapshot" on any error (missing GNU coreutils
+#     like `head -z`/`du --files0-from` on a BusyBox-ish image, `find -newer`
+#     failing because the model deleted the start marker, etc.) -- never to
+#     an unbounded copy.
+_SNAPSHOT_COMMAND = (
+    "timeout 20 sh -c '\n"
+    "  set -e\n"
+    "  STAGE=/tmp/.lc-snapshot.stage.$$\n"
+    "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
+    "  # candidate list: files under /app changed since trial start, per-file <10M\n"
+    "  find /app -xdev -maxdepth 3 -type f -size -10M -newer /tmp/.lc-start -print0 2>/dev/null \\\n"
+    "    | head -z -n 500 > \"$STAGE/.list\"           # aggregate file-count cap\n"
+    "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
+    "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
+    "  # aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
+    "  if [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
+    "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
+    "    rm -f \"$STAGE/.list\"\n"
+    "    rm -rf /tmp/.lc-snapshot && mv \"$STAGE\" /tmp/.lc-snapshot   # atomic publish\n"
+    "  else\n"
+    "    rm -rf \"$STAGE\"                                             # refuse oversize\n"
+    "  fi\n"
+    "' ; rm -rf /tmp/.lc-snapshot.stage.* 2>/dev/null                # cleanup-on-timeout"
+)
+
+
+def _compute_snapshot_delay_sec(effective_timeout_sec: float) -> float | None:
+    """Pure helper (split out for testability) for run()'s scheduling of
+    _snapshot_at_deadline: returns the sleep delay to pass it, or None to
+    skip scheduling the snapshot task at all.
+
+    Below SNAPSHOT_MIN_BUDGET_SEC, returns None -- Plan 4b's short-task edge
+    case: the naive delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would
+    already be negative and get clamped to 0 (snapshotting almost
+    immediately), and for a trial this short there's nothing meaningful yet
+    to recover that the model couldn't just redo from scratch, so the whole
+    task is skipped rather than merely delay-clamped.
+    """
+    if effective_timeout_sec < SNAPSHOT_MIN_BUDGET_SEC:
+        return None
+    return max(0.0, effective_timeout_sec - SNAPSHOT_LEAD_SEC)
+
+
+async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, logger: logging.Logger) -> None:
+    """Sleeps until SNAPSHOT_LEAD_SEC before the trial deadline, then fires
+    the one bounded snapshot command via run_harness -- never proxy.run()
+    (see _HarborShellProxy.run_harness's docstring for why that would
+    deadlock this same event loop). Meant to be wrapped in
+    asyncio.create_task() by run() and cancelled in run()'s own finally.
+
+    Insurance only: must never raise into the trial. Every failure --
+    including the container simply not having the snapshot command's
+    required coreutils -- is swallowed here; asyncio.CancelledError is the
+    one exception let through, so run()'s task.cancel() actually cancels
+    promptly instead of being silently caught by the broad handler below.
+    """
+    try:
+        await asyncio.sleep(delay_sec)
+        await proxy.run_harness(_SNAPSHOT_COMMAND, timeout=25)
+        logger.info(
+            "LittleCoderAgent: deadline snapshot attempted (best-effort; "
+            f"see {SNAPSHOT_PUBLISH_PATH} in-container if it succeeded)"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: deadline snapshot failed (non-fatal): {e}")
+
 
 def _fallback_timeout_info() -> dict:
     return {
@@ -261,12 +374,21 @@ class _HarborShellProxy:
         self.loop = loop
         self.logger = logger
         self.cwd = "/app"  # TB 2.0 convention — overridden by first `pwd`
+        # Plan 4b (shell-proxy-snapshot): serializes the actual env.exec()
+        # call across BOTH model-issued commands (via run(), the sync
+        # thread-bridge entry point) and harness-issued ones (via
+        # run_harness(), awaited directly on this loop -- see its docstring).
+        # Before this lock existed, only the reader thread ever called run(),
+        # so there was nothing to serialize against; run_harness is the first
+        # caller that can execute concurrently with it.
+        self._exec_lock = asyncio.Lock()
 
     async def _exec_async(self, command: str, timeout: int) -> str:
         sentinel = f"__LC_END_{uuid.uuid4().hex[:8]}__"
         wrapped = f"cd {self.cwd} 2>/dev/null; {{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc ; pwd"
         try:
-            result = await self.env.exec(command=wrapped, timeout_sec=timeout)
+            async with self._exec_lock:
+                result = await self.env.exec(command=wrapped, timeout_sec=timeout)
         except asyncio.TimeoutError:
             return _format_output("", "command timed out", -1, self.cwd, True)
         except Exception as e:
@@ -296,6 +418,32 @@ class _HarborShellProxy:
             return fut.result(timeout=timeout + 30)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
+
+    async def run_harness(self, command: str, timeout: int) -> str:
+        """Harness-issued exec, awaited directly on the caller's event loop.
+
+        NOT proxy.run(): run() is the sync bridge for PiRpc's reader THREAD --
+        it calls asyncio.run_coroutine_threadsafe(...).result(), which blocks
+        the calling thread until the coroutine finishes on `self.loop`. Calling
+        run() from an asyncio task running ON that same loop would deadlock:
+        fut.result() blocks the very loop that must run _exec_async to
+        complete it (Plan 4b / Codex finding 1). run_harness instead awaits
+        _exec_async directly -- same loop, no thread bridge, no fut.result().
+
+        This is also why the deadline-snapshot task (the only caller of this
+        method) must use ONLY run_harness, never run().
+
+        _exec_async's own _exec_lock still serializes this against
+        model-issued commands (via run()), so a harness command and a
+        model command can never execute concurrently inside the container.
+
+        Reuses _exec_async's cwd-tracking wrapping unchanged: each call
+        already starts fresh from self.cwd and reports pwd afterward, so as
+        long as the harness command itself never `cd`s (true of every call
+        site today -- confirmed by reading _exec_async above before writing
+        this), self.cwd is left untouched by a harness call.
+        """
+        return await self._exec_async(command, timeout)
 
     def reset(self) -> str:
         self.cwd = "/app"
@@ -433,6 +581,31 @@ class LittleCoderAgent(BaseAgent):
             )
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
 
+        # Plan 4b (shell-proxy-snapshot): schedule the best-effort deadline
+        # snapshot. Skipped entirely below SNAPSHOT_MIN_BUDGET_SEC (see that
+        # constant's comment); the start-marker touch is itself
+        # failure-tolerated (a missing marker just means find -newer fails
+        # later and the snapshot command degrades to "no snapshot", same as
+        # any other failure mode here).
+        snapshot_task: asyncio.Task | None = None
+        snapshot_delay_sec = _compute_snapshot_delay_sec(effective_timeout_sec)
+        if snapshot_delay_sec is not None:
+            try:
+                await proxy.run_harness(f"touch {SNAPSHOT_START_MARKER}", 10)
+            except Exception as e:
+                self.logger.info(
+                    f"LittleCoderAgent: snapshot start-marker touch failed (non-fatal): {e}"
+                )
+            snapshot_task = asyncio.create_task(
+                _snapshot_at_deadline(proxy, snapshot_delay_sec, self.logger)
+            )
+        else:
+            self.logger.info(
+                "LittleCoderAgent: skipping deadline snapshot -- trial budget "
+                f"({effective_timeout_sec:.0f}s) is below the "
+                f"{SNAPSHOT_MIN_BUDGET_SEC:.0f}s floor"
+            )
+
         try:
             # PiRpc spawns pi --mode rpc and wires the shell proxy. The reader
             # thread invokes tb_shell_handler synchronously; the handler
@@ -534,6 +707,17 @@ class LittleCoderAgent(BaseAgent):
                 log_fh.write(f"\nAGENT ERROR: {e}\n")
             raise
         finally:
+            # Plan 4b (shell-proxy-snapshot): the snapshot task must never
+            # outlive run() -- cancel it here regardless of how run() is
+            # exiting (normal completion, timeout, or exception above).
+            if snapshot_task is not None:
+                snapshot_task.cancel()
+                try:
+                    await snapshot_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             if log_fh:
                 log_fh.flush()
                 log_fh.close()
