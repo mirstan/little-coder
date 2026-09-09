@@ -361,11 +361,28 @@ class LittleCoderAgent(BaseAgent):
                 allowed_tools=DEFAULT_ALLOWED_TOOLS,
                 session_id=session_id,
                 tb_mode=True,
-                # 40 was too tight for tasks needing several iterative
-                # debug-retrain cycles (e.g. train-fasttext hit 41/40 turns
-                # one call away from its correct final fix -- confirmed via
-                # agent_result.metadata.n_turns in the trial's result.json).
-                max_turns=80,
+                # No turn cap: 40 was too tight (train-fasttext hit 41/40,
+                # one call from its correct final fix), so it was raised to
+                # 80 -- which mteb-leaderboard then hit at 80/80, again one
+                # investigation away from a real answer (it had already built
+                # a correct top-30 leaderboard table and was fetching the
+                # required historical snapshot when the cap fired). Any fixed
+                # N is a guess at how many turns a task needs, and task
+                # difficulty varies enormously -- this is whack-a-mole, not a
+                # fix. Wall-clock (finalize-warn's deadline trigger,
+                # _resolve_trial_timeout_sec above) is the more principled
+                # boundary: it's what Harbor itself actually enforces as the
+                # grading limit, and matches the vendor's own published
+                # Terminal-Bench methodology (flat 3h timeout, no turn limit
+                # at all). Local inference has no per-token cost, so the
+                # downside of no cap -- a genuinely stuck trial burning its
+                # full wall-clock budget instead of aborting early and
+                # cheaply -- is an acceptable trade against truncating
+                # trials that are still making real progress. Explicit 0
+                # (falsy, same as omitting the kwarg -- see rpc_client.py's
+                # `if max_turns:` check) rather than leaving it unset, so the
+                # "no cap" choice reads as deliberate, not an oversight.
+                max_turns=0,
                 tb_shell_handler=tb_shell_handler,
                 # permission-gate's SAFE_PREFIXES whitelist is meant to guard
                 # a real user's own machine during interactive use; its own
