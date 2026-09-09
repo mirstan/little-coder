@@ -21,6 +21,24 @@
 #                             ~750s base, 15x lands close to that, vs. the
 #                             prior 3x which gave the model only ~20-35% of
 #                             the vendor's reference wall-clock budget)
+#   TB_OVERRIDE_CPUS        — per-task CPU override (default: 4). Confirmed via
+#                             cgroup cpu.stat on a live run that TB2.1's own
+#                             per-task default (1 CPU for 83/89 tasks) causes
+#                             real throttling (39% of scheduling periods on
+#                             llm-inference-batching-scheduler); 4 matches the
+#                             highest CPU count any task.toml itself requests
+#                             (only 3/89 tasks ask for more than 1), so it's
+#                             not an arbitrary bump. Host has 10 physical
+#                             CPUs and --n-concurrent 1 means only one
+#                             container runs at a time, so this doesn't
+#                             compete with itself.
+#   TB_OVERRIDE_MEMORY_MB   — per-task memory override (default: 4096). Docker
+#                             Desktop's VM has only ~7.75GB total (`docker
+#                             info`) -- below what the 8 tasks requesting
+#                             8192MB in their own task.toml could ever
+#                             actually get anyway, so 4096 isn't a regression
+#                             for them, while it's a real 2x increase for the
+#                             68/89 tasks that only ask for 2048MB.
 #
 # Requires:
 #   - harbor installed (uv tool install harbor)
@@ -34,6 +52,8 @@ set -euo pipefail
 MODEL="${TB_LITTLE_CODER_MODEL:-llamacpp/qwen3.6-35b-a3b}"
 DATASET="${TB_DATASET:-terminal-bench/terminal-bench-2-1}"
 TIMEOUT_MULTIPLIER="${TB_TIMEOUT_MULTIPLIER:-15}"
+OVERRIDE_CPUS="${TB_OVERRIDE_CPUS:-4}"
+OVERRIDE_MEMORY_MB="${TB_OVERRIDE_MEMORY_MB:-4096}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$REPO_ROOT/benchmarks/harbor_runs"
 
@@ -70,6 +90,8 @@ HB_CMD=(harbor run
   --jobs-dir "$OUT"
   --n-concurrent 1
   --timeout-multiplier "$TIMEOUT_MULTIPLIER"
+  --override-cpus "$OVERRIDE_CPUS"
+  --override-memory-mb "$OVERRIDE_MEMORY_MB"
   -y
   # TB2.0 tasks pin an amd64-only prebuilt image per task; on arm64 Docker
   # hosts this silently falls back to Rosetta/QEMU emulation (confirmed:
