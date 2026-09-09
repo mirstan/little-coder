@@ -76,7 +76,18 @@ DEADLINE_SAFETY_MARGIN = 0.9
 HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 
 
-def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
+def _fallback_timeout_info() -> dict:
+    return {
+        "cache_layout": None,
+        "resolution": "fallback-default",
+        "selected_task_toml": None,
+        "base_timeout_sec": None,
+        "multiplier": None,
+        "effective_timeout_sec": DEFAULT_PROMPT_TIMEOUT_SEC,
+    }
+
+
+def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
     """Best-effort derivation of this trial's real Harbor-enforced timeout
     (task.toml's [agent].timeout_sec x the job's timeout_multiplier), so our
     internal deadline tracks Harbor's actual budget instead of a blind guess.
@@ -88,13 +99,34 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
     reasons (the trial's own config.json, and its local task-download cache).
     Falls back to DEFAULT_PROMPT_TIMEOUT_SEC on any failure -- missing files,
     unexpected shape, ambiguous cache match, etc. -- rather than raising.
+
+    Returns a provenance dict (see _fallback_timeout_info for the shape) so a
+    caller can log/record exactly which file was used and how it was found,
+    instead of just the bare float.
+
+    Harbor caches a task's files differently depending on which registry
+    resolved the dataset, and the two layouts must NEVER be mixed within one
+    lookup: a legacy name@version dataset (e.g. "terminal-bench@2.0") caches
+    at <hash>/<task_name>/task.toml (task.toml's mtime is the real download
+    time), while a newer org/name package dataset (e.g. "terminal-bench/
+    terminal-bench-2-1") caches one level deeper, at packages/<org>/
+    <task_name>/<content-hash>/task.toml -- and every package-cache task.toml
+    on disk has an EPOCH mtime (Harbor's package extractor doesn't restore
+    timestamps), so a naive "union both globs, newest mtime wins" always
+    prefers the legacy file whenever a task name happens to exist in both
+    layouts (confirmed: all TB2.1 tasks with a same-named TB2.0 predecessor
+    hit this, e.g. caffe-cifar-10 resolving 1200s instead of 3600s,
+    crack-7z-hash resolving 900s instead of 1800s). The trial's own
+    config.json shape (task.name+ref vs task.path) tells us unambiguously
+    which layout THIS trial belongs to -- use that instead of mtime.
     """
     try:
         if logs_dir is None:
-            return DEFAULT_PROMPT_TIMEOUT_SEC
+            return _fallback_timeout_info()
         trial_dir = logs_dir.parent
         config = json.loads((trial_dir / "config.json").read_text())
         multiplier = float(config["timeout_multiplier"])
+        task = config["task"]
         # A legacy name@version trial config's task dict has "path" (a bare
         # task name, e.g. "configure-git-webserver"); a newer org/name
         # package dataset's has "name" instead (namespaced, e.g.
@@ -106,31 +138,72 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
         # hard-killed by Harbor's own 2250s enforcement while this function
         # still thought it had 3600s left). Confirmed both shapes live on
         # disk, not assumed.
-        task_name = config["task"].get("name") or config["task"]["path"]
-        # Strip any "<org>/" namespace prefix -- both cache layouts key their
-        # task directory by the bare name only (see the two glob patterns
-        # below), never the namespaced form.
-        task_name = task_name.rsplit("/", 1)[-1]
-        # Harbor caches a task's files differently depending on which
-        # registry resolved the dataset: a legacy name@version dataset (e.g.
-        # "terminal-bench@2.0") caches at <hash>/<task_name>/task.toml, while
-        # a newer org/name package dataset (e.g. "terminal-bench/terminal-
-        # bench-2-1") caches one level deeper, at
-        # packages/<org>/<task_name>/<content-hash>/task.toml. Try both --
-        # confirmed by inspecting both live on disk, not assumed.
-        matches = list(HARBOR_TASK_CACHE.glob(f"*/{task_name}/task.toml"))
-        matches += list(HARBOR_TASK_CACHE.glob(f"packages/*/{task_name}/*/task.toml"))
-        if not matches:
-            return DEFAULT_PROMPT_TIMEOUT_SEC
-        # Ambiguous match (e.g. both an old and a new cache exist for the
-        # same task name, as happens right after switching dataset versions)
-        # -- prefer the most recently written one over an arbitrary pick.
-        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        toml_data = tomllib.loads(matches[0].read_text())
+        task_name = task.get("name")
+        if task_name is not None:
+            # Package shape. task_name is typically namespaced
+            # ("<org>/<bare>"); the package cache directory is keyed by
+            # (org, bare) separately, plus a content-hash directory equal to
+            # task["ref"]'s sha256 hex when present -- giving an exact,
+            # unambiguous path with no heuristics needed.
+            org, _, bare = task_name.rpartition("/")
+            org = org or "*"
+            ref = task.get("ref") or ""
+            match_path = None
+            if ref.startswith("sha256:"):
+                ref_hex = ref.split(":", 1)[1]
+                candidate = HARBOR_TASK_CACHE / "packages" / org / bare / ref_hex / "task.toml"
+                if org != "*" and candidate.exists():
+                    match_path = candidate
+                    resolution = "exact-ref"
+            if match_path is None:
+                # Ref missing/mismatched (e.g. cache evicted and re-fetched
+                # under a different content hash) -- fall back to a glob
+                # restricted to the package layout ONLY. Never fall through
+                # to the legacy glob here; that would silently read a
+                # different dataset generation's metadata.
+                pkg_matches = list(HARBOR_TASK_CACHE.glob(f"packages/{org}/{bare}/*/task.toml"))
+                if not pkg_matches:
+                    return _fallback_timeout_info()
+                # Package-cache mtimes may all be epoch (arbitrary pick among
+                # them then) -- but this is still the right dataset
+                # generation, unlike mixing in the legacy layout.
+                pkg_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                match_path = pkg_matches[0]
+                resolution = "fallback-glob"
+            layout = "package"
+        else:
+            # Legacy shape.
+            bare = task["path"].rsplit("/", 1)[-1]
+            legacy_matches = [
+                p for p in HARBOR_TASK_CACHE.glob(f"*/{bare}/task.toml")
+                if "packages" not in p.relative_to(HARBOR_TASK_CACHE).parts
+            ]
+            if not legacy_matches:
+                return _fallback_timeout_info()
+            legacy_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            match_path = legacy_matches[0]
+            resolution = "glob"
+            layout = "legacy"
+
+        toml_data = tomllib.loads(match_path.read_text())
         base_timeout_sec = float(toml_data["agent"]["timeout_sec"])
-        return base_timeout_sec * multiplier * DEADLINE_SAFETY_MARGIN
+        effective_timeout_sec = base_timeout_sec * multiplier * DEADLINE_SAFETY_MARGIN
+        return {
+            "cache_layout": layout,
+            "resolution": resolution,
+            "selected_task_toml": str(match_path),
+            "base_timeout_sec": base_timeout_sec,
+            "multiplier": multiplier,
+            "effective_timeout_sec": effective_timeout_sec,
+        }
     except Exception:
-        return DEFAULT_PROMPT_TIMEOUT_SEC
+        return _fallback_timeout_info()
+
+
+def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
+    """Thin wrapper around _resolve_trial_timeout_info for callers that only
+    need the effective timeout float."""
+    return _resolve_trial_timeout_info(logs_dir)["effective_timeout_sec"]
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
@@ -343,10 +416,21 @@ class LittleCoderAgent(BaseAgent):
                 live_log_fh.write("=== agent_end ===\n")
                 live_log_fh.flush()
 
-        effective_timeout_sec = _resolve_trial_timeout_sec(self.logs_dir)
-        self.logger.info(
-            f"LittleCoderAgent: effective trial timeout={effective_timeout_sec:.0f}s"
-        )
+        timeout_info = _resolve_trial_timeout_info(self.logs_dir)
+        effective_timeout_sec = timeout_info["effective_timeout_sec"]
+        if timeout_info["resolution"] == "fallback-default":
+            self.logger.info(
+                f"LittleCoderAgent: timeout resolved from fallback-default: "
+                f"-> {effective_timeout_sec:.0f}s"
+            )
+        else:
+            self.logger.info(
+                "LittleCoderAgent: timeout resolved from "
+                f"{timeout_info['cache_layout']}/{timeout_info['resolution']}: "
+                f"{timeout_info['selected_task_toml']} "
+                f"base={timeout_info['base_timeout_sec']:.0f}s "
+                f"x{timeout_info['multiplier']} -> {effective_timeout_sec:.0f}s"
+            )
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
 
         try:
