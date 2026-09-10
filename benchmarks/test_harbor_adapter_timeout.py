@@ -287,3 +287,122 @@ def test_provenance_dict_shapes(tmp_path, monkeypatch):
     assert info_d["resolution"] == "fallback-default"
     assert info_d["cache_layout"] is None
     assert info_d["selected_task_toml"] is None
+
+
+def test_bare_name_with_sha256_ref_resolves_via_exact_ref_glob(tmp_path, monkeypatch):
+    """Regression test: a package-shape config whose task.name has NO
+    "<org>/" prefix (e.g. "overfull-hbox") makes org.rpartition("/") yield
+    org="*", which used to skip the exact-ref fast path entirely (gated on
+    `org != "*"`) even though task.ref's content hash already identifies a
+    real, unambiguous directory. Must resolve via the new wildcard-org
+    exact-hash glob to that file's timeout_sec -- not the default, and not
+    some other same-named org's file."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(lca, "HARBOR_TASK_CACHE", cache)
+
+    real_toml = cache / "packages" / "orgA" / "overfull-hbox" / "realhash" / "task.toml"
+    _write_task_toml(real_toml, 1500.0)
+    # A decoy under a different org with the same bare name but a different
+    # hash -- must NOT be picked.
+    decoy_toml = cache / "packages" / "orgB" / "overfull-hbox" / "decoyhash" / "task.toml"
+    _write_task_toml(decoy_toml, 60.0)
+
+    trial_dir = tmp_path / "trial"
+    _write_trial_config_v21(trial_dir, "overfull-hbox", ref="sha256:realhash")
+    logs_dir = trial_dir / "agent"
+    logs_dir.mkdir()
+
+    info = lca._resolve_trial_timeout_info(logs_dir)
+    assert info["resolution"] == "exact-ref-glob"
+    assert info["selected_task_toml"] == str(real_toml)
+    assert info["base_timeout_sec"] == pytest.approx(1500.0)
+    assert info["ambiguous"] is False
+    assert info["candidates_considered"] == 1
+    assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(1500.0 * 3.0 * 0.9)
+
+
+def test_bare_name_two_orgs_same_hash_equal_timeouts_agreed(tmp_path, monkeypatch):
+    """Two different orgs happen to share both the bare name and the exact
+    content hash (e.g. a task mirrored under two org namespaces). Since
+    both candidates agree on timeout_sec, resolve to it and report
+    ambiguous=False, with resolution suffixed "-agreed"."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(lca, "HARBOR_TASK_CACHE", cache)
+
+    toml_a = cache / "packages" / "orgA" / "shared-task" / "samehash" / "task.toml"
+    _write_task_toml(toml_a, 500.0)
+    toml_b = cache / "packages" / "orgB" / "shared-task" / "samehash" / "task.toml"
+    _write_task_toml(toml_b, 500.0)
+
+    trial_dir = tmp_path / "trial"
+    _write_trial_config_v21(trial_dir, "shared-task", ref="sha256:samehash")
+    logs_dir = trial_dir / "agent"
+    logs_dir.mkdir()
+
+    info = lca._resolve_trial_timeout_info(logs_dir)
+    assert info["resolution"] == "exact-ref-glob-agreed"
+    assert info["ambiguous"] is False
+    assert info["candidates_considered"] == 2
+    assert info["base_timeout_sec"] == pytest.approx(500.0)
+    assert "candidate_task_tomls" not in info
+    assert "candidate_timeouts_sec" not in info
+
+
+def test_bare_name_two_orgs_same_hash_different_timeouts_ambiguous(tmp_path, monkeypatch):
+    """Two orgs share bare name + exact content hash but their task.toml
+    files disagree on timeout_sec (a malformed/inconsistent cache). Must
+    pick the minimum (an under-estimate merely finalizes early; an
+    over-estimate risks a hard-kill mid-write) and flag the ambiguity in the
+    provenance dict so it's visible in result.json."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(lca, "HARBOR_TASK_CACHE", cache)
+
+    toml_a = cache / "packages" / "orgA" / "shared-task" / "samehash" / "task.toml"
+    _write_task_toml(toml_a, 500.0)
+    toml_b = cache / "packages" / "orgB" / "shared-task" / "samehash" / "task.toml"
+    _write_task_toml(toml_b, 200.0)
+
+    trial_dir = tmp_path / "trial"
+    _write_trial_config_v21(trial_dir, "shared-task", ref="sha256:samehash")
+    logs_dir = trial_dir / "agent"
+    logs_dir.mkdir()
+
+    info = lca._resolve_trial_timeout_info(logs_dir)
+    assert info["resolution"] == "exact-ref-glob"
+    assert info["ambiguous"] is True
+    assert info["candidates_considered"] == 2
+    assert info["base_timeout_sec"] == pytest.approx(200.0)
+    assert sorted(info["candidate_task_tomls"]) == sorted([str(toml_a), str(toml_b)])
+    assert sorted(info["candidate_timeouts_sec"]) == [200.0, 500.0]
+    assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(200.0 * 3.0 * 0.9)
+    # Round-trips through JSON cleanly (PR27 depends on this).
+    assert json.loads(json.dumps(info)) == info
+
+
+def test_namespaced_name_still_takes_exact_ref_fast_path(tmp_path, monkeypatch):
+    """Guard against the new wildcard-org glob shadowing the original
+    exact-ref fast path: a namespaced task.name with a valid sha256 ref
+    whose exact org+hash directory exists must still resolve via plain
+    "exact-ref", not "exact-ref-glob", even when another org's directory
+    with the same bare name and hash also exists on disk."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(lca, "HARBOR_TASK_CACHE", cache)
+
+    real_toml = cache / "packages" / "terminal-bench" / "some-task" / "hashX" / "task.toml"
+    _write_task_toml(real_toml, 1234.0)
+    # Another org, same bare name and hash -- exact-ref must still win
+    # without ever consulting the wildcard-org glob.
+    other_org_toml = cache / "packages" / "otherorg" / "some-task" / "hashX" / "task.toml"
+    _write_task_toml(other_org_toml, 9999.0)
+
+    trial_dir = tmp_path / "trial"
+    _write_trial_config_v21(trial_dir, "terminal-bench/some-task", ref="sha256:hashX")
+    logs_dir = trial_dir / "agent"
+    logs_dir.mkdir()
+
+    info = lca._resolve_trial_timeout_info(logs_dir)
+    assert info["resolution"] == "exact-ref"
+    assert info["selected_task_toml"] == str(real_toml)
+    assert info["ambiguous"] is False
+    assert info["candidates_considered"] == 1
+    assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(1234.0 * 3.0 * 0.9)
