@@ -272,6 +272,87 @@ def main():
         serve_requests()
         return
 
+    if mode == "settled_after_extra_event":
+        # Pins Bug A: agent_settled arrives right after an unrelated event
+        # (not immediately after agent_end). The old two-phase drain's
+        # Phase 1 predicate only matched agent_end, so this agent_settled
+        # was treated as an ordinary event and Phase 1 waited out the
+        # entire remaining timeout for an agent_end that would never come.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "usage_update", "usage": {"tokens": 123}})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "retry_then_settled":
+        # Pins the PR28 repro: an auto_retry_end between agent_end and
+        # agent_settled must not be mistaken for "a continuation started"
+        # (which would re-arm the full remaining timeout).
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "auto_retry_end"})
+        emit({"type": "agent_settled"})
+        time.sleep(30)
+        return
+
+    if mode == "abort_then_followup_then_exit":
+        # Same sequence as abort_then_followup, but pi exits immediately
+        # after agent_settled instead of sleeping -- combined with a slow
+        # on_event in the test, this lets the reader thread race ahead and
+        # set _eof before the consumer has drained the whole queue. Pins
+        # Bug B: the old "if self._eof: break" guards discarded the queued
+        # recovery turn in exactly this race.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "thinking too long..."}})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "recovered answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        os._exit(0)
+
+    if mode == "end_then_stray_then_hang":
+        # Pins Bug C's specific "stray must not re-arm" case: a duplicate
+        # agent_end while SETTLING must not restart the settle window, and
+        # must not be treated as renewed work either. pi then hangs forever
+        # without ever emitting agent_settled.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_end"})  # stray duplicate while SETTLING
+        time.sleep(3600)
+        return
+
+    if mode == "continuation_never_finishes":
+        # Pins Bug D: a genuine continuation starts (agent_start) but never
+        # finishes. The call must run the full outer timeout and report
+        # stop_reason="deadline" -- NOT "agent_end", even though an
+        # agent_end was seen earlier in this same call.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_start"})
+        time.sleep(3600)
+        return
+
+    if mode == "chatty_then_hang":
+        # Pins the absolute (not per-event) settle window: a continuous
+        # stream of non-terminal events after agent_end must not extend
+        # SETTLING past the settle_deadline computed on entry.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        while True:
+            emit({"type": "queue_update", "queued": 1})
+            time.sleep(0.05)
+
     # default: clean single turn with one tool call
     emit({"type": "response", "id": rid, "success": True})
     emit({"type": "agent_start"})

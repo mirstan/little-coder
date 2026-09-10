@@ -76,10 +76,19 @@ class PromptResult:
     agent_ended: bool = False
     compaction_events: int = 0
     turn_count: int = 0
-    #: Why the call returned: "agent_end" (pi finished the turn), "deadline"
+    #: Why the call returned: "agent_end" (pi finished the turn -- this
+    #: covers both a genuine agent_settled and the bounded settle-window
+    #: fallback described below; "agent_settled" is deliberately NOT a
+    #: separate value here, see prompt_and_collect()'s docstring), "deadline"
     #: (budget expired), or "process_exit" (pi died mid-run). Callers must not
     #: infer this from elapsed time -- a crash burns the full budget too,
     #: because stdout EOF used not to wake the drain.
+    #:
+    #: NOTE: agent_ended=True with stop_reason="deadline" is a reachable and
+    #: meaningful combination as of the ACTIVE/SETTLING rewrite: it means a
+    #: continuation turn started (e.g. a queued follow-up after an abort) but
+    #: never finished before the outer timeout expired. Do not read
+    #: agent_ended alone as "the call completed" -- check stop_reason too.
     stop_reason: str = "agent_end"
     #: Token usage summed across every `turn_end` seen during this call
     #: (see prompt_and_collect's aggregation loop). Crash-proof but
@@ -90,6 +99,11 @@ class PromptResult:
     usage: dict = field(default_factory=lambda: {
         "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0,
     })
+    #: True only when pi's own agent_settled event was actually observed
+    #: (i.e. NOT via the settle-grace fallback). Purely observational --
+    #: stop_reason intentionally still reports "agent_end" in both cases for
+    #: backward compatibility (see stop_reason's docstring).
+    settled: bool = False
 
 
 class PiRpc:
@@ -391,35 +405,122 @@ class PiRpc:
         trajectory log instead of only seeing the aggregated PromptResult
         once this call finally returns.
 
-        Two-phase drain, because `agent_end` is not always the end of the
-        turn: an extension can react to an `agent_end` (e.g. the
+        Single loop, two modes, because `agent_end` is not always the end of
+        the turn: an extension can react to an `agent_end` (e.g. the
         thinking-budget extension aborting a runaway thinking stream) by
         queuing a follow-up message and letting pi continue processing in
         the same run. pi's queued-follow-up continuation (and auto-retry /
         auto-compaction continuations) runs to completion and only then
         emits `agent_settled` -- pi's own purpose-built "nothing left
         queued, truly idle" signal. Draining only to the first `agent_end`
-        (the old behaviour) returns before that continuation starts, which
-        for a Harbor trial means the caller treats the abort as the whole
-        run finishing and tears the process down mid-recovery.
+        returns before that continuation starts, which for a Harbor trial
+        means the caller treats the abort as the whole run finishing and
+        tears the process down mid-recovery.
 
-        Phase 1 drains until `agent_end` (or timeout/EOF), exactly as
-        before. If an `agent_end` was seen and pi hasn't exited, Phase 2
-        drains for up to `min(settle_grace, remaining)` waiting for the
-        very next event:
-          - `agent_settled` -> pi is genuinely idle; done.
-          - anything else -> a continuation turn started; append it and
-            loop back to Phase 1 to drain it out too.
-          - nothing arrives (grace expires) or EOF -> return anyway. This
-            is a defensive fallback for a pi build that never emits
-            agent_settled; it logs a warning since it means this function
-            is falling back to the old, weaker termination signal.
+        An earlier two-phase version of this drain (Phase 1 to `agent_end`,
+        Phase 2 one event to decide "settled vs. continuation") could not
+        express "am I waiting for work, or waiting for the session to
+        quiesce?" as a single predicate, and that ambiguity was four bugs:
 
-        All phases append into one `events` list, so tool calls / text /
+          (a) Phase 1's predicate only matched `agent_end`, so if the very
+              next event after looping back was `agent_settled` itself, it
+              was treated as an ordinary event and Phase 1 waited out the
+              *entire remaining timeout* for an `agent_end` that would never
+              arrive.
+          (b) an `if self._eof: break` right after Phase 1 raced the reader
+              thread: if pi's process (and EOF) arrived before a slow
+              `on_event` had drained an already-queued recovery turn, this
+              guard discarded that entire queued turn instead of letting
+              `_drain_events_until` -- the single authority on "queue empty
+              AND pi gone" -- decide.
+          (c) Phase 2 treated "any event that is not agent_settled" as
+              "a continuation started" and looped back to Phase 1 with the
+              FULL remaining timeout -- so a stray/duplicate `agent_end`
+              (pi does this) or benign post-turn chatter (`auto_retry_end`,
+              `queue_update`) re-armed the whole budget instead of just
+              being noise inside the settle window.
+          (d) `stop_reason` was derived from a latched "did we ever see an
+              agent_end", so a run that mis-looped per (c) until the outer
+              timeout expired still reported `stop_reason="agent_end"` --
+              a truncated trial reading as a completed one downstream.
+
+        This version replaces both phases with one loop carrying an explicit
+        mode:
+
+          ACTIVE   -- work is (or may be) in flight. Wait up to the FULL
+                      remaining timeout for a terminal event. The predicate
+                      matches `agent_end` OR `agent_settled` (fixes (a): a
+                      settle seen here ends the call immediately, it is
+                      never mistaken for "just another event").
+          SETTLING -- an `agent_end` has been seen; wait, ONE EVENT AT A
+                      TIME, for the session to quiesce, bounded by an
+                      ABSOLUTE settle deadline computed once on entry:
+                      `settle_deadline = min(now + settle_grace, start +
+                      timeout)`. Recomputing this per-event (rather than
+                      once) would let a chatty post-turn stream extend
+                      settling indefinitely -- bounded only by the outer
+                      timeout, the opposite of what settle_grace is for.
+
+        The event popped while SETTLING decides what happens next:
+          - `agent_settled` -> terminal; pi's real idle signal, honored
+            wherever it appears in the stream.
+          - a *renewed-work* marker (currently just `agent_start`) -> back to
+            ACTIVE with the full remaining timeout; a genuine continuation
+            turn (the abort-then-followup case this function's two-phase
+            drain was originally built for).
+          - a second, consecutive `agent_end` -> STAY in SETTLING (fixes
+            (c)): a stray/duplicate end must never re-arm the timeout.
+          - anything else (`auto_retry_end`, `queue_update`, `usage_update`,
+            an event type pi hasn't invented yet) -> STAY in SETTLING. The
+            settle deadline still bounds us, so this is cheap even when
+            wrong.
+          - settle deadline expires with nothing new -> break, emit the
+            existing "pi did not emit agent_settled" warning (unchanged
+            defensive fallback for a pi build that never emits it).
+
+        Design choice: allowlist, not denylist, for "renewed work". The old
+        rule -- "anything that isn't agent_settled means a continuation
+        started" -- is a denylist that fails OPEN on every event type pi
+        ever adds (bug (c)). Inverting it to an allowlist of markers that
+        re-enter ACTIVE fails CLOSED instead: an unrecognized event just
+        keeps settling. Failing closed is cheap specifically because of
+        (a)'s fix -- even a wrongly-ignored continuation costs at most until
+        the next `agent_settled`, never the whole timeout. The allowlist
+        starts as `{"agent_start"}` only, matching every fixture here and
+        pi's documented behaviour: a continuation turn always opens with
+        `agent_start`. Residual risk, noted rather than hidden: a
+        hypothetical pi build that resumes work WITHOUT emitting
+        `agent_start` degrades to the old pre-two-phase behaviour (return at
+        `agent_end` after `settle_grace`) plus the existing warning -- a
+        degradation, not a hang.
+
+        `_drain_events_until` is the single authority on "queue empty AND pi
+        gone" (it drains everything already queued, in order, before ever
+        consulting `self._eof`); this loop deliberately never adds its own
+        `if self._eof: break` on top of that, because such a check observes
+        only the flag, not the queue, and can discard events that are
+        already sitting there waiting to be popped (bug (b)).
+
+        `stop_reason` is derived from how the loop exited, not from a
+        latched "did we ever see agent_end" (fixes (d)):
+          - the outer `timeout` expired while in ACTIVE (work still in
+            flight) -> "deadline", even if one or more `agent_end` events
+            were seen earlier in this call;
+          - exited on `agent_settled`, or on the bounded settle-window
+            fallback after an `agent_end` -> "agent_end" (this exact string
+            is kept for both cases -- `aider_polyglot.py::_stop_reason` and
+            the polyglot metadata tests key on it; "agent_settled" is
+            deliberately NOT introduced as a new value);
+          - otherwise, if `self._eof or self._proc.poll() is not None` ->
+            "process_exit";
+          - otherwise -> "deadline".
+
+        All modes append into one `events` list, so tool calls / text /
         turn_count from a continuation turn are aggregated into the same
-        PromptResult as the initial turn. `stop_reason`/`agent_ended` stay
-        keyed on whether any `agent_end` was seen across all phases, so
-        that semantics for existing callers is unchanged.
+        PromptResult as the initial turn. `agent_ended` stays True if any
+        `agent_end` was observed across the whole call -- including a
+        continuation that never finished, see PromptResult.stop_reason's
+        docstring for why that combination is meaningful, not contradictory.
         """
         if self._closed:
             raise RuntimeError("prompt_and_collect() on a closed PiRpc")
@@ -461,40 +562,67 @@ class PiRpc:
         with self._cv:
             del self._event_q[:watermark]
 
+        # Renewed-work markers: an event of one of these types popped while
+        # SETTLING means a genuine continuation turn started, so we go back
+        # to ACTIVE with the full remaining timeout. Allowlist, not denylist
+        # -- see the docstring above for why that direction matters.
+        _RENEWED_WORK_MARKERS = ("agent_start",)
+        _TERMINAL_TYPES = ("agent_end", "agent_settled")
+
         start = time.time()
         events: list[dict] = []
         saw_agent_end = False
+        settled = False
+        mode = "ACTIVE"
+        settle_deadline = 0.0
+        # Only ever set True when ACTIVE exits because the outer timeout
+        # itself ran out (not because pi went away with time still on the
+        # clock) -- this is what lets stop_reason distinguish a genuine
+        # deadline from an EOF, per the derivation below.
+        active_timeout_expired = False
+
         while True:
-            remaining = timeout - (time.time() - start)
-            if remaining <= 0:
-                break
-            phase1_events = self._drain_events_until(
-                lambda ev: ev.get("type") == "agent_end",
-                timeout=remaining,
-                on_event=on_event,
-            )
-            events.extend(phase1_events)
-            if not any(ev.get("type") == "agent_end" for ev in phase1_events):
-                # Deadline or EOF, no agent_end this phase -- nothing left to
-                # settle-wait for.
-                break
-            saw_agent_end = True
+            if mode == "ACTIVE":
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    active_timeout_expired = True
+                    break
+                batch = self._drain_events_until(
+                    lambda ev: ev.get("type") in _TERMINAL_TYPES,
+                    timeout=remaining,
+                    on_event=on_event,
+                )
+                events.extend(batch)
+                last_type = batch[-1].get("type") if batch else None
+                if last_type not in _TERMINAL_TYPES:
+                    # Nothing terminal arrived this phase -- either the
+                    # outer timeout ran out mid-wait, or pi went away
+                    # (_drain_events_until returns "queue empty AND EOF"
+                    # either way; disambiguate by re-checking the clock, not
+                    # by adding our own separate _eof check).
+                    if timeout - (time.time() - start) <= 0:
+                        active_timeout_expired = True
+                    break
+                if last_type == "agent_settled":
+                    settled = True
+                    break
+                # agent_end -- work may or may not be fully done. Enter
+                # SETTLING with a fresh, absolute deadline.
+                saw_agent_end = True
+                mode = "SETTLING"
+                settle_deadline = min(time.time() + settle_grace, start + timeout)
+                continue
 
-            if self._eof:
-                break
-
-            remaining = timeout - (time.time() - start)
-            grace = min(settle_grace, remaining)
-            if grace <= 0:
-                break
-
-            # Phase 2: wait for the very next event, bounded by the settle
-            # grace window. `_drain_events_until` with an always-true
-            # predicate returns as soon as exactly one event arrives (or
-            # empty on timeout/EOF).
+            # mode == "SETTLING" -- one event at a time, deliberately (see
+            # the docstring's "SETTLING" description). `_drain_events_until`
+            # with an always-true predicate returns as soon as exactly one
+            # event arrives (or empty on timeout/EOF); a non-positive
+            # `grace_remaining` is passed through as-is and returns empty
+            # immediately, so no separate pre-check is needed here.
+            grace_remaining = settle_deadline - time.time()
             settle_events = self._drain_events_until(
                 lambda ev: True,
-                timeout=grace,
+                timeout=grace_remaining,
                 on_event=on_event,
             )
             if not settle_events:
@@ -508,17 +636,32 @@ class PiRpc:
                     )
                 break
             events.extend(settle_events)
-            if settle_events[-1].get("type") == "agent_settled":
+            ev_type = settle_events[-1].get("type")
+            if ev_type == "agent_settled":
+                settled = True
                 break
-            if self._eof:
-                break
-            # Renewed activity (e.g. a queued follow-up's own agent_start) --
-            # loop back to Phase 1 and drain the continuation turn too.
+            if ev_type in _RENEWED_WORK_MARKERS:
+                mode = "ACTIVE"
+                continue
+            # A duplicate/stray agent_end, or any other post-turn chatter
+            # (auto_retry_end, queue_update, usage_update, ...) -- stay in
+            # SETTLING. settle_deadline is untouched: it was fixed on entry
+            # to SETTLING and is not extended by what we see while here.
+            continue
 
         result = PromptResult()
-        # Derived from what was observed, not from how long it took: a crash
-        # burns the same wall-clock as a deadline.
-        if saw_agent_end:
+        result.settled = settled
+        # Derived from how the loop exited, not from a latched "did we ever
+        # see agent_end" -- see PromptResult.stop_reason's docstring for why
+        # agent_ended=True with stop_reason="deadline" is reachable and
+        # meaningful.
+        if active_timeout_expired:
+            result.stop_reason = "deadline"
+        elif settled or mode == "SETTLING":
+            # Either pi's real idle signal fired, or we exited the bounded
+            # settle window (deadline or EOF) after having seen an
+            # agent_end -- both report the same string for backward
+            # compatibility; see the docstring above.
             result.stop_reason = "agent_end"
         elif self._eof or self._proc.poll() is not None:
             result.stop_reason = "process_exit"
