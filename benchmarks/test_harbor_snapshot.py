@@ -2,6 +2,15 @@
 _HarborShellProxy / LittleCoderAgent.run() in little_coder_agent.py:
 
   - the bounded, atomically-staged snapshot shell command itself
+  - _wrap_command() actually composing a parseable shell script -- both for
+    a harness call's cwd=None form and a model call's cd/pwd-tracking form
+    -- verified by actually feeding the composed string to `sh -n`/`bash -n`
+    rather than merely substring-matching pieces of it. This is the
+    regression test for the 2.1 bug: an unterminated trailing `#` comment on
+    _SNAPSHOT_COMMAND's last line silently swallowed everything _exec_async
+    appended after it, and every existing substring-matching test still
+    passed because none of them ever actually composed and parsed the real
+    string.
   - _compute_snapshot_delay_sec()'s scheduling arithmetic (incl. the
     short-task skip edge case)
   - _HarborShellProxy.run_harness() staying on the caller's event loop
@@ -11,7 +20,9 @@ _HarborShellProxy / LittleCoderAgent.run() in little_coder_agent.py:
   - _exec_lock actually serializing a model-issued command (via the sync
     run() thread-bridge, exercised from a real background thread since
     calling it from the loop's own thread would itself deadlock) against a
-    harness-issued run_harness() call
+    harness-issued run_harness() call, and run_harness's track_cwd=False
+    never mutating proxy.cwd even when the underlying exec's stdout happens
+    to look like it echoed back a pwd line
 
 Requires the `harbor` package (only installed in harbor's own uv-tool venv,
 not the plain system Python these other benchmark tests run under) purely
@@ -21,6 +32,9 @@ scaffolding convention as test_harbor_adapter_timeout.py.
 """
 import asyncio
 import logging
+import re
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -54,10 +68,20 @@ class _RecordingEnv:
 class _OverlapTrackingEnv:
     """Fake environment that records the max number of concurrently-active
     exec() calls, to detect whether two callers' commands ever overlapped
-    inside the container."""
+    inside the container.
 
-    def __init__(self, hold_sec: float = 0.1):
+    fake_pwd_line, if set, fabricates a `{sentinel}:0:{fake_pwd_line}` tail
+    on the response to any command that does NOT itself end in ` ; pwd`
+    (i.e. a track_cwd=False / harness-issued composition, which never asks
+    for one) -- simulating an environment that echoes back something that
+    *looks* like a pwd line even though none was requested, so a test can
+    confirm run_harness's track_cwd=False guard (not merely the absence of a
+    real trailing `pwd` in the command) is what keeps self.cwd untouched.
+    """
+
+    def __init__(self, hold_sec: float = 0.1, fake_pwd_line: str | None = None):
         self.hold_sec = hold_sec
+        self.fake_pwd_line = fake_pwd_line
         self.current = 0
         self.max_concurrent = 0
         self.commands: list[str] = []
@@ -70,7 +94,12 @@ class _OverlapTrackingEnv:
             await asyncio.sleep(self.hold_sec)
         finally:
             self.current -= 1
-        return SimpleNamespace(stdout="", stderr="", return_code=0)
+        stdout = ""
+        if self.fake_pwd_line is not None and not command.rstrip().endswith("pwd"):
+            m = re.search(r"(__LC_END_\w+__):", command)
+            if m:
+                stdout = f"\n{m.group(1)}:0:{self.fake_pwd_line}\n"
+        return SimpleNamespace(stdout=stdout, stderr="", return_code=0)
 
 
 # ── 1. Snapshot command construction ────────────────────────────────────────
@@ -101,6 +130,62 @@ def test_snapshot_command_has_bounded_caps_and_staged_publish():
     assert "rm -rf /tmp/.lc-snapshot.stage.*" in cmd
     # refuses rather than partially copies when oversize
     assert "set -e" in cmd
+    # 2.3: publish is gated on a non-empty candidate list, so a zero-match
+    # find (or a deleted start marker) refuses rather than publishing an
+    # empty snapshot directory
+    assert '[ -s "$STAGE/.list" ]' in cmd
+
+
+def test_snapshot_command_last_line_has_no_trailing_inline_comment():
+    """Regression pin for 2.1: a trailing `#` comment (with no newline after
+    it) on _SNAPSHOT_COMMAND's last line is exactly what silently swallowed
+    everything _exec_async/_wrap_command appended after it, producing a
+    command that never parsed. Guard against re-introducing one."""
+    last_line = lca._SNAPSHOT_COMMAND.rsplit("\n", 1)[-1]
+    assert "#" not in last_line, (
+        f"_SNAPSHOT_COMMAND's last line contains a trailing inline comment "
+        f"with no newline after it -- this swallows everything appended "
+        f"after the constant when it's wrapped (2.1): {last_line!r}"
+    )
+
+
+# ── 1b. The composed command must actually shell-parse ─────────────────────
+# (not just substring-match -- substring matching is exactly what let 2.1's
+# unterminated-comment bug ship undetected)
+
+_SHELLS_TO_TRY = ("sh", "bash")
+
+
+@pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
+def test_composed_snapshot_command_parses_under_sh_n(shell):
+    """The model-command (track_cwd=True) composition of _SNAPSHOT_COMMAND,
+    fed to a real shell's syntax checker -- this is the actual regression
+    test for 2.1: `sh -n`/`bash -n` reported "unexpected end of file", rc=2,
+    every single time before the fix."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not found on PATH")
+    composed = lca._wrap_command(lca._SNAPSHOT_COMMAND, "/app", "__LC_END_test__")
+    result = subprocess.run([shell, "-n"], input=composed, text=True, capture_output=True)
+    assert result.returncode == 0, (
+        f"{shell} -n rejected the composed snapshot command "
+        f"(rc={result.returncode}): {result.stderr!r}"
+    )
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
+def test_composed_harness_command_parses_under_sh_n(shell):
+    """Same, for the track_cwd=False composition (2.2) -- run_harness's
+    actual call shape: no leading `cd`, no trailing `pwd`."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not found on PATH")
+    composed = lca._wrap_command(lca._SNAPSHOT_COMMAND, None, "__LC_END_test__")
+    result = subprocess.run([shell, "-n"], input=composed, text=True, capture_output=True)
+    assert result.returncode == 0, (
+        f"{shell} -n rejected the composed harness (track_cwd=False) command "
+        f"(rc={result.returncode}): {result.stderr!r}"
+    )
+    assert result.stderr == ""
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
@@ -213,8 +298,15 @@ def test_exec_lock_serializes_run_and_run_harness():
     there was nothing to serialize the two paths against each other; without
     it, two coroutines scheduled on the same loop that each `await
     asyncio.sleep(...)` mid-exec would interleave, and OverlapTrackingEnv's
-    max_concurrent would show 2."""
-    env = _OverlapTrackingEnv(hold_sec=0.15)
+    max_concurrent would show 2.
+
+    Also (2.2) pins that run_harness's track_cwd=False never mutates
+    proxy.cwd -- the fake env is set up to fabricate a bogus pwd-looking
+    tail on any non-pwd-ending command (i.e. exactly the harness-issued
+    composition), so a regression that let run_harness read/write self.cwd
+    would show up here as proxy.cwd changing to that bogus value.
+    """
+    env = _OverlapTrackingEnv(hold_sec=0.15, fake_pwd_line="/bogus/should-not-be-used")
     thread_result: dict[str, str] = {}
 
     async def scenario():
@@ -233,9 +325,9 @@ def test_exec_lock_serializes_run_and_run_harness():
         harness_out = await proxy.run_harness("echo harness-issued", 5)
         t.join(timeout=5)
         assert not t.is_alive()
-        return harness_out
+        return harness_out, proxy.cwd
 
-    harness_out = asyncio.run(scenario())
+    harness_out, cwd_after = asyncio.run(scenario())
 
     assert env.max_concurrent == 1, (
         f"exec calls overlapped (max_concurrent={env.max_concurrent}) -- "
@@ -246,3 +338,8 @@ def test_exec_lock_serializes_run_and_run_harness():
     assert any("echo harness-issued" in c for c in env.commands)
     assert thread_result.get("out")  # sync run() returned formatted output
     assert harness_out
+    assert cwd_after == "/app", (
+        f"proxy.cwd changed to {cwd_after!r} -- run_harness's track_cwd=False "
+        "must never read or write self.cwd, even when the underlying exec's "
+        "stdout looks like it echoed back a pwd line"
+    )
