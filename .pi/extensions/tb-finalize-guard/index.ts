@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
-import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell-write.ts";
+import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
+import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with two independent
 // trigger conditions (Plan 3 + Plan 4, reconciled after a Fable adversarial
@@ -24,14 +25,23 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // doc). IMPORTANT scope-honesty note carried over from the plan: neither of
 // those two specific trials is actually caught by Trigger A as implemented
 // here. break-filter-js-from-html's last turns hit thinking-budget's abort
-// (stopReason "aborted", explicitly excluded below — that path is owned by
-// the thinking-budget/agent_end fix, already on this branch). gpt2-codegolf's
-// last turn was a *successful* tool call with no quality-monitor complaint,
-// which points at a silent stopReason:"error" turn somewhere upstream of the
-// visible transcript, not a toolless quit. Trigger A is broadened (per the
-// adversarial review) to also catch (empty content + stopReason "error") in
-// case a case shaped like that recurs, but this is implemented honestly as a
-// forward-looking net, not a retroactive fix for either motivating trial.
+// (stopReason "aborted", excluded below). gpt2-codegolf's last turn was a
+// *successful* tool call with no quality-monitor complaint, which points at a
+// silent stopReason:"error" turn somewhere upstream of the visible
+// transcript, not a toolless quit.
+//
+// Trigger A used to also match (empty content + stopReason "error") as a
+// forward-looking net for a case shaped like that recurring. That clause was
+// removed: stopReason "error" is a provider/transport failure, not a model
+// decision — gaia-finalize-guard bails on `stopReason === "aborted" ||
+// "error"` for the same reason, and quality-monitor carries the identical
+// note ("can't fix a 400 by steering"). Worse, MAX_TRIGGER_A_FIRES is
+// session-scoped, so a repeating provider error could burn both fires on
+// turns the model never controlled, leaving the guard disarmed for the real
+// early-quit it exists to catch. The trade-off: a genuine silent-error early
+// quit (the gpt2-codegolf case) no longer gets steered — but it remains
+// diagnosable from the run log via the turn_end instrumentation below, which
+// is the point of keeping that logging unconditional.
 //
 // ---------------------------------------------------------------------------
 // Trigger B — post-finalize-warn non-compliance
@@ -47,11 +57,9 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // re-deriving over adding new cross-extension coupling, this guard
 // independently re-derives finalize-warn's own trigger condition (turn-count
 // OR wall-clock, computed the same way at turn_start) rather than reading
-// finalize-warn's private state. The WARN_REMAINING / WARN_REMAINING_MS
-// constants below are deliberately kept in lockstep with finalize-warn's
-// (5 turns / 10 minutes) — if those ever change there, they must change here
-// too, since this guard's "armed" condition needs to describe the same
-// moment finalize-warn's nudge lands, not a different one.
+// finalize-warn's private state, via the shared `finalizeWarnWouldFire` in
+// _shared/finalize-warn-trigger.ts — see that module's header for why the
+// constants and condition live there now instead of being hand-copied here.
 //
 // finalize-warn's message is delivered as deliverAs:"followUp", which lands
 // on the model's *next* turn, not the turn during which the trigger fired
@@ -60,10 +68,23 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // starting from the turn AFTER that one — the model can't be faulted for not
 // complying with a message it hasn't seen yet.
 //
-// Compliance is judged via _shared/shell-write.ts's existing write-command
-// classification, extended with `isScratchPath` (added alongside this guard)
-// so a write that only ever lands in /tmp does not count as having saved the
-// real deliverable (Codex finding folded into the merged plan).
+// Compliance is judged via _shared/shell-write.ts's `detectDeliverableWrites`
+// — a tb-finalize-guard-only superset of `detectWriteTargets` that also
+// recognizes `cp`/`mv`/`install`, `sed -i`, and a compiler's `-o` flag as
+// evidence of a write, not just shell redirection (`detectWriteTargets`
+// itself stays redirect-only because write-guard and permission-gate also
+// consume it, and both deliberately treat `cp`/`mv`/`sed -i` as safe,
+// non-write commands — see that function's own comment). Extended with
+// `isScratchPath` (added alongside this guard) so a write that only ever
+// lands in /tmp does not count as having saved the real deliverable (Codex
+// finding folded into the merged plan).
+//
+// A turn's evidence-of-work also includes `ShellSend` (writing to an
+// already-running interactive job's stdin) even though it is deliberately
+// excluded from `SHELL_TOOLS` for permission-gating purposes — a model
+// driving an editor/REPL through `ShellSend` is plainly working. This guard
+// scans for it locally rather than adding it to the shared, security-relevant
+// `SHELL_TOOLS` set.
 //
 // ---------------------------------------------------------------------------
 // Shared instrumentation
@@ -75,13 +96,11 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // occurrence of gpt2-codegolf's silent stopReason:"error" turn is
 // diagnosable from the run log instead of invisible.
 
+// WARN_REMAINING_MS lives in _shared/finalize-warn-trigger.ts now — see that
+// module's header for why (this constant used to be hand-copied here and in
+// finalize-warn/index.ts with nothing enforcing they stayed in lockstep).
 const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WARN_REMAINING_MS
 const MAX_TRIGGER_A_FIRES = 2; // per session
-
-// Mirrors finalize-warn/index.ts's own constants exactly — see the header
-// comment above for why these must stay in lockstep.
-const WARN_REMAINING = 5; // turns
-const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
 
@@ -115,22 +134,33 @@ function contentShape(message: any): { text: string; toolCallCount: number; tool
   return { text, toolCallCount: toolCalls.length, toolCalls };
 }
 
-/** Re-derives finalize-warn's own turn-count-OR-wall-clock trigger condition. */
-function finalizeWarnWouldFire(): boolean {
-  const turnTrigger =
-    capForRun > WARN_REMAINING && turnsThisRun === capForRun - WARN_REMAINING + 1;
-  const remainingMs = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
-  const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
-  return turnTrigger || timeTrigger;
-}
+// Local addition to SHELL_TOOLS, for this guard's evidence-of-work purposes
+// only. `SHELL_TOOLS` itself stays untouched — it's security-relevant and
+// shared by write-guard/permission-gate, which deliberately leave ShellSend
+// out (it writes to an already-running job's stdin rather than starting a
+// command, so it's gated by whatever approved that job in the first place —
+// see _shared/shell-write.ts's comment on SHELL_TOOLS). That's an
+// authorization judgment, not a claim that ShellSend can't produce writes:
+// a model driving an interactive editor/REPL through it is plainly working.
+const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
 
-/** Every ShellSession/bash command string found in this turn's tool calls. */
+/**
+ * Every command-shaped string found in this turn's tool calls: the `command`
+ * argument for anything in SHELL_TOOLS, plus (for Trigger B's evidence-of-work
+ * purposes only) ShellSend's `text` argument — confirmed against
+ * bg-shell/index.ts's ShellSend tool definition, which takes `text`, not
+ * `command`.
+ */
 function shellCommandsIn(toolCalls: any[]): string[] {
   const commands: string[] = [];
   for (const c of toolCalls) {
-    if (typeof c?.name !== "string" || !SHELL_TOOLS.has(c.name)) continue;
+    if (typeof c?.name !== "string") continue;
     const args = c.arguments ?? c.input ?? {};
-    if (typeof args?.command === "string") commands.push(args.command);
+    if (SHELL_TOOLS.has(c.name)) {
+      if (typeof args?.command === "string") commands.push(args.command);
+    } else if (EVIDENCE_ONLY_SHELL_TOOLS.has(c.name)) {
+      if (typeof args?.text === "string") commands.push(args.text);
+    }
   }
   return commands;
 }
@@ -138,7 +168,7 @@ function shellCommandsIn(toolCalls: any[]): string[] {
 /** True when at least one command in this turn writes somewhere other than scratch. */
 function hasNonScratchWrite(commands: string[]): boolean {
   for (const cmd of commands) {
-    for (const w of detectWriteTargets(cmd)) {
+    for (const w of detectDeliverableWrites(cmd)) {
       if (!isScratchPath(w.path)) return true;
     }
   }
@@ -163,7 +193,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async () => {
     turnsThisRun++;
     if (!isTerminalBench()) return;
-    if (!armed && !triggerBFired && finalizeWarnWouldFire()) {
+    if (!armed && !triggerBFired && finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) {
       armed = true;
       armedAtTurn = turnsThisRun;
     }
@@ -202,11 +232,10 @@ function maybeFireTriggerA(
   toolCallCount: number,
 ): boolean {
   if (triggerAFireCount >= MAX_TRIGGER_A_FIRES) return false;
-  if (message.stopReason === "aborted") return false;
+  if (message.stopReason === "aborted" || message.stopReason === "error") return false;
 
   const hasText = text.trim().length > 0;
-  const shapeMatches =
-    (hasText && toolCallCount === 0) || (!hasText && message.stopReason === "error");
+  const shapeMatches = hasText && toolCallCount === 0;
   if (!shapeMatches) return false;
 
   // Budget gate: no deadline known -> "early" is undefined, do nothing.

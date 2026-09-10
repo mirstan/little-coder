@@ -63,6 +63,18 @@ function shellTurn(commands: string[]) {
   return { message: { content, stopReason: undefined } };
 }
 
+// A turn whose only tool calls are ShellSend (writing to an already-running
+// job's stdin) — used to check that ShellSend counts as evidence-of-work for
+// Trigger B even though it's excluded from SHELL_TOOLS.
+function shellSendTurn(texts: string[]) {
+  const content = texts.map((text) => ({
+    type: "toolCall",
+    name: "ShellSend",
+    arguments: { text },
+  }));
+  return { message: { content, stopReason: undefined } };
+}
+
 async function startRun(h: ReturnType<typeof makeHarness>, maxTurns?: number) {
   await fire(
     h.pi,
@@ -153,22 +165,36 @@ describe("tb-finalize-guard", () => {
       expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(true);
     });
 
-    it("also fires on empty content with stopReason 'error', with plenty of budget left", async () => {
+    it("does not fire on empty content with stopReason 'error' (provider/transport failure, unsteerable)", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       await turn(h, assistantTurn({ stopReason: "error" }));
-      expect(h.sent).toHaveLength(1);
+      expect(h.sent).toHaveLength(0);
     });
 
-    it("does not fire on empty content with a non-error stopReason (not the broadened branch)", async () => {
+    it("does not fire on empty content with a non-error stopReason", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       await turn(h, assistantTurn({}));
       expect(h.sent).toHaveLength(0);
+    });
+
+    it("an error-stopReason turn does not consume a Trigger A fire", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" })); // would-be fire #1, but unsteerable
+      await turn(h, assistantTurn({ stopReason: "error" })); // would-be fire #2, but unsteerable
+      expect(h.sent).toHaveLength(0);
+      // Both of MAX_TRIGGER_A_FIRES's fires are still available for a real quit.
+      await turn(h, assistantTurn({ text: "One." }));
+      await turn(h, assistantTurn({ text: "Two." }));
+      expect(h.sent).toHaveLength(2);
     });
 
     it("is suppressed once remaining budget drops below the 20-minute floor", async () => {
@@ -342,6 +368,30 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 9
       await turn(h, shellTurn(["ls -la"])); // turn 10
       expect(h.sent).toHaveLength(1); // still just the one
+    });
+
+    it("a cp to a non-scratch path counts as compliant (6.2a: cp/mv/install blind spot)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await startArmableRun(h);
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — 1 non-compliant turn
+      await turn(h, shellTurn(["cp deliverable.txt /app/out/"])); // turn 8 — compliant, resets counter
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — only 1 non-compliant turn since reset
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("a ShellSend-only turn whose text writes a non-scratch path counts as compliant (6.2b: ShellSend blind spot)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await startArmableRun(h);
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — 1 non-compliant turn
+      await turn(h, shellSendTurn(["cp deliverable.txt /app/out/"])); // turn 8 — ShellSend-only, compliant
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — only 1 non-compliant turn since reset
+      expect(h.sent).toHaveLength(0);
     });
 
     it("does not burn the latch or notify when sendUserMessage throws", async () => {
