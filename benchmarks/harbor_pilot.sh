@@ -113,9 +113,17 @@ export PYTHONPATH="$REPO_ROOT"
 # retroactive look at a job's output can be matched against commit history.
 CODE_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 CODE_DIRTY=""
-if git -C "$REPO_ROOT" diff --quiet --ignore-submodules HEAD 2>/dev/null; then
-  :
-else
+# `git diff --quiet HEAD` only reports modified/staged TRACKED files -- it
+# is blind to a brand-new untracked file. This script exports
+# PYTHONPATH="$REPO_ROOT" above and Harbor imports the adapter by module
+# path, so an untracked .py file (e.g. a new module under
+# benchmarks/harbor_adapter/) is picked up by the running job while this
+# banner would otherwise still print a clean SHA -- defeating the
+# stale/mismatched-code detection this block exists for. `git status
+# --porcelain` catches both tracked and untracked changes;
+# --untracked-files=normal (not =all) reports an untracked directory once
+# rather than file-by-file.
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal --ignore-submodules=all 2>/dev/null)" ]]; then
   CODE_DIRTY="-dirty"
 fi
 
@@ -125,9 +133,9 @@ echo "tasks:   $*"
 echo "output:  $OUT"
 echo "code:    ${CODE_SHA}${CODE_DIRTY}"
 if [[ -n "$CODE_DIRTY" ]]; then
-  echo "WARNING: worktree has uncommitted changes -- this job's code does NOT" >&2
-  echo "         match any commit; the printed sha is the nearest ancestor," >&2
-  echo "         not what actually ran." >&2
+  echo "WARNING: worktree has uncommitted or untracked changes -- this job's" >&2
+  echo "         code does NOT match any commit; the printed sha is the" >&2
+  echo "         nearest ancestor, not what actually ran." >&2
 fi
 echo
 
