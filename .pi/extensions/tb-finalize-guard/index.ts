@@ -24,14 +24,23 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // doc). IMPORTANT scope-honesty note carried over from the plan: neither of
 // those two specific trials is actually caught by Trigger A as implemented
 // here. break-filter-js-from-html's last turns hit thinking-budget's abort
-// (stopReason "aborted", explicitly excluded below — that path is owned by
-// the thinking-budget/agent_end fix, already on this branch). gpt2-codegolf's
-// last turn was a *successful* tool call with no quality-monitor complaint,
-// which points at a silent stopReason:"error" turn somewhere upstream of the
-// visible transcript, not a toolless quit. Trigger A is broadened (per the
-// adversarial review) to also catch (empty content + stopReason "error") in
-// case a case shaped like that recurs, but this is implemented honestly as a
-// forward-looking net, not a retroactive fix for either motivating trial.
+// (stopReason "aborted", excluded below). gpt2-codegolf's last turn was a
+// *successful* tool call with no quality-monitor complaint, which points at a
+// silent stopReason:"error" turn somewhere upstream of the visible
+// transcript, not a toolless quit.
+//
+// Trigger A used to also match (empty content + stopReason "error") as a
+// forward-looking net for a case shaped like that recurring. That clause was
+// removed: stopReason "error" is a provider/transport failure, not a model
+// decision — gaia-finalize-guard bails on `stopReason === "aborted" ||
+// "error"` for the same reason, and quality-monitor carries the identical
+// note ("can't fix a 400 by steering"). Worse, MAX_TRIGGER_A_FIRES is
+// session-scoped, so a repeating provider error could burn both fires on
+// turns the model never controlled, leaving the guard disarmed for the real
+// early-quit it exists to catch. The trade-off: a genuine silent-error early
+// quit (the gpt2-codegolf case) no longer gets steered — but it remains
+// diagnosable from the run log via the turn_end instrumentation below, which
+// is the point of keeping that logging unconditional.
 //
 // ---------------------------------------------------------------------------
 // Trigger B — post-finalize-warn non-compliance
@@ -202,11 +211,10 @@ function maybeFireTriggerA(
   toolCallCount: number,
 ): boolean {
   if (triggerAFireCount >= MAX_TRIGGER_A_FIRES) return false;
-  if (message.stopReason === "aborted") return false;
+  if (message.stopReason === "aborted" || message.stopReason === "error") return false;
 
   const hasText = text.trim().length > 0;
-  const shapeMatches =
-    (hasText && toolCallCount === 0) || (!hasText && message.stopReason === "error");
+  const shapeMatches = hasText && toolCallCount === 0;
   if (!shapeMatches) return false;
 
   // Budget gate: no deadline known -> "early" is undefined, do nothing.

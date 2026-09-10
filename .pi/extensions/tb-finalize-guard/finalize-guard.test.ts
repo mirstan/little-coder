@@ -153,22 +153,36 @@ describe("tb-finalize-guard", () => {
       expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(true);
     });
 
-    it("also fires on empty content with stopReason 'error', with plenty of budget left", async () => {
+    it("does not fire on empty content with stopReason 'error' (provider/transport failure, unsteerable)", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       await turn(h, assistantTurn({ stopReason: "error" }));
-      expect(h.sent).toHaveLength(1);
+      expect(h.sent).toHaveLength(0);
     });
 
-    it("does not fire on empty content with a non-error stopReason (not the broadened branch)", async () => {
+    it("does not fire on empty content with a non-error stopReason", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       await turn(h, assistantTurn({}));
       expect(h.sent).toHaveLength(0);
+    });
+
+    it("an error-stopReason turn does not consume a Trigger A fire", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" })); // would-be fire #1, but unsteerable
+      await turn(h, assistantTurn({ stopReason: "error" })); // would-be fire #2, but unsteerable
+      expect(h.sent).toHaveLength(0);
+      // Both of MAX_TRIGGER_A_FIRES's fires are still available for a real quit.
+      await turn(h, assistantTurn({ text: "One." }));
+      await turn(h, assistantTurn({ text: "Two." }));
+      expect(h.sent).toHaveLength(2);
     });
 
     it("is suppressed once remaining budget drops below the 20-minute floor", async () => {
