@@ -3,6 +3,7 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
+import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with two independent
 // trigger conditions (Plan 3 + Plan 4, reconciled after a Fable adversarial
@@ -56,11 +57,9 @@ import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/
 // re-deriving over adding new cross-extension coupling, this guard
 // independently re-derives finalize-warn's own trigger condition (turn-count
 // OR wall-clock, computed the same way at turn_start) rather than reading
-// finalize-warn's private state. The WARN_REMAINING / WARN_REMAINING_MS
-// constants below are deliberately kept in lockstep with finalize-warn's
-// (5 turns / 10 minutes) — if those ever change there, they must change here
-// too, since this guard's "armed" condition needs to describe the same
-// moment finalize-warn's nudge lands, not a different one.
+// finalize-warn's private state, via the shared `finalizeWarnWouldFire` in
+// _shared/finalize-warn-trigger.ts — see that module's header for why the
+// constants and condition live there now instead of being hand-copied here.
 //
 // finalize-warn's message is delivered as deliverAs:"followUp", which lands
 // on the model's *next* turn, not the turn during which the trigger fired
@@ -97,13 +96,11 @@ import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/
 // occurrence of gpt2-codegolf's silent stopReason:"error" turn is
 // diagnosable from the run log instead of invisible.
 
+// WARN_REMAINING_MS lives in _shared/finalize-warn-trigger.ts now — see that
+// module's header for why (this constant used to be hand-copied here and in
+// finalize-warn/index.ts with nothing enforcing they stayed in lockstep).
 const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WARN_REMAINING_MS
 const MAX_TRIGGER_A_FIRES = 2; // per session
-
-// Mirrors finalize-warn/index.ts's own constants exactly — see the header
-// comment above for why these must stay in lockstep.
-const WARN_REMAINING = 5; // turns
-const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
 
@@ -135,15 +132,6 @@ function contentShape(message: any): { text: string; toolCallCount: number; tool
     .join("\n");
   const toolCalls = content.filter((c: any) => c?.type === "toolCall");
   return { text, toolCallCount: toolCalls.length, toolCalls };
-}
-
-/** Re-derives finalize-warn's own turn-count-OR-wall-clock trigger condition. */
-function finalizeWarnWouldFire(): boolean {
-  const turnTrigger =
-    capForRun > WARN_REMAINING && turnsThisRun === capForRun - WARN_REMAINING + 1;
-  const remainingMs = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
-  const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
-  return turnTrigger || timeTrigger;
 }
 
 // Local addition to SHELL_TOOLS, for this guard's evidence-of-work purposes
@@ -205,7 +193,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async () => {
     turnsThisRun++;
     if (!isTerminalBench()) return;
-    if (!armed && !triggerBFired && finalizeWarnWouldFire()) {
+    if (!armed && !triggerBFired && finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) {
       armed = true;
       armedAtTurn = turnsThisRun;
     }

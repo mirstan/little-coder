@@ -3,6 +3,11 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
+import {
+  WARN_REMAINING,
+  WARN_REMAINING_MS,
+  finalizeWarnWouldFire,
+} from "../_shared/finalize-warn-trigger.ts";
 
 // Pre-cap finalize-warn: when the agent is running low, inject a follow-up
 // user message telling it to wrap up. Two independent triggers share the
@@ -40,8 +45,11 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 // turn 40, leaving 1 useful turn of headroom (then turn 41 = abort). Raised
 // to 5 so the message lands ~4 turns before cap, giving the model real room.
 
-const WARN_REMAINING = 5; // turns
-const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
+// WARN_REMAINING / WARN_REMAINING_MS and the trigger condition itself now
+// live in _shared/finalize-warn-trigger.ts — see that module's header for
+// why (tb-finalize-guard independently re-derives this same condition and
+// used to keep a hand-copied pair of these constants "in lockstep" with
+// nothing enforcing it).
 
 let turnsThisRun = 0;
 let capForRun = 0;
@@ -60,14 +68,15 @@ export default function (pi: ExtensionAPI) {
     turnsThisRun++;
     if (warnedThisRun) return;
 
+    if (!finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) return;
+
+    // Re-derive which of the two triggers fired, purely for message wording
+    // (finalizeWarnWouldFire only reports whether — not which).
     const turnTrigger =
       capForRun > WARN_REMAINING &&
       turnsThisRun === capForRun - WARN_REMAINING + 1;
-
     const remainingMs = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
     const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
-
-    if (!turnTrigger && !timeTrigger) return;
 
     warnedThisRun = true;
     const msg = resolveFinalizeMessage(process.env.LITTLE_CODER_BENCHMARK);
