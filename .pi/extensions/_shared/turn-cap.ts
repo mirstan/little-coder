@@ -20,9 +20,21 @@
 // llamacpp/qwen3.6-35b-a3b, the pilot's own advertised default model.
 // Interactive use (no env var set) is unaffected: the profile value still
 // applies via the absent-env branch below.
+//
+// "Set" means set to a non-empty, non-whitespace-only string. An
+// empty-but-exported var (`export LITTLE_CODER_MAX_TURNS=` in a wrapper
+// script, a CI matrix that exports unset variables, `env VAR= cmd`) leaves
+// `process.env.LITTLE_CODER_MAX_TURNS` defined as `""`, which is !==
+// undefined but is not a deliberate "0" from anyone -- Number("") is 0, so
+// treating it as set would silently produce "no cap" and invert exactly the
+// precedence this fix exists to enforce, reached through an ambient-leak
+// path instead of the profile-override path it was meant to close. Such a
+// value is therefore treated as unset and falls through to the profile
+// override below, same as a literal absent env var. A literal "0" (or any
+// other in-range value) is unaffected and stays authoritative.
 export function resolveTurnCap(event: unknown): number {
   const raw = process.env.LITTLE_CODER_MAX_TURNS;
-  if (raw !== undefined) {
+  if (raw !== undefined && raw.trim() !== "") {
     // Number(), not parseInt(): parseInt truncates at the first non-numeric
     // character ("40abc" -> 40, "3.7" -> 3) instead of rejecting the whole
     // malformed value, and a fractional cap would make the turn-count and

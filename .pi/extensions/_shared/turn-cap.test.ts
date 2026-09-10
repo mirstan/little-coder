@@ -48,4 +48,55 @@ describe("resolveTurnCap", () => {
     expect(resolveTurnCap({ systemPromptOptions: { littleCoder: {} } })).toBe(0);
     expect(resolveTurnCap({ systemPromptOptions: {} })).toBe(0);
   });
+
+  // An empty-but-set env var (`export LITTLE_CODER_MAX_TURNS=` in a wrapper
+  // script, a CI matrix that exports unset variables, `env VAR= cmd`) must
+  // be treated as UNSET, not as an authoritative "0" -- Number("") is 0,
+  // and treating "" as set would silently invert the precedence this fix
+  // exists to enforce. Each case is crossed with "profile override present
+  // / absent" since the bug is specifically about which one wins.
+  describe("empty-but-set env var (Priority 3 fix)", () => {
+    it("\"\" with a profile override present falls back to the PROFILE value, not 0", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "";
+      const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
+      // This is the exact inversion being fixed: "" must NOT win as an
+      // authoritative 0 over a positive profile override.
+      expect(resolveTurnCap(event)).toBe(40);
+    });
+
+    it("\"\" with no profile override falls back to 0", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "";
+      expect(resolveTurnCap({})).toBe(0);
+      expect(resolveTurnCap({ systemPromptOptions: {} })).toBe(0);
+    });
+
+    it("whitespace-only (\"  \") with a profile override present falls back to the PROFILE value", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "  ";
+      const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
+      expect(resolveTurnCap(event)).toBe(40);
+    });
+
+    it("whitespace-only (\"  \") with no profile override falls back to 0", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "  ";
+      expect(resolveTurnCap({})).toBe(0);
+    });
+
+    it("a literal \"0\" stays authoritative regardless of a profile override", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "0";
+      expect(resolveTurnCap({ systemPromptOptions: { littleCoder: { maxTurns: 40 } } })).toBe(0);
+      expect(resolveTurnCap({})).toBe(0);
+    });
+
+    it("undefined (unset) with a profile override present falls back to the profile value", () => {
+      delete process.env.LITTLE_CODER_MAX_TURNS;
+      const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
+      expect(resolveTurnCap(event)).toBe(40);
+    });
+
+    it("a valid positive value stays authoritative regardless of a profile override", () => {
+      process.env.LITTLE_CODER_MAX_TURNS = "40";
+      expect(resolveTurnCap({ systemPromptOptions: { littleCoder: { maxTurns: 10 } } })).toBe(40);
+      expect(resolveTurnCap({})).toBe(40);
+    });
+  });
 });

@@ -40,4 +40,60 @@ describe("resolveDeadlineEpochMs", () => {
     expect(resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: {} } })).toBe(0);
     expect(resolveDeadlineEpochMs({ systemPromptOptions: {} })).toBe(0);
   });
+
+  // An empty-but-set env var (`export LITTLE_CODER_DEADLINE_EPOCH_MS=` in a
+  // wrapper script, a CI matrix that exports unset variables, `env VAR=
+  // cmd`) must be treated as UNSET, not as an authoritative "0" --
+  // Number("") is 0, and treating "" as set would silently invert the
+  // precedence this fix exists to enforce. Each case is crossed with
+  // "event override present / absent" since the bug is specifically about
+  // which one wins.
+  describe("empty-but-set env var (Priority 3 fix)", () => {
+    it("\"\" with an event override present falls back to the EVENT value, not 0", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "";
+      const event = { systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } };
+      // This is the exact inversion being fixed: "" must NOT win as an
+      // authoritative 0 over a positive event override.
+      expect(resolveDeadlineEpochMs(event)).toBe(1234567890);
+    });
+
+    it("\"\" with no event override falls back to 0", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "";
+      expect(resolveDeadlineEpochMs({})).toBe(0);
+      expect(resolveDeadlineEpochMs({ systemPromptOptions: {} })).toBe(0);
+    });
+
+    it("whitespace-only (\"  \") with an event override present falls back to the EVENT value", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "  ";
+      const event = { systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } };
+      expect(resolveDeadlineEpochMs(event)).toBe(1234567890);
+    });
+
+    it("whitespace-only (\"  \") with no event override falls back to 0", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "  ";
+      expect(resolveDeadlineEpochMs({})).toBe(0);
+    });
+
+    it("a literal \"0\" stays authoritative regardless of an event override", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "0";
+      expect(
+        resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } }),
+      ).toBe(0);
+      expect(resolveDeadlineEpochMs({})).toBe(0);
+    });
+
+    it("undefined (unset) with an event override present falls back to the event value", () => {
+      delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+      const event = { systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } };
+      expect(resolveDeadlineEpochMs(event)).toBe(1234567890);
+    });
+
+    it("a valid positive value stays authoritative regardless of an event override", () => {
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "1700000000000";
+      expect(
+        resolveDeadlineEpochMs({ systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } }),
+      ).toBe(1700000000000);
+      expect(resolveDeadlineEpochMs({})).toBe(1700000000000);
+    });
+  });
 });

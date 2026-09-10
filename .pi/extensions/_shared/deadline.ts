@@ -16,9 +16,22 @@
 // observable from inside a custom agent. The adapter is likewise the only
 // writer of either source today, so inverting the precedence to match
 // turn-cap.ts is consistency-only and changes no observed behavior yet.
+//
+// "Set" means set to a non-empty, non-whitespace-only string. An
+// empty-but-exported var (`export LITTLE_CODER_DEADLINE_EPOCH_MS=` in a
+// wrapper script, a CI matrix that exports unset variables, `env VAR= cmd`)
+// leaves `process.env.LITTLE_CODER_DEADLINE_EPOCH_MS` defined as `""`,
+// which is !== undefined but is not a deliberate "0" from anyone --
+// Number("") is 0, so treating it as set would silently produce "no
+// deadline" and invert exactly the precedence this fix exists to enforce,
+// reached through an ambient-leak path instead of the event-override path
+// it was meant to close. Such a value is therefore treated as unset and
+// falls through to the event override below, same as a literal absent env
+// var. A literal "0" (or any other in-range value) is unaffected and stays
+// authoritative.
 export function resolveDeadlineEpochMs(event: unknown): number {
   const raw = process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
-  if (raw !== undefined) {
+  if (raw !== undefined && raw.trim() !== "") {
     // Number(), not parseInt(): parseInt accepts a malformed value with a
     // numeric prefix ("1700000000000garbage" -> 1700000000000) instead of
     // rejecting it outright, silently changing the warning deadline.
