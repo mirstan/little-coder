@@ -272,6 +272,27 @@ def main():
         serve_requests()
         return
 
+    if mode == "null_message_usage":
+        # Two turns whose "message" field itself is (or contains) JSON null,
+        # not merely absent -- pins that turn_end handling uses an
+        # isinstance() guard rather than dict.get(key, default), which only
+        # substitutes the default when the key is MISSING, never when its
+        # value is null. `.get("message", {}).get("usage")` raises
+        # AttributeError on a None "message"; this must not crash the trial.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "first"}})
+        emit({"type": "turn_end", "message": None})  # message itself is null
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "second"}})
+        emit({"type": "turn_end", "message": {"usage": None}})  # usage is null
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
+
     if mode == "settled_after_extra_event":
         # Pins Bug A: agent_settled arrives right after an unrelated event
         # (not immediately after agent_end). The old two-phase drain's

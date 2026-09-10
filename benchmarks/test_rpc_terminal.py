@@ -307,6 +307,19 @@ def test_usage_tolerates_missing_or_malformed_usage(fake_pi, tmp_path):
     assert r.usage["cache_read"] == fake_pi_mod.TURN_USAGE["cacheRead"]
 
 
+def test_turn_end_survives_null_message_and_null_usage(fake_pi, tmp_path):
+    """turn_end.message can arrive as JSON null itself, or as a dict whose
+    "usage" key is null -- not merely absent. `dict.get(key, default)` only
+    substitutes the default when the key is MISSING, never when its value is
+    null, so `ev.get("message", {}).get("usage")` raises AttributeError on a
+    null "message". Both turns here must be skipped without raising, leaving
+    usage all zero, and turn_count must still reflect both turns."""
+    with fake_pi("null_message_usage", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.turn_count == 2
+    assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+
+
 def test_settled_after_extra_event_returns_fast(fake_pi, tmp_path):
     """Pins Bug A: the old Phase 1 predicate only matched agent_end, so an
     agent_settled arriving after some other event (not immediately after

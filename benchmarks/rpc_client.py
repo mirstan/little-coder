@@ -691,7 +691,8 @@ class PiRpc:
                 result.tool_calls.append(entry)
             elif t == "turn_end":
                 result.turn_count += 1
-                usage = ev.get("message", {}).get("usage")
+                msg = ev.get("message")
+                usage = msg.get("usage") if isinstance(msg, dict) else None
                 if isinstance(usage, dict):
                     # Defensive .get(..., 0) + isinstance checks throughout:
                     # this is untrusted wire data from a pi build we don't
