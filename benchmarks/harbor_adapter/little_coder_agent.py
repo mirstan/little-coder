@@ -87,6 +87,39 @@ def _fallback_timeout_info() -> dict:
     }
 
 
+_MAX_CANDIDATES_RECORDED = 10
+
+
+def _resolve_pkg_candidates(matches: list[Path], base_resolution: str):
+    """Resolve >=1 surviving package-cache task.toml candidates by reading
+    each one's [agent].timeout_sec instead of trusting mtime (every real
+    package-cache task.toml on disk has an EPOCH mtime, so mtime carries no
+    signal here at all -- see this module's cache-layout docstring).
+
+    Returns (match_path, resolution, ambiguous, candidates_considered,
+    candidate_task_tomls, candidate_timeouts_sec). Raises on a malformed
+    candidate; the caller's broad except degrades that to the default
+    timeout like any other unexpected shape.
+    """
+    timeouts = [float(tomllib.loads(p.read_text())["agent"]["timeout_sec"]) for p in matches]
+    considered = len(matches)
+    if considered == 1 or len(set(timeouts)) == 1:
+        resolution = base_resolution if considered == 1 else f"{base_resolution}-agreed"
+        return matches[0], resolution, False, considered, None, None
+    # Disagreement: an under-estimate merely finalizes early; an
+    # over-estimate gets the trial hard-killed by Harbor mid-write (the
+    # original incident's failure mode) -- so the minimum is the safer pick.
+    min_idx = min(range(considered), key=lambda i: timeouts[i])
+    return (
+        matches[min_idx],
+        base_resolution,
+        True,
+        considered,
+        [str(p) for p in matches[:_MAX_CANDIDATES_RECORDED]],
+        timeouts[:_MAX_CANDIDATES_RECORDED],
+    )
+
+
 def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
     """Best-effort derivation of this trial's real Harbor-enforced timeout
     (task.toml's [agent].timeout_sec x the job's timeout_multiplier), so our
@@ -149,27 +182,51 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
             org = org or "*"
             ref = task.get("ref") or ""
             match_path = None
+            candidates_considered = 1
+            ambiguous = False
+            candidate_task_tomls = None
+            candidate_timeouts_sec = None
             if ref.startswith("sha256:"):
                 ref_hex = ref.split(":", 1)[1]
                 candidate = HARBOR_TASK_CACHE / "packages" / org / bare / ref_hex / "task.toml"
                 if org != "*" and candidate.exists():
                     match_path = candidate
                     resolution = "exact-ref"
+            if match_path is None and ref.startswith("sha256:"):
+                # Wildcard org, exact content hash: task_name had no
+                # "<org>/" prefix (a bare package-shape name), which used to
+                # force org="*" and skip the exact-ref fast path above
+                # entirely -- even though the content hash alone already
+                # identifies a real, unambiguous directory regardless of
+                # which org it lives under. This outranks the
+                # generation-mixing fallback glob below because the hash
+                # match is exact.
+                ref_hex = ref.split(":", 1)[1]
+                glob_matches = sorted(
+                    HARBOR_TASK_CACHE.glob(f"packages/*/{bare}/{ref_hex}/task.toml")
+                )
+                if glob_matches:
+                    (
+                        match_path, resolution, ambiguous, candidates_considered,
+                        candidate_task_tomls, candidate_timeouts_sec,
+                    ) = _resolve_pkg_candidates(glob_matches, "exact-ref-glob")
             if match_path is None:
                 # Ref missing/mismatched (e.g. cache evicted and re-fetched
                 # under a different content hash) -- fall back to a glob
                 # restricted to the package layout ONLY. Never fall through
                 # to the legacy glob here; that would silently read a
                 # different dataset generation's metadata.
-                pkg_matches = list(HARBOR_TASK_CACHE.glob(f"packages/{org}/{bare}/*/task.toml"))
+                pkg_matches = sorted(HARBOR_TASK_CACHE.glob(f"packages/{org}/{bare}/*/task.toml"))
                 if not pkg_matches:
                     return _fallback_timeout_info()
-                # Package-cache mtimes may all be epoch (arbitrary pick among
-                # them then) -- but this is still the right dataset
-                # generation, unlike mixing in the legacy layout.
-                pkg_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                match_path = pkg_matches[0]
-                resolution = "fallback-glob"
+                # Package-cache mtimes may all be epoch, and (when org=="*")
+                # this glob also spans every org sharing the bare name -- so
+                # mtime is never trusted here; _resolve_pkg_candidates reads
+                # each candidate's real timeout_sec instead.
+                (
+                    match_path, resolution, ambiguous, candidates_considered,
+                    candidate_task_tomls, candidate_timeouts_sec,
+                ) = _resolve_pkg_candidates(pkg_matches, "fallback-glob")
             layout = "package"
         else:
             # Legacy shape.
@@ -184,18 +241,28 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
             match_path = legacy_matches[0]
             resolution = "glob"
             layout = "legacy"
+            candidates_considered = 1
+            ambiguous = False
+            candidate_task_tomls = None
+            candidate_timeouts_sec = None
 
         toml_data = tomllib.loads(match_path.read_text())
         base_timeout_sec = float(toml_data["agent"]["timeout_sec"])
         effective_timeout_sec = base_timeout_sec * multiplier * DEADLINE_SAFETY_MARGIN
-        return {
+        info = {
             "cache_layout": layout,
             "resolution": resolution,
             "selected_task_toml": str(match_path),
             "base_timeout_sec": base_timeout_sec,
             "multiplier": multiplier,
             "effective_timeout_sec": effective_timeout_sec,
+            "candidates_considered": candidates_considered,
+            "ambiguous": ambiguous,
         }
+        if ambiguous:
+            info["candidate_task_tomls"] = candidate_task_tomls
+            info["candidate_timeouts_sec"] = candidate_timeouts_sec
+        return info
     except Exception:
         return _fallback_timeout_info()
 
