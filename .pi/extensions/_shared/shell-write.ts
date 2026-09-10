@@ -48,7 +48,15 @@ export const SHELL_TOOLS: ReadonlySet<string> = new Set([
   "ShellStart",
 ]);
 
-export type WriteKind = "redirect" | "append" | "tee" | "dd";
+export type WriteKind =
+  | "redirect"
+  | "append"
+  | "tee"
+  | "dd"
+  | "copy"
+  | "move"
+  | "inplace"
+  | "compile";
 
 export interface ShellWrite {
   /** The (possibly relative) path the command writes to. */
@@ -286,6 +294,104 @@ export function detectWriteTargets(raw: string): ShellWrite[] {
 /** True when the command writes to the filesystem through the shell. */
 export function hasWriteRedirection(cmd: string): boolean {
   return detectWriteTargets(cmd).length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// detectDeliverableWrites — a broader, tb-finalize-guard-only superset
+// ---------------------------------------------------------------------------
+// `detectWriteTargets` deliberately only covers redirection (`>`, `>>`,
+// `tee`, `dd of=`) because it also feeds write-guard and permission-gate, and
+// those two are security/permission gates: `cp`/`mv`/`sed -i`/a compiler's
+// `-o` are all deliberately treated as SAFE, whitelisted, non-write commands
+// there (see permission-gate's BUILTIN_SAFE_PREFIXES — "cp "/"mv " are
+// explicitly routine filesystem scaffolding). Folding those into
+// `detectWriteTargets` itself would make both guards start refusing commands
+// they intentionally let through today (confirmed: permission-gate's own
+// test asserts `isSafeBash("cp a b") === true`).
+//
+// tb-finalize-guard has a different question to answer: not "is this command
+// safe to run," but "did the model do something that plausibly produced its
+// deliverable." For that purpose `cp`/`mv`/`install`/`sed -i`/a compiler's
+// `-o` are all evidence of a write, so this function layers detection for
+// those on top of `detectWriteTargets` — used ONLY by tb-finalize-guard.
+function lastOperandOrTargetFlag(words: string[]): string | undefined {
+  let tDir: string | undefined;
+  const operands: string[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    if (w === "-t") {
+      tDir = words[i + 1];
+      i++;
+      continue;
+    }
+    if (w.startsWith("--target-directory=")) {
+      tDir = w.slice("--target-directory=".length);
+      continue;
+    }
+    if (w.startsWith("-")) continue; // flag — skip
+    operands.push(w);
+  }
+  return tDir ?? operands[operands.length - 1];
+}
+
+// `-i`, `-i.bak` (GNU, suffix glued on), `--in-place`, `--in-place=.bak`.
+// BSD sed's mandatory suffix arg (`-i ''`) is NOT specially handled — this is
+// a heuristic feeding a nudge, not a security gate, so over-detecting a
+// trailing `''`/suffix token as an extra "target" is an acceptable false
+// positive (better than missing a real in-place edit).
+function hasSedInPlaceFlag(words: string[]): boolean {
+  return words.some(
+    (w) => w === "-i" || w.startsWith("-i") || w === "--in-place" || w.startsWith("--in-place="),
+  );
+}
+
+/**
+ * `detectWriteTargets` plus command-shape coverage that only matters for
+ * judging evidence-of-work, never for permission-gating: `cp`/`mv`/`install`
+ * (last non-flag operand, or the `-t DIR` argument), `sed -i`/`--in-place`
+ * (every non-flag operand after the script), and a compiler's `-o` output
+ * flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above for why this
+ * is a separate function rather than a change to `detectWriteTargets` itself.
+ */
+export function detectDeliverableWrites(raw: string): ShellWrite[] {
+  const writes = [...detectWriteTargets(raw)];
+  const cmd = stripHeredocBodies(raw);
+
+  for (const segment of splitCommandChain(cmd)) {
+    const words = splitWords(segment);
+    if (words.length === 0) continue;
+    const name = words[0];
+
+    if (name === "cp" || name === "mv" || name === "install") {
+      const target = lastOperandOrTargetFlag(words);
+      if (target) writes.push({ path: unquote(target), kind: name === "mv" ? "move" : "copy" });
+      continue;
+    }
+
+    if (name === "sed" && hasSedInPlaceFlag(words)) {
+      const nonFlagOperands = words.slice(1).filter((w) => !w.startsWith("-"));
+      for (const t of nonFlagOperands.slice(1)) {
+        writes.push({ path: unquote(t), kind: "inplace" });
+      }
+      continue;
+    }
+
+    if (name === "gcc" || name === "cc" || name === "ld") {
+      for (let i = 1; i < words.length; i++) {
+        if (words[i] === "-o" && words[i + 1]) {
+          writes.push({ path: unquote(words[i + 1]), kind: "compile" });
+          i++;
+        }
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  return writes.filter((w) => {
+    if (!w.path || seen.has(w.path) || isNonDestructiveTarget(w.path)) return false;
+    seen.add(w.path);
+    return true;
+  });
 }
 
 // Roots that are obviously scratch space rather than a deliverable location.

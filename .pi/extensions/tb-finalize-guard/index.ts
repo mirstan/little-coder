@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
-import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell-write.ts";
+import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with two independent
 // trigger conditions (Plan 3 + Plan 4, reconciled after a Fable adversarial
@@ -69,10 +69,23 @@ import { SHELL_TOOLS, detectWriteTargets, isScratchPath } from "../_shared/shell
 // starting from the turn AFTER that one — the model can't be faulted for not
 // complying with a message it hasn't seen yet.
 //
-// Compliance is judged via _shared/shell-write.ts's existing write-command
-// classification, extended with `isScratchPath` (added alongside this guard)
-// so a write that only ever lands in /tmp does not count as having saved the
-// real deliverable (Codex finding folded into the merged plan).
+// Compliance is judged via _shared/shell-write.ts's `detectDeliverableWrites`
+// — a tb-finalize-guard-only superset of `detectWriteTargets` that also
+// recognizes `cp`/`mv`/`install`, `sed -i`, and a compiler's `-o` flag as
+// evidence of a write, not just shell redirection (`detectWriteTargets`
+// itself stays redirect-only because write-guard and permission-gate also
+// consume it, and both deliberately treat `cp`/`mv`/`sed -i` as safe,
+// non-write commands — see that function's own comment). Extended with
+// `isScratchPath` (added alongside this guard) so a write that only ever
+// lands in /tmp does not count as having saved the real deliverable (Codex
+// finding folded into the merged plan).
+//
+// A turn's evidence-of-work also includes `ShellSend` (writing to an
+// already-running interactive job's stdin) even though it is deliberately
+// excluded from `SHELL_TOOLS` for permission-gating purposes — a model
+// driving an editor/REPL through `ShellSend` is plainly working. This guard
+// scans for it locally rather than adding it to the shared, security-relevant
+// `SHELL_TOOLS` set.
 //
 // ---------------------------------------------------------------------------
 // Shared instrumentation
@@ -133,13 +146,33 @@ function finalizeWarnWouldFire(): boolean {
   return turnTrigger || timeTrigger;
 }
 
-/** Every ShellSession/bash command string found in this turn's tool calls. */
+// Local addition to SHELL_TOOLS, for this guard's evidence-of-work purposes
+// only. `SHELL_TOOLS` itself stays untouched — it's security-relevant and
+// shared by write-guard/permission-gate, which deliberately leave ShellSend
+// out (it writes to an already-running job's stdin rather than starting a
+// command, so it's gated by whatever approved that job in the first place —
+// see _shared/shell-write.ts's comment on SHELL_TOOLS). That's an
+// authorization judgment, not a claim that ShellSend can't produce writes:
+// a model driving an interactive editor/REPL through it is plainly working.
+const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
+
+/**
+ * Every command-shaped string found in this turn's tool calls: the `command`
+ * argument for anything in SHELL_TOOLS, plus (for Trigger B's evidence-of-work
+ * purposes only) ShellSend's `text` argument — confirmed against
+ * bg-shell/index.ts's ShellSend tool definition, which takes `text`, not
+ * `command`.
+ */
 function shellCommandsIn(toolCalls: any[]): string[] {
   const commands: string[] = [];
   for (const c of toolCalls) {
-    if (typeof c?.name !== "string" || !SHELL_TOOLS.has(c.name)) continue;
+    if (typeof c?.name !== "string") continue;
     const args = c.arguments ?? c.input ?? {};
-    if (typeof args?.command === "string") commands.push(args.command);
+    if (SHELL_TOOLS.has(c.name)) {
+      if (typeof args?.command === "string") commands.push(args.command);
+    } else if (EVIDENCE_ONLY_SHELL_TOOLS.has(c.name)) {
+      if (typeof args?.text === "string") commands.push(args.text);
+    }
   }
   return commands;
 }
@@ -147,7 +180,7 @@ function shellCommandsIn(toolCalls: any[]): string[] {
 /** True when at least one command in this turn writes somewhere other than scratch. */
 function hasNonScratchWrite(commands: string[]): boolean {
   for (const cmd of commands) {
-    for (const w of detectWriteTargets(cmd)) {
+    for (const w of detectDeliverableWrites(cmd)) {
       if (!isScratchPath(w.path)) return true;
     }
   }
