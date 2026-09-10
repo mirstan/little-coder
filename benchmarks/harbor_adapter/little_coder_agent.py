@@ -253,20 +253,35 @@ def _resolve_token_usage(result_usage: dict, turn_count: int, stats: dict | None
     input/output/cache_read/cache_write/cost breakdown) and "token_source"
     ("session_stats" | "event_sum" | "unavailable") for context.metadata.
     """
-    if stats and isinstance(stats.get("tokens"), dict):
+    def _num(v):
+        # bool is an int subclass -- exclude it so a stray True doesn't
+        # silently count as 1. Anything else non-numeric (a string, a dict,
+        # None, ...) coerces to 0 rather than propagating a TypeError into
+        # `input_tok + cache_read + cache_write` or `cost > 0` below, which
+        # would otherwise fail an OTHERWISE-SUCCESSFUL Harbor trial purely
+        # over token telemetry -- untrusted wire data (stats is pi's
+        # get_session_stats response; result_usage is itself summed from
+        # equally-untrusted turn_end events) must not do that.
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    if isinstance(stats, dict) and isinstance(stats.get("tokens"), dict):
         tok = stats["tokens"]
-        input_tok = tok.get("input", 0) or 0
-        output_tok = tok.get("output", 0) or 0
-        cache_read = tok.get("cacheRead", 0) or 0
-        cache_write = tok.get("cacheWrite", 0) or 0
-        cost = stats.get("cost") or 0
+        input_tok = _num(tok.get("input", 0))
+        output_tok = _num(tok.get("output", 0))
+        cache_read = _num(tok.get("cacheRead", 0))
+        cache_write = _num(tok.get("cacheWrite", 0))
+        cost = _num(stats.get("cost", 0))
+        # token_source reflects that a session_stats payload WAS available
+        # and had a "tokens" dict -- even if every field inside it turned out
+        # to be non-numeric junk that _num() coerced to 0. Don't silently
+        # reclassify that as event_sum/unavailable; the source was real.
         token_source = "session_stats"
     else:
-        input_tok = result_usage.get("input", 0)
-        output_tok = result_usage.get("output", 0)
-        cache_read = result_usage.get("cache_read", 0)
-        cache_write = result_usage.get("cache_write", 0)
-        cost = result_usage.get("cost", 0)
+        input_tok = _num(result_usage.get("input", 0))
+        output_tok = _num(result_usage.get("output", 0))
+        cache_read = _num(result_usage.get("cache_read", 0))
+        cache_write = _num(result_usage.get("cache_write", 0))
+        cost = _num(result_usage.get("cost", 0))
         # No turn_end ever fired (e.g. pi crashed before completing a single
         # turn) -- there is nothing meaningful to have summed, so this is
         # genuinely "unavailable" rather than a real (zero) event sum.

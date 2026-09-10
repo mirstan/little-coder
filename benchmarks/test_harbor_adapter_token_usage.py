@@ -80,3 +80,56 @@ def test_session_stats_present_but_malformed_falls_back():
     out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats={"cost": 0.1})
     assert out["token_source"] == "event_sum"
     assert out["n_output_tokens"] == 20
+
+
+@pytest.mark.parametrize("bad_stats", [None, [], "nope"])
+def test_non_dict_stats_falls_back_without_raising(bad_stats):
+    """`stats` itself was never isinstance-checked before `.get("tokens")` --
+    a non-dict truthy `stats` (a list, a string, ...) must fall back to
+    event_sum rather than raise AttributeError calling .get() on it."""
+    out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats=bad_stats)
+    assert out["token_source"] == "event_sum"
+    assert out["n_output_tokens"] == 20
+
+
+def test_tokens_present_but_not_a_dict_falls_back():
+    """stats["tokens"] itself malformed (a string, not a dict) -- same
+    fall-back-to-event_sum treatment as a missing "tokens" key."""
+    out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats={"tokens": "nope"})
+    assert out["token_source"] == "event_sum"
+    assert out["n_output_tokens"] == 20
+
+
+def test_string_typed_token_field_coerces_to_zero_not_typeerror():
+    """A string-typed numeric field (e.g. "12345") must not sail through
+    `.get(key, 0) or 0` (which only filters FALSY values) and then blow up
+    at `input_tok + cache_read + cache_write` with TypeError. It coerces to
+    0, and token_source still correctly reports session_stats -- the source
+    WAS available, even though this one field was junk."""
+    stats = {"tokens": {"input": "12345", "output": 20, "cacheRead": 10, "cacheWrite": 0}}
+    out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats=stats)
+    assert out["token_source"] == "session_stats"
+    assert out["n_input_tokens"] == 0 + 10 + 0
+    assert out["raw"]["input"] == 0
+
+
+def test_string_typed_cost_coerces_to_zero_not_typeerror():
+    """A string-typed "cost" (e.g. "1.23") must not blow up at `cost > 0`
+    with TypeError -- it coerces to 0, which reads as cost_usd=None."""
+    stats = {
+        "tokens": {"input": 1000, "output": 200, "cacheRead": 0, "cacheWrite": 0},
+        "cost": "1.23",
+    }
+    out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats=stats)
+    assert out["token_source"] == "session_stats"
+    assert out["cost_usd"] is None
+    assert out["raw"]["cost"] == 0
+
+
+def test_bool_typed_token_field_coerces_to_zero_not_one():
+    """bool is an int subclass in Python -- a stray `True` must not silently
+    count as 1 token."""
+    stats = {"tokens": {"input": True, "output": 20, "cacheRead": 10, "cacheWrite": 0}}
+    out = lca._resolve_token_usage(EVENT_SUM_USAGE, turn_count=1, stats=stats)
+    assert out["token_source"] == "session_stats"
+    assert out["raw"]["input"] == 0
