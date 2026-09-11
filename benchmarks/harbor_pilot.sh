@@ -155,6 +155,11 @@ HB_CMD+=(
   # and cached, so it's a one-time build per task, not per-trial.
   --force-build)
 
+# Prevents sleep from breaking Docker's VM networking
+if [[ "$(uname -s)" == "Darwin" ]] && command -v caffeinate >/dev/null 2>&1; then
+  HB_CMD=(caffeinate -s -i "${HB_CMD[@]}")
+fi
+
 # `sg` (group-switch) is a Linux-only workaround for a user who isn't in the
 # `docker` group; it doesn't exist on macOS, and Docker Desktop grants socket
 # access without that unix-group mechanism at all, so `groups` never contains
