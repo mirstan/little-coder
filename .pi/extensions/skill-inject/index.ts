@@ -246,12 +246,33 @@ const RESEARCH_TRIGGERS = [
   /\bfact[-\s]?check/i,
 ];
 
-function looksLikeResearchTask(text: string): boolean {
+export function looksLikeResearchTask(text: string): boolean {
   if (!text) return false;
   for (const re of RESEARCH_TRIGGERS) {
     if (re.test(text)) return true;
   }
   return false;
+}
+
+// Tools the research directive actually recommends calling (BrowserNavigate /
+// BrowserExtract / websearch — see researchDirective below). When none of
+// these are callable, the directive has nothing actionable left to say: every
+// Terminal-Bench trial's own boilerplate ("briefly research the task first...")
+// trips looksLikeResearchTask on 100% of trials even though the trial's
+// allow-list is ShellSession-only, so the directive fired universally and
+// pointed the model at tools tool-gating would refuse (confirmed: 52 retained
+// trials, 36 rejected browser-tool calls across 15 trials). Gating on browse-
+// tool availability, rather than on prompt shape, fixes the whole failure
+// class instead of just this one template's wording.
+const BROWSE_TOOLS = ["BrowserNavigate", "BrowserExtract", "websearch"];
+
+/** Should the research-first directive be injected for this prompt/allow-list?
+ *  Exported for unit testing alongside looksLikeResearchTask. */
+export function shouldInjectResearchDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  return looksLikeResearchTask(prompt) && (!allowed || BROWSE_TOOLS.some((t) => allowed.has(t)));
 }
 
 // Built per-turn rather than as a constant: the evidence step only makes sense
@@ -263,11 +284,19 @@ const EVIDENCE_TOOLS = ["EvidenceAdd", "EvidenceGet", "EvidenceList"];
 
 function researchDirective(allowed: Set<string> | undefined): string {
   const canCite = toolsAvailable(["EvidenceAdd"], allowed);
+  // Name only the browse tools that are actually callable when there is an
+  // allow-list at all, so partial availability (e.g. only websearch) still
+  // yields a coherent, callable instruction rather than naming gated tools
+  // alongside available ones. Falls back to the full list with no allow-list
+  // (matches the pre-existing top-level/interactive behavior).
+  const availableBrowseTools = allowed
+    ? BROWSE_TOOLS.filter((t) => allowed.has(t))
+    : BROWSE_TOOLS;
   const lines = [
     "",
     "## Research-first directive",
     "This task involves online research. Before producing a final answer:",
-    "1. Use BrowserNavigate / BrowserExtract (or websearch for first hops) to gather facts.",
+    `1. Use ${availableBrowseTools.join(" / ")} to gather facts.`,
   ];
   if (canCite) {
     lines.push("2. Save each citable fact via EvidenceAdd before relying on it.");
@@ -342,7 +371,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
-    const researchTask = looksLikeResearchTask(event.prompt ?? "");
+    const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
 
     if (selected.length === 0 && !researchTask) return;
 
