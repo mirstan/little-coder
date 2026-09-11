@@ -172,16 +172,14 @@ describe("skill-inject still injects after the #73 conversion", () => {
   });
 });
 
-// The research-first directive misfire: every Terminal-Bench 2.0 trial's own
-// boilerplate ("Approach: briefly research the task first...") tripped
-// looksLikeResearchTask on 100% of trials, and the directive it injected
-// recommended BrowserNavigate/BrowserExtract/websearch — none of which are in
-// a TB trial's ShellSession-only allow-list. Confirmed by a Codex adversarial
-// review: 52 retained trials got the directive, producing 36 rejected
-// browser-tool calls across 15 trials. The fix gates injection on browse-tool
-// availability (shouldInjectResearchDirective) rather than on prompt shape
-// alone, and (defense-in-depth) rewords the adapter's own boilerplate so it no
-// longer smells like a research task by itself.
+// The research directive should only fire when a browse tool is actually
+// callable: the Harbor adapter's default allow-list is ShellSession-only, so
+// a shell-only trial whose own prompt boilerplate happens to sound like a
+// research task must not get told to call BrowserNavigate/BrowserExtract/
+// websearch — tools tool-gating would refuse. shouldInjectResearchDirective
+// gates on browse-tool availability rather than on prompt shape, and the
+// adapter's own boilerplate is reworded (defense-in-depth) so it no longer
+// smells like a research task by itself.
 //
 // These helpers read the real source files rather than mirroring their
 // content as string literals, so drift in either the Harbor prompt template
@@ -240,7 +238,7 @@ function gaiaAllowedTools(): string[] {
   return extractQuotedStrings(block[1]);
 }
 
-describe("research directive gates on browse-tool availability (research-directive-misfire)", () => {
+describe("research directive gates on browse-tool availability", () => {
   it("DEFAULT_ALLOWED_TOOLS is ShellSession-only (sanity check on the extraction itself)", () => {
     expect(harborDefaultAllowedTools()).toEqual([
       "ShellSession",
@@ -279,7 +277,7 @@ describe("research directive gates on browse-tool availability (research-directi
     expect(result.message.content).toContain("EvidenceAdd");
   });
 
-  it("the real Harbor boilerplate no longer smells like a research task by itself (Part 2, defense-in-depth)", () => {
+  it("the real Harbor boilerplate no longer smells like a research task by itself", () => {
     expect(harborPromptTemplate()).not.toContain("briefly research the task");
     expect(looksLikeResearchTask(harborPromptTemplate())).toBe(false);
   });
@@ -290,7 +288,7 @@ describe("research directive gates on browse-tool availability (research-directi
     expect(looksLikeResearchTask("check wikipedia for details")).toBe(true);
   });
 
-  it("shouldInjectResearchDirective suppresses only when no browse tool is callable", () => {
+  it("requires websearch, or both browser tools, before injecting", () => {
     const shellOnly = new Set(harborDefaultAllowedTools());
     const gaia = new Set(gaiaAllowedTools());
 
@@ -300,6 +298,44 @@ describe("research directive gates on browse-tool availability (research-directi
     // Partial availability (only websearch, say) is still enough to fire.
     expect(shouldInjectResearchDirective("research this online", new Set(["websearch"]))).toBe(true);
     expect(shouldInjectResearchDirective("edit the file", shellOnly)).toBe(false);
+    // BrowserNavigate alone can't gather page text (no body in its output).
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserNavigate"])),
+    ).toBe(false);
+    // BrowserExtract alone reads an unnavigated about:blank session.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserExtract"])),
+    ).toBe(false);
+    // The pair together is genuinely actionable.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserExtract"]),
+      ),
+    ).toBe(true);
+    // Other browser tools alongside BrowserNavigate don't substitute for
+    // BrowserExtract.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserClick", "BrowserScroll"]),
+      ),
+    ).toBe(false);
+    // websearch plus a lone browser tool still fires, via the websearch leg.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["websearch", "BrowserNavigate"])),
+    ).toBe(true);
+  });
+
+  it("does not inject the directive for a browse allow-list that cannot actually browse (BrowserNavigate alone)", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const prompt = "Research the article on Wikipedia and summarize its key points.";
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = ["BrowserNavigate", "ShellSession"];
+
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
   });
 });
 

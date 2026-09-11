@@ -76,11 +76,11 @@ def test_org_name_package_layout(tmp_path, monkeypatch):
     )
 
     trial_dir = tmp_path / "trial"
-    # No task.name in this config (legacy shape) -- exercised separately by
-    # test_v21_config_shape_with_namespaced_task_name below. This test just
-    # covers the on-disk package layout via a legacy-shaped config whose bare
-    # name happens to only exist in the package cache, using the fallback
-    # (ref-less) glob path.
+    # Package-shaped config with a namespaced task.name but no task.ref -- so
+    # both exact-ref fast paths are skipped and this exercises the package
+    # fallback-glob path, restricted to the package layout only, never the
+    # legacy one. The ref-carrying variant is covered by
+    # test_v21_config_shape_with_namespaced_task_name below.
     trial_dir.mkdir(parents=True, exist_ok=True)
     (trial_dir / "config.json").write_text(json.dumps({
         "timeout_multiplier": 3.0,
@@ -375,7 +375,8 @@ def test_bare_name_two_orgs_same_hash_different_timeouts_ambiguous(tmp_path, mon
     assert sorted(info["candidate_task_tomls"]) == sorted([str(toml_a), str(toml_b)])
     assert sorted(info["candidate_timeouts_sec"]) == [200.0, 500.0]
     assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(200.0 * 3.0 * 0.9)
-    # Round-trips through JSON cleanly (PR27 depends on this).
+    # The provenance dict is written into result.json, so it must round-trip
+    # through JSON cleanly as-is.
     assert json.loads(json.dumps(info)) == info
 
 
