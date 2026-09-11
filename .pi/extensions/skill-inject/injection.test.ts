@@ -288,7 +288,7 @@ describe("research directive gates on browse-tool availability", () => {
     expect(looksLikeResearchTask("check wikipedia for details")).toBe(true);
   });
 
-  it("shouldInjectResearchDirective suppresses only when no browse tool is callable", () => {
+  it("requires websearch, or both browser tools, before injecting", () => {
     const shellOnly = new Set(harborDefaultAllowedTools());
     const gaia = new Set(gaiaAllowedTools());
 
@@ -298,6 +298,44 @@ describe("research directive gates on browse-tool availability", () => {
     // Partial availability (only websearch, say) is still enough to fire.
     expect(shouldInjectResearchDirective("research this online", new Set(["websearch"]))).toBe(true);
     expect(shouldInjectResearchDirective("edit the file", shellOnly)).toBe(false);
+    // BrowserNavigate alone can't gather page text (no body in its output).
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserNavigate"])),
+    ).toBe(false);
+    // BrowserExtract alone reads an unnavigated about:blank session.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserExtract"])),
+    ).toBe(false);
+    // The pair together is genuinely actionable.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserExtract"]),
+      ),
+    ).toBe(true);
+    // Other browser tools alongside BrowserNavigate don't substitute for
+    // BrowserExtract.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserClick", "BrowserScroll"]),
+      ),
+    ).toBe(false);
+    // websearch plus a lone browser tool still fires, via the websearch leg.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["websearch", "BrowserNavigate"])),
+    ).toBe(true);
+  });
+
+  it("does not inject the directive for a browse allow-list that cannot actually browse (BrowserNavigate alone)", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const prompt = "Research the article on Wikipedia and summarize its key points.";
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = ["BrowserNavigate", "ShellSession"];
+
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
   });
 });
 

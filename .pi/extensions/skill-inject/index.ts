@@ -264,13 +264,35 @@ export function looksLikeResearchTask(text: string): boolean {
 // caused it.
 const BROWSE_TOOLS = ["BrowserNavigate", "BrowserExtract", "websearch"];
 
+// Neither browser tool is independently actionable: BrowserNavigate returns
+// only `[status] <url>\ntitle: <title>` (no page body text), and
+// BrowserExtract reads from a session that is always about:blank unless
+// something already navigated it first -- nothing does that standalone. So
+// an allow-list needs BOTH of these together (or websearch on its own) before
+// the directive has anything real to point at.
+const BROWSER_RESEARCH_PAIR = ["BrowserNavigate", "BrowserExtract"];
+
 /** Should the research-first directive be injected for this prompt/allow-list?
- *  Exported for unit testing alongside looksLikeResearchTask. */
+ *  Exported for unit testing alongside looksLikeResearchTask.
+ *
+ *  Gate is: websearch alone, or BrowserNavigate+BrowserExtract together. This
+ *  guarantees availableBrowseTools in researchDirective below can never end
+ *  up empty -- a future loosening of this gate must preserve that invariant,
+ *  or handle an empty-tool-list directive body.
+ *
+ *  This does not close every gap: an allow-list with webfetch (which can
+ *  fetch full page text on its own) but no BrowserExtract is now suppressed
+ *  too, even though webfetch alone is arguably research-capable. That's a
+ *  real, currently-hypothetical trade-off -- no allow-list in this repo has
+ *  that shape today -- not an oversight this fix claims to close. */
 export function shouldInjectResearchDirective(
   prompt: string,
   allowed: Set<string> | undefined,
 ): boolean {
-  return looksLikeResearchTask(prompt) && (!allowed || BROWSE_TOOLS.some((t) => allowed.has(t)));
+  return (
+    looksLikeResearchTask(prompt) &&
+    (toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed))
+  );
 }
 
 // Built per-turn rather than as a constant: the evidence step only makes sense
