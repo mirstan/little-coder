@@ -256,23 +256,43 @@ export function looksLikeResearchTask(text: string): boolean {
 
 // Tools the research directive actually recommends calling (BrowserNavigate /
 // BrowserExtract / websearch — see researchDirective below). When none of
-// these are callable, the directive has nothing actionable left to say: every
-// Terminal-Bench trial's own boilerplate ("briefly research the task first...")
-// trips looksLikeResearchTask on 100% of trials even though the trial's
-// allow-list is ShellSession-only, so the directive fired universally and
-// pointed the model at tools tool-gating would refuse (confirmed: 52 retained
-// trials, 36 rejected browser-tool calls across 15 trials). Gating on browse-
-// tool availability, rather than on prompt shape, fixes the whole failure
-// class instead of just this one template's wording.
+// these are callable, the directive has nothing actionable left to say:
+// looksLikeResearchTask matches on prompt wording alone, so a prompt can trip
+// it even when the caller's allow-list is shell-only, pointing the model at
+// tools it can't actually call. Gating on browse-tool availability, rather
+// than on prompt shape, avoids that regardless of which prompt template
+// caused it.
 const BROWSE_TOOLS = ["BrowserNavigate", "BrowserExtract", "websearch"];
 
+// Neither browser tool is independently actionable: BrowserNavigate returns
+// only `[status] <url>\ntitle: <title>` (no page body text), and
+// BrowserExtract reads from a session that is always about:blank unless
+// something already navigated it first -- nothing does that standalone. So
+// an allow-list needs BOTH of these together (or websearch on its own) before
+// the directive has anything real to point at.
+const BROWSER_RESEARCH_PAIR = ["BrowserNavigate", "BrowserExtract"];
+
 /** Should the research-first directive be injected for this prompt/allow-list?
- *  Exported for unit testing alongside looksLikeResearchTask. */
+ *  Exported for unit testing alongside looksLikeResearchTask.
+ *
+ *  Gate is: websearch alone, or BrowserNavigate+BrowserExtract together. This
+ *  guarantees availableBrowseTools in researchDirective below can never end
+ *  up empty -- a future loosening of this gate must preserve that invariant,
+ *  or handle an empty-tool-list directive body.
+ *
+ *  This does not close every gap: an allow-list with webfetch (which can
+ *  fetch full page text on its own) but no BrowserExtract is now suppressed
+ *  too, even though webfetch alone is arguably research-capable. That's a
+ *  real, currently-hypothetical trade-off -- no allow-list in this repo has
+ *  that shape today -- not an oversight this fix claims to close. */
 export function shouldInjectResearchDirective(
   prompt: string,
   allowed: Set<string> | undefined,
 ): boolean {
-  return looksLikeResearchTask(prompt) && (!allowed || BROWSE_TOOLS.some((t) => allowed.has(t)));
+  return (
+    looksLikeResearchTask(prompt) &&
+    (toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed))
+  );
 }
 
 // Built per-turn rather than as a constant: the evidence step only makes sense

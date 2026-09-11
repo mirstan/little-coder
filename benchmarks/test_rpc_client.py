@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rpc_client as RC  # noqa: E402
 from rpc_client import PiRpc, _extension_paths, REPO_ROOT  # noqa: E402
 
 PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
@@ -113,3 +114,86 @@ def test_rpc_tb_mode_env_propagates(tmp_path):
         assert resp["success"] is True
     finally:
         rpc.close(timeout=3)
+
+
+class _FakeStream:
+    """Minimal stand-in for a subprocess pipe: EOF immediately, no I/O."""
+
+    def __init__(self):
+        self.closed = False
+
+    def readline(self):
+        return ""
+
+    def write(self, *_a, **_k):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProc:
+    """Records the `env` kwarg Popen was called with, without spawning
+    anything real -- used to assert on PiRpc's full_env construction
+    directly, rather than going through turn-cap.ts's own resolution, which
+    is covered separately in TS."""
+
+    captured_env: dict | None = None
+
+    def __init__(self, *_args, **kwargs):
+        _FakeProc.captured_env = kwargs.get("env")
+        self.stdin = _FakeStream()
+        self.stdout = _FakeStream()
+        self.stderr = _FakeStream()
+
+    def poll(self):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_max_turns_explicit_zero_clobbers_ambient_env(tmp_path, monkeypatch):
+    """max_turns=0 is a deliberate "no cap" choice and must still WRITE
+    LITTLE_CODER_MAX_TURNS=0 into the subprocess env, clobbering any ambient
+    value inherited from the calling process's own environment (full_env
+    starts as a copy of os.environ). A truthiness check (`if max_turns:`)
+    would treat 0 as falsy and skip the write entirely, silently leaving a
+    leaked ambient cap (e.g. from a wrapper script) in place."""
+    monkeypatch.setenv("LITTLE_CODER_MAX_TURNS", "40")
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC.subprocess, "Popen", _FakeProc)
+
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path), max_turns=0)
+    try:
+        assert _FakeProc.captured_env["LITTLE_CODER_MAX_TURNS"] == "0"
+    finally:
+        rpc.close(timeout=1)
+
+
+def test_max_turns_unset_leaves_ambient_env_untouched(tmp_path, monkeypatch):
+    """max_turns=None (the default, e.g. interactive use / callers that
+    never pass the kwarg) must NOT touch LITTLE_CODER_MAX_TURNS at all --
+    only an explicit value (including 0) is authoritative."""
+    monkeypatch.setenv("LITTLE_CODER_MAX_TURNS", "40")
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC.subprocess, "Popen", _FakeProc)
+
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path))
+    try:
+        assert _FakeProc.captured_env["LITTLE_CODER_MAX_TURNS"] == "40"
+    finally:
+        rpc.close(timeout=1)

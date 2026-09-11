@@ -90,6 +90,15 @@ class PromptResult:
     #: never finished before the outer timeout expired. Do not read
     #: agent_ended alone as "the call completed" -- check stop_reason too.
     stop_reason: str = "agent_end"
+    #: Token usage summed across every `turn_end` seen during this call
+    #: (see prompt_and_collect's aggregation loop). Crash-proof but
+    #: incomplete: unlike session_stats(), it does not include tool-result
+    #: usage or compaction/branch-summary generation tokens, and it only
+    #: covers turns whose `turn_end` actually arrived (see PiRpc.session_stats
+    #: docstring for why session_stats is preferred when available).
+    usage: dict = field(default_factory=lambda: {
+        "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0,
+    })
     #: True only when pi's own agent_settled event was actually observed
     #: (i.e. NOT via the settle-grace fallback). Purely observational --
     #: stop_reason intentionally still reports "agent_end" in both cases for
@@ -139,7 +148,14 @@ class PiRpc:
             full_env["LITTLE_CODER_SESSION_ID"] = session_id
         if tb_mode:
             full_env["LITTLE_CODER_TB_MODE"] = "1"
-        if max_turns:
+        if max_turns is not None:
+            # `is not None`, not truthiness: an explicit max_turns=0 (deliberate
+            # "no cap") must still WRITE the env var so it clobbers any ambient
+            # LITTLE_CODER_MAX_TURNS inherited from the caller's own environment
+            # (full_env starts as a copy of os.environ, above) -- otherwise a
+            # leaked wrapper-script value would silently survive an explicit
+            # "no cap" request. turn-cap.ts's resolveTurnCap already handles the
+            # string "0" correctly: Number("0") == 0, so a cap of 0 is applied.
             full_env["LITTLE_CODER_MAX_TURNS"] = str(max_turns)
 
         cmd = [str(PI_BIN), "--mode", "rpc", "--no-session", "--model", model]
@@ -682,6 +698,30 @@ class PiRpc:
                 result.tool_calls.append(entry)
             elif t == "turn_end":
                 result.turn_count += 1
+                msg = ev.get("message")
+                usage = msg.get("usage") if isinstance(msg, dict) else None
+                if isinstance(usage, dict):
+                    # Defensive .get(..., 0) + isinstance checks throughout:
+                    # this is untrusted wire data from a pi build we don't
+                    # control, and a malformed/missing field here must not
+                    # crash a whole Harbor trial over token accounting.
+                    for key, src in (
+                        ("input", "input"), ("output", "output"),
+                        ("cache_read", "cacheRead"), ("cache_write", "cacheWrite"),
+                    ):
+                        val = usage.get(src, 0)
+                        if isinstance(val, (int, float)):
+                            result.usage[key] += val
+                    cost = usage.get("cost", 0)
+                    # Documented shape is {"input", "output", "cacheRead",
+                    # "cacheWrite", "total"}; tolerate a flat number too, in
+                    # case a future/older pi build ever reports cost bare.
+                    if isinstance(cost, dict):
+                        total = cost.get("total", 0)
+                        if isinstance(total, (int, float)):
+                            result.usage["cost"] += total
+                    elif isinstance(cost, (int, float)):
+                        result.usage["cost"] += cost
             elif t == "compaction_end":
                 result.compaction_events += 1
             elif t == "agent_end":
@@ -711,6 +751,36 @@ class PiRpc:
             # from a legitimately empty (but successful) state.
             raise RuntimeError(f"pi rejected get_state: {resp.get('error')}")
         return resp.get("data", {})
+
+    def session_stats(self, timeout: float = 10) -> Optional[dict]:
+        """Query pi's own cumulative token/cost accounting for this session.
+
+        More complete than summing `turn_end.message.usage` in
+        prompt_and_collect(): per docs/rpc.md, `get_session_stats`'s
+        `tokens`/`cost` include tool-result usage and compaction/branch-
+        summary generation across the WHOLE session, not just assistant
+        turns. Session-cumulative, not per-call -- if a caller ever issues
+        more than one prompt_and_collect() per PiRpc session, this reflects
+        the running total across all of them, not just the most recent one
+        (the Harbor adapter calls once per trial, so the two agree there).
+
+        Never raises: returns None on any failure -- pi process already
+        dead, timeout, or an older pinned pi build that doesn't recognize
+        `get_session_stats` at all -- so a caller can treat this exactly
+        like the graceful-degradation pattern used elsewhere in this class
+        (e.g. capture_environment_snapshot's best-effort reads).
+        """
+        if self._closed or self._proc.poll() is not None:
+            return None
+        try:
+            rid = str(uuid.uuid4())
+            self._send({"id": rid, "type": "get_session_stats"})
+            resp = self._await_response(rid, timeout=timeout)
+        except Exception:
+            return None
+        if not resp.get("success"):
+            return None
+        return resp.get("data")
 
     def _settle_stderr(self, timeout: float = 1.0):
         """Let the existing stderr reader finish once pi is gone.

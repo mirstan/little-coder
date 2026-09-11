@@ -2,15 +2,12 @@
 // WARN_REMAINING turns left before the turn-cap would abort the run, OR
 // WARN_REMAINING_MS left before a known wall-clock deadline.
 //
-// Extracted because finalize-warn/index.ts and tb-finalize-guard/index.ts
-// each kept a hand-copied pair of these constants with a comment admitting
-// they "must stay in lockstep" — enforced by nothing. tb-finalize-guard
-// needs its own copy of the condition because it
-// independently re-derives whether finalize-warn's nudge would have fired
-// this turn (see that extension's own header comment for why it re-derives
-// rather than reading finalize-warn's private state); this module is the one
-// place both extensions now import the constants and the condition from, so
-// they cannot drift again.
+// finalize-warn and tb-finalize-guard both need this condition:
+// tb-finalize-guard independently re-derives whether finalize-warn's nudge
+// would have fired this turn rather than reading finalize-warn's private
+// state, since finalize-warn exposes no latch for that (see
+// tb-finalize-guard/index.ts for why). Both extensions import the constants
+// and the condition from this one module so they cannot drift apart.
 //
 // This dir has no `index.ts` on purpose — the launcher's extension discovery
 // requires one, so `_shared` is skipped and stays a plain library.
