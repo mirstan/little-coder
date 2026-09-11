@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
 from rpc_client import PiRpc  # noqa: E402
+import fake_pi as fake_pi_mod  # noqa: E402  -- module, not the `fake_pi` fixture below
 
 FAKE = Path(__file__).parent / "fake_pi.py"
 
@@ -245,6 +246,80 @@ def test_stray_event_on_reused_session_does_not_corrupt_next_turn(fake_pi, tmp_p
     assert "second answer" in r2.assistant_text
 
 
+def test_usage_summed_from_turn_end(fake_pi, tmp_path):
+    """PromptResult.usage accumulates the fake's per-turn usage exactly
+    (single turn_end in the clean-mode fixture)."""
+    with fake_pi("clean", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    expected_cost = fake_pi_mod.TURN_USAGE["cost"]["total"]
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+    assert r.usage["cache_read"] == fake_pi_mod.TURN_USAGE["cacheRead"]
+    assert r.usage["cache_write"] == fake_pi_mod.TURN_USAGE["cacheWrite"]
+    assert r.usage["cost"] == pytest.approx(expected_cost)
+
+
+def test_session_stats_returns_fake_aggregate(fake_pi, tmp_path):
+    """session_stats() round-trips the fake's canned get_session_stats
+    response -- the complete, session-cumulative source Plan 7 prefers."""
+    with fake_pi("clean", tmp_path) as rpc:
+        rpc.prompt_and_collect("go", timeout=30)
+        stats = rpc.session_stats()
+    assert stats == fake_pi_mod.SESSION_STATS_DATA
+
+
+def test_session_stats_none_after_process_exit(fake_pi, tmp_path):
+    """end_then_exit kills the fake process right after its agent_end --
+    session_stats() must return None promptly (not hang for its timeout),
+    while the event-summed usage from the turn that DID complete is still
+    populated. Pins verification plan item (b)."""
+    with fake_pi("end_then_exit", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30)
+        stats = rpc.session_stats(timeout=2)
+        elapsed = time.time() - t0
+    assert elapsed < 5, f"took {elapsed:.1f}s -- session_stats() did not notice the dead process"
+    assert stats is None
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+
+
+def test_usage_includes_continuation_turn(fake_pi, tmp_path):
+    """abort_then_followup's first turn aborts mid-thought with no turn_end
+    (no usage to contribute); only the recovery turn's turn_end carries
+    usage. Usage must reflect that recovery turn, pinning that Plan 1's
+    settle-grace continuation is included in Plan 7's accumulation too."""
+    with fake_pi("abort_then_followup", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+
+
+def test_usage_tolerates_missing_or_malformed_usage(fake_pi, tmp_path):
+    """One turn with no "usage" key and one with a malformed (non-dict)
+    "usage" must be skipped, not raise -- only the third, valid turn's
+    numbers should end up in the total."""
+    with fake_pi("mixed_usage", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.turn_count == 3
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+    assert r.usage["cache_read"] == fake_pi_mod.TURN_USAGE["cacheRead"]
+
+
+def test_turn_end_survives_null_message_and_null_usage(fake_pi, tmp_path):
+    """turn_end.message can arrive as JSON null itself, or as a dict whose
+    "usage" key is null -- not merely absent. `dict.get(key, default)` only
+    substitutes the default when the key is MISSING, never when its value is
+    null, so `ev.get("message", {}).get("usage")` raises AttributeError on a
+    null "message". Both turns here must be skipped without raising, leaving
+    usage all zero, and turn_count must still reflect both turns."""
+    with fake_pi("null_message_usage", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.turn_count == 2
+    assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+
+
 def test_settled_after_extra_event_returns_fast(fake_pi, tmp_path):
     """Pins Bug A: the old Phase 1 predicate only matched agent_end, so an
     agent_settled arriving after some other event (not immediately after
@@ -345,6 +420,7 @@ def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False
     assert r.tool_calls == []
+    assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
 
 
 class _NeverFinishingThread:
