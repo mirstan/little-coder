@@ -369,6 +369,83 @@ class _HarborShellProxy:
         return f"shell reset (cwd → /app)"
 
 
+def _resolve_token_usage(result_usage: dict, turn_count: int, stats: dict | None) -> dict:
+    """Pick a token-usage source and compute the Harbor AgentContext mapping.
+
+    Plan 7 (token-usage-tracking): pi computes full per-turn `Usage` and a
+    session-cumulative `get_session_stats`, but Harbor's `result.json` fields
+    were left null since nothing read either. `stats` (PiRpc.session_stats()'s
+    return value) is preferred when available -- it's session-complete,
+    including tool-result usage and compaction/branch-summary generation
+    tokens (docs/rpc.md), which summing `turn_end` events alone misses.
+    `result_usage` (PromptResult.usage, itself summed from `turn_end` events)
+    is the fallback for when pi already died (process_exit/deadline paths) or
+    is running an older build without `get_session_stats` -- exactly the
+    trials where token counts matter most, per the plan's rejected
+    alternatives.
+
+    Pulled out as a standalone function (rather than inlined in run()) so it
+    can be unit-tested without needing a live PiRpc/AgentContext/harbor
+    environment -- pure function of already-fetched data.
+
+    Returns a dict with "n_input_tokens", "n_cache_tokens", "n_output_tokens",
+    "cost_usd" (Harbor AgentContext field values) plus "raw" (the flat
+    input/output/cache_read/cache_write/cost breakdown) and "token_source"
+    ("session_stats" | "event_sum" | "unavailable") for context.metadata.
+    """
+    def _num(v):
+        # bool is an int subclass -- exclude it so a stray True doesn't
+        # silently count as 1. Anything else non-numeric (a string, a dict,
+        # None, ...) coerces to 0 rather than propagating a TypeError into
+        # `input_tok + cache_read + cache_write` or `cost > 0` below, which
+        # would otherwise fail an OTHERWISE-SUCCESSFUL Harbor trial purely
+        # over token telemetry -- untrusted wire data (stats is pi's
+        # get_session_stats response; result_usage is itself summed from
+        # equally-untrusted turn_end events) must not do that.
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    if isinstance(stats, dict) and isinstance(stats.get("tokens"), dict):
+        tok = stats["tokens"]
+        input_tok = _num(tok.get("input", 0))
+        output_tok = _num(tok.get("output", 0))
+        cache_read = _num(tok.get("cacheRead", 0))
+        cache_write = _num(tok.get("cacheWrite", 0))
+        cost = _num(stats.get("cost", 0))
+        # token_source reflects that a session_stats payload WAS available
+        # and had a "tokens" dict -- even if every field inside it turned out
+        # to be non-numeric junk that _num() coerced to 0. Don't silently
+        # reclassify that as event_sum/unavailable; the source was real.
+        token_source = "session_stats"
+    else:
+        input_tok = _num(result_usage.get("input", 0))
+        output_tok = _num(result_usage.get("output", 0))
+        cache_read = _num(result_usage.get("cache_read", 0))
+        cache_write = _num(result_usage.get("cache_write", 0))
+        cost = _num(result_usage.get("cost", 0))
+        # No turn_end ever fired (e.g. pi crashed before completing a single
+        # turn) -- there is nothing meaningful to have summed, so this is
+        # genuinely "unavailable" rather than a real (zero) event sum.
+        # Distinct from a provider that legitimately reports zero usage for
+        # turns that DID complete -- that case is still "event_sum", just
+        # with zero-valued fields.
+        token_source = "event_sum" if turn_count > 0 else "unavailable"
+
+    return {
+        "n_input_tokens": input_tok + cache_read + cache_write,
+        "n_cache_tokens": cache_read,
+        "n_output_tokens": output_tok,
+        "cost_usd": cost if cost > 0 else None,
+        "token_source": token_source,
+        "raw": {
+            "input": input_tok,
+            "output": output_tok,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
+            "cost": cost,
+        },
+    }
+
+
 class LittleCoderAgent(BaseAgent):
     """Harbor (TB 2.0) adapter for little-coder (v0.1.0+ pi port)."""
 
@@ -604,8 +681,34 @@ class LittleCoderAgent(BaseAgent):
                     stderr = rpc.stderr()
                     if stderr:
                         log_fh.write(f"\n=== pi stderr ===\n{stderr}\n")
-                # Harbor's AgentContext: populate what we can. Token usage
-                # isn't currently plumbed through pi-ai; leave None.
+
+                # Token usage: prefer pi's own cumulative get_session_stats
+                # (includes tool-result usage and compaction/branch-summary
+                # generation -- see PiRpc.session_stats' docstring) and fall
+                # back to the per-turn event sum on PromptResult.usage when
+                # stats are unavailable (pi already dead on the
+                # process_exit/deadline paths, or an older pi build without
+                # the get_session_stats command). Queried here, before
+                # rpc.close(), because a closed/dead process can't answer it.
+                stats = await asyncio.to_thread(rpc.session_stats)
+                tokens = _resolve_token_usage(result.usage, result.turn_count, stats)
+
+                # Harbor's AgentContext (harbor/models/agent/context.py) field
+                # semantics are underspecified beyond their doc comments, so
+                # this mapping is spelled out explicitly:
+                #   n_input_tokens: field doc says "including cache" -> add
+                #     both cache directions in, not just reads.
+                #   n_cache_tokens: report cache READ hits (the reused-token
+                #     savings) here; cache_write is mirrored into metadata
+                #     separately since Harbor has no dedicated field for it.
+                #   cost_usd: local providers (llama.cpp, omlx) report 0 --
+                #     None reads as "not priced", matching how other Harbor
+                #     agents report an unpriced run, rather than "free".
+                context.n_input_tokens = tokens["n_input_tokens"]
+                context.n_cache_tokens = tokens["n_cache_tokens"]
+                context.n_output_tokens = tokens["n_output_tokens"]
+                context.cost_usd = tokens["cost_usd"]
+
                 context.metadata = {
                     "stop_reason": stop_reason,
                     "n_tool_calls": len(result.tool_calls),
@@ -614,6 +717,8 @@ class LittleCoderAgent(BaseAgent):
                     "n_notifications": len(rpc.notifications()) if hasattr(rpc, "notifications") else 0,
                     "little_coder_version": self.version(),
                     "benchmark": "terminal_bench_2.0",
+                    "token_usage": tokens["raw"],
+                    "token_source": tokens["token_source"],
                 }
             finally:
                 await asyncio.to_thread(rpc.close, 3)
