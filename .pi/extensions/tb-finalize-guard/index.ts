@@ -273,6 +273,13 @@ function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, toolCalls: any[]): voi
   consecutiveNoWriteTurns++;
   if (consecutiveNoWriteTurns < NO_WRITE_TURNS_BEFORE_NUDGE) return;
 
+  // Turn-cap headroom: a nudge queued now becomes the prompt for
+  // turnsThisRun + 1; if that would exceed the cap, turn-cap aborts before
+  // the model ever sees it (mirrors maybeFireTriggerA's own equivalent
+  // guard above). Bookkeeping above (the counter reset/increment) still
+  // happens even when suppressed here, matching Trigger A's placement.
+  if (capForRun > 0 && turnsThisRun >= capForRun) return;
+
   const msg =
     "You still have not written your answer. Run exactly one command now that writes " +
     "your best current value to the deliverable path, then stop. If your previous " +

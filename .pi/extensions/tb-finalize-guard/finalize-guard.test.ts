@@ -411,6 +411,71 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 9 — still non-compliant, retries
       expect(h.sent).toHaveLength(1);
     });
+
+    it("fires one turn below the cap", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await startArmableRun(h); // maxTurns=10
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // turn 7 — compliant, resets counter
+      await turn(h, shellTurn(["ls -la"])); // turn 8 — 1st non-compliant turn since reset
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — 2nd non-compliant turn; 9 >= 10 is false
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("is suppressed exactly at the cap (a queued nudge turn-cap would abort before delivery)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await startArmableRun(h); // maxTurns=10
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // turn 7 — compliant, resets counter
+      await turn(h, shellTurn(["echo done2 > /app/result2.txt"])); // turn 8 — compliant again, shifts by one turn
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — 1st non-compliant turn since reset
+      await turn(h, shellTurn(["ls -la"])); // turn 10 — 2nd non-compliant turn; 10 >= 10 is true
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("does not burn the one-shot latch when suppressed by the cap — a later run in the same session still fires", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await startArmableRun(h); // maxTurns=10
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // turn 7 — compliant, resets counter
+      await turn(h, shellTurn(["echo done2 > /app/result2.txt"])); // turn 8 — compliant again, shifts by one turn
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — 1st non-compliant turn since reset
+      await turn(h, shellTurn(["ls -la"])); // turn 10 — 2nd non-compliant turn; suppressed by the cap
+      expect(h.sent).toHaveLength(0);
+
+      // A new run within the SAME session (before_agent_start again, no
+      // session_start), with a normal (non-capped-out) turn budget. If the
+      // suppression above had wrongly consumed the one-shot latch, nothing
+      // below would fire.
+      await startRun(h, 10);
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
+      await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("no cap means no suppression (capForRun === 0 must not be treated as an exceeded cap)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      // Deadline set before the run starts (before_agent_start resolves it
+      // from the env var). 8 minutes is within finalize-warn's own 10-minute
+      // wall-clock window, but well under Trigger A's 20-minute floor, so
+      // Trigger A cannot interfere.
+      setDeadlineMinutesFromNow(8);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h); // no maxTurns -> capForRun === 0
+      await turn(h, shellTurn(["ls -la"])); // turn 1 — arms via the wall-clock trigger
+      await turn(h, shellTurn(["ls -la"])); // turn 2 — 1st non-compliant turn
+      await turn(h, shellTurn(["ls -la"])); // turn 3 — 2nd non-compliant turn; fires
+      expect(h.sent).toHaveLength(1);
+    });
   });
 
   describe("precedence between the two triggers", () => {
