@@ -404,6 +404,26 @@ export function detectDeliverableWrites(raw: string): ShellWrite[] {
 const SCRATCH_ROOTS = ["/tmp", "/var/tmp", "/private/tmp"];
 
 /**
+ * Lexically collapse `.` and `..` segments in an absolute path, the way a
+ * shell's path resolution would, without touching the filesystem. `path`
+ * must already start with `/`. An empty stack absorbs a leading `..` (the
+ * parent of `/` is `/`), which is exactly the POSIX semantics we want here.
+ */
+function normalizeAbsPath(path: string): string {
+  const parts = path.split("/");
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  return "/" + stack.join("/");
+}
+
+/**
  * True when `path` is rooted under an obviously-scratch directory (`/tmp`
  * and friends) rather than a plausible deliverable location.
  *
@@ -415,9 +435,31 @@ const SCRATCH_ROOTS = ["/tmp", "/var/tmp", "/private/tmp"];
  * deliverable target, since the harness cannot know the task's real
  * deliverable path (parsing it out of instruction.md was considered and
  * rejected as too fragile to rely on).
+ *
+ * The path is normalized (lexically) before the prefix check, so
+ * `/tmp/../app/answer.txt` (which really resolves to `/app/answer.txt`) does
+ * not misclassify as scratch, and `/app/../tmp/x` (which really resolves to
+ * `/tmp/x`) does not misclassify as a deliverable. Normalization is
+ * lexical-only and never resolves symlinks — which is exactly why
+ * `/private/tmp` is listed in SCRATCH_ROOTS separately from `/tmp` rather
+ * than relying on normalization to unify them (macOS's `/tmp` symlink can't
+ * be resolved here). This only feeds a nudge heuristic in tb-finalize-guard,
+ * not any write-permission gate, so a misclassification in either direction
+ * is low-stakes.
+ *
+ * One contrived edge case, left unfixed on purpose: `/tmp/../dev/null`
+ * normalizes to `/dev/null` (not scratch), but callers elsewhere in this
+ * file that inspect the raw (non-normalized) command text may have already
+ * treated it as a non-destructive write target before normalization ever
+ * runs — so it can end up counted as a compliant deliverable write even
+ * though it is actually `/dev/null`. Documented so it isn't a silent
+ * surprise later, not something worth adding path-normalization elsewhere
+ * in this file to close.
  */
 export function isScratchPath(path: string): boolean {
-  return SCRATCH_ROOTS.some((root) => path === root || path.startsWith(root + "/"));
+  if (!path.startsWith("/")) return false;
+  const normalized = normalizeAbsPath(path);
+  return SCRATCH_ROOTS.some((root) => normalized === root || normalized.startsWith(root + "/"));
 }
 
 function unquote(word: string): string {

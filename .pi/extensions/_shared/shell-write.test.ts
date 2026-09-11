@@ -4,6 +4,7 @@ import {
   detectDeliverableWrites,
   detectWriteTargets,
   hasWriteRedirection,
+  isScratchPath,
   splitCommandChain,
   stripHeredocBodies,
 } from "./shell-write.ts";
@@ -275,6 +276,55 @@ describe("detectDeliverableWrites", () => {
     expect(detectWriteTargets("mv draft.txt /app/answer.txt")).toEqual([]);
     expect(detectWriteTargets("sed -i 's/a/b/' /app/result.txt")).toEqual([]);
     expect(detectWriteTargets("gcc main.c -o /app/main")).toEqual([]);
+  });
+});
+
+describe("isScratchPath", () => {
+  it("recognizes the scratch roots and their children", () => {
+    expect(isScratchPath("/tmp")).toBe(true);
+    expect(isScratchPath("/tmp/x")).toBe(true);
+    expect(isScratchPath("/var/tmp/a/b")).toBe(true);
+    expect(isScratchPath("/private/tmp/x")).toBe(true);
+  });
+
+  it("rejects non-scratch and non-absolute paths", () => {
+    expect(isScratchPath("/app/answer.txt")).toBe(false);
+    expect(isScratchPath("/tmpfoo")).toBe(false);
+    expect(isScratchPath("relative/path")).toBe(false);
+    expect(isScratchPath("tmp/x")).toBe(false);
+  });
+
+  it("normalizes .. traversal before classifying (the reported bug)", () => {
+    // Lexically resolves to /app/answer.txt -- not scratch, even though the
+    // raw string starts with /tmp/.
+    expect(isScratchPath("/tmp/../app/answer.txt")).toBe(false);
+  });
+
+  it("normalizes .. traversal the other way too", () => {
+    // Lexically resolves to /tmp/x -- scratch, even though the raw string
+    // starts with /app.
+    expect(isScratchPath("/app/../tmp/x")).toBe(true);
+  });
+
+  it("collapses redundant separators and dot segments", () => {
+    expect(isScratchPath("/tmp/./x")).toBe(true);
+    expect(isScratchPath("/tmp//x")).toBe(true);
+    expect(isScratchPath("/tmp/")).toBe(true);
+  });
+
+  it("collapses a root-only path to non-scratch", () => {
+    expect(isScratchPath("/tmp/..")).toBe(false);
+    expect(isScratchPath("/")).toBe(false);
+  });
+
+  it("clamps a root escape instead of producing garbage (POSIX /.. === /)", () => {
+    // /../etc/passwd normalizes to /etc/passwd, per POSIX's "the parent of /
+    // is /" -- an empty stack absorbs the leading .. rather than erroring or
+    // walking outside the root. Not scratch.
+    expect(isScratchPath("/../etc/passwd")).toBe(false);
+    // Same clamping, but this time it lands inside a scratch root -- do not
+    // "fix" this into false, it is correct per the same POSIX semantics.
+    expect(isScratchPath("/../tmp/x")).toBe(true);
   });
 });
 
