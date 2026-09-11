@@ -450,8 +450,20 @@ class LittleCoderAgent(BaseAgent):
         live_log_path = self.logs_dir / "little_coder.live.log"
         live_log_fh = live_log_path.open("w") if self.logs_dir else None
         pending_text: list[str] = []
+        # Turn boundary counter for the markers below. One prompt_and_collect
+        # call can now legitimately span several agent_end events (an
+        # abort-then-recover continuation, an auto-retry, ...), so an
+        # unqualified "=== agent_end ===" marker (the original version of
+        # this closure, and the misdiagnosis evidence cited by this PR's own
+        # first commit) is worse than before: a reader tailing the live log
+        # would stop at the FIRST agent_end and miss every turn after it.
+        # Track turn boundaries explicitly instead -- agent_settled is the
+        # only line a reader should treat as "the trial's turn is actually
+        # done".
+        turn_counter = 0
 
         def on_event(ev: dict) -> None:
+            nonlocal turn_counter
             if live_log_fh is None:
                 return
             t = ev.get("type")
@@ -476,11 +488,21 @@ class LittleCoderAgent(BaseAgent):
                 )
                 live_log_fh.write(f"<< {text[:400]}\n")
                 live_log_fh.flush()
+            elif t == "agent_start":
+                turn_counter += 1
+                live_log_fh.write(f"=== turn {turn_counter} start ===\n")
+                live_log_fh.flush()
             elif t == "agent_end":
                 if pending_text:
                     live_log_fh.write("".join(pending_text) + "\n")
                     pending_text.clear()
-                live_log_fh.write("=== agent_end ===\n")
+                live_log_fh.write(f"=== turn {turn_counter} agent_end (may continue) ===\n")
+                live_log_fh.flush()
+            elif t == "agent_settled":
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
+                live_log_fh.write("=== agent_settled — trial turn complete ===\n")
                 live_log_fh.flush()
 
         timeout_info = _resolve_trial_timeout_info(self.logs_dir)
