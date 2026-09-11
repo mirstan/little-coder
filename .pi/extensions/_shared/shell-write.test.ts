@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   SHELL_TOOLS,
+  detectDeliverableWrites,
   detectWriteTargets,
   hasWriteRedirection,
+  isScratchPath,
   splitCommandChain,
   stripHeredocBodies,
 } from "./shell-write.ts";
@@ -200,6 +202,129 @@ describe("stripHeredocBodies", () => {
   it("handles more than one heredoc", () => {
     const cmd = "cat > a << 'E1'\nx\nE1\ncat > b << 'E2'\ny\nE2";
     expect(splitCommandChain(cmd)).toEqual(["cat > a", "cat > b"]);
+  });
+});
+
+describe("detectDeliverableWrites", () => {
+  it("still reports everything detectWriteTargets does", () => {
+    expect(detectDeliverableWrites("echo x > out.log")).toEqual([
+      { path: "out.log", kind: "redirect" },
+    ]);
+  });
+
+  it("catches cp's last non-flag operand as the target", () => {
+    expect(detectDeliverableWrites("cp deliverable.txt /app/out/")).toEqual([
+      { path: "/app/out/", kind: "copy" },
+    ]);
+    // Multiple sources: only the final operand is the target.
+    expect(detectDeliverableWrites("cp -r a.txt b.txt /app/dest")).toEqual([
+      { path: "/app/dest", kind: "copy" },
+    ]);
+  });
+
+  it("catches mv's last non-flag operand as the target", () => {
+    expect(detectDeliverableWrites("mv -f draft.txt /app/answer.txt")).toEqual([
+      { path: "/app/answer.txt", kind: "move" },
+    ]);
+  });
+
+  it("catches install's last non-flag operand as the target", () => {
+    expect(detectDeliverableWrites("install -m 644 out.bin /app/bin/out")).toEqual([
+      { path: "/app/bin/out", kind: "copy" },
+    ]);
+  });
+
+  it("prefers -t DIR / --target-directory over the last operand", () => {
+    expect(detectDeliverableWrites("cp -t /app/out a.txt b.txt")).toEqual([
+      { path: "/app/out", kind: "copy" },
+    ]);
+    expect(detectDeliverableWrites("mv --target-directory=/app/out a.txt")).toEqual([
+      { path: "/app/out", kind: "move" },
+    ]);
+  });
+
+  it("catches sed -i's non-flag operands after the script as targets", () => {
+    expect(detectDeliverableWrites("sed -i 's/a/b/' /app/result.txt")).toEqual([
+      { path: "/app/result.txt", kind: "inplace" },
+    ]);
+    expect(detectDeliverableWrites("sed --in-place 's/a/b/' /app/result.txt")).toEqual([
+      { path: "/app/result.txt", kind: "inplace" },
+    ]);
+  });
+
+  it("does not treat a plain (non -i) sed as a write", () => {
+    expect(detectDeliverableWrites("sed 's/a/b/' file.txt")).toEqual([]);
+  });
+
+  it("catches a compiler's -o output flag", () => {
+    expect(detectDeliverableWrites("gcc main.c -o /app/main")).toEqual([
+      { path: "/app/main", kind: "compile" },
+    ]);
+    expect(detectDeliverableWrites("cc -O2 main.c -o /app/main")).toEqual([
+      { path: "/app/main", kind: "compile" },
+    ]);
+    expect(detectDeliverableWrites("ld -o /app/out.elf a.o")).toEqual([
+      { path: "/app/out.elf", kind: "compile" },
+    ]);
+  });
+
+  it("does not affect detectWriteTargets itself (permission-gate/write-guard scope)", () => {
+    // cp/mv/sed -i are intentionally NOT writes for detectWriteTargets — see
+    // permission-gate's BUILTIN_SAFE_PREFIXES, which whitelists "cp "/"mv "
+    // as routine, non-write scaffolding.
+    expect(detectWriteTargets("cp deliverable.txt /app/out/")).toEqual([]);
+    expect(detectWriteTargets("mv draft.txt /app/answer.txt")).toEqual([]);
+    expect(detectWriteTargets("sed -i 's/a/b/' /app/result.txt")).toEqual([]);
+    expect(detectWriteTargets("gcc main.c -o /app/main")).toEqual([]);
+  });
+});
+
+describe("isScratchPath", () => {
+  it("recognizes the scratch roots and their children", () => {
+    expect(isScratchPath("/tmp")).toBe(true);
+    expect(isScratchPath("/tmp/x")).toBe(true);
+    expect(isScratchPath("/var/tmp/a/b")).toBe(true);
+    expect(isScratchPath("/private/tmp/x")).toBe(true);
+  });
+
+  it("rejects non-scratch and non-absolute paths", () => {
+    expect(isScratchPath("/app/answer.txt")).toBe(false);
+    expect(isScratchPath("/tmpfoo")).toBe(false);
+    expect(isScratchPath("relative/path")).toBe(false);
+    expect(isScratchPath("tmp/x")).toBe(false);
+  });
+
+  it("normalizes .. traversal before classifying (the reported bug)", () => {
+    // Lexically resolves to /app/answer.txt -- not scratch, even though the
+    // raw string starts with /tmp/.
+    expect(isScratchPath("/tmp/../app/answer.txt")).toBe(false);
+  });
+
+  it("normalizes .. traversal the other way too", () => {
+    // Lexically resolves to /tmp/x -- scratch, even though the raw string
+    // starts with /app.
+    expect(isScratchPath("/app/../tmp/x")).toBe(true);
+  });
+
+  it("collapses redundant separators and dot segments", () => {
+    expect(isScratchPath("/tmp/./x")).toBe(true);
+    expect(isScratchPath("/tmp//x")).toBe(true);
+    expect(isScratchPath("/tmp/")).toBe(true);
+  });
+
+  it("collapses a root-only path to non-scratch", () => {
+    expect(isScratchPath("/tmp/..")).toBe(false);
+    expect(isScratchPath("/")).toBe(false);
+  });
+
+  it("clamps a root escape instead of producing garbage (POSIX /.. === /)", () => {
+    // /../etc/passwd normalizes to /etc/passwd, per POSIX's "the parent of /
+    // is /" -- an empty stack absorbs the leading .. rather than erroring or
+    // walking outside the root. Not scratch.
+    expect(isScratchPath("/../etc/passwd")).toBe(false);
+    // Same clamping, but this time it lands inside a scratch root -- do not
+    // "fix" this into false, it is correct per the same POSIX semantics.
+    expect(isScratchPath("/../tmp/x")).toBe(true);
   });
 });
 

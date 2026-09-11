@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import setupSkillInject from "./index.ts";
+import setupSkillInject, { looksLikeResearchTask, shouldInjectResearchDirective } from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
 
 // End-to-end check of the #73 conversion: drive the real `before_agent_start`
@@ -166,6 +169,173 @@ describe("skill-inject still injects after the #73 conversion", () => {
   it("stays silent when nothing matches", async () => {
     const handler = handlerFor(setupSkillInject);
     expect(await handler(turn("zzzz"), ctx)).toBeUndefined();
+  });
+});
+
+// The research directive should only fire when a browse tool is actually
+// callable: the Harbor adapter's default allow-list is ShellSession-only, so
+// a shell-only trial whose own prompt boilerplate happens to sound like a
+// research task must not get told to call BrowserNavigate/BrowserExtract/
+// websearch — tools tool-gating would refuse. shouldInjectResearchDirective
+// gates on browse-tool availability rather than on prompt shape, and the
+// adapter's own boilerplate is reworded (defense-in-depth) so it no longer
+// smells like a research task by itself.
+//
+// These helpers read the real source files rather than mirroring their
+// content as string literals, so drift in either the Harbor prompt template
+// or its allow-list (or GAIA's) re-trips the tests below automatically.
+function repoRoot(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+}
+
+/** Decode a Python double-quoted string body (the only escapes these files
+ *  use are \n and \\, both valid inside a JSON string literal too). */
+function decodePyString(body: string): string {
+  return JSON.parse(`"${body}"`);
+}
+
+function extractQuotedStrings(block: string): string[] {
+  const out: string[] = [];
+  const re = /"((?:[^"\\]|\\.)*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block))) out.push(m[1]);
+  return out;
+}
+
+/** Rebuild the exact string little_coder_agent.py's `prompt = (...)` produces,
+ *  by concatenating its quoted segments the way Python's implicit adjacent-
+ *  string-literal concatenation does. The `f"TASK:\n{instruction}\n\n"` segment
+ *  is extracted like any other literal (the `{instruction}` placeholder is
+ *  left as literal text, then substituted below). */
+function harborPromptTemplate(): string {
+  const src = readFileSync(
+    join(repoRoot(), "benchmarks", "harbor_adapter", "little_coder_agent.py"),
+    "utf-8",
+  );
+  const block = src.match(/prompt = \(\n([\s\S]*?)\n\s*\)\n/);
+  if (!block) throw new Error("could not find `prompt = (...)` in little_coder_agent.py");
+  return extractQuotedStrings(block[1]).map(decodePyString).join("");
+}
+
+function harborPrompt(instruction: string): string {
+  return harborPromptTemplate().replace("{instruction}", instruction);
+}
+
+function harborDefaultAllowedTools(): string[] {
+  const src = readFileSync(
+    join(repoRoot(), "benchmarks", "harbor_adapter", "little_coder_agent.py"),
+    "utf-8",
+  );
+  const block = src.match(/DEFAULT_ALLOWED_TOOLS = \[([^\]]*)\]/);
+  if (!block) throw new Error("could not find DEFAULT_ALLOWED_TOOLS in little_coder_agent.py");
+  return extractQuotedStrings(block[1]);
+}
+
+function gaiaAllowedTools(): string[] {
+  const src = readFileSync(join(repoRoot(), "benchmarks", "gaia.py"), "utf-8");
+  const block = src.match(/\nALLOWED_TOOLS = \[([\s\S]*?)\n\]\n/);
+  if (!block) throw new Error("could not find ALLOWED_TOOLS in gaia.py");
+  return extractQuotedStrings(block[1]);
+}
+
+describe("research directive gates on browse-tool availability", () => {
+  it("DEFAULT_ALLOWED_TOOLS is ShellSession-only (sanity check on the extraction itself)", () => {
+    expect(harborDefaultAllowedTools()).toEqual([
+      "ShellSession",
+      "ShellSessionCwd",
+      "ShellSessionReset",
+    ]);
+  });
+
+  it("does not inject the directive for a real Harbor trial (ShellSession-only allow-list), even when the task itself says 'research'", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const prompt = harborPrompt("Research the article on Wikipedia and summarize its key points.");
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = harborDefaultAllowedTools();
+
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
+  });
+
+  it("still injects the directive for the same research-shaped task with no allow-list", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const prompt = harborPrompt("Research the article on Wikipedia and summarize its key points.");
+    const result = await handler(turn(prompt), ctx);
+
+    expect(result?.message.content).toContain("## Research-first directive");
+  });
+
+  it("injects the directive with the EvidenceAdd steps for a GAIA-shaped prompt + GAIA's allow-list", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("GAIA research question: look up the answer on Wikipedia and cite your source.");
+    event.systemPromptOptions.littleCoder.allowedTools = gaiaAllowedTools();
+
+    const result = await handler(event, ctx);
+
+    expect(result?.message.content).toContain("## Research-first directive");
+    expect(result.message.content).toContain("EvidenceAdd");
+  });
+
+  it("the real Harbor boilerplate no longer smells like a research task by itself", () => {
+    expect(harborPromptTemplate()).not.toContain("briefly research the task");
+    expect(looksLikeResearchTask(harborPromptTemplate())).toBe(false);
+  });
+
+  it("looksLikeResearchTask still catches genuine research phrasing", () => {
+    expect(looksLikeResearchTask("please research online for the answer")).toBe(true);
+    expect(looksLikeResearchTask("look up the capital of France")).toBe(true);
+    expect(looksLikeResearchTask("check wikipedia for details")).toBe(true);
+  });
+
+  it("requires websearch, or both browser tools, before injecting", () => {
+    const shellOnly = new Set(harborDefaultAllowedTools());
+    const gaia = new Set(gaiaAllowedTools());
+
+    expect(shouldInjectResearchDirective("research this online", shellOnly)).toBe(false);
+    expect(shouldInjectResearchDirective("research this online", gaia)).toBe(true);
+    expect(shouldInjectResearchDirective("research this online", undefined)).toBe(true);
+    // Partial availability (only websearch, say) is still enough to fire.
+    expect(shouldInjectResearchDirective("research this online", new Set(["websearch"]))).toBe(true);
+    expect(shouldInjectResearchDirective("edit the file", shellOnly)).toBe(false);
+    // BrowserNavigate alone can't gather page text (no body in its output).
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserNavigate"])),
+    ).toBe(false);
+    // BrowserExtract alone reads an unnavigated about:blank session.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["BrowserExtract"])),
+    ).toBe(false);
+    // The pair together is genuinely actionable.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserExtract"]),
+      ),
+    ).toBe(true);
+    // Other browser tools alongside BrowserNavigate don't substitute for
+    // BrowserExtract.
+    expect(
+      shouldInjectResearchDirective(
+        "research this online",
+        new Set(["BrowserNavigate", "BrowserClick", "BrowserScroll"]),
+      ),
+    ).toBe(false);
+    // websearch plus a lone browser tool still fires, via the websearch leg.
+    expect(
+      shouldInjectResearchDirective("research this online", new Set(["websearch", "BrowserNavigate"])),
+    ).toBe(true);
+  });
+
+  it("does not inject the directive for a browse allow-list that cannot actually browse (BrowserNavigate alone)", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const prompt = "Research the article on Wikipedia and summarize its key points.";
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = ["BrowserNavigate", "ShellSession"];
+
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
   });
 });
 

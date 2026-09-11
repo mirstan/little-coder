@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
 from rpc_client import PiRpc  # noqa: E402
+import fake_pi as fake_pi_mod  # noqa: E402  -- module, not the `fake_pi` fixture below
 
 FAKE = Path(__file__).parent / "fake_pi.py"
 
@@ -63,7 +64,7 @@ def test_on_event_fires_for_every_event_in_order(fake_pi, tmp_path):
         rpc.prompt_and_collect("go", timeout=30, on_event=lambda ev: seen.append(ev["type"]))
     assert seen == [
         "agent_start", "message_update", "tool_execution_start",
-        "tool_execution_end", "turn_end", "agent_end",
+        "tool_execution_end", "turn_end", "agent_end", "agent_settled",
     ]
 
 
@@ -120,6 +121,41 @@ def test_agent_end_and_eof_together_still_agent_end(fake_pi, tmp_path):
         r = rpc.prompt_and_collect("go", timeout=30)
     assert r.agent_ended is True
     assert r.stop_reason == "agent_end"
+
+
+def test_abort_then_followup_returns_recovered_answer(fake_pi, tmp_path):
+    """Reproduces the thinking-budget-abort bug directly: an extension's
+    ctx.abort() makes pi emit agent_end mid-thought, but a queued follow-up
+    survives the abort and pi immediately runs a second, real turn on the
+    same connection. Draining only to the first agent_end (the old
+    behaviour) would return here with empty/partial assistant_text and miss
+    the recovery turn entirely, because the caller would treat the abort's
+    agent_end as the whole run finishing. This test fails on the old
+    single-phase drain and passes once the drain continues through to
+    agent_settled."""
+    with fake_pi("abort_then_followup", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert "recovered answer" in r.assistant_text
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    assert r.turn_count == 1
+
+
+def test_end_never_settles_falls_back_after_grace(fake_pi, tmp_path, capsys):
+    """Defensive fallback: a pi that emits agent_end but never agent_settled
+    (and never exits) must not hang the caller forever -- settle_grace
+    bounds the wait, stop_reason still reports agent_end, and a warning is
+    logged since this means the caller fell back to the weaker signal."""
+    with fake_pi("end_never_settles", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed < 10, f"took {elapsed:.1f}s -- settle_grace did not bound the wait"
+    assert r.agent_ended is True
+    assert r.stop_reason == "agent_end"
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "agent_settled" in err
 
 
 def test_exit_before_ack_raises_with_stderr(fake_pi, tmp_path):
@@ -187,20 +223,204 @@ def test_stray_event_on_reused_session_does_not_corrupt_next_turn(fake_pi, tmp_p
     involved, a fix gated on readiness_attempt > 0 never runs -- the stray
     event sits ahead of the second turn's own completion and the drain
     returns on it immediately, same silent-empty-response symptom as the
-    readiness-retry case."""
+    readiness-retry case.
+
+    Timing pin: this fixture's turn 1 has nothing left to settle-wait for
+    (fake pi is blocked on read_prompt() for turn 2, which the test can't
+    send until turn 1 returns), so turn 1 can only end via the settle-grace
+    fallback. settle_grace is passed explicitly (small) so that fallback --
+    and therefore this whole test -- is fast; the bug this pins made turn 1
+    instead re-arm to the FULL remaining `timeout` on the stray duplicate
+    (measured 35.04s here vs 5.03s pre-regression), which passed every
+    assertion below while being 7x slower -- exactly why the regression
+    shipped unnoticed."""
+    t0 = time.time()
     with fake_pi("stray_end_then_clean_reuse", tmp_path) as rpc:
-        r1 = rpc.prompt_and_collect("go", timeout=30)
-        r2 = rpc.prompt_and_collect("go again", timeout=30)
+        r1 = rpc.prompt_and_collect("go", timeout=30, settle_grace=2)
+        r2 = rpc.prompt_and_collect("go again", timeout=30, settle_grace=2)
+    elapsed = time.time() - t0
+    assert elapsed < 10, f"took {elapsed:.1f}s -- stray duplicate re-armed the timeout again"
     assert "first answer" in r1.assistant_text
     assert r2.agent_ended is True
     assert r2.stop_reason == "agent_end"
     assert "second answer" in r2.assistant_text
 
 
+def test_usage_summed_from_turn_end(fake_pi, tmp_path):
+    """PromptResult.usage accumulates the fake's per-turn usage exactly
+    (single turn_end in the clean-mode fixture)."""
+    with fake_pi("clean", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    expected_cost = fake_pi_mod.TURN_USAGE["cost"]["total"]
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+    assert r.usage["cache_read"] == fake_pi_mod.TURN_USAGE["cacheRead"]
+    assert r.usage["cache_write"] == fake_pi_mod.TURN_USAGE["cacheWrite"]
+    assert r.usage["cost"] == pytest.approx(expected_cost)
+
+
+def test_session_stats_returns_fake_aggregate(fake_pi, tmp_path):
+    """session_stats() round-trips the fake's canned get_session_stats
+    response -- the complete, session-cumulative source Plan 7 prefers."""
+    with fake_pi("clean", tmp_path) as rpc:
+        rpc.prompt_and_collect("go", timeout=30)
+        stats = rpc.session_stats()
+    assert stats == fake_pi_mod.SESSION_STATS_DATA
+
+
+def test_session_stats_none_after_process_exit(fake_pi, tmp_path):
+    """end_then_exit kills the fake process right after its agent_end --
+    session_stats() must return None promptly (not hang for its timeout),
+    while the event-summed usage from the turn that DID complete is still
+    populated. Pins verification plan item (b)."""
+    with fake_pi("end_then_exit", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30)
+        stats = rpc.session_stats(timeout=2)
+        elapsed = time.time() - t0
+    assert elapsed < 5, f"took {elapsed:.1f}s -- session_stats() did not notice the dead process"
+    assert stats is None
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+
+
+def test_usage_includes_continuation_turn(fake_pi, tmp_path):
+    """abort_then_followup's first turn aborts mid-thought with no turn_end
+    (no usage to contribute); only the recovery turn's turn_end carries
+    usage. Usage must reflect that recovery turn, pinning that Plan 1's
+    settle-grace continuation is included in Plan 7's accumulation too."""
+    with fake_pi("abort_then_followup", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+
+
+def test_usage_tolerates_missing_or_malformed_usage(fake_pi, tmp_path):
+    """One turn with no "usage" key and one with a malformed (non-dict)
+    "usage" must be skipped, not raise -- only the third, valid turn's
+    numbers should end up in the total."""
+    with fake_pi("mixed_usage", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.turn_count == 3
+    assert r.usage["input"] == fake_pi_mod.TURN_USAGE["input"]
+    assert r.usage["output"] == fake_pi_mod.TURN_USAGE["output"]
+    assert r.usage["cache_read"] == fake_pi_mod.TURN_USAGE["cacheRead"]
+
+
+def test_turn_end_survives_null_message_and_null_usage(fake_pi, tmp_path):
+    """turn_end.message can arrive as JSON null itself, or as a dict whose
+    "usage" key is null -- not merely absent. `dict.get(key, default)` only
+    substitutes the default when the key is MISSING, never when its value is
+    null, so `ev.get("message", {}).get("usage")` raises AttributeError on a
+    null "message". Both turns here must be skipped without raising, leaving
+    usage all zero, and turn_count must still reflect both turns."""
+    with fake_pi("null_message_usage", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.turn_count == 2
+    assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+
+
+def test_settled_after_extra_event_returns_fast(fake_pi, tmp_path):
+    """Pins Bug A: the old Phase 1 predicate only matched agent_end, so an
+    agent_settled arriving after some other event (not immediately after
+    agent_end) was treated as an ordinary event and Phase 1 waited out the
+    entire remaining timeout. Reproduced at ~12.2s; must now return in well
+    under 2s."""
+    with fake_pi("settled_after_extra_event", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=12)
+        elapsed = time.time() - t0
+    assert elapsed < 2, f"took {elapsed:.1f}s -- agent_settled after an extra event was missed"
+    assert r.agent_ended is True
+    assert r.settled is True
+    assert r.stop_reason == "agent_end"
+
+
+def test_retry_then_settled_does_not_rearm_timeout(fake_pi, tmp_path):
+    """Pins the PR28 repro: auto_retry_end between agent_end and
+    agent_settled must not be mistaken for a continuation (which would
+    re-arm the full remaining timeout). Reproduced at 6.29s with
+    timeout=6, settle_grace=2; must now return in well under 2s."""
+    with fake_pi("retry_then_settled", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=6, settle_grace=2)
+        elapsed = time.time() - t0
+    assert elapsed < 2, f"took {elapsed:.1f}s -- auto_retry_end re-armed the timeout"
+    assert r.agent_ended is True
+    assert r.settled is True
+    assert r.stop_reason == "agent_end"
+
+
+def test_abort_then_followup_survives_slow_on_event_eof_race(fake_pi, tmp_path):
+    """Pins Bug B directly: the old `if self._eof: break` guards raced the
+    reader thread against a slow on_event (Harbor's live-log writer) --
+    when the reader ran ahead and set _eof before on_event had drained an
+    already-queued recovery turn, the whole queued turn was discarded.
+    Reproduced failing 3/3 with a 50ms on_event; must now recover the
+    followup every time."""
+    def slow_on_event(ev):
+        time.sleep(0.05)
+
+    with fake_pi("abort_then_followup_then_exit", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30, on_event=slow_on_event)
+    assert "recovered answer" in r.assistant_text
+    assert r.turn_count == 1
+
+
+def test_stray_end_must_not_rearm_settle_window(fake_pi, tmp_path, capsys):
+    """Pins Bug C's specific 'stray must not re-arm' case: a duplicate
+    agent_end seen while SETTLING must stay in SETTLING (bounded by the
+    ORIGINAL settle deadline), not restart the window and not be read as
+    renewed work. pi never emits agent_settled here, so this also exercises
+    the defensive fallback."""
+    with fake_pi("end_then_stray_then_hang", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed < 5, f"took {elapsed:.1f}s -- stray agent_end re-armed the settle window"
+    assert r.agent_ended is True
+    assert r.settled is False
+    assert r.stop_reason == "agent_end"
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+
+
+def test_continuation_that_never_finishes_is_deadline_not_agent_end(fake_pi, tmp_path):
+    """Pins Bug D: stop_reason must reflect how the call actually ended, not
+    a latched 'did we ever see an agent_end'. Here a genuine continuation
+    starts (agent_start) but never finishes -- the call must run the full
+    outer timeout and report stop_reason == 'deadline', even though an
+    agent_end was seen earlier in this same call."""
+    with fake_pi("continuation_never_finishes", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=3, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed >= 3
+    assert r.agent_ended is True
+    assert r.settled is False
+    assert r.stop_reason == "deadline"
+
+
+def test_chatty_stream_bounded_by_absolute_settle_window(fake_pi, tmp_path):
+    """Pins the absolute (not per-event) settle window: a continuous stream
+    of non-terminal events after agent_end must not extend SETTLING past
+    the settle_deadline computed on entry. A per-event reset would let this
+    hang until the outer `timeout` instead."""
+    with fake_pi("chatty_then_hang", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=30, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed < 10, f"took {elapsed:.1f}s -- chatty post-turn stream extended settling"
+    assert r.agent_ended is True
+    assert r.settled is False
+    assert r.stop_reason == "agent_end"
+
+
 def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False
     assert r.tool_calls == []
+    assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
 
 
 class _NeverFinishingThread:

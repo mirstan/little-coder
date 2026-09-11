@@ -115,7 +115,7 @@ describe("finalize-warn", () => {
 
   it("fires on wall-clock deadline even when turn count is nowhere near the cap", async () => {
     process.env.LITTLE_CODER_MAX_TURNS = "80";
-    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 60_000); // 60s out, under the 5-min threshold
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 60_000); // 60s out, under the 10-min threshold
     const h = makeHarness();
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", {}, h.ctx);
@@ -130,6 +130,26 @@ describe("finalize-warn", () => {
     setupExtension(h.pi as any);
     await fire(h.pi, "before_agent_start", {}, h.ctx);
     await runTurns(h, 10);
+    expect(h.sent).toEqual([]);
+  });
+
+  it("fires just inside the 10-minute wall-clock threshold, not just outside it", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "80";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 9 * 60_000 + 59_000); // 9m59s out
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 1);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("does not fire just outside the 10-minute wall-clock threshold", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "80";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 10 * 60_000 + 1_000); // 10m01s out
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 1);
     expect(h.sent).toEqual([]);
   });
 

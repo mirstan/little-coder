@@ -246,12 +246,53 @@ const RESEARCH_TRIGGERS = [
   /\bfact[-\s]?check/i,
 ];
 
-function looksLikeResearchTask(text: string): boolean {
+export function looksLikeResearchTask(text: string): boolean {
   if (!text) return false;
   for (const re of RESEARCH_TRIGGERS) {
     if (re.test(text)) return true;
   }
   return false;
+}
+
+// Tools the research directive actually recommends calling (BrowserNavigate /
+// BrowserExtract / websearch — see researchDirective below). When none of
+// these are callable, the directive has nothing actionable left to say:
+// looksLikeResearchTask matches on prompt wording alone, so a prompt can trip
+// it even when the caller's allow-list is shell-only, pointing the model at
+// tools it can't actually call. Gating on browse-tool availability, rather
+// than on prompt shape, avoids that regardless of which prompt template
+// caused it.
+const BROWSE_TOOLS = ["BrowserNavigate", "BrowserExtract", "websearch"];
+
+// Neither browser tool is independently actionable: BrowserNavigate returns
+// only `[status] <url>\ntitle: <title>` (no page body text), and
+// BrowserExtract reads from a session that is always about:blank unless
+// something already navigated it first -- nothing does that standalone. So
+// an allow-list needs BOTH of these together (or websearch on its own) before
+// the directive has anything real to point at.
+const BROWSER_RESEARCH_PAIR = ["BrowserNavigate", "BrowserExtract"];
+
+/** Should the research-first directive be injected for this prompt/allow-list?
+ *  Exported for unit testing alongside looksLikeResearchTask.
+ *
+ *  Gate is: websearch alone, or BrowserNavigate+BrowserExtract together. This
+ *  guarantees availableBrowseTools in researchDirective below can never end
+ *  up empty -- a future loosening of this gate must preserve that invariant,
+ *  or handle an empty-tool-list directive body.
+ *
+ *  This does not close every gap: an allow-list with webfetch (which can
+ *  fetch full page text on its own) but no BrowserExtract is now suppressed
+ *  too, even though webfetch alone is arguably research-capable. That's a
+ *  real, currently-hypothetical trade-off -- no allow-list in this repo has
+ *  that shape today -- not an oversight this fix claims to close. */
+export function shouldInjectResearchDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  return (
+    looksLikeResearchTask(prompt) &&
+    (toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed))
+  );
 }
 
 // Built per-turn rather than as a constant: the evidence step only makes sense
@@ -263,11 +304,19 @@ const EVIDENCE_TOOLS = ["EvidenceAdd", "EvidenceGet", "EvidenceList"];
 
 function researchDirective(allowed: Set<string> | undefined): string {
   const canCite = toolsAvailable(["EvidenceAdd"], allowed);
+  // Name only the browse tools that are actually callable when there is an
+  // allow-list at all, so partial availability (e.g. only websearch) still
+  // yields a coherent, callable instruction rather than naming gated tools
+  // alongside available ones. Falls back to the full list with no allow-list
+  // (matches the pre-existing top-level/interactive behavior).
+  const availableBrowseTools = allowed
+    ? BROWSE_TOOLS.filter((t) => allowed.has(t))
+    : BROWSE_TOOLS;
   const lines = [
     "",
     "## Research-first directive",
     "This task involves online research. Before producing a final answer:",
-    "1. Use BrowserNavigate / BrowserExtract (or websearch for first hops) to gather facts.",
+    `1. Use ${availableBrowseTools.join(" / ")} to gather facts.`,
   ];
   if (canCite) {
     lines.push("2. Save each citable fact via EvidenceAdd before relying on it.");
@@ -342,7 +391,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
-    const researchTask = looksLikeResearchTask(event.prompt ?? "");
+    const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
 
     if (selected.length === 0 && !researchTask) return;
 
