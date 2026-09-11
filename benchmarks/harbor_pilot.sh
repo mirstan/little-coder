@@ -158,11 +158,10 @@ HB_CMD+=(
 # TB runs are long (hours per task, sometimes the full timeout-multiplier
 # budget) and unattended -- on macOS the display/system would otherwise
 # sleep mid-run, killing Docker Desktop's VM and every in-flight trial.
-# `caffeinate -s -i` (prevent idle sleep, and system sleep while on AC
-# power) exec's the given command and holds the assertion for exactly its
-# lifetime, then exits on its own -- no separate cleanup needed. Linux has
-# no equivalent concern here (no display-sleep-driven suspend by default),
-# so this is macOS-only.
+# caffeinate exec's the given command and holds its sleep-prevention
+# assertion for exactly that lifetime, then exits on its own -- no
+# separate cleanup needed. Linux has no equivalent concern here (no
+# display-sleep-driven suspend by default), so this is macOS-only.
 if [[ "$(uname -s)" == "Darwin" ]] && command -v caffeinate >/dev/null 2>&1; then
   HB_CMD=(caffeinate -s -i "${HB_CMD[@]}")
 fi
