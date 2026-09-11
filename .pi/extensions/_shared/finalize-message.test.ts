@@ -21,11 +21,11 @@ describe("resolveFinalizeMessage", () => {
     // targets the observed failure mode of having a working answer ready but
     // never persisting it before the deadline hit (e.g. raman-fitting).
     expect(msg).toMatch(/do not run further|stop investigating/i);
-    // Plan 4b (shell-proxy-snapshot): pointer to the best-effort deadline
-    // snapshot little_coder_agent.py stages under /tmp/.lc-snapshot, for the
-    // overfull-hbox failure mode (a late mistake destroying earlier good
-    // state with nothing to recover it). TB-specific only -- the snapshot is
-    // a container-file mechanism, meaningless for GAIA's chat-reply scoring.
+    // Pointer to the best-effort deadline snapshot little_coder_agent.py
+    // stages under /tmp/.lc-snapshot, which recovers a working state that a
+    // late mistake overwrites with nothing left to fall back on. TB-specific
+    // only -- the snapshot is a container-file mechanism, meaningless for
+    // GAIA's chat-reply scoring.
     expect(msg).toMatch(/\/tmp\/\.lc-snapshot/);
   });
 

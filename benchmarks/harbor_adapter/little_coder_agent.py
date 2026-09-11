@@ -75,8 +75,8 @@ DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 DEADLINE_SAFETY_MARGIN = 0.9
 HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 
-# Plan 4b (shell-proxy-snapshot): a deadline snapshot of files the model
-# changed since trial start, staged under /tmp/.lc-snapshot in the container.
+# A deadline snapshot of files the model changed since trial start, staged
+# under /tmp/.lc-snapshot in the container.
 # Insurance/recovery only -- grading reads the live container files, never
 # this snapshot; it's useful only via the finalize-message pointer telling
 # the model it exists, for the case where a late mistake destroys earlier
@@ -104,12 +104,12 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 
 # Bounded, atomically-staged snapshot of files modified under /app since
 # SNAPSHOT_START_MARKER was touched. Every cap here answers a specific
-# Codex review finding (see Plan 4b's "Chosen fix" #2 for the full writeup):
+# failure mode:
 #   - per-file size cap (-size -10M) and an aggregate file-count cap
 #     (head -z -n 500) and an aggregate byte cap (209715200 = 200MB, via the
 #     `du --files0-from` sum) together bound total copy volume regardless of
-#     how many small files changed -- a per-file cap alone was found
-#     insufficient (thousands of small files could still copy gigabytes).
+#     how many small files changed -- a per-file cap alone is insufficient
+#     (thousands of small files could still copy gigabytes).
 #   - a free-space reserve check (FREE >= TOTAL + 524288000, i.e. 500MB)
 #     protects storage_mb-tight task containers (10240MB typical in TB2.1
 #     task.tomls) from being pushed over their quota by the snapshot itself.
@@ -118,16 +118,13 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 #     published path (atomic publish).
 #   - the whole body runs under an internal `timeout 20`, and the trailing
 #     `rm -rf SNAPSHOT_STAGE_GLOB` (outside that timeout) reaps a stage dir
-#     orphaned if the 20s kill lands mid-copy -- this is "cleanup-on-timeout"
-#     duty; it used to be documented via a trailing inline `#` comment on the
-#     command string's own last line, but that trailing comment (with no
-#     newline after it) is exactly what silently swallowed this whole
-#     epilogue once _exec_async appended `; }} ; __rc=$? ; printf ... ; pwd`
-#     after it -- see 2.1 in this stack's fix-plan. Documented here in the
-#     Python comment instead; the command string itself now ends on a plain
-#     statement with no trailing `#` of its own, and (per Codex's own advice
-#     on this bug class) should stay that way -- do not re-add a trailing
-#     inline comment to this constant's last line.
+#     orphaned if the 20s kill lands mid-copy ("cleanup-on-timeout" duty).
+#     Documented here rather than as a trailing inline comment on the command
+#     string's own last line: _exec_async appends a wrapper epilogue
+#     (`; }} ; __rc=$? ; printf ... ; pwd`) directly onto whatever this string
+#     ends with, so a trailing `#` comment with no newline after it silently
+#     swallows that whole epilogue. Do not add a trailing inline comment to
+#     this constant's last line.
 #   - `set -e` plus every failure being swallowed by the caller means this
 #     command degrades to "no snapshot" on any error (missing GNU coreutils
 #     like `head -z`/`du --files0-from` on a BusyBox-ish image, `find -newer`
@@ -177,8 +174,8 @@ def _compute_snapshot_delay_sec(effective_timeout_sec: float) -> float | None:
     _snapshot_at_deadline: returns the sleep delay to pass it, or None to
     skip scheduling the snapshot task at all.
 
-    Below SNAPSHOT_MIN_BUDGET_SEC, returns None -- Plan 4b's short-task edge
-    case: the naive delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would
+    Below SNAPSHOT_MIN_BUDGET_SEC, returns None -- a short-task edge case:
+    the naive delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would
     already be negative and get clamped to 0 (snapshotting almost
     immediately), and for a trial this short there's nothing meaningful yet
     to recover that the model couldn't just redo from scratch, so the whole
@@ -513,10 +510,10 @@ class _HarborShellProxy:
         self.loop = loop
         self.logger = logger
         self.cwd = "/app"  # TB 2.0 convention — overridden by first `pwd`
-        # Plan 4b (shell-proxy-snapshot): serializes the actual env.exec()
-        # call across BOTH model-issued commands (via run(), the sync
-        # thread-bridge entry point) and harness-issued ones (via
-        # run_harness(), awaited directly on this loop -- see its docstring).
+        # Serializes the actual env.exec() call across BOTH model-issued
+        # commands (via run(), the sync thread-bridge entry point) and
+        # harness-issued ones (via run_harness(), awaited directly on this
+        # loop -- see its docstring).
         # Before this lock existed, only the reader thread ever called run(),
         # so there was nothing to serialize against; run_harness is the first
         # caller that can execute concurrently with it.
@@ -584,8 +581,8 @@ class _HarborShellProxy:
         the calling thread until the coroutine finishes on `self.loop`. Calling
         run() from an asyncio task running ON that same loop would deadlock:
         fut.result() blocks the very loop that must run _exec_async to
-        complete it (Plan 4b / Codex finding 1). run_harness instead awaits
-        _exec_async directly -- same loop, no thread bridge, no fut.result().
+        complete it. run_harness instead awaits _exec_async directly -- same
+        loop, no thread bridge, no fut.result().
 
         This is also why the deadline-snapshot task (the only caller of this
         method) must use ONLY run_harness, never run().
@@ -761,12 +758,11 @@ class LittleCoderAgent(BaseAgent):
             )
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
 
-        # Plan 4b (shell-proxy-snapshot): schedule the best-effort deadline
-        # snapshot. Skipped entirely below SNAPSHOT_MIN_BUDGET_SEC (see that
-        # constant's comment); the start-marker touch is itself
-        # failure-tolerated (a missing marker just means find -newer fails
-        # later and the snapshot command degrades to "no snapshot", same as
-        # any other failure mode here).
+        # Schedule the best-effort deadline snapshot. Skipped entirely below
+        # SNAPSHOT_MIN_BUDGET_SEC (see that constant's comment); the
+        # start-marker touch is itself failure-tolerated (a missing marker
+        # just means find -newer fails later and the snapshot command
+        # degrades to "no snapshot", same as any other failure mode here).
         snapshot_task: asyncio.Task | None = None
         snapshot_delay_sec = _compute_snapshot_delay_sec(effective_timeout_sec)
         if snapshot_delay_sec is not None:
@@ -887,9 +883,9 @@ class LittleCoderAgent(BaseAgent):
                 log_fh.write(f"\nAGENT ERROR: {e}\n")
             raise
         finally:
-            # Plan 4b (shell-proxy-snapshot): the snapshot task must never
-            # outlive run() -- cancel it here regardless of how run() is
-            # exiting (normal completion, timeout, or exception above).
+            # The snapshot task must never outlive run() -- cancel it here
+            # regardless of how run() is exiting (normal completion, timeout,
+            # or exception above).
             if snapshot_task is not None:
                 snapshot_task.cancel()
                 try:

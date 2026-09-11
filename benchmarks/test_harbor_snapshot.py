@@ -1,22 +1,22 @@
-"""Plan 4b (shell-proxy-snapshot) -- the deadline-snapshot mechanism added to
-_HarborShellProxy / LittleCoderAgent.run() in little_coder_agent.py:
+"""Tests for the deadline-snapshot mechanism in _HarborShellProxy /
+LittleCoderAgent.run() in little_coder_agent.py:
 
   - the bounded, atomically-staged snapshot shell command itself
   - _wrap_command() actually composing a parseable shell script -- both for
     a harness call's cwd=None form and a model call's cd/pwd-tracking form
     -- verified by actually feeding the composed string to `sh -n`/`bash -n`
     rather than merely substring-matching pieces of it. This is the
-    regression test for the 2.1 bug: an unterminated trailing `#` comment on
-    _SNAPSHOT_COMMAND's last line silently swallowed everything _exec_async
-    appended after it, and every existing substring-matching test still
-    passed because none of them ever actually composed and parsed the real
+    regression test for an unterminated trailing `#` comment on
+    _SNAPSHOT_COMMAND's last line silently swallowing everything _exec_async
+    appended after it -- a bug that every existing substring-matching test
+    missed, because none of them ever actually composed and parsed the real
     string.
   - _compute_snapshot_delay_sec()'s scheduling arithmetic (incl. the
     short-task skip edge case)
   - _HarborShellProxy.run_harness() staying on the caller's event loop
     (never routing through asyncio.run_coroutine_threadsafe(), which is
     exactly the sync thread-bridge path that would deadlock a same-loop
-    asyncio task -- Codex finding 1)
+    asyncio task)
   - _exec_lock actually serializing a model-issued command (via the sync
     run() thread-bridge, exercised from a real background thread since
     calling it from the loop's own thread would itself deadlock) against a
@@ -105,10 +105,10 @@ class _OverlapTrackingEnv:
 # ── 1. Snapshot command construction ────────────────────────────────────────
 
 def test_snapshot_command_has_bounded_caps_and_staged_publish():
-    """Every Codex-review-motivated cap and the atomic-publish mechanism must
-    actually be present in the composite command -- this is the command that
-    literally runs in the container, so a typo here silently defeats one of
-    the bounds."""
+    """Every safety cap and the atomic-publish mechanism must actually be
+    present in the composite command -- this is the command that literally
+    runs in the container, so a typo here silently defeats one of the
+    bounds."""
     cmd = lca._SNAPSHOT_COMMAND
     # per-file size cap
     assert "-size -10M" in cmd
@@ -207,8 +207,8 @@ def test_snapshot_delay_clamped_to_zero_when_lead_exceeds_budget():
 
 
 def test_snapshot_delay_skips_entirely_below_min_budget():
-    """Plan 4b's short-task edge case: below SNAPSHOT_MIN_BUDGET_SEC the
-    snapshot is skipped outright (None), not merely delay-clamped."""
+    """Short-task edge case: below SNAPSHOT_MIN_BUDGET_SEC the snapshot is
+    skipped outright (None), not merely delay-clamped."""
     eff = lca.SNAPSHOT_MIN_BUDGET_SEC - 1.0
     assert lca._compute_snapshot_delay_sec(eff) is None
 
@@ -272,7 +272,7 @@ def test_run_harness_never_routes_through_run_coroutine_threadsafe(monkeypatch):
         raise AssertionError(
             "run_harness routed through run_coroutine_threadsafe -- this is "
             "the thread-bridge path that deadlocks when called from an "
-            "asyncio task on the same loop (Plan 4b / Codex finding 1)"
+            "asyncio task on the same loop"
         )
 
     monkeypatch.setattr(lca.asyncio, "run_coroutine_threadsafe", _must_not_be_called)

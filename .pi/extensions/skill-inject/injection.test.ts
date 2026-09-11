@@ -176,12 +176,12 @@ describe("skill-inject still injects after the #73 conversion", () => {
 // boilerplate ("Approach: briefly research the task first...") tripped
 // looksLikeResearchTask on 100% of trials, and the directive it injected
 // recommended BrowserNavigate/BrowserExtract/websearch — none of which are in
-// a TB trial's ShellSession-only allow-list. Confirmed by a Codex adversarial
-// review: 52 retained trials got the directive, producing 36 rejected
-// browser-tool calls across 15 trials. The fix gates injection on browse-tool
-// availability (shouldInjectResearchDirective) rather than on prompt shape
-// alone, and (defense-in-depth) rewords the adapter's own boilerplate so it no
-// longer smells like a research task by itself.
+// a TB trial's ShellSession-only allow-list. Measured against retained
+// trials: 52 got the directive, producing 36 rejected browser-tool calls
+// across 15 trials. Injection is gated on browse-tool availability
+// (shouldInjectResearchDirective) rather than on prompt shape alone, and
+// (defense-in-depth) the adapter's own boilerplate is worded so it no longer
+// smells like a research task by itself.
 //
 // These helpers read the real source files rather than mirroring their
 // content as string literals, so drift in either the Harbor prompt template

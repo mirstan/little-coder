@@ -6,11 +6,9 @@ import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/
 import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with two independent
-// trigger conditions (Plan 3 + Plan 4, reconciled after a Fable adversarial
-// review — see the plan doc for the full history). Both are scoped to
-// LITTLE_CODER_BENCHMARK === "terminal_bench" only; GAIA has its own
-// separate gaia-finalize-guard, and the two must never fire on the same
-// benchmark's sessions.
+// trigger conditions. Both are scoped to LITTLE_CODER_BENCHMARK ===
+// "terminal_bench" only; GAIA has its own separate gaia-finalize-guard, and
+// the two must never fire on the same benchmark's sessions.
 //
 // This is a sibling of finalize-warn, not an addition to it: abort policy
 // (turn-cap, thinking-budget), warn policy (finalize-warn), and guard policy
@@ -21,14 +19,13 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // Trigger A — early voluntary quit
 // ---------------------------------------------------------------------------
 // Motivated by trials that stopped calling tools with most of their wall-clock
-// budget still unused (gpt2-codegolf, break-filter-js-from-html — see the plan
-// doc). IMPORTANT scope-honesty note carried over from the plan: neither of
+// budget still unused (gpt2-codegolf, break-filter-js-from-html). Neither of
 // those two specific trials is actually caught by Trigger A as implemented
-// here. break-filter-js-from-html's last turns hit thinking-budget's abort
-// (stopReason "aborted", excluded below). gpt2-codegolf's last turn was a
-// *successful* tool call with no quality-monitor complaint, which points at a
-// silent stopReason:"error" turn somewhere upstream of the visible
-// transcript, not a toolless quit.
+// here, which is worth stating explicitly: break-filter-js-from-html's last
+// turns hit thinking-budget's abort (stopReason "aborted", excluded below),
+// and gpt2-codegolf's last turn was a *successful* tool call with no
+// quality-monitor complaint, which points at a silent stopReason:"error" turn
+// somewhere upstream of the visible transcript, not a toolless quit.
 //
 // Trigger A used to also match (empty content + stopReason "error") as a
 // forward-looking net for a case shaped like that recurring. That clause was
@@ -48,16 +45,15 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // ---------------------------------------------------------------------------
 // Motivated by trials where finalize-warn's "save now" nudge fired correctly
 // but the model kept investigating instead of writing its deliverable
-// (overfull-hbox, mteb-leaderboard — see the plan doc).
+// (overfull-hbox, mteb-leaderboard).
 //
 // finalize-warn keeps no exported latch or state describing whether it has
 // already fired this run (checked: finalize-warn/index.ts has no exports at
 // all beyond the default extension function, and _shared/ has no shared
-// "has finalize-warn fired" module). Per the plan's explicit preference for
-// re-deriving over adding new cross-extension coupling, this guard
-// independently re-derives finalize-warn's own trigger condition (turn-count
-// OR wall-clock, computed the same way at turn_start) rather than reading
-// finalize-warn's private state, via the shared `finalizeWarnWouldFire` in
+// "has finalize-warn fired" module). Rather than add new cross-extension
+// coupling to expose that state, this guard independently re-derives
+// finalize-warn's own trigger condition (turn-count OR wall-clock, computed
+// the same way at turn_start) via the shared `finalizeWarnWouldFire` in
 // _shared/finalize-warn-trigger.ts — see that module's header for why the
 // constants and condition live there now instead of being hand-copied here.
 //
@@ -75,9 +71,8 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // itself stays redirect-only because write-guard and permission-gate also
 // consume it, and both deliberately treat `cp`/`mv`/`sed -i` as safe,
 // non-write commands — see that function's own comment). Extended with
-// `isScratchPath` (added alongside this guard) so a write that only ever
-// lands in /tmp does not count as having saved the real deliverable (Codex
-// finding folded into the merged plan).
+// `isScratchPath` so a write that only ever lands in /tmp does not count as
+// having saved the real deliverable.
 //
 // A turn's evidence-of-work also includes `ShellSend` (writing to an
 // already-running interactive job's stdin) even though it is deliberately
