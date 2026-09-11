@@ -256,14 +256,12 @@ export function looksLikeResearchTask(text: string): boolean {
 
 // Tools the research directive actually recommends calling (BrowserNavigate /
 // BrowserExtract / websearch — see researchDirective below). When none of
-// these are callable, the directive has nothing actionable left to say: every
-// Terminal-Bench trial's own boilerplate ("briefly research the task first...")
-// trips looksLikeResearchTask on 100% of trials even though the trial's
-// allow-list is ShellSession-only, so the directive fired universally and
-// pointed the model at tools tool-gating would refuse (confirmed: 52 retained
-// trials, 36 rejected browser-tool calls across 15 trials). Gating on browse-
-// tool availability, rather than on prompt shape, fixes the whole failure
-// class instead of just this one template's wording.
+// these are callable, the directive has nothing actionable left to say:
+// looksLikeResearchTask matches on prompt wording alone, so a prompt can trip
+// it even when the caller's allow-list is shell-only, pointing the model at
+// tools it can't actually call. Gating on browse-tool availability, rather
+// than on prompt shape, avoids that regardless of which prompt template
+// caused it.
 const BROWSE_TOOLS = ["BrowserNavigate", "BrowserExtract", "websearch"];
 
 /** Should the research-first directive be injected for this prompt/allow-list?

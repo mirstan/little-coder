@@ -204,7 +204,7 @@ describe("stripHeredocBodies", () => {
   });
 });
 
-describe("detectDeliverableWrites — Priority 6.2a blind spots", () => {
+describe("detectDeliverableWrites", () => {
   it("still reports everything detectWriteTargets does", () => {
     expect(detectDeliverableWrites("echo x > out.log")).toEqual([
       { path: "out.log", kind: "redirect" },

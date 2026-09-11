@@ -407,14 +407,14 @@ const SCRATCH_ROOTS = ["/tmp", "/var/tmp", "/private/tmp"];
  * True when `path` is rooted under an obviously-scratch directory (`/tmp`
  * and friends) rather than a plausible deliverable location.
  *
- * Used by tb-finalize-guard's post-finalize-warn compliance check (issue: a
+ * Used by tb-finalize-guard's post-finalize-warn compliance check: a
  * write-shaped command that only ever touches `/tmp` must not count as
- * evidence the model saved its actual answer — see that extension for the
- * full rationale). Intentionally conservative: only an *absolute* path under
- * one of `SCRATCH_ROOTS` counts as scratch; a relative path or any other
- * absolute path is treated as a plausible deliverable target, since the
- * harness cannot know the task's real deliverable path (rejected alternative
- * in tb-finalize-guard's plan: parsing it out of instruction.md).
+ * evidence the model saved its actual answer. Intentionally conservative:
+ * only an *absolute* path under one of `SCRATCH_ROOTS` counts as scratch; a
+ * relative path or any other absolute path is treated as a plausible
+ * deliverable target, since the harness cannot know the task's real
+ * deliverable path (parsing it out of instruction.md was considered and
+ * rejected as too fragile to rely on).
  */
 export function isScratchPath(path: string): boolean {
   return SCRATCH_ROOTS.some((root) => path === root || path.startsWith(root + "/"));

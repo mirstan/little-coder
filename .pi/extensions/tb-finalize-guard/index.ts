@@ -6,11 +6,9 @@ import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/
 import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with two independent
-// trigger conditions (Plan 3 + Plan 4, reconciled after a Fable adversarial
-// review — see the plan doc for the full history). Both are scoped to
-// LITTLE_CODER_BENCHMARK === "terminal_bench" only; GAIA has its own
-// separate gaia-finalize-guard, and the two must never fire on the same
-// benchmark's sessions.
+// trigger conditions, scoped to LITTLE_CODER_BENCHMARK === "terminal_bench"
+// only. GAIA has its own separate gaia-finalize-guard, and the two must
+// never fire on the same benchmark's sessions.
 //
 // This is a sibling of finalize-warn, not an addition to it: abort policy
 // (turn-cap, thinking-budget), warn policy (finalize-warn), and guard policy
@@ -20,46 +18,32 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // ---------------------------------------------------------------------------
 // Trigger A — early voluntary quit
 // ---------------------------------------------------------------------------
-// Motivated by trials that stopped calling tools with most of their wall-clock
-// budget still unused (gpt2-codegolf, break-filter-js-from-html — see the plan
-// doc). IMPORTANT scope-honesty note carried over from the plan: neither of
-// those two specific trials is actually caught by Trigger A as implemented
-// here. break-filter-js-from-html's last turns hit thinking-budget's abort
-// (stopReason "aborted", excluded below). gpt2-codegolf's last turn was a
-// *successful* tool call with no quality-monitor complaint, which points at a
-// silent stopReason:"error" turn somewhere upstream of the visible
-// transcript, not a toolless quit.
+// Fires when a turn ends with text but no tool calls while a large share of
+// the wall-clock budget still remains (at least EARLY_QUIT_MIN_REMAINING_MS)
+// and there is still turn-cap headroom to deliver a nudge before the cap
+// would abort the run.
 //
-// Trigger A used to also match (empty content + stopReason "error") as a
-// forward-looking net for a case shaped like that recurring. That clause was
-// removed: stopReason "error" is a provider/transport failure, not a model
-// decision — gaia-finalize-guard bails on `stopReason === "aborted" ||
-// "error"` for the same reason, and quality-monitor carries the identical
-// note ("can't fix a 400 by steering"). Worse, MAX_TRIGGER_A_FIRES is
-// session-scoped, so a repeating provider error could burn both fires on
-// turns the model never controlled, leaving the guard disarmed for the real
-// early-quit it exists to catch. The trade-off: a genuine silent-error early
-// quit (the gpt2-codegolf case) no longer gets steered — but it remains
-// diagnosable from the run log via the turn_end instrumentation below, which
-// is the point of keeping that logging unconditional.
+// A turn whose stopReason is "aborted" or "error" is deliberately excluded
+// from this shape check: that's a provider/transport failure, not a model
+// decision, and steering can't fix it. Treating a repeating provider error as
+// a "quit" would also be actively harmful here, since MAX_TRIGGER_A_FIRES is
+// session-scoped — burning both fires on turns the model never controlled
+// would leave the guard disarmed for a real early-quit later in the same
+// session. The trade-off is a real limitation: a quit that manifests as a
+// silent stopReason:"error" turn, rather than a toolless one with visible
+// text, is not steerable by this trigger. It remains diagnosable from the
+// run log via the turn_end instrumentation below, which is the point of
+// keeping that logging unconditional.
 //
 // ---------------------------------------------------------------------------
 // Trigger B — post-finalize-warn non-compliance
 // ---------------------------------------------------------------------------
-// Motivated by trials where finalize-warn's "save now" nudge fired correctly
-// but the model kept investigating instead of writing its deliverable
-// (overfull-hbox, mteb-leaderboard — see the plan doc).
-//
-// finalize-warn keeps no exported latch or state describing whether it has
-// already fired this run (checked: finalize-warn/index.ts has no exports at
-// all beyond the default extension function, and _shared/ has no shared
-// "has finalize-warn fired" module). Per the plan's explicit preference for
-// re-deriving over adding new cross-extension coupling, this guard
-// independently re-derives finalize-warn's own trigger condition (turn-count
-// OR wall-clock, computed the same way at turn_start) rather than reading
-// finalize-warn's private state, via the shared `finalizeWarnWouldFire` in
-// _shared/finalize-warn-trigger.ts — see that module's header for why the
-// constants and condition live there now instead of being hand-copied here.
+// finalize-warn keeps no exported latch describing whether its "save now"
+// nudge has already fired this run, so this guard independently re-derives
+// finalize-warn's own trigger condition (turn-count OR wall-clock, computed
+// the same way at turn_start) rather than reading finalize-warn's private
+// state, via the shared `finalizeWarnWouldFire` in
+// _shared/finalize-warn-trigger.ts.
 //
 // finalize-warn's message is delivered as deliverAs:"followUp", which lands
 // on the model's *next* turn, not the turn during which the trigger fired
@@ -75,9 +59,8 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // itself stays redirect-only because write-guard and permission-gate also
 // consume it, and both deliberately treat `cp`/`mv`/`sed -i` as safe,
 // non-write commands — see that function's own comment). Extended with
-// `isScratchPath` (added alongside this guard) so a write that only ever
-// lands in /tmp does not count as having saved the real deliverable (Codex
-// finding folded into the merged plan).
+// `isScratchPath` so a write that only ever lands in /tmp does not count as
+// having saved the real deliverable.
 //
 // A turn's evidence-of-work also includes `ShellSend` (writing to an
 // already-running interactive job's stdin) even though it is deliberately
@@ -92,8 +75,8 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // On every terminal_bench turn_end, log the turn's stopReason and a coarse
 // content-shape summary via ctx.ui.notify at "info"-but-diagnostic framing —
 // NOT a harnessIntervention call, deliberately, so this doesn't inflate the
-// intervention-count metric with pure diagnostics. This exists so a future
-// occurrence of gpt2-codegolf's silent stopReason:"error" turn is
+// intervention-count metric with pure diagnostics. This makes a silent
+// stopReason:"error" turn — the shape Trigger A can't steer on, see above —
 // diagnosable from the run log instead of invisible.
 
 // WARN_REMAINING_MS lives in _shared/finalize-warn-trigger.ts now — see that

@@ -107,8 +107,8 @@ def _resolve_pkg_candidates(matches: list[Path], base_resolution: str):
         resolution = base_resolution if considered == 1 else f"{base_resolution}-agreed"
         return matches[0], resolution, False, considered, None, None
     # Disagreement: an under-estimate merely finalizes early; an
-    # over-estimate gets the trial hard-killed by Harbor mid-write (the
-    # original incident's failure mode) -- so the minimum is the safer pick.
+    # over-estimate risks the trial getting hard-killed by Harbor mid-write
+    # -- so the minimum is the safer pick.
     min_idx = min(range(considered), key=lambda i: timeouts[i])
     return (
         matches[min_idx],
@@ -145,13 +145,13 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
     terminal-bench-2-1") caches one level deeper, at packages/<org>/
     <task_name>/<content-hash>/task.toml -- and every package-cache task.toml
     on disk has an EPOCH mtime (Harbor's package extractor doesn't restore
-    timestamps), so a naive "union both globs, newest mtime wins" always
-    prefers the legacy file whenever a task name happens to exist in both
-    layouts (confirmed: all TB2.1 tasks with a same-named TB2.0 predecessor
-    hit this, e.g. caffe-cifar-10 resolving 1200s instead of 3600s,
-    crack-7z-hash resolving 900s instead of 1800s). The trial's own
-    config.json shape (task.name+ref vs task.path) tells us unambiguously
-    which layout THIS trial belongs to -- use that instead of mtime.
+    timestamps). A naive "union both globs, newest mtime wins" therefore
+    always prefers the legacy file whenever a task name happens to exist in
+    both layouts, silently reading the wrong dataset generation's timeout for
+    any task that shares a name with a predecessor from the other layout. The
+    trial's own config.json shape (task.name+ref vs task.path) tells us
+    unambiguously which layout THIS trial belongs to -- use that instead of
+    mtime.
     """
     try:
         if logs_dir is None:
@@ -163,14 +163,14 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
         # A legacy name@version trial config's task dict has "path" (a bare
         # task name, e.g. "configure-git-webserver"); a newer org/name
         # package dataset's has "name" instead (namespaced, e.g.
-        # "terminal-bench/overfull-hbox") and no "path" key at all -- using
-        # the wrong key unconditionally raised KeyError, silently swallowed
-        # by this function's own broad except-fallback, so every trial under
-        # a package dataset silently used DEFAULT_PROMPT_TIMEOUT_SEC instead
-        # of its real per-task budget (confirmed: caused overfull-hbox to be
-        # hard-killed by Harbor's own 2250s enforcement while this function
-        # still thought it had 3600s left). Confirmed both shapes live on
-        # disk, not assumed.
+        # "terminal-bench/some-task") and no "path" key at all -- using the
+        # wrong key unconditionally raised KeyError, silently swallowed by
+        # this function's own broad except-fallback, so every trial under a
+        # package dataset silently used DEFAULT_PROMPT_TIMEOUT_SEC instead of
+        # its real per-task budget. That's a real risk, not just a wrong
+        # number: a task under-timed this way can be hard-killed by Harbor's
+        # own enforcement while this function still thinks it has budget
+        # left. Both shapes are read from config.json directly, not assumed.
         task_name = task.get("name")
         if task_name is not None:
             # Package shape. task_name is typically namespaced

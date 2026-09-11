@@ -375,7 +375,8 @@ def test_bare_name_two_orgs_same_hash_different_timeouts_ambiguous(tmp_path, mon
     assert sorted(info["candidate_task_tomls"]) == sorted([str(toml_a), str(toml_b)])
     assert sorted(info["candidate_timeouts_sec"]) == [200.0, 500.0]
     assert lca._resolve_trial_timeout_sec(logs_dir) == pytest.approx(200.0 * 3.0 * 0.9)
-    # Round-trips through JSON cleanly (PR27 depends on this).
+    # The provenance dict is written into result.json, so it must round-trip
+    # through JSON cleanly as-is.
     assert json.loads(json.dumps(info)) == info
 
 
