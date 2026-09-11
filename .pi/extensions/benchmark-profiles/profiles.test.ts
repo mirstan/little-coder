@@ -29,9 +29,9 @@ describe("benchmark-profiles resolution against real settings.json", () => {
     const p = resolveProfileFrom(settings, "llamacpp/qwen3.6-35b-a3b", "terminal_bench");
     expect(p.thinking_budget).toBe(3000); // benchmark override kept
     expect(p.temperature).toBe(0.2);
-    // Plan 5: terminal_bench's max_turns override was deleted from
-    // settings.json -- wall-clock (finalize-warn's deadline), not a turn
-    // count, governs TB trials; see little_coder_agent.py's max_turns=0.
+    // terminal_bench has no max_turns override -- wall-clock (finalize-warn's
+    // deadline), not a turn count, governs TB trials; see
+    // little_coder_agent.py's max_turns=0.
     expect(p.max_turns).toBeUndefined();
     expect(p.context_limit).toBeUndefined(); // no override → live model window
   });

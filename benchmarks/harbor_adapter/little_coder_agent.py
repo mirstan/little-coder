@@ -62,13 +62,12 @@ def _read_code_sha() -> str:
     module IMPORT time -- not per-trial. Import time is exactly when this
     process's copy of the adapter code was frozen, so a Harbor job that has
     been running for hours on stale code still reports its OWN stale SHA
-    here, unaffected by anything landing on disk afterward. That's the
-    missing positive signal from the stale-code incident (dfa706b's
-    max_turns fix landed mid-job at 2026-09-08 22:26, but the already-running
-    job kept enforcing the pre-fix behavior for hours with nothing recording
-    which code was actually active). Falls back to "unknown" for a non-git
-    checkout or missing git binary, mirroring
-    _read_version_from_package_json()'s fallback.
+    here, unaffected by anything landing on disk afterward -- without this,
+    a long-running job silently keeps enforcing whatever behavior was
+    current when it started, with nothing on disk recording which code was
+    actually active. Falls back to "unknown" for a non-git checkout or
+    missing git binary, mirroring _read_version_from_package_json()'s
+    fallback.
     """
     try:
         out = subprocess.run(
@@ -311,9 +310,9 @@ def _resolve_trial_timeout_sec(logs_dir: Path | None) -> float:
 
 def _derive_benchmark_label(logs_dir: Path | None) -> str:
     """Best-effort derivation of this trial's own dataset identity, for
-    context.metadata["benchmark"] -- replacing the hardcoded
-    "terminal_bench_2.0" (wrong now that harbor_pilot.sh defaults to TB2.1;
-    Codex finding [medium]).
+    context.metadata["benchmark"] -- a hardcoded literal like
+    "terminal_bench_2.0" would go stale as harbor_pilot.sh's default dataset
+    changes (e.g. to TB2.1).
 
     Reads the same trial config.json _resolve_trial_timeout_info reads
     (confirmed on disk: both the package shape -- task.name/ref/source --
@@ -360,8 +359,8 @@ def _build_environment_snapshot(
     ambient_max_turns_env: str | None,
     timeout_info: dict,
 ) -> dict:
-    """Assemble the per-trial environment_snapshot.json payload (Plan 5,
-    fix D): rpc_client.capture_environment_snapshot()'s existing pi-config
+    """Assemble the per-trial environment_snapshot.json payload:
+    rpc_client.capture_environment_snapshot()'s existing pi-config
     introspection, plus the config values this adapter itself resolved --
     the active turn cap, the ambient env var seen at process entry, this
     process's own code identity, and the FULL timeout-provenance dict from
@@ -726,14 +725,14 @@ class LittleCoderAgent(BaseAgent):
         # of aborting early and cheaply -- is an acceptable trade against
         # truncating trials that are still making real progress. Explicit 0
         # rather than leaving it unset, so the "no cap" choice reads as
-        # deliberate, not an oversight -- and, since rpc_client.py now
-        # writes the env var on `is not None` rather than truthiness (Plan
-        # 5, fix A1), this 0 is guaranteed to actually reach the subprocess
-        # rather than being silently skipped.
+        # deliberate, not an oversight -- and since rpc_client.py writes the
+        # env var whenever max_turns is not None (not based on truthiness),
+        # this 0 is guaranteed to actually reach the subprocess rather than
+        # being silently skipped.
         #
         # Hoisted to a named local (rather than inlined as the kwarg below)
         # so this log line and the PiRpc kwarg read the exact same value and
-        # can never diverge (Plan 5, fix C).
+        # can never diverge.
         max_turns = 0
         ambient_max_turns_env = os.environ.get("LITTLE_CODER_MAX_TURNS")
         self.logger.info(
@@ -744,8 +743,8 @@ class LittleCoderAgent(BaseAgent):
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
         )
 
-        # Per-trial environment_snapshot.json (Plan 5, fix D): best-effort,
-        # must never fail a trial. Executes before the PiRpc-construction
+        # Per-trial environment_snapshot.json: best-effort, must never fail
+        # a trial. Executes before the PiRpc-construction
         # try/except below so it (and the config-provenance log line above)
         # still land even if PiRpc itself fails to construct (e.g. PI_BIN
         # missing) -- exactly the diagnostics that failure needs most.
@@ -859,10 +858,9 @@ class LittleCoderAgent(BaseAgent):
                     "n_compactions": result.compaction_events,
                     "n_notifications": len(rpc.notifications()) if hasattr(rpc, "notifications") else 0,
                     "little_coder_version": self.version(),
-                    # Derived from the trial's own config.json rather than
-                    # hardcoded (Plan 5, fix E) -- the pilot's default
-                    # dataset moved to TB2.1 (see harbor_pilot.sh) and the
-                    # old literal no longer matched reality.
+                    # Read from the trial's own config.json -- the pilot's
+                    # dataset varies by run (TB2.0 vs TB2.1), so a hardcoded
+                    # literal would silently go stale.
                     "benchmark": _derive_benchmark_label(self.logs_dir),
                     "token_usage": tokens["raw"],
                     "token_source": tokens["token_source"],

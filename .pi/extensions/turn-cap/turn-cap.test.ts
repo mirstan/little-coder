@@ -61,10 +61,6 @@ describe("turn-cap", () => {
   });
 
   it("an explicitly-set env var overrides systemPromptOptions.littleCoder.maxTurns", async () => {
-    // Plan 5 / Codex finding [high]: the env var (set by the harness
-    // constructing PiRpc) is now the authoritative source -- a benchmark
-    // profile's maxTurns only applies when the env var is absent. Here the
-    // env var's cap of 2 wins over the profile's 40.
     process.env.LITTLE_CODER_MAX_TURNS = "2";
     const h = makeHarness();
     setupExtension(h.pi as any);

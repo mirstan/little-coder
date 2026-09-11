@@ -138,8 +138,8 @@ class _FakeStream:
 class _FakeProc:
     """Records the `env` kwarg Popen was called with, without spawning
     anything real -- used to assert on PiRpc's full_env construction
-    directly (Plan 5, verification item 1) rather than going through
-    turn-cap.ts's own resolution, which is covered separately in TS."""
+    directly, rather than going through turn-cap.ts's own resolution, which
+    is covered separately in TS."""
 
     captured_env: dict | None = None
 
@@ -166,10 +166,9 @@ def test_max_turns_explicit_zero_clobbers_ambient_env(tmp_path, monkeypatch):
     """max_turns=0 is a deliberate "no cap" choice and must still WRITE
     LITTLE_CODER_MAX_TURNS=0 into the subprocess env, clobbering any ambient
     value inherited from the calling process's own environment (full_env
-    starts as a copy of os.environ). The old `if max_turns:` check treated
-    0 as falsy and skipped the write entirely, silently leaving a leaked
-    ambient cap (e.g. from a wrapper script) in place -- see Plan 5 (Codex
-    finding [high]: turn-cap-still-active-via-profile/ambient-env)."""
+    starts as a copy of os.environ). A truthiness check (`if max_turns:`)
+    would treat 0 as falsy and skip the write entirely, silently leaving a
+    leaked ambient cap (e.g. from a wrapper script) in place."""
     monkeypatch.setenv("LITTLE_CODER_MAX_TURNS", "40")
     pi_bin = tmp_path / "pi"
     pi_bin.write_text("")

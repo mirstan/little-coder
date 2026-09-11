@@ -5,16 +5,14 @@
 #   benchmarks/harbor_pilot.sh hello-world
 #   benchmarks/harbor_pilot.sh task-a task-b
 #
-# Runbook note (Plan 5 / stale-code incident, 2026-09-08 22:26): a running
-# Harbor job never reloads code -- it imports LittleCoderAgent once at job
-# start and keeps running that frozen module for the job's entire lifetime,
-# however many hours that is. After pulling a fix on this branch (or any
-# branch a job is running from), the fix does NOT take effect until you kill
-# the running job and relaunch this script; there is no live-reload path
-# (see little_coder_agent.py's module docstring / Plan 5's "Rejected
-# alternatives"). The banner this script prints below (code: <sha>) and each
-# trial's own logged code_sha (little_coder_agent.py, at trial start) are the
-# retroactive cross-check: compare either against `result.json`'s
+# Runbook note: a running Harbor job never reloads code -- it imports
+# LittleCoderAgent once at job start and keeps running that frozen module
+# for the job's entire lifetime, however many hours that is. After pulling
+# a change on the branch a job is running from, it does NOT take effect
+# until you kill the running job and relaunch this script; there is no
+# live-reload path. The banner this script prints below (code: <sha>) and
+# each trial's own logged code_sha (little_coder_agent.py, at trial start)
+# are the retroactive cross-check: compare either against `result.json`'s
 # started_at timestamp and the commit history to tell whether a given run
 # actually used the code you think it did.
 #
@@ -46,28 +44,23 @@
 #                             --n-concurrent 1 means only one container runs
 #                             at a time, so this doesn't compete with itself.
 #   TB_OVERRIDE_MEMORY_MB   — OPT-IN per-task memory override, unset by
-#                             default (Plan 5 / Codex finding [high]: this
-#                             used to default to 4096 and was ALWAYS applied,
-#                             but Harbor's --override-memory-mb REPLACES a
-#                             task's own request rather than raising a floor
-#                             -- verified via `harbor run --help`, no
-#                             per-task max()/floor mode exists. Verified
-#                             against the TB2.1 package cache: 68/89 tasks
+#                             default. Harbor's --override-memory-mb
+#                             REPLACES a task's own request rather than
+#                             raising a floor -- verified via `harbor run
+#                             --help`, no per-task max()/floor mode exists.
+#                             Against the TB2.1 package cache: 68/89 tasks
 #                             request 2048MB, 13 request 4096MB, and 8
 #                             request 8192MB (including mteb-leaderboard,
-#                             gpt2-codegolf, caffe-cifar-10). Forcing 4096
-#                             unconditionally therefore LOWERED those 8 tasks'
+#                             gpt2-codegolf, caffe-cifar-10). Forcing a
+#                             uniform value therefore lowers those 8 tasks'
 #                             memory ceiling -- under --n-concurrent 1 (one
 #                             container at a time) a single container can
 #                             actually get most of Docker Desktop's ~7.75GB
-#                             VM, so the old comment claiming "4096 isn't a
-#                             regression for them" was wrong; it assumed
-#                             concurrent-container contention that
-#                             --n-concurrent 1 rules out. Set this env var
-#                             only for a deliberate, informed override -- it
-#                             will still replace, not floor, every task's own
-#                             request, including lowering the 8 that ask for
-#                             more than whatever you set.
+#                             VM. Set this env var only for a deliberate,
+#                             informed override -- it will still replace,
+#                             not floor, every task's own request, including
+#                             lowering the 8 that ask for more than whatever
+#                             you set.
 #
 # Requires:
 #   - harbor installed (uv tool install harbor)
@@ -107,10 +100,10 @@ export OLLAMA_API_KEY="${OLLAMA_API_KEY:-noop}"
 # --agent plus an explicit PYTHONPATH instead (found working this session).
 export PYTHONPATH="$REPO_ROOT"
 
-# Launch-time code provenance (Plan 5 / Codex finding [medium], stale-code
-# incident): a job launched right now runs whatever this worktree's HEAD is
-# at this instant, frozen for the job's whole lifetime -- print it so a
-# retroactive look at a job's output can be matched against commit history.
+# Launch-time code provenance: a job launched right now runs whatever this
+# worktree's HEAD is at this instant, frozen for the job's whole lifetime --
+# print it so a retroactive look at a job's output can be matched against
+# commit history.
 CODE_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 CODE_DIRTY=""
 # `git diff --quiet HEAD` only reports modified/staged TRACKED files -- it

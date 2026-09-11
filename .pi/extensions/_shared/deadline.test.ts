@@ -44,16 +44,11 @@ describe("resolveDeadlineEpochMs", () => {
   // An empty-but-set env var (`export LITTLE_CODER_DEADLINE_EPOCH_MS=` in a
   // wrapper script, a CI matrix that exports unset variables, `env VAR=
   // cmd`) must be treated as UNSET, not as an authoritative "0" --
-  // Number("") is 0, and treating "" as set would silently invert the
-  // precedence this fix exists to enforce. Each case is crossed with
-  // "event override present / absent" since the bug is specifically about
-  // which one wins.
-  describe("empty-but-set env var (Priority 3 fix)", () => {
+  // Number("") is 0, which would otherwise silently invert the precedence.
+  describe("empty-but-set env var", () => {
     it("\"\" with an event override present falls back to the EVENT value, not 0", () => {
       process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = "";
       const event = { systemPromptOptions: { littleCoder: { deadlineEpochMs: 1234567890 } } };
-      // This is the exact inversion being fixed: "" must NOT win as an
-      // authoritative 0 over a positive event override.
       expect(resolveDeadlineEpochMs(event)).toBe(1234567890);
     });
 

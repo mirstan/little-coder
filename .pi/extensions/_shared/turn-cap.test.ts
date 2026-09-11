@@ -32,10 +32,6 @@ describe("resolveTurnCap", () => {
   });
 
   it("an explicit env var of \"0\" wins over a positive profile maxTurns", () => {
-    // Plan 5 / Codex finding [high]: little_coder_agent.py passes max_turns=0
-    // (no cap) but a model's benchmark_overrides.terminal_bench.max_turns
-    // profile still published 40 -- the explicit "0" must win so the harness
-    // kwarg is the deliberate per-run authority, not the profile.
     process.env.LITTLE_CODER_MAX_TURNS = "0";
     const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
     expect(resolveTurnCap(event)).toBe(0);
@@ -52,15 +48,11 @@ describe("resolveTurnCap", () => {
   // An empty-but-set env var (`export LITTLE_CODER_MAX_TURNS=` in a wrapper
   // script, a CI matrix that exports unset variables, `env VAR= cmd`) must
   // be treated as UNSET, not as an authoritative "0" -- Number("") is 0,
-  // and treating "" as set would silently invert the precedence this fix
-  // exists to enforce. Each case is crossed with "profile override present
-  // / absent" since the bug is specifically about which one wins.
-  describe("empty-but-set env var (Priority 3 fix)", () => {
+  // which would otherwise silently invert the precedence.
+  describe("empty-but-set env var", () => {
     it("\"\" with a profile override present falls back to the PROFILE value, not 0", () => {
       process.env.LITTLE_CODER_MAX_TURNS = "";
       const event = { systemPromptOptions: { littleCoder: { maxTurns: 40 } } };
-      // This is the exact inversion being fixed: "" must NOT win as an
-      // authoritative 0 over a positive profile override.
       expect(resolveTurnCap(event)).toBe(40);
     });
 

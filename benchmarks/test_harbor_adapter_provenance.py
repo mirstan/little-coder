@@ -1,5 +1,5 @@
-"""Plan 5 (config-provenance v2): _derive_benchmark_label() and
-_build_environment_snapshot() in little_coder_agent.py.
+"""Tests for _derive_benchmark_label() and _build_environment_snapshot() in
+little_coder_agent.py.
 
 Requires the `harbor` package (only installed in harbor's own uv-tool venv,
 not the plain system Python these other benchmark tests run under) purely
