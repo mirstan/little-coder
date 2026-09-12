@@ -205,7 +205,7 @@ describe("stripHeredocBodies", () => {
   });
 });
 
-describe("detectDeliverableWrites", () => {
+describe("detectDeliverableWrites — commands detectWriteTargets misses", () => {
   it("still reports everything detectWriteTargets does", () => {
     expect(detectDeliverableWrites("echo x > out.log")).toEqual([
       { path: "out.log", kind: "redirect" },

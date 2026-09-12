@@ -110,6 +110,166 @@ DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 DEADLINE_SAFETY_MARGIN = 0.9
 HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 
+# A deadline snapshot of files the model changed since trial start, staged
+# under /tmp/.lc-snapshot in the container.
+# Insurance/recovery only -- grading reads the live container files, never
+# this snapshot; it's useful only via the finalize-message pointer telling
+# the model it exists, for the case where a late mistake destroys earlier
+# good state (the motivating trial: overfull-hbox, where a debug script
+# clobbered a graded file that had already reached the goal state).
+#
+# Fires SNAPSHOT_LEAD_SEC before the trial's own effective_timeout_sec --
+# deliberately mirrors finalize-warn's own WARN_REMAINING_MS (see
+# .pi/extensions/finalize-warn/index.ts) so the snapshot and the "you're
+# running low" nudge land around the same moment; if either constant is
+# ever changed there, consider changing it here too (no shared import --
+# this is Python, that's TypeScript -- so the two are only in comment-level
+# lockstep, same as tb-finalize-guard's own WARN_REMAINING_MS is with
+# finalize-warn's).
+SNAPSHOT_LEAD_SEC = 600.0
+# Below this total trial budget, skip the snapshot entirely: the computed
+# delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would already be clamped
+# to 0 (snapshotting almost immediately at trial start), and for a trial this
+# short there's nothing meaningful yet to recover that the model couldn't
+# just redo from scratch.
+SNAPSHOT_MIN_BUDGET_SEC = 300.0
+SNAPSHOT_START_MARKER = "/tmp/.lc-start"
+SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-snapshot"
+SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
+
+# Bounded, atomically-staged snapshot of files modified under /app since
+# SNAPSHOT_START_MARKER was touched. Every cap here answers a specific
+# failure mode:
+#   - per-file size cap (-size -10M) and an aggregate file-count cap
+#     (head -z -n 500) and an aggregate byte cap (209715200 = 200MB, via the
+#     `du --files0-from` sum) together bound total copy volume regardless of
+#     how many small files changed -- a per-file cap alone is insufficient
+#     (thousands of small files could still copy gigabytes).
+#   - a free-space reserve check (FREE >= TOTAL + 524288000, i.e. 500MB)
+#     protects storage_mb-tight task containers (10240MB typical in TB2.1
+#     task.tomls) from being pushed over their quota by the snapshot itself.
+#   - staging into $STAGE and only `mv`-ing it to SNAPSHOT_PUBLISH_PATH once
+#     fully populated means a half-copied snapshot is never visible at the
+#     published path (atomic publish).
+#   - the whole body runs under an internal `timeout 20`, and the trailing
+#     `rm -rf SNAPSHOT_STAGE_GLOB` (outside that timeout) reaps a stage dir
+#     orphaned if the 20s kill lands mid-copy ("cleanup-on-timeout" duty).
+#     Documented here rather than as a trailing inline comment on the command
+#     string's own last line: _exec_async appends a wrapper epilogue
+#     (`; }} ; __rc=$? ; printf ... ; pwd`) directly onto whatever this string
+#     ends with, so a trailing `#` comment with no newline after it silently
+#     swallows that whole epilogue. Do not add a trailing inline comment to
+#     this constant's last line.
+#   - `set -e` plus every failure being swallowed by the caller means this
+#     command degrades to "no snapshot" on any error (missing GNU coreutils
+#     like `head -z`/`du --files0-from` on a BusyBox-ish image, `find -newer`
+#     failing because the model deleted the start marker, etc.) -- never to
+#     an unbounded copy.
+#   - the publish branch is additionally gated on `[ -s "$STAGE/.list" ]`:
+#     with zero candidate files (e.g. the model deleted /tmp/.lc-start, so
+#     `find -newer` errors -- not fatal under `set -e` since the pipeline's
+#     exit status is `head`'s, which is 0 -- or the model simply hasn't
+#     touched anything yet), GNU `xargs` still runs its command once with no
+#     input unless told not to, so `cp --parents -t "$STAGE"` would run with
+#     no operands, fail, get swallowed by `|| true`, and publish an empty
+#     $STAGE anyway. `-s` is the portable fix and also directly covers "find
+#     matched nothing". Deliberately NOT also passing `xargs -r`
+#     (--no-run-if-empty) as belt-and-braces: that flag is GNU-specific, and
+#     under `set -e` an unsupported flag on a non-GNU findutils image would
+#     abort the whole script instead of merely running xargs once -- turning
+#     a portability gap into a silent full-feature outage, which is worse
+#     than the bug the `-s` gate already fixes on its own. This codebase has
+#     no confirmed inventory of every TB task container's base image/findutils
+#     provenance, so rather than bet on GNU everywhere, `-s` alone is the
+#     whole fix here -- it's portable and sufficient on its own.
+_SNAPSHOT_COMMAND = (
+    "timeout 20 sh -c '\n"
+    "  set -e\n"
+    "  STAGE=/tmp/.lc-snapshot.stage.$$\n"
+    "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
+    "  # candidate list: files under /app changed since trial start, per-file <10M\n"
+    "  find /app -xdev -maxdepth 3 -type f -size -10M -newer /tmp/.lc-start -print0 2>/dev/null \\\n"
+    "    | head -z -n 500 > \"$STAGE/.list\"           # aggregate file-count cap\n"
+    "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
+    "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
+    "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
+    "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
+    "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
+    "    rm -f \"$STAGE/.list\"\n"
+    "    rm -rf /tmp/.lc-snapshot && mv \"$STAGE\" /tmp/.lc-snapshot   # atomic publish\n"
+    "  else\n"
+    "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
+    "  fi\n"
+    "' ; rm -rf /tmp/.lc-snapshot.stage.* 2>/dev/null"
+)
+
+
+def _compute_snapshot_delay_sec(effective_timeout_sec: float) -> float | None:
+    """Pure helper (split out for testability) for run()'s scheduling of
+    _snapshot_at_deadline: returns the sleep delay to pass it, or None to
+    skip scheduling the snapshot task at all.
+
+    Below SNAPSHOT_MIN_BUDGET_SEC, returns None -- a short-task edge case:
+    the naive delay (effective_timeout_sec - SNAPSHOT_LEAD_SEC) would
+    already be negative and get clamped to 0 (snapshotting almost
+    immediately), and for a trial this short there's nothing meaningful yet
+    to recover that the model couldn't just redo from scratch, so the whole
+    task is skipped rather than merely delay-clamped.
+    """
+    if effective_timeout_sec < SNAPSHOT_MIN_BUDGET_SEC:
+        return None
+    return max(0.0, effective_timeout_sec - SNAPSHOT_LEAD_SEC)
+
+
+_HARNESS_EXIT_CODE_RE = re.compile(r"^\[exit=(-?\d+)", re.MULTILINE)
+
+
+def _extract_exit_code(formatted_output: str) -> int | None:
+    """Pulls the rc _format_output embeds in its footer line (e.g.
+    `[exit=0 cwd=/app timed_out=false backend=harbor-env]`) back out of
+    run_harness's returned string. Pure/module-level so it's directly
+    testable without a fake proxy.
+
+    Returns None only if the footer itself is missing/malformed (should not
+    happen in practice -- _format_output always emits it); callers should
+    treat that the same as "did not succeed".
+    """
+    m = _HARNESS_EXIT_CODE_RE.search(formatted_output)
+    return int(m.group(1)) if m else None
+
+
+async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, logger: logging.Logger) -> None:
+    """Sleeps until SNAPSHOT_LEAD_SEC before the trial deadline, then fires
+    the one bounded snapshot command via run_harness -- never proxy.run()
+    (see _HarborShellProxy.run_harness's docstring for why that would
+    deadlock this same event loop). Meant to be wrapped in
+    asyncio.create_task() by run() and cancelled in run()'s own finally.
+
+    Insurance only: must never raise into the trial. Every failure --
+    including the container simply not having the snapshot command's
+    required coreutils -- is swallowed here; asyncio.CancelledError is the
+    one exception let through, so run()'s task.cancel() actually cancels
+    promptly instead of being silently caught by the broad handler below.
+
+    Logs an outcome derived from the actual rc instead of an unconditional
+    "attempted" message -- that unconditional message is exactly what let
+    2.1's unterminated-comment syntax error (rc=2, every single time) ship
+    and run undetected: "attempted" is true whether or not anything actually
+    happened, so it told us nothing.
+    """
+    try:
+        await asyncio.sleep(delay_sec)
+        out = await proxy.run_harness(_SNAPSHOT_COMMAND, timeout=25)
+        rc = _extract_exit_code(out)
+        if rc == 0:
+            logger.info("LittleCoderAgent: deadline snapshot succeeded")
+        else:
+            logger.info(f"LittleCoderAgent: deadline snapshot did not produce a snapshot (rc={rc})")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: deadline snapshot failed (non-fatal): {e}")
+
 
 def _fallback_timeout_info() -> dict:
     return {
@@ -412,6 +572,28 @@ def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: boo
     return f"{body}\n{footer}" if body else footer
 
 
+def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
+    """Pure, module-level composition of the wrapper _exec_async prepends and
+    appends around a caller's command -- split out specifically so a test
+    can shell-parse the exact string that gets sent to env.exec() (see
+    test_harbor_snapshot.py's `sh -n` parse tests). Without this seam, the
+    2.1 bug (an unterminated `#` comment on _SNAPSHOT_COMMAND's last line
+    silently swallowing everything _exec_async appended after it) was
+    invisible to any test that only substring-matched _SNAPSHOT_COMMAND in
+    isolation -- it never actually composed and parsed the real string.
+
+    cwd=None omits the leading `cd` and the trailing `pwd` entirely (used
+    when track_cwd=False): sound only for a command that never itself needs
+    a starting cwd and never `cd`s in a way the caller needs reported back --
+    true of _SNAPSHOT_COMMAND, the only cwd=None caller today, which uses
+    absolute paths (/app, /tmp) throughout.
+    """
+    body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
+    if cwd is None:
+        return body
+    return f"cd {cwd} 2>/dev/null; {body} ; pwd"
+
+
 class _HarborShellProxy:
     """Stateful shell proxy over harbor's BaseEnvironment.exec().
 
@@ -427,32 +609,59 @@ class _HarborShellProxy:
         self.loop = loop
         self.logger = logger
         self.cwd = "/app"  # TB 2.0 convention — overridden by first `pwd`
+        # Serializes the actual env.exec() call across BOTH model-issued
+        # commands (via run(), the sync thread-bridge entry point) and
+        # harness-issued ones (via run_harness(), awaited directly on this
+        # loop -- see its docstring).
+        # Before this lock existed, only the reader thread ever called run(),
+        # so there was nothing to serialize against; run_harness is the first
+        # caller that can execute concurrently with it.
+        self._exec_lock = asyncio.Lock()
 
-    async def _exec_async(self, command: str, timeout: int) -> str:
+    async def _exec_async(self, command: str, timeout: int, track_cwd: bool = True) -> str:
+        """track_cwd=False (used by run_harness -- see its docstring) skips
+        reading/writing self.cwd entirely: no leading `cd`, no trailing
+        `pwd`, no assignment back to self.cwd.
+
+        track_cwd=True (the model-command path, via run()) holds
+        self._exec_lock across the full read(self.cwd)-exec-write(self.cwd)
+        triple: the wrap is built from self.cwd, the exec happens, and any
+        new cwd parsed from the trailing `pwd` is written back to self.cwd,
+        all before the lock is released. This closes a race where a model
+        command that `cd`s could interleave with a concurrent exec (e.g. the
+        snapshot's run_harness call) and leave self.cwd pointing somewhere
+        wrong for every subsequent command -- previously the wrap was built,
+        and self.cwd assigned, both outside the lock.
+
+        The lock is released (via `async with` exit) before formatting the
+        result; the except branches below read self.cwd purely for display
+        after that release, which is harmless since a failed exec never
+        wrote a new cwd.
+        """
         sentinel = f"__LC_END_{uuid.uuid4().hex[:8]}__"
-        wrapped = f"cd {self.cwd} 2>/dev/null; {{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc ; pwd"
         try:
-            result = await self.env.exec(command=wrapped, timeout_sec=timeout)
+            async with self._exec_lock:
+                wrapped = _wrap_command(command, self.cwd if track_cwd else None, sentinel)
+                result = await self.env.exec(command=wrapped, timeout_sec=timeout)
+                out = result.stdout or ""
+                err = result.stderr or ""
+                # Peel sentinel to recover exit code + (if tracked) new cwd
+                marker = out.rfind(sentinel + ":")
+                code = result.return_code if result.return_code is not None else 0
+                if marker >= 0:
+                    tail = out[marker + len(sentinel) + 1:]
+                    parts = tail.split(":", 1)
+                    try: code = int(parts[0])
+                    except (ValueError, IndexError): pass
+                    if track_cwd and len(parts) > 1:
+                        cwd_line = parts[1].lstrip("\r\n").split("\n")
+                        if cwd_line and cwd_line[0].strip():
+                            self.cwd = cwd_line[0].strip()
+                    out = out[:marker].rstrip()
         except asyncio.TimeoutError:
             return _format_output("", "command timed out", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"env.exec error: {e}", -1, self.cwd, False)
-
-        out = result.stdout or ""
-        err = result.stderr or ""
-        # Peel sentinel to recover exit code + new cwd
-        marker = out.rfind(sentinel + ":")
-        code = result.return_code if result.return_code is not None else 0
-        if marker >= 0:
-            tail = out[marker + len(sentinel) + 1:]
-            parts = tail.split(":", 1)
-            try: code = int(parts[0])
-            except (ValueError, IndexError): pass
-            if len(parts) > 1:
-                cwd_line = parts[1].lstrip("\r\n").split("\n")
-                if cwd_line and cwd_line[0].strip():
-                    self.cwd = cwd_line[0].strip()
-            out = out[:marker].rstrip()
         return _format_output(out, err, code, self.cwd, False)
 
     def run(self, command: str, timeout: int) -> str:
@@ -462,6 +671,33 @@ class _HarborShellProxy:
             return fut.result(timeout=timeout + 30)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
+
+    async def run_harness(self, command: str, timeout: int) -> str:
+        """Harness-issued exec, awaited directly on the caller's event loop.
+
+        NOT proxy.run(): run() is the sync bridge for PiRpc's reader THREAD --
+        it calls asyncio.run_coroutine_threadsafe(...).result(), which blocks
+        the calling thread until the coroutine finishes on `self.loop`. Calling
+        run() from an asyncio task running ON that same loop would deadlock:
+        fut.result() blocks the very loop that must run _exec_async to
+        complete it. run_harness instead awaits _exec_async directly -- same
+        loop, no thread bridge, no fut.result().
+
+        This is also why the deadline-snapshot task (the only caller of this
+        method) must use ONLY run_harness, never run().
+
+        _exec_async's own _exec_lock still serializes this against
+        model-issued commands (via run()), so a harness command and a
+        model command can never execute concurrently inside the container.
+
+        Passes track_cwd=False: self.cwd is genuinely never read or written
+        by a harness call (by construction, not by accident -- contrast the
+        old docstring here, which claimed the same result but only held
+        because every harness command happened to never `cd`). Sound because
+        _SNAPSHOT_COMMAND, the only harness command today, uses absolute
+        paths (/app, /tmp) throughout and needs no starting cwd.
+        """
+        return await self._exec_async(command, timeout, track_cwd=False)
 
     def reset(self) -> str:
         self.cwd = "/app"
@@ -750,6 +986,30 @@ class LittleCoderAgent(BaseAgent):
             except Exception as e:
                 self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
 
+        # Schedule the best-effort deadline snapshot. Skipped entirely below
+        # SNAPSHOT_MIN_BUDGET_SEC (see that constant's comment); the
+        # start-marker touch is itself failure-tolerated (a missing marker
+        # just means find -newer fails later and the snapshot command
+        # degrades to "no snapshot", same as any other failure mode here).
+        snapshot_task: asyncio.Task | None = None
+        snapshot_delay_sec = _compute_snapshot_delay_sec(effective_timeout_sec)
+        if snapshot_delay_sec is not None:
+            try:
+                await proxy.run_harness(f"touch {SNAPSHOT_START_MARKER}", 10)
+            except Exception as e:
+                self.logger.info(
+                    f"LittleCoderAgent: snapshot start-marker touch failed (non-fatal): {e}"
+                )
+            snapshot_task = asyncio.create_task(
+                _snapshot_at_deadline(proxy, snapshot_delay_sec, self.logger)
+            )
+        else:
+            self.logger.info(
+                "LittleCoderAgent: skipping deadline snapshot -- trial budget "
+                f"({effective_timeout_sec:.0f}s) is below the "
+                f"{SNAPSHOT_MIN_BUDGET_SEC:.0f}s floor"
+            )
+
         try:
             # PiRpc spawns pi --mode rpc and wires the shell proxy. The reader
             # thread invokes tb_shell_handler synchronously; the handler
@@ -855,6 +1115,17 @@ class LittleCoderAgent(BaseAgent):
                 log_fh.write(f"\nAGENT ERROR: {e}\n")
             raise
         finally:
+            # The snapshot task must never outlive run() -- cancel it here
+            # regardless of how run() is exiting (normal completion, timeout,
+            # or exception above).
+            if snapshot_task is not None:
+                snapshot_task.cancel()
+                try:
+                    await snapshot_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             if log_fh:
                 log_fh.flush()
                 log_fh.close()
