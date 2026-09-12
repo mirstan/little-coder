@@ -97,7 +97,7 @@ export OLLAMA_API_KEY="${OLLAMA_API_KEY:-noop}"
 # --agent-import-path is deprecated and fails with "ModuleNotFoundError: No
 # module named 'benchmarks'" under harbor's isolated uv-tool Python env,
 # which doesn't inherit this repo's cwd on sys.path automatically -- use
-# --agent plus an explicit PYTHONPATH instead (found working this session).
+# --agent plus an explicit PYTHONPATH instead.
 export PYTHONPATH="$REPO_ROOT"
 
 # Launch-time code provenance: a job launched right now runs whatever this
@@ -146,7 +146,7 @@ if [[ -n "$OVERRIDE_MEMORY_MB" ]]; then
 fi
 HB_CMD+=(
   -y
-  # TB2.0 tasks pin an amd64-only prebuilt image per task; on arm64 Docker
+  # TB tasks pin an amd64-only prebuilt image per task; on arm64 Docker
   # hosts this silently falls back to Rosetta/QEMU emulation (confirmed:
   # overfull-hbox's perl/pdflatex search loop ran under rosetta, contributing
   # to it hitting its deadline). --force-build makes harbor build each task's

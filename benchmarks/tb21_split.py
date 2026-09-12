@@ -4,7 +4,7 @@ Re-runnable and reproducible (fixed random seed), not a hand-typed list --
 regenerate with `python3 benchmarks/tb21_split.py`, which overwrites
 benchmarks/tb21_splits.json.
 
-Rationale for a train/validate/test split at all: this session's harness
+Rationale for a train/validate/test split at all: harness
 development (permission-gate whitelist behavior, deadline-derivation,
 TB-aware finalize messaging, etc.) iterated directly against a hand-picked
 subset of tasks. Any pass-rate computed on those same tasks going forward is
@@ -29,10 +29,10 @@ OUTPUT_PATH = Path(__file__).resolve().parent / "tb21_splits.json"
 
 EXPECTED_TASK_COUNT = 89
 
-# Every distinct task name that appeared under benchmarks/harbor_runs/ this
-# session (not just the final curated 9 -- includes earlier subset runs from
-# before the harness settled), i.e. every task this session's harness fixes
-# were actually diagnosed and iterated against:
+# Every distinct task name that appeared under benchmarks/harbor_runs/ (not
+# just the final curated 9 -- includes earlier subset runs from before the
+# harness settled), i.e. every task the harness fixes were actually
+# diagnosed and iterated against:
 #   find benchmarks/harbor_runs -mindepth 2 -maxdepth 2 -type d \
 #     | sed 's|.*/||; s|__.*||' | sort -u
 TRAIN_TASKS = sorted([

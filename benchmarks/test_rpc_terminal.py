@@ -321,7 +321,7 @@ def test_turn_end_survives_null_message_and_null_usage(fake_pi, tmp_path):
 
 
 def test_settled_after_extra_event_returns_fast(fake_pi, tmp_path):
-    """Pins Bug A: the old Phase 1 predicate only matched agent_end, so an
+    """The old Phase 1 predicate only matched agent_end, so an
     agent_settled arriving after some other event (not immediately after
     agent_end) was treated as an ordinary event and Phase 1 waited out the
     entire remaining timeout. Reproduced at ~12.2s; must now return in well
@@ -337,7 +337,7 @@ def test_settled_after_extra_event_returns_fast(fake_pi, tmp_path):
 
 
 def test_retry_then_settled_does_not_rearm_timeout(fake_pi, tmp_path):
-    """Pins the PR28 repro: auto_retry_end between agent_end and
+    """auto_retry_end between agent_end and
     agent_settled must not be mistaken for a continuation (which would
     re-arm the full remaining timeout). Reproduced at 6.29s with
     timeout=6, settle_grace=2; must now return in well under 2s."""
@@ -352,7 +352,7 @@ def test_retry_then_settled_does_not_rearm_timeout(fake_pi, tmp_path):
 
 
 def test_abort_then_followup_survives_slow_on_event_eof_race(fake_pi, tmp_path):
-    """Pins Bug B directly: the old `if self._eof: break` guards raced the
+    """The old `if self._eof: break` guards raced the
     reader thread against a slow on_event (Harbor's live-log writer) --
     when the reader ran ahead and set _eof before on_event had drained an
     already-queued recovery turn, the whole queued turn was discarded.
@@ -368,7 +368,7 @@ def test_abort_then_followup_survives_slow_on_event_eof_race(fake_pi, tmp_path):
 
 
 def test_stray_end_must_not_rearm_settle_window(fake_pi, tmp_path, capsys):
-    """Pins Bug C's specific 'stray must not re-arm' case: a duplicate
+    """The 'stray must not re-arm' case: a duplicate
     agent_end seen while SETTLING must stay in SETTLING (bounded by the
     ORIGINAL settle deadline), not restart the window and not be read as
     renewed work. pi never emits agent_settled here, so this also exercises
@@ -386,7 +386,7 @@ def test_stray_end_must_not_rearm_settle_window(fake_pi, tmp_path, capsys):
 
 
 def test_continuation_that_never_finishes_is_deadline_not_agent_end(fake_pi, tmp_path):
-    """Pins Bug D: stop_reason must reflect how the call actually ended, not
+    """stop_reason must reflect how the call actually ended, not
     a latched 'did we ever see an agent_end'. Here a genuine continuation
     starts (agent_start) but never finishes -- the call must run the full
     outer timeout and report stop_reason == 'deadline', even though an

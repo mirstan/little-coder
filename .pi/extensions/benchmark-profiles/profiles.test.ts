@@ -57,10 +57,10 @@ describe("benchmark-profiles resolution against real settings.json", () => {
   });
 
   it("every shipped per-model profile carries the 4096 budget, except the fixed omlx/rapidmlx real-budget profiles", () => {
-    // omlx/tiel-coder-oq4e and rapidmlx/tiel-coder-oq4e were deliberately given a real
-    // 32768 budget (PR #17) to fix a bug where these models silently fell through to
-    // default_model_profile's 4096 default, unconditionally shadowing
-    // LITTLE_CODER_THINKING_BUDGET. Every other shipped profile is unaffected.
+    // omlx/tiel-coder-oq4e and rapidmlx/tiel-coder-oq4e carry a real 32768 budget;
+    // without it they fall through to default_model_profile's 4096 default, which
+    // unconditionally shadows LITTLE_CODER_THINKING_BUDGET. Every other shipped
+    // profile is unaffected.
     const REAL_BUDGET_PROFILES = new Set(["omlx/tiel-coder-oq4e", "rapidmlx/tiel-coder-oq4e"]);
     for (const key of Object.keys(settings.model_profiles)) {
       const expected = REAL_BUDGET_PROFILES.has(key) ? 32768 : 4096;

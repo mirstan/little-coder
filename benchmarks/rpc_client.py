@@ -81,8 +81,7 @@ class PromptResult:
     #: fallback described below; "agent_settled" is deliberately NOT a
     #: separate value here, see prompt_and_collect()'s docstring), "deadline"
     #: (budget expired), or "process_exit" (pi died mid-run). Callers must not
-    #: infer this from elapsed time -- a crash burns the full budget too,
-    #: because stdout EOF used not to wake the drain.
+    #: infer this from elapsed time.
     #:
     #: NOTE: agent_ended=True with stop_reason="deadline" is a reachable and
     #: meaningful combination as of the ACTIVE/SETTLING rewrite: it means a
