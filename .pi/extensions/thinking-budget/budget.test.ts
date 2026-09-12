@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import setupExtension from "./index.ts";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import setupExtension, { resolveAdaptiveBudget } from "./index.ts";
 
 // Exercise the char→token conversion (matches local/context_manager.py)
 function charsToTokens(chars: number): number {
@@ -215,6 +215,153 @@ describe("thinking-budget resolution", () => {
     await fire(h.pi, "turn_start", {}, h.ctx);
     // 200 chars ≈ 58 tokens — under the 100-token profile budget, over env's 10.
     await fire(h.pi, "message_update", thinkingDelta("x".repeat(200)), h.ctx);
+    expect(h.calls).toEqual([]);
+  });
+});
+
+// ── Mechanism 1: turn-boundary adaptive budget ──────────────────────────────
+// resolveAdaptiveBudget is pure/stateless, so it's exercised directly with
+// explicit inputs rather than through the extension harness.
+describe("resolveAdaptiveBudget", () => {
+  afterEach(() => {
+    delete process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS;
+    delete process.env.LITTLE_CODER_THINKING_ADAPT_OUTSIZED_FRACTION;
+  });
+
+  const NOW = 1_700_000_000_000;
+
+  it.each([
+    {
+      name: "no deadline configured -> baseBudget unchanged",
+      params: {
+        baseBudget: 4096,
+        remainingMs: Infinity,
+        avgTurnMs: 5000,
+        lastTurnMs: 600_000, // would be "outsized" if a deadline existed
+        now: NOW,
+        totalBudgetMs: Infinity,
+      },
+      expected: 4096,
+    },
+    {
+      name: "healthy: plenty of predicted turns, no outsized turn -> baseBudget unchanged",
+      params: {
+        baseBudget: 4096,
+        remainingMs: 600_000, // 10 min left
+        avgTurnMs: 30_000, // 30s/turn -> ~20 turns fit
+        lastTurnMs: 30_000,
+        now: NOW,
+        totalBudgetMs: 3_600_000, // 1h original window
+      },
+      expected: 4096,
+    },
+    {
+      name: "few predicted turns remain -> thinking off (0)",
+      params: {
+        baseBudget: 4096,
+        remainingMs: 60_000, // 1 min left
+        avgTurnMs: 30_000,
+        lastTurnMs: 30_000, // -> predicts 2 more turns, under the 4-turn floor
+        now: NOW,
+        totalBudgetMs: 3_600_000,
+      },
+      expected: 0,
+    },
+    {
+      name: "single turn ate an outsized share of the original budget -> halved",
+      params: {
+        baseBudget: 4096,
+        remainingMs: 2_500_000, // ~41.7 min left -> predicts ~4.16 turns, still healthy
+        avgTurnMs: 200_000,
+        lastTurnMs: 600_000, // 10 min, ~16.7% of the 1h original window
+        now: NOW,
+        totalBudgetMs: 3_600_000,
+      },
+      expected: 2048,
+    },
+  ])("$name", ({ params, expected }) => {
+    expect(resolveAdaptiveBudget(params)).toBe(expected);
+  });
+
+  it("thresholds are overridable via env vars", () => {
+    // remainingMs / turnEstimateMs predicts exactly 5 more turns: healthy
+    // under the default 4-turn floor, but a tightened override (6) now
+    // classifies it as too few turns remaining.
+    process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS = "6";
+    expect(
+      resolveAdaptiveBudget({
+        baseBudget: 4096,
+        remainingMs: 150_000,
+        avgTurnMs: 30_000,
+        lastTurnMs: 30_000,
+        now: NOW,
+        totalBudgetMs: 3_600_000,
+      }),
+    ).toBe(0);
+  });
+});
+
+// ── Mechanism 2: per-turn wall-clock guard ──────────────────────────────────
+// This is the mechanism that actually interrupts a hung in-flight generation
+// (mechanism 1's shrunk token budget can't stop a request already underway).
+describe("thinking-budget wall-clock guard", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    // A tiny hard cap so the test doesn't need to simulate 15 real minutes.
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "1000";
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS;
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+  });
+
+  it("fires the exact recovery sequence, in order, before abort, on breach", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    vi.advanceTimersByTime(1500); // past the 1000ms hard cap
+
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
+    expect(h.calls).toEqual(["set:off", "send", "notify", "abort"]);
+    expect(h.level()).toBe("off");
+    expect(h.followUps[0]).toMatch(/wall-clock/i);
+    expect(h.notifies[0]).toMatch(/harness intervention:.*wall-clock/i);
+  });
+
+  // This is the test that fails if the guard is placed AFTER the
+  // `ev.type !== "thinking_delta"` early-return: a non-thinking delta type
+  // (here, a plain text delta) must still trip the guard.
+  it("fires for a non-thinking delta type too, not just thinking_delta", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    vi.advanceTimersByTime(1500);
+
+    await fire(
+      h.pi,
+      "message_update",
+      { assistantMessageEvent: { type: "text_delta", delta: "hello there" } },
+      h.ctx,
+    );
+
+    expect(h.calls).toEqual(["set:off", "send", "notify", "abort"]);
+    expect(h.level()).toBe("off");
+  });
+
+  it("does not fire while comfortably within the guard window", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    vi.advanceTimersByTime(200); // well under the 1000ms hard cap
+
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
     expect(h.calls).toEqual([]);
   });
 });
