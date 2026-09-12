@@ -1112,6 +1112,66 @@ def prompt_with_error_retry(
         )
 
 
+# ── Log previews ────────────────────────────────────────────────────────────
+
+
+def preview_tool_result(text: str, limit: int = 400) -> str:
+    """Shorten a formatted tool result for a trajectory log, readably.
+
+    A raw `text[:limit]` slice -- what all three call sites used to do --
+    fails a log reader twice over: it lands mid-word, and it drops the
+    trailing `[exit=... cwd=... timed_out=... backend=...]` footer that
+    `_format_output()` appends, which is the single most useful line in the
+    whole result (did the command actually succeed, and where did it run?).
+    Every result longer than `limit` therefore lost exactly the part worth
+    keeping.
+
+    So: cut the BODY at the last newline or space before the budget, mark how
+    much was dropped, and re-attach the footer verbatim. The footer is taken
+    to be the final line when it is bracket-delimited -- the shape both
+    adapters' `_format_output()` always produces, and the reason this is a
+    line test rather than a search for "exit=".
+
+    Budget: the whole preview -- kept body, marker, footer -- stays within
+    `limit`, with the body giving up whatever room the other two need. The
+    one exception is a footer wider than `limit` itself, which is still
+    preserved in full: dropping it is the bug this exists to fix.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+
+    lines = text.split("\n")
+    footer = ""
+    body = text
+    if len(lines) > 1 and lines[-1].startswith("[") and lines[-1].endswith("]"):
+        footer = lines[-1]
+        body = "\n".join(lines[:-1])
+
+    # Reserve room for the marker so the common case stays within `limit`.
+    # A fixed reserve, not the marker's exact length, because that length
+    # depends on the omitted count, which depends on where we cut.
+    marker_reserve = 40
+    body_budget = max(0, limit - marker_reserve - (len(footer) + 1 if footer else 0))
+    if len(body) <= body_budget:
+        return f"{body}\n{footer}" if footer else body
+
+    cut = body[:body_budget]
+    for sep in ("\n", " "):
+        idx = cut.rfind(sep)
+        if idx > 0:
+            cut = cut[:idx]
+            break
+    # No boundary at all (one unbroken token wider than the budget) leaves
+    # `cut` as the hard slice -- unavoidable, and still better than also
+    # losing the footer.
+    marker = f"… [+{len(body) - len(cut)} chars truncated]"
+    # `if cut` so a footer wide enough to leave no body budget at all doesn't
+    # produce a preview that opens on a blank line.
+    out = f"{cut}\n{marker}" if cut else marker
+    return f"{out}\n{footer}" if footer else out
+
+
 # ── Environment snapshot ────────────────────────────────────────────────────
 
 

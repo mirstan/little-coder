@@ -97,6 +97,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rpc_client import (  # noqa: E402
     PiRpc,
     capture_environment_snapshot,
+    preview_tool_result,
     prompt_with_error_retry,
 )
 
@@ -900,7 +901,7 @@ class LittleCoderAgent(BaseAgent):
                 text = "\n".join(
                     c.get("text", "") for c in content if c.get("type") == "text"
                 )
-                live_log_fh.write(f"<< {text[:400]}\n")
+                live_log_fh.write(f"<< {preview_tool_result(text)}\n")
                 live_log_fh.flush()
             elif t == "turn_end":
                 # A turn that ended in a provider error, logged inline so the
@@ -1107,8 +1108,9 @@ class LittleCoderAgent(BaseAgent):
                     log_fh.write(f"=== assistant text ===\n{result.assistant_text}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
-                        preview = (tc.get("result_text", "") or "")[:400]
-                        log_fh.write(f"<< {preview}\n")
+                        log_fh.write(
+                            f"<< {preview_tool_result(tc.get('result_text', '') or '')}\n"
+                        )
                     notes = rpc.notifications() if hasattr(rpc, "notifications") else []
                     if notes:
                         log_fh.write(f"\n=== pi notifications ({len(notes)}) ===\n")

@@ -24,6 +24,7 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rpc_client import (  # noqa: E402
     PiRpc,
+    preview_tool_result,
     prompt_with_error_retry,
 )
 
@@ -349,8 +350,9 @@ class LittleCoderAgent(BaseAgent):
                     log_fh.write(f"=== assistant text ===\n{text_out}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
-                        preview = (tc.get("result_text", "") or "")[:400]
-                        log_fh.write(f"<< {preview}\n")
+                        log_fh.write(
+                            f"<< {preview_tool_result(tc.get('result_text', '') or '')}\n"
+                        )
                     # Extension notifications: per-turn evidence of
                     # skill-inject / knowledge-inject / thinking-budget /
                     # quality-monitor / turn-cap firing. Structured as one

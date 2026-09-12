@@ -261,3 +261,5 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     assert "prompt_with_error_retry" in source
     assert "rpc.prompt_and_collect(" not in source, "should go through the retry helper"
     assert "n_error_retries" in source
+    assert "preview_tool_result(" in source
+    assert "[:400]" not in source, "raw slice should be gone from the log previews"
