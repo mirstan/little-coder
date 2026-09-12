@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import setupSkillInject, { looksLikeResearchTask, shouldInjectResearchDirective } from "./index.ts";
+import setupSkillInject, {
+  looksLikeResearchTask,
+  looksLikeTemporalTask,
+  shouldInjectResearchDirective,
+  shouldInjectTemporalDirective,
+} from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
 
 // End-to-end check of the #73 conversion: drive the real `before_agent_start`
@@ -336,6 +341,103 @@ describe("research directive gates on browse-tool availability", () => {
     const result = await handler(event, ctx);
 
     expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
+  });
+});
+
+// mteb-leaderboard trajectory: the model correctly noticed the task named a
+// past date, but "answered" it by filtering today's live leaderboard by an
+// unrelated proxy field (model release date) instead of finding an actual
+// dated snapshot. The temporal directive exists to redirect that pattern
+// toward a git revision / archived page instead.
+describe("temporal directive triggers on phrasing that names a PAST state", () => {
+  it("fires for each TEMPORAL_TRIGGERS regex on a realistic example phrase", () => {
+    expect(looksLikeTemporalTask("what was on top as of August 2025?")).toBe(true);
+    expect(looksLikeTemporalTask("at the time, GPT-4 was the top model")).toBe(true);
+    expect(looksLikeTemporalTask("what did the historical rankings look like?")).toBe(true);
+    expect(looksLikeTemporalTask("historically, this model ranked lower")).toBe(true);
+    expect(looksLikeTemporalTask("give me a snapshot of the results")).toBe(true);
+    expect(looksLikeTemporalTask("what was the MTEB leaderboard as of March 2024?")).toBe(true);
+    expect(looksLikeTemporalTask("check the 2023 leaderboard for the top row")).toBe(true);
+  });
+
+  // Deliberate near-miss: "historic" (an adjective describing an old
+  // building) is not "historical"/"historically" and must not be treated as
+  // a signal that the task wants a past snapshot of live/versioned data.
+  it("does not fire for 'historic building' (proper adjective use, not a temporal-research signal)", () => {
+    expect(
+      looksLikeTemporalTask("This town has several historic buildings from the 1800s."),
+    ).toBe(false);
+  });
+
+  it("does not inject the directive when no git-capable/browse tool is available, even though the trigger matches", async () => {
+    const readOnly = new Set(["read", "edit"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", readOnly)).toBe(false);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = ["read", "edit"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Temporal-research directive");
+  });
+
+  it("injects when a git-capable shell tool is available even without any browse tool", async () => {
+    const shellOnly = new Set(["ShellSession", "ShellSessionCwd", "ShellSessionReset"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", shellOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = [
+      "ShellSession",
+      "ShellSessionCwd",
+      "ShellSessionReset",
+    ];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").toContain("## Temporal-research directive");
+    // ShellSession-only can't reach an archived web page, so the directive
+    // should only mention the git route, not the web.archive.org one.
+    expect(result?.message?.content ?? "").toContain("git log");
+    expect(result?.message?.content ?? "").not.toContain("web.archive.org");
+  });
+
+  it("injects when only browse tools are available even without a shell tool", async () => {
+    const browseOnly = new Set(["websearch"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", browseOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = ["websearch"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").toContain("## Temporal-research directive");
+    expect(result?.message?.content ?? "").toContain("web.archive.org");
+    expect(result?.message?.content ?? "").not.toContain("git log");
+  });
+
+  it("fires both the research and temporal directives on a prompt that trips both, temporal last", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const result = await handler(
+      turn("please research the leaderboard as of March 2024"),
+      ctx,
+    );
+    const content: string = result?.message?.content ?? "";
+
+    expect(content).toContain("## Research-first directive");
+    expect(content).toContain("## Temporal-research directive");
+    // The more specific, corrective directive wins the recency argument.
+    expect(content.indexOf("## Temporal-research directive")).toBeGreaterThan(
+      content.indexOf("## Research-first directive"),
+    );
+  });
+
+  it("skips a repeat of the identical temporal-directive block on the next turn", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const first = await handler(turn("what was the leaderboard as of March 2024?"), ctx);
+    expect(first?.message?.content ?? "").toContain("## Temporal-research directive");
+
+    const second = await handler(turn("what was the leaderboard as of March 2024?"), ctx);
+    expect(second).toBeUndefined();
   });
 });
 

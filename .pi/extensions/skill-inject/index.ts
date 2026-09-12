@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseSkillFile } from "./frontmatter.ts";
 import { injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
+import { SHELL_TOOLS } from "../_shared/shell-write.ts";
 
 // ── Tool-skill registry ─────────────────────────────────────────────────
 // Port of local/skill_augment.py. Loads skills/tools/*.md once, hooks
@@ -335,6 +336,106 @@ function researchDirective(allowed: Set<string> | undefined): string {
   return lines.join("\n");
 }
 
+// Keyword-triggered directive: when the prompt asks about a PAST state of
+// something (a leaderboard "as of" some date, a repo "at the time" of a
+// release, a "historical" snapshot), warn the model against reconstructing
+// that past state by filtering CURRENT data with an unrelated proxy field.
+//
+// This is the mteb-leaderboard trajectory: the model correctly noticed the
+// question named a past date, but then "answered" it by filtering today's
+// live leaderboard by an unrelated proxy field (model release date) instead
+// of finding an actual dated snapshot -- a git commit of the underlying
+// results repo (which the reference solution used) or an archived web page.
+// It never considered a versioned/archived source at all.
+//
+// Deliberately does NOT match on bare "historic" -- "historic building" is a
+// proper-noun/adjective use (an old building), not a signal that the task
+// wants a past snapshot of live/versioned data. Requiring "historical"/
+// "historically" keeps that phrase from tripping the gate; see the
+// "historic building" non-firing case in injection.test.ts.
+const TEMPORAL_TRIGGERS = [
+  /\bas of\b/i,
+  /\bat the time\b/i,
+  /\bhistorical(?:ly)?\b/i,
+  /\bsnapshot\b/i,
+  // "leaderboard as of/in/on <date>" and similar phrasing that names a
+  // versioned source and a temporal anchor together.
+  /\b(?:leaderboard|repo(?:sitory)?|dataset|ranking)s?\b[^.\n]{0,40}\b(?:as of|in|on)\b[^.\n]{0,20}\b(?:19|20)\d{2}\b/i,
+  // An explicit past date sitting near one of those nouns, date-first order
+  // (e.g. "the 2023 leaderboard", "as it stood in 2022's dataset release").
+  /\b(?:19|20)\d{2}\b[^.\n]{0,40}\b(?:leaderboard|repo(?:sitory)?|dataset|ranking)s?\b/i,
+];
+
+export function looksLikeTemporalTask(text: string): boolean {
+  if (!text) return false;
+  for (const re of TEMPORAL_TRIGGERS) {
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
+// True when at least one git-capable shell tool (bash / ShellSession /
+// ShellStart -- see SHELL_TOOLS in _shared/shell-write.ts, the same canonical
+// list permission-gate and write-guard share, reused here rather than
+// redefined) is callable. The temporal directive's git-log/git-show advice is
+// dead guidance without one.
+function anyShellToolAvailable(allowed: Set<string> | undefined): boolean {
+  if (!allowed) return true;
+  for (const t of SHELL_TOOLS) if (allowed.has(t)) return true;
+  return false;
+}
+
+/** Should the temporal-research directive be injected for this prompt/allow-list?
+ *  Exported for unit testing alongside looksLikeTemporalTask.
+ *
+ *  Gated on either a git-capable shell tool (to read a historical revision)
+ *  or the same browse-tool gate the research directive uses (to reach an
+ *  archived/versioned copy of a live page). Reuses BROWSE_TOOLS /
+ *  BROWSER_RESEARCH_PAIR rather than redefining a second browse gate. */
+export function shouldInjectTemporalDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  return (
+    looksLikeTemporalTask(prompt) &&
+    (anyShellToolAvailable(allowed) ||
+      toolsAvailable(["websearch"], allowed) ||
+      toolsAvailable(BROWSER_RESEARCH_PAIR, allowed))
+  );
+}
+
+// Built per-turn (like researchDirective) so the advice only names sources
+// that are actually reachable given this turn's allow-list.
+function temporalDirective(allowed: Set<string> | undefined): string {
+  const canGit = anyShellToolAvailable(allowed);
+  const canBrowse =
+    toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed);
+  const lines = [
+    "",
+    "## Temporal-research directive",
+    "This task asks about a PAST state, not the current/live state. Do not " +
+      "approximate the past by filtering current data with an unrelated proxy " +
+      "field (e.g. a release date, version string) -- that reconstructs a " +
+      "different thing, not the historical state actually asked about.",
+  ];
+  if (canGit) {
+    lines.push(
+      "- If the data lives in a git repository, use `git log` / " +
+        "`git show <rev>:<path>` to read an actual historical snapshot from " +
+        "around the relevant date.",
+    );
+  }
+  if (canBrowse) {
+    lines.push(
+      "- For live web data, prefer an archived/versioned copy (e.g. " +
+        "web.archive.org) over the current live page.",
+    );
+  }
+  lines.push("State which historical snapshot or archived source you actually used.");
+  lines.push("");
+  return lines.join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
   // `/skills` (issue #118). pi's own `/skill:name` addresses pi skills; these
   // cards are a different mechanism (selected per turn by error-recovery >
@@ -392,8 +493,9 @@ export default function (pi: ExtensionAPI) {
 
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
+    const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
 
-    if (selected.length === 0 && !researchTask) return;
+    if (selected.length === 0 && !researchTask && !temporalTask) return;
 
     const skillBlock = selected.length > 0
       ? (() => {
@@ -410,13 +512,20 @@ export default function (pi: ExtensionAPI) {
         })()
       : "";
 
-    const directive = researchTask ? researchDirective(allowed) : "";
-
-    // Order within the block: [tool skill cards] [research directive]. The
-    // directive comes LAST by design — small models show strong recency bias
-    // and the per-task instruction is what we want freshest in their
-    // attention. Delivered at the conversation tail (see _shared/inject.ts),
-    // which is later still than the end of the system prompt.
+    // Order within the block: [tool skill cards] [research directive]
+    // [temporal directive]. Both directives come after the skill cards by
+    // design — small models show strong recency bias and the per-task
+    // instructions are what we want freshest in their attention. The
+    // temporal directive comes LAST of all: it is the more specific,
+    // corrective one (don't reconstruct a past state from current data),
+    // so it wins the recency argument over the more general research
+    // directive when a prompt trips both (e.g. "research the leaderboard as
+    // of March 2024"). Delivered at the conversation tail (see
+    // _shared/inject.ts), which is later still than the end of the system
+    // prompt.
+    const directive =
+      (researchTask ? researchDirective(allowed) : "") +
+      (temporalTask ? temporalDirective(allowed) : "");
     const block = skillBlock + directive;
 
     // Identical to last turn's block? The previous copy is still in the
@@ -431,6 +540,7 @@ export default function (pi: ExtensionAPI) {
         parts.push(`+${selected.length} [${selected.map((s) => s.targetTool).join(",")}]`);
       }
       if (researchTask) parts.push("+research-directive");
+      if (temporalTask) parts.push("+temporal-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
     } catch {
       // UI unavailable in some run modes — silent best-effort
