@@ -416,10 +416,101 @@ def test_chatty_stream_bounded_by_absolute_settle_window(fake_pi, tmp_path):
     assert r.stop_reason == "agent_end"
 
 
+# ── provider-error completions ───────────────────────────────────────────
+
+
+def test_error_completion_reports_error_and_message(fake_pi, tmp_path):
+    """The shape three of three error-truncated TB2.1 trials actually hit:
+    `turn_end stopReason=error hasText=false hasToolCalls=false`, then
+    agent_end, then silence. It used to report a clean "agent_end", which is
+    exactly why the trial looked finished instead of broken."""
+    with fake_pi("error_end", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.agent_ended is True
+    assert r.stop_reason == "error"
+    assert r.error_message == "upstream 500 from provider"
+
+
+def test_empty_completion_without_error_message_is_error(fake_pi, tmp_path):
+    """Nothing on the wire says "error" -- the turn just came back with no
+    text and no tool calls. Providers do report an empty body as a normal
+    stop, so the content fingerprint has to catch this one on its own."""
+    with fake_pi("error_empty_completion", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.stop_reason == "error"
+    assert r.error_message == "empty completion"
+
+
+def test_last_agent_end_wins_over_an_earlier_errored_one(fake_pi, tmp_path):
+    """THE ordering rule: two agent_end events in one call, the first
+    errored, the second clean. A verdict latched at the first would report
+    "error" for a call that demonstrably recovered and finished -- and would
+    then have the adapter re-prompt an agent that was already done."""
+    with fake_pi("error_then_clean_same_call", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.stop_reason == "agent_end"
+    assert r.error_message == ""
+    assert r.turn_count == 2
+    assert "recovered answer" in r.assistant_text
+
+
+def test_will_retry_agent_end_is_not_our_error(fake_pi, tmp_path):
+    """pi's own retry is already queued (willRetry:true) and succeeds in the
+    same call. Counting it as our error too would double-retry a turn pi was
+    handling itself."""
+    with fake_pi("error_but_will_retry", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.stop_reason == "agent_end"
+    assert r.error_message == ""
+    assert "recovered answer" in r.assistant_text
+
+
+def test_deadline_outranks_an_earlier_error(fake_pi, tmp_path):
+    """"error" refines the agent_end branch only. Here a turn errored and a
+    continuation then hung, so the call ended because the budget ran out --
+    "deadline" is the more informative fact about a truncated trial and must
+    not be displaced."""
+    with fake_pi("error_then_continuation_hangs", tmp_path) as rpc:
+        t0 = time.time()
+        r = rpc.prompt_and_collect("go", timeout=3, settle_grace=1)
+        elapsed = time.time() - t0
+    assert elapsed >= 3
+    assert r.stop_reason == "deadline"
+    assert r.error_message == ""
+
+
+def test_error_then_clean_across_two_prompts_on_one_session(fake_pi, tmp_path):
+    """The adapters' retry path, end to end: prompt 1 errors, the re-prompt
+    on the SAME session completes. Pins that an errored call leaves the
+    session usable -- re-prompting is only cheaper than restarting because
+    the transcript survives."""
+    with fake_pi("error_then_clean", tmp_path) as rpc:
+        r1 = rpc.prompt_and_collect("go", timeout=30)
+        r2 = rpc.prompt_and_collect("continue", timeout=30)
+    assert r1.stop_reason == "error"
+    assert r2.stop_reason == "agent_end"
+    assert "second answer" in r2.assistant_text
+
+
+def test_prompt_with_error_retry_recovers_on_the_same_session(fake_pi, tmp_path):
+    """prompt_with_error_retry against a real (fake) pi process rather than a
+    stubbed rpc: one error, one retry, recovered -- and the error that was
+    recovered from is still reported, not erased by the success."""
+    with fake_pi("error_then_clean", tmp_path) as rpc:
+        outcome = rpc_client.prompt_with_error_retry(
+            rpc, "go", 600, sleep=lambda _s: None,
+        )
+    assert outcome.n_error_retries == 1
+    assert outcome.error_message == "upstream 500 from provider"
+    assert outcome.result.stop_reason == "agent_end"
+    assert "second answer" in outcome.result.assistant_text
+
+
 def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False
     assert r.tool_calls == []
+    assert r.error_message == ""
     assert r.usage == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
 
 

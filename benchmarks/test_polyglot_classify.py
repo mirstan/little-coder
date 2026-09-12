@@ -59,6 +59,12 @@ def test_is_empty_response(res, expected):
     # process_exit outranks emptiness -- the process dying is the bigger fact
     (Res(stop_reason="process_exit", turn_count=1, tool_calls=[], assistant_text=""),
      "process_exit"),
+    # rpc_client's "error" is a refinement of agent_end, not a fourth peer:
+    # the classification still comes from the content shape, so an errored
+    # attempt lands exactly where it landed before the value existed.
+    (Res(stop_reason="error", turn_count=1, tool_calls=[], assistant_text=""),
+     "empty_response"),
+    (Res(stop_reason="error"), "completed"),
 ])
 def test_attempt_outcome(res, expected):
     assert AP._attempt_outcome(res) == expected

@@ -435,7 +435,12 @@ def _exit_code(records_written: dict) -> int:
 
 
 def _stop_reason(result) -> str:
-    """Why an attempt ended: agent_end | deadline | process_exit.
+    """Why an attempt ended: agent_end | error | deadline | process_exit.
+
+    "error" (a provider-error or empty completion) is a refinement of
+    "agent_end", not a fourth peer: _attempt_outcome below deliberately does
+    not branch on it, so an errored attempt keeps classifying exactly as it
+    did before the value existed -- see that function.
 
     Shim, deliberately: if rpc_client predates PromptResult.stop_reason (or that
     change is reverted -- it has been once already), fall back to the old signal
@@ -454,6 +459,11 @@ def _is_empty_response(result) -> bool:
     no turn of work and no assistant text. Six of sixteen recorded attempts in
     this repo's log tree look like this. Classified as agent_end they read as
     clean failures, hiding a provider-side fault behind a model-quality number.
+
+    Keyed on the content shape alone, never on the stop_reason string -- which
+    is why rpc_client growing a stop_reason of "error" for this same shape
+    changes nothing here: agent_ended stays True on that path, so an empty
+    completion still classifies as "empty_response" exactly as before.
     """
     return (
         getattr(result, "agent_ended", False)
@@ -464,7 +474,16 @@ def _is_empty_response(result) -> bool:
 
 
 def _attempt_outcome(result) -> str:
-    """One attempt's outcome, independent of whether the tests passed."""
+    """One attempt's outcome, independent of whether the tests passed.
+
+    "error" is intentionally absent from the process_exit/deadline check: it
+    means the session ended on a completion that failed, which is an
+    agent_end at this level. An errored attempt with the empty shape falls to
+    "empty_response" (where it already landed before the value existed); one
+    with real work behind it falls to "completed", same as any other attempt
+    that finished without passing. The retry that makes an errored completion
+    worth reacting to lives in the Harbor/TB adapters, not in this scorer.
+    """
     reason = _stop_reason(result)
     if reason in ("process_exit", "deadline"):
         return reason
