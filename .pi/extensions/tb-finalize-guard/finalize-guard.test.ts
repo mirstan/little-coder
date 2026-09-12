@@ -49,6 +49,34 @@ function assistantTurn(opts: { text?: string; toolCalls?: number; stopReason?: s
   return { message: { content, stopReason: opts.stopReason } };
 }
 
+// A raw assistant message (role + content + stopReason), for Trigger C's
+// agent_end tests — built from the same options as assistantTurn, but
+// returned as a bare message object (with `role`) rather than wrapped in a
+// turn_end-shaped `{ message }` event, since agent_end's payload is
+// `{ messages: AgentMessage[] }` and lastAssistantMessage() filters on role.
+function assistantMessage(opts: { text?: string; toolCalls?: number; stopReason?: string }) {
+  const content: any[] = [];
+  if (opts.text !== undefined) content.push({ type: "text", text: opts.text });
+  for (let i = 0; i < (opts.toolCalls ?? 0); i++) {
+    content.push({ type: "toolCall", name: "websearch", arguments: {} });
+  }
+  return { role: "assistant", content, stopReason: opts.stopReason };
+}
+
+// An agent_end event whose `messages` array ends with an assistant message
+// of the given shape. Includes a leading user message so a test failure
+// where lastAssistantMessage() forgot to filter by role (and just grabbed
+// the array's last element) would still be caught by other cases below.
+function agentEndEvent(opts: { text?: string; toolCalls?: number; stopReason?: string }) {
+  return {
+    messages: [{ role: "user", content: "do the task" }, assistantMessage(opts)],
+  };
+}
+
+async function agentEnd(h: ReturnType<typeof makeHarness>, event: any) {
+  await fire(h.pi, "agent_end", event, h.ctx);
+}
+
 // A turn that ran zero or more ShellSession commands — used for Trigger B's
 // write-classification checks. Deliberately has no text and no non-shell
 // tool call, so it never matches Trigger A's shape (a ShellSession call
@@ -490,6 +518,129 @@ describe("tb-finalize-guard", () => {
       await turn(h, assistantTurn({ text: "I believe I'm done." }));
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).toMatch(/stopped without calling a tool/i);
+    });
+  });
+
+  describe("Trigger C — dead run: errored or empty final message on agent_end", () => {
+    it("fires when the last assistant message has stopReason 'error'", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({ text: "oops", stopReason: "error" }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
+      expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+      expect(h.sent[0].text).toMatch(/task is not complete/i);
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(true);
+    });
+
+    it("fires when the last assistant message is empty (no text, no tool calls)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({}));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+    });
+
+    it("fires regardless of remaining budget — no deadline known, still fires", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h); // no deadline set at all
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("does not fire on a clean/successful agent_end", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({ text: "All done.", toolCalls: 1, stopReason: "stop" }));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("does not fire for non-terminal_bench sessions", async () => {
+      process.env.LITTLE_CODER_BENCHMARK = "gaia";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("honors the fire cap of 2 — a 3rd qualifying agent_end does not fire", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(2);
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(2);
+    });
+
+    it("resets on session_start, allowing fresh fires for a new task", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(2);
+
+      await newSession(h); // session_start resets the latch
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(3);
+    });
+
+    it("does not burn the fire cap or notify when sendUserMessage throws", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+
+      h.state.sendThrows = true;
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toEqual([]);
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(false);
+
+      h.state.sendThrows = false;
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("Trigger A/B/C fire caps are independent of each other", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 10);
+
+      // Exhaust Trigger A's session cap (2 fires).
+      await turn(h, assistantTurn({ text: "One." })); // turn 1
+      await turn(h, assistantTurn({ text: "Two." })); // turn 2
+      expect(h.sent).toHaveLength(2);
+
+      // Trigger C fires twice via agent_end, unaffected by Trigger A's
+      // now-exhausted cap.
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(4);
+      // Trigger C's own cap is now exhausted; a 3rd agent_end does not fire.
+      await agentEnd(h, agentEndEvent({ stopReason: "error" }));
+      expect(h.sent).toHaveLength(4);
+
+      // Trigger A's cap is still exhausted, unaffected by Trigger C's fires.
+      await turn(h, assistantTurn({ text: "Three." })); // turn 3
+      expect(h.sent).toHaveLength(4);
+
+      // Drive turns up to Trigger B's arm point (turn 6 for capForRun=10)
+      // with no-op shell turns, then two non-compliant turns to fire B —
+      // proving B's arming/latch was untouched by A's and C's exhausted caps.
+      await turn(h, shellTurn(["ls -la"])); // turn 4
+      await turn(h, shellTurn(["ls -la"])); // turn 5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
+      await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
+      expect(h.sent).toHaveLength(5);
     });
   });
 
