@@ -42,25 +42,18 @@ import { resolveTurnCap } from "../_shared/turn-cap.ts";
 // they only describe the current run's position against the turn cap.
 
 // A close mirror of gaia_scorer.py's extract_final_answer() regex, applied
-// per physical line like the Python version (splitlines() + line.strip()) —
-// NOT the naive line-blob version this extension shipped with initially,
-// which used a bare `\s*` between the colon and the value. That let the
-// value cross a newline (e.g. "Answer:\n42"), which the Python scorer never
-// allows (it matches within one already-newline-free line), so this guard
-// could wrongly treat a multi-line trailer as "answered" when the scorer
-// would actually reject it and fall through to its own last-non-empty-line
-// fallback. Fixed here:
+// per physical line like the Python version (splitlines() + line.strip()):
 //   - `^\s*` tolerates leading indentation, mirroring the scorer's
 //     line.strip() before matching.
 //   - `[ \t]*` (not `\s*`) between the colon and the value can't cross a
-//     newline, matching the scorer's same-physical-line requirement.
+//     newline, matching the scorer's same-physical-line requirement — the
+//     scorer never accepts a value on the next line ("Answer:\n42"), so
+//     neither may this guard.
 //   - `(\S.*)$` requires a non-whitespace value, catching a bare "Answer:"
-//     with nothing meaningful after it — worth nudging on even though the
-//     scorer itself doesn't special-case it (it would match, .strip() the
-//     captured value down to "", and return that empty string rather than
-//     falling back — deliberately stricter here, not a scorer bug we need
-//     to reproduce exactly, since a bare "Answer:" is exactly the kind of
-//     unfinished reply this guard exists to catch).
+//     with nothing meaningful after it — deliberately stricter than the
+//     scorer (which would match, strip the value to "", and return that),
+//     since a bare "Answer:" is exactly the kind of unfinished reply this
+//     guard exists to catch.
 const ANSWER_LINE_RE = /^\s*(?:final\s+answer|answer)\s*[:\-][ \t]*(\S.*)$/im;
 
 let nudgedThisSession = false;

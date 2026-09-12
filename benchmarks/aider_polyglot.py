@@ -69,14 +69,10 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-#: Per-attempt RPC budget, seconds. 900 suited a fast hosted model, but a
-#: local model with a genuine large thinking budget (PR #17 fixed
-#: omlx/rapidmlx's thinking_budget profile, previously silently stuck at
-#: 4096) needs real headroom -- wordy/transpose already hit 691-722s even
-#: at that broken smaller budget, and GAIA runs under the real 32768 budget
-#: showed single completions taking 200-900+s. Tripled to 2700, matching
-#: the same 3x used for GAIA's --timeout, so a hard multi-turn exercise is
-#: capability-limited rather than clock-limited.
+#: Per-attempt RPC budget, seconds. A local model with a real large thinking
+#: budget needs headroom: wordy/transpose hit 691-722s even at a smaller
+#: budget, and GAIA completions under the 32768 budget ran 200-900+s. 2700
+#: keeps a hard multi-turn exercise capability-limited, not clock-limited.
 ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
 #: Per-attempt budget for `codex exec`, seconds.
 CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
@@ -132,10 +128,8 @@ def _run_python(work: Path, timeout: int):
 # the rest are disabled via Jest's xtest()/xit()/.skip() ("unlock more tests
 # as you pass" -- an interactive-workflow convention, not a runtime gate).
 # Un-skip them all before running, or scoring only checks 1 of up to ~49
-# cases per exercise. Same defect independently found and fixed in Harbor's
-# packaged aider-polyglot verifier (harness/patch_aider_polyglot_xitstrip.py
-# in the qwen36-aa repo) -- confirmed here directly against the raw upstream
-# exercise fixtures (Aider-AI/polyglot-benchmark), not just Harbor's copy.
+# cases per exercise. Confirmed directly against the raw upstream exercise
+# fixtures (Aider-AI/polyglot-benchmark), not just Harbor's copy.
 _JS_UNSKIP_PATTERNS = [
     (re.compile(r"\bxtest\("), "test("),
     (re.compile(r"\bxit\("), "it("),
@@ -562,11 +556,8 @@ def _run_codex_turn(
     """
     # Under log_dir, not work: work is the sandbox's writable root, so a file
     # there is visible to the model (who could delete or overwrite it) and
-    # gets copied into every _score() snapshot. A fixed name under `work`
-    # also went stale across attempts when resume never actually ran (the
-    # bug this whole rewrite fixes) -- attempt 2's read would silently pick
-    # up attempt 1's leftover file. Naming it per-attempt removes that hazard
-    # even now that resume is fixed.
+    # gets copied into every _score() snapshot. Named per-attempt so attempt
+    # 2's read can't pick up attempt 1's leftover file.
     out_file = log_dir / f"codex_last_message_{attempt_name}.txt"
 
     if session_id is None:

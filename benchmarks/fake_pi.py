@@ -294,7 +294,7 @@ def main():
         return
 
     if mode == "settled_after_extra_event":
-        # Pins Bug A: agent_settled arrives right after an unrelated event
+        # agent_settled arrives right after an unrelated event
         # (not immediately after agent_end). The old two-phase drain's
         # Phase 1 predicate only matched agent_end, so this agent_settled
         # was treated as an ordinary event and Phase 1 waited out the
@@ -308,7 +308,7 @@ def main():
         return
 
     if mode == "retry_then_settled":
-        # Pins the PR28 repro: an auto_retry_end between agent_end and
+        # An auto_retry_end between agent_end and
         # agent_settled must not be mistaken for "a continuation started"
         # (which would re-arm the full remaining timeout).
         emit({"type": "response", "id": rid, "success": True})
@@ -323,9 +323,9 @@ def main():
         # Same sequence as abort_then_followup, but pi exits immediately
         # after agent_settled instead of sleeping -- combined with a slow
         # on_event in the test, this lets the reader thread race ahead and
-        # set _eof before the consumer has drained the whole queue. Pins
-        # Bug B: the old "if self._eof: break" guards discarded the queued
-        # recovery turn in exactly this race.
+        # set _eof before the consumer has drained the whole queue. The old
+        # "if self._eof: break" guards discarded the queued recovery turn in
+        # exactly this race.
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
         emit({"type": "message_update",
@@ -340,7 +340,7 @@ def main():
         os._exit(0)
 
     if mode == "end_then_stray_then_hang":
-        # Pins Bug C's specific "stray must not re-arm" case: a duplicate
+        # The "stray must not re-arm" case: a duplicate
         # agent_end while SETTLING must not restart the settle window, and
         # must not be treated as renewed work either. pi then hangs forever
         # without ever emitting agent_settled.
@@ -352,7 +352,7 @@ def main():
         return
 
     if mode == "continuation_never_finishes":
-        # Pins Bug D: a genuine continuation starts (agent_start) but never
+        # A genuine continuation starts (agent_start) but never
         # finishes. The call must run the full outer timeout and report
         # stop_reason="deadline" -- NOT "agent_end", even though an
         # agent_end was seen earlier in this same call.

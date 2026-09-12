@@ -17,9 +17,7 @@ TB_RUNS="$REPO_ROOT/benchmarks/tb_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  # Portable, no find/printf: -regextype and -printf are GNU-only, so this
-  # was a silent no-op on macOS's real BSD find (same bug diagnosed and
-  # fixed in harbor_status.sh's identical run-dir-autodetection). Names are
+  # Portable, no find/printf: -regextype and -printf are GNU-only. Names are
   # ISO-date-prefixed (leaderboard-YYYY-MM-DD...), so lexicographic string
   # comparison is correct here -- no mtime lookup needed.
   NEWEST=""

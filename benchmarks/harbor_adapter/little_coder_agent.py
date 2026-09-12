@@ -198,14 +198,7 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
         # A legacy name@version trial config's task dict has "path" (a bare
         # task name, e.g. "configure-git-webserver"); a newer org/name
         # package dataset's has "name" instead (namespaced, e.g.
-        # "terminal-bench/some-task") and no "path" key at all -- using the
-        # wrong key unconditionally raised KeyError, silently swallowed by
-        # this function's own broad except-fallback, so every trial under a
-        # package dataset silently used DEFAULT_PROMPT_TIMEOUT_SEC instead of
-        # its real per-task budget. That's a real risk, not just a wrong
-        # number: a task under-timed this way can be hard-killed by Harbor's
-        # own enforcement while this function still thinks it has budget
-        # left. Both shapes are read from config.json directly, not assumed.
+        # "terminal-bench/some-task") and no "path" key at all.
         task_name = task.get("name")
         if task_name is not None:
             # Package shape. task_name is typically namespaced
@@ -228,13 +221,10 @@ def _resolve_trial_timeout_info(logs_dir: Path | None) -> dict:
                     match_path = candidate
                     resolution = "exact-ref"
             if match_path is None and ref.startswith("sha256:"):
-                # Wildcard org, exact content hash: task_name had no
-                # "<org>/" prefix (a bare package-shape name), which used to
-                # force org="*" and skip the exact-ref fast path above
-                # entirely -- even though the content hash alone already
-                # identifies a real, unambiguous directory regardless of
-                # which org it lives under. This outranks the
-                # generation-mixing fallback glob below because the hash
+                # Bare (un-namespaced) package name, so org is "*": the
+                # content hash alone still identifies a real, unambiguous
+                # directory regardless of which org it lives under. Outranks
+                # the generation-mixing fallback glob below because the hash
                 # match is exact.
                 ref_hex = ref.split(":", 1)[1]
                 glob_matches = sorted(
@@ -637,12 +627,10 @@ class LittleCoderAgent(BaseAgent):
         live_log_fh = live_log_path.open("w") if self.logs_dir else None
         pending_text: list[str] = []
         # Turn boundary counter for the markers below. One prompt_and_collect
-        # call can now legitimately span several agent_end events (an
+        # call can legitimately span several agent_end events (an
         # abort-then-recover continuation, an auto-retry, ...), so an
-        # unqualified "=== agent_end ===" marker (the original version of
-        # this closure, and the misdiagnosis evidence cited by this PR's own
-        # first commit) is worse than before: a reader tailing the live log
-        # would stop at the FIRST agent_end and miss every turn after it.
+        # unqualified "=== agent_end ===" marker would stop a reader tailing
+        # the live log at the FIRST agent_end and hide every turn after it.
         # Track turn boundaries explicitly instead -- agent_settled is the
         # only line a reader should treat as "the trial's turn is actually
         # done".
@@ -777,22 +765,16 @@ class LittleCoderAgent(BaseAgent):
                 max_turns=max_turns,
                 tb_shell_handler=tb_shell_handler,
                 # permission-gate's SAFE_PREFIXES whitelist is meant to guard
-                # a real user's own machine during interactive use; its own
-                # header comment already documents the opt-out for exactly
-                # this context: "'accept-all' mode all commands pass
-                # (benchmark runs set this explicitly)". Docker is the actual
-                # isolation boundary for a TB trial, not the whitelist, and
-                # every other TB agent (bare pi, codex) already runs here
-                # with unrestricted tool access -- so withholding it only
-                # from little-coder was an unfair, unintentional handicap,
-                # not a deliberate safety choice. Observed directly: fix-git
-                # blocked on `cd`/`git -C` (no way to work outside /app),
-                # prove-plus-comm blocked on `coqc` (wrote a correct proof,
-                # couldn't compile it), configure-git-webserver blocked on
-                # `setsid`/`nc`/`socat`/`crontab` (no way to daemonize the
-                # server the task needed running) -- three different tools
-                # across three unrelated tasks, not a pattern fixable by
-                # allow-listing one command at a time.
+                # a real user's own machine during interactive use, and its
+                # own header documents this opt-out for benchmark runs.
+                # Docker is the actual isolation boundary for a TB trial, and
+                # every other TB agent (bare pi, codex) already runs here with
+                # unrestricted tool access. Observed directly: fix-git blocked
+                # on `cd`/`git -C`, prove-plus-comm blocked on `coqc`,
+                # configure-git-webserver blocked on `setsid`/`nc`/`socat`/
+                # `crontab` -- three different tools across three unrelated
+                # tasks, not a pattern fixable by allow-listing one command at
+                # a time.
                 env={
                     "LITTLE_CODER_PERMISSION_MODE": "accept-all",
                     "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
