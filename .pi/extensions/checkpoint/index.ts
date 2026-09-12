@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
+import { SHELL_TOOLS, detectWriteTargets } from "../_shared/shell-write.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
 // or Edit tool modifies it. First-write-wins per session (don't re-backup
@@ -64,15 +65,47 @@ export default function (pi: ExtensionAPI) {
     currentSessionId = ctx.sessionManager.getSessionFile()?.split("/").pop() ?? "default";
   });
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     const name = (event as any).toolName;
-    if (name !== "write" && name !== "Write" && name !== "edit" && name !== "Edit") {
+    const input: any = (event as any).input ?? (event as any).args;
+
+    if (name === "write" || name === "Write" || name === "edit" || name === "Edit") {
+      const filePath = checkpointPath(input ?? {});
+      if (filePath) {
+        backupIfNeeded(currentSessionId, filePath);
+      }
       return;
     }
-    const input: any = (event as any).input ?? (event as any).args;
-    const filePath = checkpointPath(input ?? {});
-    if (filePath) {
-      backupIfNeeded(currentSessionId, filePath);
+
+    // Issue: a model's own buggy shell script overwrote a task file in place
+    // with garbage, and no backup existed anywhere — the net above only
+    // watches the write/edit tools, not a shell command that redirects output
+    // to a file (`cat > f`, `tee f`, `dd of=f`, …). Reuse the same detector
+    // permission-gate/write-guard already rely on for this exact parsing job
+    // (issue #70) so a shell-redirect write gets the same pre-write snapshot.
+    //
+    // Two known limitations of this net:
+    // - `detectWriteTargets` only understands shell-redirection syntax; it
+    //   cannot see a program's own internal file writes (e.g. a Python/C
+    //   script's `open(path).write(...)`). This closes the shell-redirect-
+    //   shaped gap, not a general backstop against every way a subprocess can
+    //   modify a file.
+    // - `ShellSession`'s persistent working directory (tracked internally by
+    //   that tool across calls) isn't visible from this event, so a relative
+    //   path after an earlier `cd` may resolve against the wrong base here.
+    //   This is a deliberate gap, not an oversight: shadow-tracking `cd` to
+    //   compensate is the same rabbit hole write-guard chose to stay out of,
+    //   for uncertain benefit. Resolution below is best-effort against
+    //   `ctx.cwd`; if the resolved path doesn't exist, the `.absent` sentinel
+    //   in `backupIfNeeded` already handles that gracefully.
+    if (SHELL_TOOLS.has(name)) {
+      const command = typeof input?.command === "string" ? input.command : undefined;
+      if (!command) return;
+      const cwd = ctx?.cwd ?? process.cwd();
+      for (const write of detectWriteTargets(command)) {
+        const resolved = isAbsolute(write.path) ? write.path : join(cwd, write.path);
+        backupIfNeeded(currentSessionId, resolved);
+      }
     }
   });
 }

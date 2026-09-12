@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import setupCheckpoint, { checkpointPath, tracked } from "./index.ts";
@@ -75,5 +75,112 @@ describe("checkpoint pre-edit backup net", () => {
     await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-0.json" } });
     await h.tool_call({ toolName: "write", input: { content: "no path here" } });
     expect(existsSync(join(home, ".little-coder", "checkpoints", "sess-0.json"))).toBe(false);
+  });
+});
+
+describe("checkpoint pre-edit backup net — shell writes", () => {
+  let home: string;
+  let origHome: string | undefined;
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    home = mkdtempSync(join(tmpdir(), "ckpt-shell-"));
+    process.env.HOME = home;
+    tracked.clear();
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function ckptDir(sessionFile: string): string {
+    return join(home, ".little-coder", "checkpoints", sessionFile.split("/").pop()!);
+  }
+
+  it("backs up a file redirected to via `>` in a bash call", async () => {
+    const h = setup();
+    const target = join(home, "task.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh1.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `echo garbage > ${target}` } });
+
+    const dir = ckptDir("sess-sh1.json");
+    expect(existsSync(dir)).toBe(true);
+    expect(readdirSync(dir).length).toBe(1);
+  });
+
+  it("backs up a file redirected to via `>>` in a ShellSession call", async () => {
+    const h = setup();
+    const target = join(home, "task2.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh2.json" } });
+    await h.tool_call({ toolName: "ShellSession", input: { command: `echo more >> ${target}` } });
+
+    expect(existsSync(ckptDir("sess-sh2.json"))).toBe(true);
+  });
+
+  it("backs up every file targeted by `tee`", async () => {
+    const h = setup();
+    const target = join(home, "task3.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh3.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `echo hi | tee ${target}` } });
+
+    expect(existsSync(ckptDir("sess-sh3.json"))).toBe(true);
+  });
+
+  it("backs up the `of=` target of `dd`", async () => {
+    const h = setup();
+    const target = join(home, "task4.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh4.json" } });
+    await h.tool_call({
+      toolName: "bash",
+      input: { command: `dd if=/dev/zero of=${target} bs=1 count=1` },
+    });
+
+    expect(existsSync(ckptDir("sess-sh4.json"))).toBe(true);
+  });
+
+  it("is a no-op for a read-only shell command", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh5.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `cat somefile.txt | grep foo` } });
+
+    expect(existsSync(ckptDir("sess-sh5.json"))).toBe(false);
+  });
+
+  it("first-write-wins across a Write call followed by a shell redirect to the same path", async () => {
+    const h = setup();
+    const target = join(home, "shared.txt");
+    writeFileSync(target, "PRE-EXISTING");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh6.json" } });
+
+    await h.tool_call({ toolName: "Write", input: { path: target, content: "intermediate" } });
+    // Simulate the Write actually landing, then a later shell redirect to the
+    // same path in the same session.
+    writeFileSync(target, "intermediate");
+    await h.tool_call({ toolName: "bash", input: { command: `echo clobber > ${target}` } });
+
+    const dir = ckptDir("sess-sh6.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    const backedUp = readFileSync(join(dir, files[0]), "utf8");
+    expect(backedUp).toBe("PRE-EXISTING");
+  });
+
+  it("attempts a best-effort resolution for a relative path without crashing", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh7.json" } });
+
+    await expect(
+      h.tool_call({ toolName: "bash", input: { command: `echo hi > relative-out.txt` } }),
+    ).resolves.not.toThrow();
+
+    // Best-effort: resolves against ctx.cwd (defaulting to process.cwd() when
+    // no ctx is supplied), and the `.absent` sentinel covers the common case
+    // where the path doesn't exist there.
+    const dir = ckptDir("sess-sh7.json");
+    expect(existsSync(dir)).toBe(true);
   });
 });
