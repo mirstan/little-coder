@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectWriteTargets } from "../_shared/shell-write.ts";
+import { normalizeWritePath } from "../write-guard/index.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
 // or Edit tool modifies it. First-write-wins per session (don't re-backup
@@ -35,6 +36,20 @@ function checkpointDir(sessionId: string): string {
 
 function safeName(filePath: string): string {
   return filePath.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200);
+}
+
+// Local to checkpoint: the shell expands `~/` itself and writes bare-absolute
+// paths (e.g. `> /foo.md`) verbatim -- no write-guard-style cwd rewrite happens
+// for shell redirection, so fidelity to the file the shell will actually touch
+// beats key-uniformity with the write branch here. A write-tool call and a
+// shell redirect that both "look like" the same bare-absolute path are
+// legitimately DIFFERENT physical files today (write-guard rewrites one into
+// cwd; the shell does not) -- divergent backup keys for this shape are correct.
+export function resolveShellTarget(p: string, cwd: string): string {
+  let out = p;
+  if (out === "~") out = homedir();
+  else if (out.startsWith("~/")) out = join(homedir(), out.slice(2));
+  return isAbsolute(out) ? out : join(cwd, out);
 }
 
 export const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // exported for tests
@@ -80,9 +95,10 @@ export default function (pi: ExtensionAPI) {
     const input: any = (event as any).input ?? (event as any).args;
 
     if (name === "write" || name === "Write" || name === "edit" || name === "Edit") {
-      const filePath = checkpointPath(input ?? {});
-      if (filePath) {
-        backupIfNeeded(currentSessionId, filePath);
+      const raw = checkpointPath(input ?? {});
+      if (raw) {
+        const cwd = ctx?.cwd ?? process.cwd();
+        backupIfNeeded(currentSessionId, normalizeWritePath(raw, cwd).path);
       }
       return;
     }
@@ -113,8 +129,7 @@ export default function (pi: ExtensionAPI) {
       if (!command) return;
       const cwd = ctx?.cwd ?? process.cwd();
       for (const write of detectWriteTargets(command)) {
-        const resolved = isAbsolute(write.path) ? write.path : join(cwd, write.path);
-        backupIfNeeded(currentSessionId, resolved);
+        backupIfNeeded(currentSessionId, resolveShellTarget(write.path, cwd));
       }
     }
   });
