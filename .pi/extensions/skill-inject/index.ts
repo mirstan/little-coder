@@ -363,9 +363,17 @@ const QUAL = String.raw`(?:(?:early|mid|late)[-\s]+)?`;
 const ISO_DATE = String.raw`${YEAR}-\d{2}-\d{2}`;
 // "August 2025", "May 3, 2024", "June 2024" — month, optional day, year.
 const MONTH_DATE = String.raw`${MONTH}\.?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?${YEAR}`;
-const FULL_DATE = String.raw`(?:${ISO_DATE}|${MONTH_DATE})`;
+// Day-first ("1 March 2024", "3rd May 2024", "21 Aug. 2025"). Same anchor
+// strength as MONTH_DATE -- a bare day number is only read as a date when a
+// month name and year follow it, so this cannot pick up loose integers.
+const DAY_MONTH_DATE = String.raw`\d{1,2}(?:st|nd|rd|th)?\s+${MONTH}\.?,?\s+${YEAR}`;
+const FULL_DATE = String.raw`(?:${ISO_DATE}|${MONTH_DATE}|${DAY_MONTH_DATE})`;
 const RELATIVE = String.raw`last\s+(?:year|month|week)`;
-const VERSION = String.raw`(?:v|version\s+)\d+(?:\.\d+)+`;
+// The `\b` before `v` is load-bearing: without it this matches the `v1.2`
+// inside identifiers like `srv1.2`, `rev1.4`, `conv1.0`, `env1.2`. ANCHOR
+// uses VERSION at a fixed position so it was safe there, but the snapshot
+// trigger and PROMPT_DATE scan freely and did fire on those.
+const VERSION = String.raw`(?:\bv|\bversion\s+)\d+(?:\.\d+)+`;
 const COMMIT = String.raw`commit\s+[0-9a-f]{6,40}\b`;
 // Object of a strong anchor phrase ("as of X", "at the time of X").
 const ANCHOR = String.raw`(?:${QUAL}${FULL_DATE}|${QUAL}${YEAR}\b|${RELATIVE}|(?:the\s+)?${VERSION}|${COMMIT})`;
@@ -393,12 +401,15 @@ const TEMPORAL_TRIGGERS = [
   new RegExp(String.raw`\bsnapshots?\b[^.\n]{0,60}?(?:${FULL_DATE}|\b${YEAR}\b|${VERSION})`, "i"),
   // source noun ... in/on/during <year>. Weak prepositions get the
   // structural unit-guard: a bare year only counts as a date when it sits at
-  // a clause boundary (end / punctuation next). A year followed by another
-  // word is a count ("in 2000 epochs/chunks/partitions") — the (?!\s+[a-z])
-  // lookahead runs under /i, so it rejects ANY following word; deliberately
-  // structural, no enumerated unit list to outgrow. Full dates are exempt.
+  // a clause boundary (end / sentence punctuation next). A year followed by a
+  // unit is a count, and the unit can lead with a letter ("in 2000 chunks"),
+  // a digit ("in 2048 4-byte blocks"), a hyphen ("in 2048-byte pages"), or a
+  // list comma ("in 2048, 4096 chunks") — hence [-,]? and [a-z0-9] rather
+  // than a bare \s+[a-z]. The class runs under /i so it rejects capitalised
+  // units too; deliberately structural, no enumerated unit list to outgrow.
+  // Full dates are exempt.
   new RegExp(
-    String.raw`\b${SOURCE_NOUN}\b[^.\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s+[a-z]))`,
+    String.raw`\b${SOURCE_NOUN}\b[^.\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s*[-,]?\s*[a-z0-9]))`,
     "i",
   ),
   // past-tense question + weak preposition + FULL date (never a bare year):

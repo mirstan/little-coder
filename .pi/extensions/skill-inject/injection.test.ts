@@ -373,6 +373,10 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
       ),
     ).toBe(true);
     expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
+    // Day-first dates ("1 March 2024") are as real an anchor as "March 1, 2024".
+    expect(looksLikeTemporalTask("what was the leaderboard as of 1 March 2024")).toBe(true);
+    expect(looksLikeTemporalTask("what was the leaderboard as of 3rd May 2024")).toBe(true);
+    expect(looksLikeTemporalTask("as of 21 Aug. 2025 the rankings changed")).toBe(true);
     // Must keep firing -- protects the existing gate tests below.
     expect(looksLikeTemporalTask("what was this as of last year?")).toBe(true);
     // Must keep firing both research+temporal directives (see the
@@ -405,6 +409,21 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
     expect(looksLikeTemporalTask("the 2021 census dataset")).toBe(false);
     expect(looksLikeTemporalTask("split the dataset in 2000 buckets")).toBe(false);
     expect(looksLikeTemporalTask("run the dataset in 2020 workers")).toBe(false);
+    // The unit after a bare year can lead with a digit, a hyphen or a list
+    // comma, not just a letter -- all still counts, not dates.
+    expect(looksLikeTemporalTask("shard the dataset in 2048 4-byte blocks")).toBe(false);
+    expect(looksLikeTemporalTask("bump the dataset in 2048-byte pages")).toBe(false);
+    expect(looksLikeTemporalTask("split the dataset in 2048, 4096 chunks")).toBe(false);
+    expect(looksLikeTemporalTask("load the dataset in 2048 Chunks")).toBe(false);
+    // A version-shaped tail inside an identifier is not a version anchor.
+    expect(looksLikeTemporalTask("take a snapshot of the srv1.2 host")).toBe(false);
+    expect(looksLikeTemporalTask("snapshot the conv1.0 model weights")).toBe(false);
+    // ...and must not arm the anaphoric "at the time" check either.
+    expect(
+      looksLikeTemporalTask("the env1.2 config broke; what was set at the time?"),
+    ).toBe(false);
+    // A real version anchor still fires.
+    expect(looksLikeTemporalTask("what was this repo as of the v1.2 release")).toBe(true);
     expect(looksLikeTemporalTask("the 2024 dataset loader has an off-by-one bug")).toBe(false);
     expect(looksLikeTemporalTask("add a retry to the 2024 dataset loader")).toBe(false);
     expect(looksLikeTemporalTask("at the time of writing this is broken")).toBe(false);
