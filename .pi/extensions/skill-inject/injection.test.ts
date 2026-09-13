@@ -350,14 +350,75 @@ describe("research directive gates on browse-tool availability", () => {
 // dated snapshot. The temporal directive exists to redirect that pattern
 // toward a git revision / archived page instead.
 describe("temporal directive triggers on phrasing that names a PAST state", () => {
-  it("fires for each TEMPORAL_TRIGGERS regex on a realistic example phrase", () => {
-    expect(looksLikeTemporalTask("what was on top as of August 2025?")).toBe(true);
-    expect(looksLikeTemporalTask("at the time, GPT-4 was the top model")).toBe(true);
+  it("fires for genuine temporal-research phrasing (date/version-anchored)", () => {
+    expect(looksLikeTemporalTask("what was the leaderboard as of August 2025")).toBe(true);
+    expect(looksLikeTemporalTask("what was this repo as of the v2.0 release")).toBe(true);
+    expect(looksLikeTemporalTask("the dataset's state at the time of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("as of 2024-05-01 what did the rankings look like")).toBe(true);
+    expect(looksLikeTemporalTask("as of May 3, 2024, what were the standings")).toBe(true);
+    expect(
+      looksLikeTemporalTask("find an archived snapshot of the results page from 2024-01-15"),
+    ).toBe(true);
     expect(looksLikeTemporalTask("what did the historical rankings look like?")).toBe(true);
-    expect(looksLikeTemporalTask("historically, this model ranked lower")).toBe(true);
-    expect(looksLikeTemporalTask("give me a snapshot of the results")).toBe(true);
-    expect(looksLikeTemporalTask("what was the MTEB leaderboard as of March 2024?")).toBe(true);
-    expect(looksLikeTemporalTask("check the 2023 leaderboard for the top row")).toBe(true);
+    expect(looksLikeTemporalTask("what were the repositories' stars in 2021")).toBe(true);
+    expect(looksLikeTemporalTask("as of commit abc123 what was in this repo")).toBe(true);
+    expect(looksLikeTemporalTask("back in 2019 what was the leaderboard")).toBe(true);
+    expect(looksLikeTemporalTask("leaderboard standings as of early 2024")).toBe(true);
+    expect(looksLikeTemporalTask("as of mid-2022 what did the repo contain")).toBe(true);
+    // Anaphoric case: no date in the "at the time" clause itself, but a real
+    // date appears earlier in the prompt (the original mteb-leaderboard shape).
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. Which model led the leaderboard at the time?",
+      ),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
+    // Must keep firing -- protects the existing gate tests below.
+    expect(looksLikeTemporalTask("what was this as of last year?")).toBe(true);
+    // Must keep firing both research+temporal directives (see the
+    // both-directives test below).
+    expect(looksLikeTemporalTask("please research the leaderboard as of March 2024")).toBe(true);
+  });
+
+  it("does not fire for dev-artifact snapshots, discourse adverbs, bare counts, or dateless anchors", () => {
+    expect(looksLikeTemporalTask("snapshot of memory usage right now")).toBe(false);
+    expect(looksLikeTemporalTask("let's take a snapshot of the docker image")).toBe(false);
+    expect(looksLikeTemporalTask("the snapshot test in CI is flaky")).toBe(false);
+    expect(looksLikeTemporalTask("as of today the build is green")).toBe(false);
+    expect(looksLikeTemporalTask("as of now the tests pass")).toBe(false);
+    expect(looksLikeTemporalTask("as of yesterday the CI is red, please fix the tests")).toBe(
+      false,
+    );
+    expect(looksLikeTemporalTask("historically we used tabs not spaces")).toBe(false);
+    expect(looksLikeTemporalTask("historic buildings from the 1800s")).toBe(false);
+    // No date anywhere in the prompt -- the anaphoric disjunct requires a
+    // prompt-level date, so a bare "at the time" alone does not fire.
+    expect(looksLikeTemporalTask("at the time, GPT-4 was the top model")).toBe(false);
+    // Inverted from an old assertion: bare adverb no longer fires.
+    expect(looksLikeTemporalTask("historically, this model ranked lower")).toBe(false);
+    // Inverted from an old assertion: no date, no qualifier.
+    expect(looksLikeTemporalTask("give me a snapshot of the results")).toBe(false);
+    expect(looksLikeTemporalTask("batches of 2048")).toBe(false);
+    expect(looksLikeTemporalTask("port 2000")).toBe(false);
+    expect(looksLikeTemporalTask("resize to 1920x1080")).toBe(false);
+    expect(looksLikeTemporalTask("load the dataset in 2048 chunks")).toBe(false);
+    expect(looksLikeTemporalTask("the 2021 census dataset")).toBe(false);
+    expect(looksLikeTemporalTask("split the dataset in 2000 buckets")).toBe(false);
+    expect(looksLikeTemporalTask("run the dataset in 2020 workers")).toBe(false);
+    expect(looksLikeTemporalTask("the 2024 dataset loader has an off-by-one bug")).toBe(false);
+    expect(looksLikeTemporalTask("add a retry to the 2024 dataset loader")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of writing this is broken")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the crash")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the incident")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the outage")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the deployment")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the error")).toBe(false);
+    expect(looksLikeTemporalTask("prune the archived snapshots on the ZFS pool")).toBe(false);
+    // A bare year elsewhere in the prompt must NOT arm the anaphoric
+    // "at the time" check.
+    expect(
+      looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
+    ).toBe(false);
   });
 
   // Deliberate near-miss: "historic" (an adjective describing an old
@@ -366,6 +427,17 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
   it("does not fire for 'historic building' (proper adjective use, not a temporal-research signal)", () => {
     expect(
       looksLikeTemporalTask("This town has several historic buildings from the 1800s."),
+    ).toBe(false);
+  });
+
+  it("anaphoric 'at the time' requires a real date/version somewhere in the prompt", () => {
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. Which model led the leaderboard at the time?",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
     ).toBe(false);
   });
 

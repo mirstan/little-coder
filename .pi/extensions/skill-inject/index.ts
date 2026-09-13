@@ -348,41 +348,109 @@ function researchDirective(allowed: Set<string> | undefined): string {
 // results repo (which the reference solution used) or an archived web page.
 // It never considered a versioned/archived source at all.
 //
-// Deliberately does NOT match on bare "historic" -- "historic building" is a
-// proper-noun/adjective use (an old building), not a signal that the task
-// wants a past snapshot of live/versioned data. Requiring "historical"/
-// "historically" keeps that phrase from tripping the gate; see the
-// "historic building" non-firing case in injection.test.ts.
+// Deliberately does NOT match on bare "historic" or bare "historically" --
+// "historic building" is a proper-noun/adjective use (an old building), and
+// "historically we used tabs" is a discourse adverb, neither a signal that
+// the task wants a past snapshot of live/versioned data. Only "historical
+// <source noun>" (e.g. "historical rankings") counts as a signal; both bare
+// forms are non-signals -- pinned by non-firing tests in injection.test.ts.
+
+// ── Date/version anchor grammar (building blocks) ──────────────────────
+const MONTH = String.raw`(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)`;
+const YEAR = String.raw`(?:19|20)\d{2}`;
+// Optional "early"/"mid"/"late" qualifier between anchor phrase and date.
+const QUAL = String.raw`(?:(?:early|mid|late)[-\s]+)?`;
+const ISO_DATE = String.raw`${YEAR}-\d{2}-\d{2}`;
+// "August 2025", "May 3, 2024", "June 2024" — month, optional day, year.
+const MONTH_DATE = String.raw`${MONTH}\.?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?${YEAR}`;
+const FULL_DATE = String.raw`(?:${ISO_DATE}|${MONTH_DATE})`;
+const RELATIVE = String.raw`last\s+(?:year|month|week)`;
+const VERSION = String.raw`(?:v|version\s+)\d+(?:\.\d+)+`;
+const COMMIT = String.raw`commit\s+[0-9a-f]{6,40}\b`;
+// Object of a strong anchor phrase ("as of X", "at the time of X").
+const ANCHOR = String.raw`(?:${QUAL}${FULL_DATE}|${QUAL}${YEAR}\b|${RELATIVE}|(?:the\s+)?${VERSION}|${COMMIT})`;
+
+// Nouns naming an external / versioned / time-varying data source.
+const SOURCE_NOUN = String.raw`(?:leaderboards?|rankings?|standings|repo(?:s|sitor(?:y|ies))?|datasets?|results|stars|prices?)`;
+
 const TEMPORAL_TRIGGERS = [
-  /\bas of\b/i,
-  /\bat the time\b/i,
-  /\bhistorical(?:ly)?\b/i,
-  /\bsnapshot\b/i,
-  // "leaderboard as of/in/on <date>" and similar phrasing that names a
-  // versioned source and a temporal anchor together.
-  /\b(?:leaderboard|repo(?:sitory)?|dataset|ranking)s?\b[^.\n]{0,40}\b(?:as of|in|on)\b[^.\n]{0,20}\b(?:19|20)\d{2}\b/i,
-  // An explicit past date sitting near one of those nouns, date-first order
-  // (e.g. "the 2023 leaderboard", "as it stood in 2022's dataset release").
-  /\b(?:19|20)\d{2}\b[^.\n]{0,40}\b(?:leaderboard|repo(?:sitory)?|dataset|ranking)s?\b/i,
+  // "as of <date-ish>": permissive object (bare year OK) because "as of" is
+  // itself an unambiguous temporal anchor. today/now/yesterday are absent
+  // from ANCHOR on purpose ("as of today the build is green" is a status
+  // report, not a temporal-research request).
+  new RegExp(String.raw`\bas of\s+${ANCHOR}`, "i"),
+  // "back in <year/date>": same strong-anchor permissiveness.
+  new RegExp(String.raw`\bback in\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b)`, "i"),
+  // "at the time of <date/version-shaped object>". The object must itself be
+  // date-shaped: "at the time of the 2019 audit" fires, "at the time of the
+  // crash/incident/writing" does not.
+  new RegExp(String.raw`\bat the time of\s+(?:the\s+)?${ANCHOR}`, "i"),
+  // "historical <source noun>". Bare "historically" is a discourse adverb
+  // ("historically we used tabs") and no longer fires.
+  new RegExp(String.raw`\bhistorical\s+${SOURCE_NOUN}\b`, "i"),
+  // snapshot + a date/version in the same sentence. Dev-artifact snapshots
+  // (memory, docker, ZFS, snapshot tests) carry no date and do not fire.
+  new RegExp(String.raw`\bsnapshots?\b[^.\n]{0,60}?(?:${FULL_DATE}|\b${YEAR}\b|${VERSION})`, "i"),
+  // source noun ... in/on/during <year>. Weak prepositions get the
+  // structural unit-guard: a bare year only counts as a date when it sits at
+  // a clause boundary (end / punctuation next). A year followed by another
+  // word is a count ("in 2000 epochs/chunks/partitions") — the (?!\s+[a-z])
+  // lookahead runs under /i, so it rejects ANY following word; deliberately
+  // structural, no enumerated unit list to outgrow. Full dates are exempt.
+  new RegExp(
+    String.raw`\b${SOURCE_NOUN}\b[^.\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s+[a-z]))`,
+    "i",
+  ),
+  // past-tense question + weak preposition + FULL date (never a bare year):
+  // "what was the price of bitcoin in March 2023".
+  new RegExp(
+    String.raw`\b(?:what|which|who|how)\b[^.\n]{0,80}?\b(?:was|were|did)\b[^.\n]{0,80}?\b(?:in|on|during)\s+${QUAL}${FULL_DATE}`,
+    "i",
+  ),
+  // date-first, tight adjacency, riskiest-noun list only: "the 2023
+  // leaderboard". NOT dataset/repo/generic nouns — "the 2024 dataset loader"
+  // is an ordinary artifact name (see the pinned non-firing tests).
+  new RegExp(String.raw`\b${YEAR}\s+(?:leaderboards?|rankings?|standings)\b`, "i"),
 ];
+
+// Anaphoric whole-prompt check: a bare "at the time" with no date object in
+// its own clause still signals temporal research when the prompt names a real
+// date/version ANYWHERE ("The paper came out in June 2024. Which model led
+// the leaderboard at the time?" — the original mteb-leaderboard shape). Bare
+// years are deliberately excluded here: a stray "2048" elsewhere must not arm
+// "at the time".
+const AT_THE_TIME = /\bat the time\b/i;
+const PROMPT_DATE = new RegExp(String.raw`(?:${FULL_DATE}|${VERSION}|${COMMIT})`, "i");
 
 export function looksLikeTemporalTask(text: string): boolean {
   if (!text) return false;
   for (const re of TEMPORAL_TRIGGERS) {
     if (re.test(text)) return true;
   }
-  return false;
+  return AT_THE_TIME.test(text) && PROMPT_DATE.test(text);
 }
 
 // True when at least one git-capable shell tool (bash / ShellSession /
 // ShellStart -- see SHELL_TOOLS in _shared/shell-write.ts, the same canonical
 // list permission-gate and write-guard share, reused here rather than
 // redefined) is callable. The temporal directive's git-log/git-show advice is
-// dead guidance without one.
+// dead guidance without one. Intentional coupling -- a new shell tool is by
+// construction git-capable.
 function anyShellToolAvailable(allowed: Set<string> | undefined): boolean {
   if (!allowed) return true;
   for (const t of SHELL_TOOLS) if (allowed.has(t)) return true;
   return false;
+}
+
+// Shared by the gate and the directive builder below, so the two capability
+// checks can't drift apart (Finding 7a).
+function temporalCapabilities(
+  allowed: Set<string> | undefined,
+): { canGit: boolean; canBrowse: boolean } {
+  return {
+    canGit: anyShellToolAvailable(allowed),
+    canBrowse: toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed),
+  };
 }
 
 /** Should the temporal-research directive be injected for this prompt/allow-list?
@@ -396,20 +464,14 @@ export function shouldInjectTemporalDirective(
   prompt: string,
   allowed: Set<string> | undefined,
 ): boolean {
-  return (
-    looksLikeTemporalTask(prompt) &&
-    (anyShellToolAvailable(allowed) ||
-      toolsAvailable(["websearch"], allowed) ||
-      toolsAvailable(BROWSER_RESEARCH_PAIR, allowed))
-  );
+  const c = temporalCapabilities(allowed);
+  return looksLikeTemporalTask(prompt) && (c.canGit || c.canBrowse);
 }
 
 // Built per-turn (like researchDirective) so the advice only names sources
 // that are actually reachable given this turn's allow-list.
 function temporalDirective(allowed: Set<string> | undefined): string {
-  const canGit = anyShellToolAvailable(allowed);
-  const canBrowse =
-    toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed);
+  const { canGit, canBrowse } = temporalCapabilities(allowed);
   const lines = [
     "",
     "## Temporal-research directive",
