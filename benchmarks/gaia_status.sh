@@ -192,6 +192,7 @@ def count_pattern(p: str) -> tuple[int, int]:
 
 skill_t, skill_n = count_pattern("skill-inject:")
 research_t, research_n = count_pattern("research-directive")
+temporal_t, temporal_n = count_pattern("temporal-directive")
 quality_t, quality_n = count_pattern("quality-monitor:")
 turncap_t, _ = count_pattern("turn-cap:")
 finalize_t, finalize_n = count_pattern("finalize-warn:")
@@ -273,6 +274,7 @@ if tool_name_counts:
 print(f"\n── extension activity (over {done} tasks) ──")
 print(f"skill-inject       : {skill_n} fires / {skill_t} tasks")
 print(f"research-directive : {research_n} injections / {research_t} tasks")
+print(f"temporal-directive : {temporal_n} injections / {temporal_t} tasks")
 print(f"quality-monitor    : {quality_n} corrections / {quality_t} tasks")
 print(f"thinking-budget    : {budget_n} fires / {budget_t} tasks")
 print(f"turn-cap aborts    : {turncap_t} tasks")

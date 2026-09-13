@@ -3,6 +3,7 @@ import {
   SHELL_TOOLS,
   detectDeliverableWrites,
   detectWriteTargets,
+  hasCommandSubstitution,
   hasWriteRedirection,
   isScratchPath,
   scan,
@@ -194,6 +195,74 @@ describe("splitCommandChain", () => {
       "cat > f.sh",
     ]);
   });
+
+  // A bare `&` backgrounds the first command and runs the next, separating
+  // them exactly like `;`. It was missing from CHAIN_OPERATORS, so
+  // `ls & rm -rf /` reached the permission gate as one `ls`-prefixed segment.
+  it("splits on a bare backgrounding &", () => {
+    expect(splitCommandChain("ls & rm -rf /")).toEqual(["ls", "rm -rf /"]);
+    expect(splitCommandChain("ls & echo hi")).toEqual(["ls", "echo hi"]);
+    expect(splitCommandChain("sleep 1 &")).toEqual(["sleep 1"]);
+    expect(splitCommandChain("a & b & c")).toEqual(["a", "b", "c"]);
+  });
+
+  it("still treats && as one cut now that a lone & is an operator too", () => {
+    expect(splitCommandChain("ls && rm -rf /")).toEqual(["ls", "rm -rf /"]);
+    expect(splitCommandChain("a && b && c")).toEqual(["a", "b", "c"]);
+    expect(splitCommandChain("ls >/dev/null&& echo hi")).toEqual([
+      "ls >/dev/null",
+      "echo hi",
+    ]);
+  });
+
+  it("does not cut on the & of fd duplication or an &> redirect", () => {
+    expect(splitCommandChain("make 2>&1")).toEqual(["make 2>&1"]);
+    expect(splitCommandChain("cmd >&2")).toEqual(["cmd >&2"]);
+    expect(splitCommandChain("cmd 2>&-")).toEqual(["cmd 2>&-"]);
+    expect(splitCommandChain("cmd <&3")).toEqual(["cmd <&3"]);
+    expect(splitCommandChain("cmd &>/dev/null")).toEqual(["cmd &>/dev/null"]);
+    expect(splitCommandChain("cmd &>>/dev/null")).toEqual(["cmd &>>/dev/null"]);
+  });
+
+  // Under bash `&>` redirects both streams and any words after the target are
+  // arguments; under /bin/sh or dash the same bytes are `cmd &` followed by a
+  // separate `>` redirect, which makes those "arguments" a second command. The
+  // exemption only holds where the target is the last word, so the two
+  // readings cannot disagree about how many commands run.
+  it("still cuts on &> when a command word follows the redirect target", () => {
+    expect(splitCommandChain("cat &>/dev/null rm -rf /")).toEqual([
+      "cat",
+      ">/dev/null rm -rf /",
+    ]);
+    expect(splitCommandChain("ls &>>/dev/null rm -rf /")).toEqual([
+      "ls",
+      ">>/dev/null rm -rf /",
+    ]);
+  });
+
+  it("keeps the &> exemption when the target ends the command", () => {
+    expect(splitCommandChain("make &>/dev/null; echo hi")).toEqual([
+      "make &>/dev/null",
+      "echo hi",
+    ]);
+    expect(splitCommandChain("make &> /dev/null && echo hi")).toEqual([
+      "make &> /dev/null",
+      "echo hi",
+    ]);
+  });
+
+  // `|&` is bash's pipe-stderr-too spelling of `|`. The `|` cut lands first
+  // and the `&` cut immediately after it, leaving an empty segment that the
+  // trailing filter drops — so it yields the same two commands `|` would.
+  it("treats |& as the single pipe it is", () => {
+    expect(splitCommandChain("ls |& cat")).toEqual(["ls", "cat"]);
+  });
+
+  it("does not cut on a quoted or escaped &", () => {
+    expect(splitCommandChain('echo "a & b"')).toEqual(['echo "a & b"']);
+    expect(splitCommandChain("echo 'a & b'")).toEqual(["echo 'a & b'"]);
+    expect(splitCommandChain("echo a \\& b")).toEqual(["echo a \\& b"]);
+  });
 });
 
 describe("stripHeredocBodies", () => {
@@ -215,6 +284,145 @@ describe("stripHeredocBodies", () => {
     const cmd = "cat > a << 'E1'\nx\nE1\ncat > b << 'E2'\ny\nE2";
     expect(splitCommandChain(cmd)).toEqual(["cat > a", "cat > b"]);
   });
+
+  // The deletion ran from the `<<DELIM` token straight through the body, so
+  // anything between that token and the newline — the rest of the opening
+  // line, where real shell syntax lives — went with it.
+  it("keeps the rest of the opening line after the <<DELIM token", () => {
+    expect(stripHeredocBodies("cat <<EOF & rm -rf /\nbody\nEOF")).toBe("cat  & rm -rf /");
+    expect(stripHeredocBodies("cat << 'EOF' > backend/app.js\nX\nEOF")).toBe(
+      "cat  > backend/app.js",
+    );
+  });
+
+  it("sees the commands and writes that used to be swallowed with the body", () => {
+    expect(splitCommandChain("cat <<EOF & rm -rf /\nbody\nEOF")).toEqual([
+      "cat",
+      "rm -rf /",
+    ]);
+    expect(detectWriteTargets("cat << 'EOF' > backend/app.js\nX\nEOF")).toEqual([
+      { path: "backend/app.js", kind: "redirect" },
+    ]);
+  });
+});
+
+// ── `>&PATH` ───────────────────────────────────────────────────────────────
+// Any redirect target starting with `&` was waved through as fd duplication.
+// Bash only reads it that way when the whole word is digits or `-`; otherwise
+// it truncates a file, exactly as `&>word` does.
+
+describe("detectWriteTargets — >&word is only plumbing when word is a fd", () => {
+  it("reports a >& redirect whose target is a path", () => {
+    expect(detectWriteTargets("cat README.md >&backend/app.js")).toEqual([
+      { path: "backend/app.js", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls >&/etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls >& /etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls 2>&/etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls 1>&/tmp/victim.txt")).toEqual([
+      { path: "/tmp/victim.txt", kind: "redirect" },
+    ]);
+  });
+
+  // Verified against real bash: `ls >&2foo` creates a file named `2foo`. A
+  // leading-digit test would call that plumbing and miss the truncation.
+  it("requires the WHOLE word to be digits, not merely to start with one", () => {
+    expect(detectWriteTargets("ls >&2foo")).toEqual([{ path: "2foo", kind: "redirect" }]);
+    expect(detectWriteTargets("ls >&1x")).toEqual([{ path: "1x", kind: "redirect" }]);
+  });
+
+  it("leaves genuine descriptor plumbing alone", () => {
+    for (const cmd of [
+      "make 2>&1",
+      "echo err >&2",
+      "cmd 1>&2",
+      "cmd 2>&-",
+      "cmd 2>&1; echo done",
+      "cmd 2>&1 | grep x",
+      ">& 2",
+      "ls >& 2",
+      "cmd >&",
+    ]) {
+      expect(detectWriteTargets(cmd), cmd).toEqual([]);
+    }
+  });
+
+  it("still drops a >& redirect aimed at a non-destructive device", () => {
+    expect(detectWriteTargets("ls >&/dev/null")).toEqual([]);
+  });
+});
+
+// ── Command substitution ───────────────────────────────────────────────────
+// `$(…)`, backticks and `<(…)`/`>(…)` run a whole command line that the
+// prefix whitelist never sees: `echo $(rm -rf /)` is judged as `echo`.
+
+describe("hasCommandSubstitution", () => {
+  it("catches every substitution spelling", () => {
+    for (const cmd of [
+      "echo $(touch X)",
+      "echo `touch X`",
+      'echo "$(touch X)"',
+      "cat <(touch X)",
+      "echo hi >(touch X)",
+      "echo ${x:-$(touch X)}",
+      "echo $((1+1))",
+    ]) {
+      expect(hasCommandSubstitution(cmd), cmd).toBe(true);
+    }
+  });
+
+  // Bash expands `$(…)` and backticks inside a heredoc body whose delimiter is
+  // unquoted. Scanning only the stripped string misses it (the body is gone);
+  // scanning only the raw string misses it too, because an apostrophe in the
+  // body leaves the quote tracker open and every later operator looks literal.
+  it("catches substitution inside an unquoted-delimiter heredoc body", () => {
+    expect(hasCommandSubstitution("cat <<EOF\n$(touch PWNED)\nEOF")).toBe(true);
+    expect(hasCommandSubstitution("cat <<EOF\n`touch PWNED`\nEOF")).toBe(true);
+  });
+
+  it("catches it even when an apostrophe in the body poisons quote tracking", () => {
+    expect(hasCommandSubstitution("cat <<EOF\ndon't worry\n$(touch PWNED)\nEOF")).toBe(true);
+  });
+
+  it("does not flag a quoted delimiter, which suppresses expansion", () => {
+    expect(hasCommandSubstitution("cat <<'EOF'\n$(not expanded)\nEOF")).toBe(false);
+    expect(hasCommandSubstitution('cat <<"EOF"\n$(not expanded)\nEOF')).toBe(false);
+    expect(hasCommandSubstitution("cat << EOF\nplain body\nEOF")).toBe(false);
+  });
+
+  it("does not flag text that merely looks like substitution", () => {
+    for (const cmd of [
+      "echo $HOME",
+      "echo '$(x)'",
+      "awk '{print $1}'",
+      'echo "$var"',
+      'grep foo <<< "$var"',
+      "ls -la",
+      "git status",
+      "cat README.md",
+      "make 2>&1",
+      "sed -n '1,20p' file.ts",
+      "wc -l < input.txt",
+    ]) {
+      expect(hasCommandSubstitution(cmd), cmd).toBe(false);
+    }
+  });
+});
+
+describe("scan — backslash escaping inside double quotes", () => {
+  // `\"` does not close a double quote in bash. The tracker used to think it
+  // did, so everything after it read as unquoted and this `>` looked like a
+  // redirect into a file named `b"`.
+  it("does not let an escaped quote close the quote", () => {
+    expect(detectWriteTargets('echo "a \\" > b"')).toEqual([]);
+    expect(hasCommandSubstitution('echo "a \\" $(touch X)"')).toBe(true);
+  });
 });
 
 describe("detectDeliverableWrites — commands detectWriteTargets misses", () => {
@@ -226,32 +434,44 @@ describe("detectDeliverableWrites — commands detectWriteTargets misses", () =>
 
   it("catches cp's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("cp deliverable.txt /app/out/")).toEqual([
-      { path: "/app/out/", kind: "copy" },
+      { path: "/app/out/", kind: "copy", sources: ["deliverable.txt"] },
     ]);
     // Multiple sources: only the final operand is the target.
     expect(detectDeliverableWrites("cp -r a.txt b.txt /app/dest")).toEqual([
-      { path: "/app/dest", kind: "copy" },
+      { path: "/app/dest", kind: "copy", sources: ["a.txt", "b.txt"] },
     ]);
   });
 
   it("catches mv's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("mv -f draft.txt /app/answer.txt")).toEqual([
-      { path: "/app/answer.txt", kind: "move" },
+      { path: "/app/answer.txt", kind: "move", sources: ["draft.txt"] },
     ]);
   });
 
   it("catches install's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("install -m 644 out.bin /app/bin/out")).toEqual([
-      { path: "/app/bin/out", kind: "copy" },
+      { path: "/app/bin/out", kind: "copy", sources: ["out.bin"] },
+    ]);
+  });
+
+  it("consumes a separate-word flag value instead of reading it as a source", () => {
+    // `644` is -m's value, not a file. It never affected the target (the last
+    // operand either way), but it did land in `sources`, which checkpoint uses
+    // to work out what `install … /app/bin/` clobbers inside that directory.
+    expect(detectDeliverableWrites("install -m 644 out.bin /app/bin/")).toEqual([
+      { path: "/app/bin/", kind: "copy", sources: ["out.bin"] },
+    ]);
+    expect(detectDeliverableWrites("install -o root -g wheel a.bin /app/bin/")).toEqual([
+      { path: "/app/bin/", kind: "copy", sources: ["a.bin"] },
     ]);
   });
 
   it("prefers -t DIR / --target-directory over the last operand", () => {
     expect(detectDeliverableWrites("cp -t /app/out a.txt b.txt")).toEqual([
-      { path: "/app/out", kind: "copy" },
+      { path: "/app/out", kind: "copy", sources: ["a.txt", "b.txt"] },
     ]);
     expect(detectDeliverableWrites("mv --target-directory=/app/out a.txt")).toEqual([
-      { path: "/app/out", kind: "move" },
+      { path: "/app/out", kind: "move", sources: ["a.txt"] },
     ]);
   });
 

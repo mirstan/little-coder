@@ -40,8 +40,17 @@ async function fire(pi: any, name: string, event: any, ctx: any) {
 
 // A turn with plain text and/or tool calls (generic tool, not a shell tool —
 // used for Trigger A's shape checks where the specific tool doesn't matter).
-function assistantTurn(opts: { text?: string; toolCalls?: number; stopReason?: string }) {
+// `thinking`, when present, is pushed as a thinking content block ahead of
+// the text entry — used to simulate an aborted turn whose only content was
+// reasoning tokens (invisible to contentShape's text/toolCall scan).
+function assistantTurn(opts: {
+  text?: string;
+  toolCalls?: number;
+  stopReason?: string;
+  thinking?: string;
+}) {
   const content: any[] = [];
+  if (opts.thinking !== undefined) content.push({ type: "thinking", thinking: opts.thinking });
   if (opts.text !== undefined) content.push({ type: "text", text: opts.text });
   for (let i = 0; i < (opts.toolCalls ?? 0); i++) {
     content.push({ type: "toolCall", name: "websearch", arguments: {} });
@@ -92,6 +101,14 @@ async function newSession(h: ReturnType<typeof makeHarness>, maxTurns?: number) 
 async function turn(h: ReturnType<typeof makeHarness>, event: any) {
   await fire(h.pi, "turn_start", {}, h.ctx);
   await fire(h.pi, "turn_end", event, h.ctx);
+}
+
+// Named `settle` for historical/test-readability reasons (Trigger C used to
+// fire on `agent_settled`) -- it now fires the `agent_end` event the
+// extension actually listens on, since agent_settled proved undeliverable
+// against the real Python harness (see index.ts's Trigger C comment).
+async function settle(h: ReturnType<typeof makeHarness>) {
+  await fire(h.pi, "agent_end", {}, h.ctx);
 }
 
 const REAL_NOW = Date.now;
@@ -490,6 +507,234 @@ describe("tb-finalize-guard", () => {
       await turn(h, assistantTurn({ text: "I believe I'm done." }));
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).toMatch(/stopped without calling a tool/i);
+    });
+  });
+
+  describe("Trigger C — dead run: errored or empty final message on agent_end", () => {
+    it("does not fire when a mid-run retry recovers before agent_end (the whole point of snapshotting from turn_end)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      // An errored turn, papered over by pi's own internal retry, followed by
+      // a healthy turn before the run actually ends -- lastTurnMessage must
+      // reflect the LAST turn_end, not the errored one.
+      await turn(h, assistantTurn({ text: "oops", stopReason: "error" }));
+      await turn(h, assistantTurn({ text: "All done.", toolCalls: 1, stopReason: "stop" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("fires on stopReason error", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "oops", stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
+      expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+      expect(h.sent[0].text).toMatch(/task is not complete/i);
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(true);
+      // No deadline/cap configured in this test -> recovery-framed, not urgency-framed.
+      expect(h.sent[0].text).toMatch(/ample time/i);
+      expect(h.sent[0].text).not.toMatch(/very little time left/i);
+    });
+
+    it("fires on empty message (no text, no tool calls)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({}));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+    });
+
+    it("fires regardless of budget — no deadline known, still fires", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h); // no deadline set at all
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("clean settle does not fire", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "All done.", toolCalls: 1, stopReason: "stop" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("does not fire for non-terminal_bench sessions", async () => {
+      process.env.LITTLE_CODER_BENCHMARK = "gaia";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("honors the fire cap of 2 — a 3rd qualifying settled run does not fire", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      await startRun(h); // a new run — the fire cap is session-scoped, not run-scoped
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(2);
+      await startRun(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(2);
+    });
+
+    it("resets on session_start, allowing fresh fires for a new task", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      await startRun(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(2);
+
+      await newSession(h); // session_start resets the counter
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(3);
+    });
+
+    it("does not burn the fire cap or notify when sendUserMessage throws", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+
+      h.state.sendThrows = true;
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toEqual([]);
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(false);
+
+      h.state.sendThrows = false;
+      await startRun(h); // start a new run
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("does not fire on an aborted run whose final message is thinking-only (thinking-budget abort)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ thinking: "let me think about this...", stopReason: "aborted" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+      // The abort did not burn a fire: a genuinely dead run later still fires.
+      await startRun(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("uses the urgency finalize message when the run is also near the wall-clock deadline", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      // Inside finalize-warn's 10-minute window, so turn_start arms Trigger B's latch.
+      setDeadlineMinutesFromNow(5);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toMatch(/very little time left/i);
+      expect(h.sent[0].text).not.toMatch(/ample time/i);
+    });
+
+    it("uses the urgency finalize message when the run is inside the turn-cap warn window", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 10); // finalize-warn's turn window opens at turn 6 (WARN_REMAINING=5)
+      for (let i = 0; i < 6; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-6, arms Trigger B's latch at turn 6
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 7 — still below the cap itself
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toMatch(/very little time left/i);
+    });
+
+    it("is suppressed when the run ended at its turn-cap (would grant a capped-out run a fresh turn budget)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 3);
+      await turn(h, shellTurn(["ls -la"])); // turn 1
+      await turn(h, shellTurn(["ls -la"])); // turn 2
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 3 == capForRun
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("still fires with headroom below the turn-cap", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 10);
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of 10
+      await settle(h);
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("Trigger A/B/C fire caps are independent of each other", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 10);
+
+      // Exhaust Trigger A's session cap (2 fires).
+      await turn(h, assistantTurn({ text: "One." })); // turn 1
+      await turn(h, assistantTurn({ text: "Two." })); // turn 2
+      expect(h.sent).toHaveLength(2);
+
+      // Trigger C fires on a settled run with an errored final message,
+      // unaffected by Trigger A's now-exhausted cap.
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 3
+      await settle(h);
+      expect(h.sent).toHaveLength(3);
+
+      // A fresh run, still within the same session — Trigger C fires again.
+      await startRun(h, 10);
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of the new run
+      await settle(h);
+      expect(h.sent).toHaveLength(4);
+
+      // Trigger C's own session-scoped cap is now exhausted; a 3rd settled
+      // error run does not fire.
+      await startRun(h, 10);
+      await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of yet another run
+      await settle(h);
+      expect(h.sent).toHaveLength(4);
+
+      // Trigger A's cap is still exhausted, unaffected by Trigger C's fires.
+      await turn(h, assistantTurn({ text: "Three." })); // turn 2 of this run
+      expect(h.sent).toHaveLength(4);
+
+      // Drive turns up to Trigger B's arm point (turn 6 for capForRun=10)
+      // with no-op shell turns, then two non-compliant turns to fire B —
+      // proving B's arming/latch was untouched by A's and C's exhausted caps.
+      await turn(h, shellTurn(["ls -la"])); // turn 3
+      await turn(h, shellTurn(["ls -la"])); // turn 4
+      await turn(h, shellTurn(["ls -la"])); // turn 5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
+      await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
+      expect(h.sent).toHaveLength(5);
     });
   });
 

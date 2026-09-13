@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import setupSkillInject, { looksLikeResearchTask, shouldInjectResearchDirective } from "./index.ts";
+import setupSkillInject, {
+  looksLikeResearchTask,
+  looksLikeTemporalTask,
+  shouldInjectResearchDirective,
+  shouldInjectTemporalDirective,
+} from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
 
 // End-to-end check of the #73 conversion: drive the real `before_agent_start`
@@ -336,6 +341,277 @@ describe("research directive gates on browse-tool availability", () => {
     const result = await handler(event, ctx);
 
     expect(result?.message?.content ?? "").not.toContain("## Research-first directive");
+  });
+});
+
+// mteb-leaderboard trajectory: the model correctly noticed the task named a
+// past date, but "answered" it by filtering today's live leaderboard by an
+// unrelated proxy field (model release date) instead of finding an actual
+// dated snapshot. The temporal directive exists to redirect that pattern
+// toward a git revision / archived page instead.
+describe("temporal directive triggers on phrasing that names a PAST state", () => {
+  it("fires for genuine temporal-research phrasing (date/version-anchored)", () => {
+    expect(looksLikeTemporalTask("what was the leaderboard as of August 2025")).toBe(true);
+    expect(looksLikeTemporalTask("what was this repo as of the v2.0 release")).toBe(true);
+    expect(looksLikeTemporalTask("the dataset's state at the time of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("as of 2024-05-01 what did the rankings look like")).toBe(true);
+    expect(looksLikeTemporalTask("as of May 3, 2024, what were the standings")).toBe(true);
+    expect(
+      looksLikeTemporalTask("find an archived snapshot of the results page from 2024-01-15"),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("what did the historical rankings look like?")).toBe(true);
+    expect(looksLikeTemporalTask("what were the repositories' stars in 2021")).toBe(true);
+    expect(looksLikeTemporalTask("as of commit abc123 what was in this repo")).toBe(true);
+    expect(looksLikeTemporalTask("back in 2019 what was the leaderboard")).toBe(true);
+    expect(looksLikeTemporalTask("leaderboard standings as of early 2024")).toBe(true);
+    expect(looksLikeTemporalTask("as of mid-2022 what did the repo contain")).toBe(true);
+    // Anaphoric case: no date in the "at the time" clause itself, but a real
+    // date appears earlier in the prompt (the original mteb-leaderboard shape).
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. Which model led the leaderboard at the time?",
+      ),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
+    // A comma or a spaced hyphen after a bare year is a clause break, not the
+    // start of a unit -- the unit-guard must not swallow these.
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023, before the reshuffle?"),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("what were the standings in 2023, and who won?")).toBe(true);
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023 - before the reshuffle"),
+    ).toBe(true);
+    // An optional leading "the" is accepted before EVERY anchor shape, not
+    // just a version -- "as of the v1.2" used to be the only one that fired.
+    expect(looksLikeTemporalTask("as of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("as of the March 2024 release")).toBe(true);
+    expect(looksLikeTemporalTask("as of the last year")).toBe(true);
+    expect(looksLikeTemporalTask("as of the v1.2")).toBe(true);
+    expect(
+      looksLikeTemporalTask("what was the leaderboard as of the March 2024 release"),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("at the time of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("at the time of the March 2024 release")).toBe(true);
+    // Single-component versions are anchors when a strong phrase precedes
+    // them (the free-scanning triggers still require 2+ components below).
+    expect(looksLikeTemporalTask("what did the API look like as of v2")).toBe(true);
+    expect(looksLikeTemporalTask("what was the config as of version 3")).toBe(true);
+    expect(looksLikeTemporalTask("what did the API look like at the time of v2")).toBe(true);
+    // Day-first dates ("1 March 2024") are as real an anchor as "March 1, 2024".
+    expect(looksLikeTemporalTask("what was the leaderboard as of 1 March 2024")).toBe(true);
+    expect(looksLikeTemporalTask("what was the leaderboard as of 3rd May 2024")).toBe(true);
+    expect(looksLikeTemporalTask("as of 21 Aug. 2025 the rankings changed")).toBe(true);
+    // Must keep firing -- protects the existing gate tests below.
+    expect(looksLikeTemporalTask("what was this as of last year?")).toBe(true);
+    // Must keep firing both research+temporal directives (see the
+    // both-directives test below).
+    expect(looksLikeTemporalTask("please research the leaderboard as of March 2024")).toBe(true);
+  });
+
+  it("does not fire for dev-artifact snapshots, discourse adverbs, bare counts, or dateless anchors", () => {
+    expect(looksLikeTemporalTask("snapshot of memory usage right now")).toBe(false);
+    expect(looksLikeTemporalTask("let's take a snapshot of the docker image")).toBe(false);
+    expect(looksLikeTemporalTask("the snapshot test in CI is flaky")).toBe(false);
+    expect(looksLikeTemporalTask("as of today the build is green")).toBe(false);
+    expect(looksLikeTemporalTask("as of now the tests pass")).toBe(false);
+    expect(looksLikeTemporalTask("as of yesterday the CI is red, please fix the tests")).toBe(
+      false,
+    );
+    expect(looksLikeTemporalTask("historically we used tabs not spaces")).toBe(false);
+    expect(looksLikeTemporalTask("historic buildings from the 1800s")).toBe(false);
+    // No date anywhere in the prompt -- the anaphoric disjunct requires a
+    // prompt-level date, so a bare "at the time" alone does not fire.
+    expect(looksLikeTemporalTask("at the time, GPT-4 was the top model")).toBe(false);
+    // Inverted from an old assertion: bare adverb no longer fires.
+    expect(looksLikeTemporalTask("historically, this model ranked lower")).toBe(false);
+    // Inverted from an old assertion: no date, no qualifier.
+    expect(looksLikeTemporalTask("give me a snapshot of the results")).toBe(false);
+    expect(looksLikeTemporalTask("batches of 2048")).toBe(false);
+    expect(looksLikeTemporalTask("port 2000")).toBe(false);
+    expect(looksLikeTemporalTask("resize to 1920x1080")).toBe(false);
+    expect(looksLikeTemporalTask("load the dataset in 2048 chunks")).toBe(false);
+    expect(looksLikeTemporalTask("the 2021 census dataset")).toBe(false);
+    expect(looksLikeTemporalTask("split the dataset in 2000 buckets")).toBe(false);
+    expect(looksLikeTemporalTask("run the dataset in 2020 workers")).toBe(false);
+    // The unit after a bare year can lead with a digit, a hyphen or a list
+    // comma, not just a letter -- all still counts, not dates.
+    expect(looksLikeTemporalTask("shard the dataset in 2048 4-byte blocks")).toBe(false);
+    expect(looksLikeTemporalTask("bump the dataset in 2048-byte pages")).toBe(false);
+    expect(looksLikeTemporalTask("split the dataset in 2048, 4096 chunks")).toBe(false);
+    expect(looksLikeTemporalTask("load the dataset in 2048 Chunks")).toBe(false);
+    // A version-shaped tail inside an identifier is not a version anchor.
+    expect(looksLikeTemporalTask("take a snapshot of the srv1.2 host")).toBe(false);
+    expect(looksLikeTemporalTask("snapshot the conv1.0 model weights")).toBe(false);
+    // ...and must not arm the anaphoric "at the time" check either.
+    expect(
+      looksLikeTemporalTask("the env1.2 config broke; what was set at the time?"),
+    ).toBe(false);
+    // A real version anchor still fires.
+    expect(looksLikeTemporalTask("what was this repo as of the v1.2 release")).toBe(true);
+    expect(looksLikeTemporalTask("the 2024 dataset loader has an off-by-one bug")).toBe(false);
+    expect(looksLikeTemporalTask("add a retry to the 2024 dataset loader")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of writing this is broken")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the crash")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the incident")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the outage")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the deployment")).toBe(false);
+    expect(looksLikeTemporalTask("at the time of the error")).toBe(false);
+    expect(looksLikeTemporalTask("prune the archived snapshots on the ZFS pool")).toBe(false);
+    // A bare year elsewhere in the prompt must NOT arm the anaphoric
+    // "at the time" check.
+    expect(
+      looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
+    ).toBe(false);
+    // A single-component version stays too weak for the free-scanning
+    // snapshot trigger and for the anaphoric check -- only strongly-anchored
+    // "as of"/"at the time of" accept it.
+    expect(looksLikeTemporalTask("take a snapshot of the v2 host")).toBe(false);
+    expect(looksLikeTemporalTask("bump to v2. the config at the time was fine.")).toBe(false);
+    // Accepted collateral of the comma-then-digit unit-guard: a comma'd list
+    // of YEARS reads the same as a comma'd list of sizes, and rejecting
+    // "in 2048, 4096 chunks" necessarily rejects this too.
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023, 2024 and 2025?"),
+    ).toBe(false);
+  });
+
+  // Sentence-ending punctuation ends a trigger's reach. Without this, a
+  // question about something else entirely binds to a date in the NEXT
+  // sentence and fires -- two unrelated sentences read as one temporal ask.
+  it("does not bind a trigger across ? ! or ; into a new sentence", () => {
+    expect(
+      looksLikeTemporalTask(
+        "What should I name this helper? The schema was frozen in March 2024.",
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeTemporalTask("Which dataset is best? Did the crash happen in March 2020?"),
+    ).toBe(false);
+    // Genuine same-sentence phrasings are untouched.
+    expect(looksLikeTemporalTask("what were the repositories' stars in 2021")).toBe(true);
+    expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
+  });
+
+  // Deliberate near-miss: "historic" (an adjective describing an old
+  // building) is not "historical"/"historically" and must not be treated as
+  // a signal that the task wants a past snapshot of live/versioned data.
+  it("does not fire for 'historic building' (proper adjective use, not a temporal-research signal)", () => {
+    expect(
+      looksLikeTemporalTask("This town has several historic buildings from the 1800s."),
+    ).toBe(false);
+  });
+
+  it("anaphoric 'at the time' requires a real date NEAR it, not anywhere in the prompt", () => {
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. Which model led the leaderboard at the time?",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
+    ).toBe(false);
+    // An unrelated version string plus the ordinary English idiom "at the
+    // time" ("at that point in the process") is a dependency-pinning task,
+    // not temporal research. Versions are held to a same-sentence rule.
+    expect(
+      looksLikeTemporalTask(
+        "Pin to v1.26.0 in requirements.txt. It was pinned at the time to avoid a regression.",
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeTemporalTask(
+        "Pin to v1 in requirements.txt. It was pinned at the time to avoid a regression.",
+      ),
+    ).toBe(false);
+    // A version in the SAME sentence is a genuine back-reference.
+    expect(
+      looksLikeTemporalTask("we were on v2.3.1 and the leaderboard at the time showed X"),
+    ).toBe(true);
+    // A real date far outside the window no longer arms it.
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. " +
+          "We then refactored the loader, renamed a few helpers, deleted the old cache layer, " +
+          "rewrote the config parser, fixed the flaky retry logic, and cleaned up the docs folder. " +
+          "Which model led the leaderboard at the time?",
+      ),
+    ).toBe(false);
+    // ...and it reads in both directions within the window.
+    expect(looksLikeTemporalTask("at the time of interest, June 2024, which model led?")).toBe(
+      true,
+    );
+  });
+
+  it("does not inject the directive when no git-capable/browse tool is available, even though the trigger matches", async () => {
+    const readOnly = new Set(["read", "edit"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", readOnly)).toBe(false);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = ["read", "edit"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Temporal-research directive");
+  });
+
+  it("injects when a git-capable shell tool is available even without any browse tool", async () => {
+    const shellOnly = new Set(["ShellSession", "ShellSessionCwd", "ShellSessionReset"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", shellOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = [
+      "ShellSession",
+      "ShellSessionCwd",
+      "ShellSessionReset",
+    ];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").toContain("## Temporal-research directive");
+    // ShellSession-only can't reach an archived web page, so the directive
+    // should only mention the git route, not the web.archive.org one.
+    expect(result?.message?.content ?? "").toContain("git log");
+    expect(result?.message?.content ?? "").not.toContain("web.archive.org");
+  });
+
+  it("injects when only browse tools are available even without a shell tool", async () => {
+    const browseOnly = new Set(["websearch"]);
+    expect(shouldInjectTemporalDirective("what was this as of last year?", browseOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn("what was this as of last year?");
+    event.systemPromptOptions.littleCoder.allowedTools = ["websearch"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").toContain("## Temporal-research directive");
+    expect(result?.message?.content ?? "").toContain("web.archive.org");
+    expect(result?.message?.content ?? "").not.toContain("git log");
+  });
+
+  it("fires both the research and temporal directives on a prompt that trips both, temporal last", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const result = await handler(
+      turn("please research the leaderboard as of March 2024"),
+      ctx,
+    );
+    const content: string = result?.message?.content ?? "";
+
+    expect(content).toContain("## Research-first directive");
+    expect(content).toContain("## Temporal-research directive");
+    // The more specific, corrective directive wins the recency argument.
+    expect(content.indexOf("## Temporal-research directive")).toBeGreaterThan(
+      content.indexOf("## Research-first directive"),
+    );
+  });
+
+  it("skips a repeat of the identical temporal-directive block on the next turn", async () => {
+    const handler = handlerFor(setupSkillInject);
+    const first = await handler(turn("what was the leaderboard as of March 2024?"), ctx);
+    expect(first?.message?.content ?? "").toContain("## Temporal-research directive");
+
+    const second = await handler(turn("what was the leaderboard as of March 2024?"), ctx);
+    expect(second).toBeUndefined();
   });
 });
 

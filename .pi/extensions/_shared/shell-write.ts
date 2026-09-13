@@ -62,12 +62,34 @@ export interface ShellWrite {
   /** The (possibly relative) path the command writes to. */
   path: string;
   kind: WriteKind;
+  /**
+   * For `copy`/`move` only: the source operands, in command order.
+   *
+   * `cp a.md docs/` writes `docs/a.md`, not `docs` — `path` alone cannot say
+   * which file gets clobbered, because that depends on whether `path` is a
+   * directory on disk, which this pure string module deliberately does not
+   * look at. Consumers that care (checkpoint, deciding what to snapshot) stat
+   * `path` themselves and recombine it with these basenames. Purely additive:
+   * every existing consumer reads only `path`/`kind` and is unaffected.
+   */
+  sources?: string[];
 }
 
 // Operators that chain one command into the next. Splitting on these lets the
 // whitelist judge every segment rather than only the first one, so
 // `ls && rm -rf /` can't ride in on `ls`.
-const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
+//
+// Bare `&` backgrounds a job and starts the next command, exactly like `;`.
+// Leaving it out meant `ls & rm -rf /` passed the gate as one `ls`-prefixed
+// segment while `ls && rm -rf /` was correctly refused. It must stay AFTER
+// `&&`: the scanner is first-match-wins per position and skips positions a
+// longer match already consumed, so `&&` claims both characters of a real
+// `&&` before the lone `&` entry can see the second one.
+const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n", "&"];
+
+// The only characters a backslash escapes inside double quotes. Everything
+// else keeps both the backslash and the character literally ("\d" is "\d").
+const ESCAPABLE_IN_DOUBLE_QUOTES = new Set(["$", "`", '"', "\\"]);
 
 /**
  * Walk `cmd` once, tracking quote state, and hand each character to `visit`.
@@ -76,6 +98,11 @@ const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
  * merely looks like shell syntax — `grep "a > b" file` writes nothing. A
  * backslash escape outside single quotes hides the next character too.
  *
+ * `visit` receives the OPEN QUOTE CHARACTER, not a boolean, because the two
+ * quotes are not interchangeable: a single quote makes its contents wholly
+ * literal, while a double quote still expands `$(…)` and backticks. A
+ * consumer that only cares whether it is quoted at all can test truthiness.
+ *
  * Exported (not just used internally) so shell-contract-nudge can reuse the
  * same quote/escape-tracking walk for its own `&`-detection rather than
  * re-implementing it — one shared copy of security/correctness-sensitive
@@ -83,7 +110,7 @@ const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
  */
 export function scan(
   cmd: string,
-  visit: (ch: string, index: number, quoted: boolean) => void,
+  visit: (ch: string, index: number, quote: '"' | "'" | null) => void,
 ): void {
   let quote: '"' | "'" | null = null;
   for (let i = 0; i < cmd.length; i++) {
@@ -94,7 +121,15 @@ export function scan(
     }
     if (quote === "'" && ch === "\\") {
       // Backslash is literal inside single quotes — no escaping happens.
-      visit(ch, i, true);
+      visit(ch, i, quote);
+      continue;
+    }
+    if (quote === '"' && ch === "\\" && ESCAPABLE_IN_DOUBLE_QUOTES.has(cmd[i + 1])) {
+      // Bash's real escaping rule inside double quotes. Without it a `\"`
+      // closed the quote tracker, and `echo "a \" > b"` reported a write to a
+      // file named `b"`.
+      i++;
+      visit(cmd[i], i, quote); // the escaped character, as a quoted literal
       continue;
     }
     if (quote === null && (ch === '"' || ch === "'")) {
@@ -105,7 +140,7 @@ export function scan(
       quote = null;
       continue;
     }
-    visit(ch, i, quote !== null);
+    visit(ch, i, quote);
   }
 }
 
@@ -114,18 +149,30 @@ export function scan(
 // a third `<` at the call site.
 const HEREDOC_START = /<<-?[ \t]*(?:'([^']*)'|"([^"]*)"|([A-Za-z_][A-Za-z0-9_]*))/;
 
+/** One heredoc body found by `parseHeredocs`, with how its delimiter was written. */
+interface HeredocBody {
+  /** The body text, data only — never the opening line. */
+  text: string;
+  /**
+   * True for `<<'EOF'` / `<<"EOF"`. Bash performs parameter, command and
+   * arithmetic expansion inside a body whose delimiter is UNQUOTED, and none
+   * at all when it is quoted — the distinction `hasCommandSubstitution` needs
+   * to know whether a `$(…)` in the body actually runs.
+   */
+  delimiterQuoted: boolean;
+}
+
 /**
- * Remove heredoc bodies, leaving the command line that opened them.
+ * Strip every heredoc body out of `cmd`, returning the remaining command text
+ * alongside the bodies that were removed.
  *
- * A heredoc body is data, not shell syntax, and analyzing it produces noise in
- * both directions: a `>` in the payload (`if a > b:`) looks like a redirect,
- * and an apostrophe (`don't`) leaves the quote scanner stuck mid-string for
- * everything after it. The redirect we actually care about — the `>` in
- * `cat > main.py << 'EOF'` — always sits on the opening line, so dropping the
- * body loses nothing and removes every one of those false readings.
+ * `stripHeredocBodies` is the string half of this; `hasCommandSubstitution`
+ * needs the bodies too, and both must agree character-for-character about
+ * where a body starts and ends — hence one parser rather than two.
  */
-export function stripHeredocBodies(cmd: string): string {
+function parseHeredocs(cmd: string): { stripped: string; bodies: HeredocBody[] } {
   let out = cmd;
+  const bodies: HeredocBody[] = [];
   let searchFrom = 0;
   // One pass per heredoc; a command can open several.
   for (let guard = 0; guard < 32; guard++) {
@@ -139,10 +186,13 @@ export function stripHeredocBodies(cmd: string): string {
       continue;
     }
     const delim = m[1] ?? m[2] ?? m[3] ?? "";
-    const bodyStart = out.indexOf("\n", at + m[0].length);
+    // Groups 1 and 2 are the `'DELIM'` / `"DELIM"` spellings; group 3 is bare.
+    const delimiterQuoted = m[1] !== undefined || m[2] !== undefined;
+    const openEnd = at + m[0].length;
+    const bodyStart = out.indexOf("\n", openEnd);
     if (bodyStart === -1 || !delim) {
       // Body never started (single-line command) — nothing to remove.
-      searchFrom = at + m[0].length;
+      searchFrom = openEnd;
       continue;
     }
     const lines = out.slice(bodyStart + 1).split("\n");
@@ -159,22 +209,147 @@ export function stripHeredocBodies(cmd: string): string {
     const bodyEnd = closed
       ? Math.min(bodyStart + consumed, out.length)
       : out.length; // unterminated heredoc: the rest of the string is body
-    out = out.slice(0, at) + out.slice(bodyEnd);
+    bodies.push({ text: out.slice(bodyStart + 1, bodyEnd), delimiterQuoted });
+    // The span between the `<<DELIM` token and the body is the rest of the
+    // opening line, where real shell syntax lives. Deleting straight through
+    // to `bodyEnd` took it too, so `cat <<EOF & rm -rf /` reached the gate as
+    // a lone `cat`, and `cat << 'EOF' > app.js` lost the very redirect this
+    // module exists to catch.
+    out = out.slice(0, at) + out.slice(openEnd, bodyStart) + out.slice(bodyEnd);
     searchFrom = at;
   }
-  return out;
+  return { stripped: out, bodies };
+}
+
+/**
+ * Remove heredoc bodies, leaving the command line that opened them.
+ *
+ * A heredoc body is data, not shell syntax, and analyzing it produces noise in
+ * both directions: a `>` in the payload (`if a > b:`) looks like a redirect,
+ * and an apostrophe (`don't`) leaves the quote scanner stuck mid-string for
+ * everything after it. The redirect we actually care about — the `>` in
+ * `cat > main.py << 'EOF'` — always sits on the opening line, so dropping the
+ * body loses nothing and removes every one of those false readings.
+ */
+export function stripHeredocBodies(cmd: string): string {
+  return parseHeredocs(cmd).stripped;
+}
+
+/**
+ * True when `text` contains a substitution operator at top level — `$(…)`,
+ * backticks, or `<(…)`/`>(…)`. `text` must already have heredoc bodies
+ * removed: an apostrophe in a body (`don't`) opens a quote the tracker never
+ * sees closed, and every operator after it would be dismissed as literal.
+ */
+function scanForSubstitution(text: string): boolean {
+  let found = false;
+  scan(text, (ch, i, quote) => {
+    if (quote === "'") return; // wholly literal
+    // Backticks run even inside double quotes.
+    if (ch === "`") found = true;
+    // `$(…)` and `$((…))` alike — arithmetic can itself embed a `$(…)`, and
+    // one check covers both spellings.
+    if (ch === "$" && text[i + 1] === "(") found = true;
+    // Process substitution is not performed inside double quotes.
+    if (quote === null && (ch === "<" || ch === ">") && text[i + 1] === "(") found = true;
+  });
+  return found;
+}
+
+/**
+ * True when running `cmd` would execute a nested command through substitution.
+ *
+ * Substitution runs an arbitrary command with no trace of it in the outer
+ * command's prefix, so a prefix whitelist cannot see it at all: `echo $(rm -rf
+ * /)` is judged as `echo`. The whole shape is refused rather than analyzed,
+ * because the nested text is itself a full command line.
+ *
+ * Heredocs are handled in two halves, and both are load-bearing. The outer
+ * structure is scanned with bodies stripped, since a stray apostrophe in a
+ * body otherwise poisons quote tracking for everything after it. Each body
+ * whose delimiter was UNQUOTED is then scanned separately, with no quote
+ * tracking at all — bash expands `$(…)` and backticks inside those bodies and
+ * a body has no quote syntax of its own, every character being literal except
+ * the substitution operators. `<<'EOF'` suppresses expansion entirely, so
+ * those bodies are skipped and stay allowed.
+ *
+ * KNOWN GAP, deliberate: only permission-gate consults this. write-guard's
+ * accept-all/benchmark mode has a different threat model, where `$(…)` appears
+ * in ubiquitous legitimate commands (`cd $(git rev-parse --show-toplevel)`)
+ * and a blanket refusal would break benchmark runs wholesale; closing it there
+ * needs detection of redirects INSIDE the substituted text, which is a
+ * separate design. Not closed — out of scope, not overlooked.
+ */
+export function hasCommandSubstitution(cmd: string): boolean {
+  const { stripped, bodies } = parseHeredocs(cmd);
+  if (scanForSubstitution(stripped)) return true;
+  return bodies.some(
+    (b) => !b.delimiterQuoted && (b.text.includes("$(") || b.text.includes("`")),
+  );
+}
+
+/**
+ * True when the `&>`/`&>>` starting at `at` is followed by its redirect
+ * target and nothing more before the command ends or the next chain operator
+ * begins — the only shape in which bash's "redirect both streams" reading and
+ * a POSIX shell's "background, then redirect" reading agree that no second
+ * command runs. Anything past the next chain operator belongs to a different
+ * command and is judged on its own, so it is not counted here.
+ *
+ * Quoted whitespace inside the target (`&>"my file"`) counts as two words and
+ * so declines the exemption. That only ever costs a cut that produces a
+ * redirect-only segment, which `detectWriteTargets` already refuses as a file
+ * write — the conservative direction.
+ */
+function redirectTargetEndsCommand(cmd: string, at: number): boolean {
+  const opLen = cmd[at + 2] === ">" ? 3 : 2;
+  const tail = cmd.slice(at + opLen).split(/[;|\n&]/, 1)[0];
+  return tail.trim().split(/\s+/).filter(Boolean).length <= 1;
 }
 
 /**
  * Split a command line into the individual commands it runs, on unquoted
- * `&&`, `||`, `;`, `|` and newlines. Heredoc bodies are stripped first so
+ * `&&`, `||`, `;`, `|`, `&` and newlines. Heredoc bodies are stripped first so
  * their contents are never mistaken for commands.
  */
 export function splitCommandChain(raw: string): string[] {
   const cmd = stripHeredocBodies(raw);
   const cuts: Array<{ at: number; len: number }> = [];
-  scan(cmd, (_ch, i, quoted) => {
-    if (quoted) return;
+  // The unquoted character immediately before the one being visited — the only
+  // thing that separates a backgrounding `&` from the `&` of `2>&1`. `scan`
+  // skips escaped characters outright and flags quoted ones, so neither can
+  // land here and neither can pose as the redirect that suppresses a cut.
+  let prevUnquoted: { ch: string; at: number } | undefined;
+  scan(cmd, (ch, i, quote) => {
+    const prev = prevUnquoted;
+    if (!quote) prevUnquoted = { ch, at: i };
+    if (quote) return;
+    if (ch === "&" && !cmd.startsWith("&&", i)) {
+      // `>&`/`<&` is always fd-duplication syntax in bash, never a real chain
+      // separator — suppressing here can never hide a genuine bare `&`.
+      if (prev && prev.at === i - 1 && (prev.ch === ">" || prev.ch === "<")) return;
+      // `&>`/`&>>` redirect stdout and stderr together under bash — but under
+      // /bin/sh or dash the same bytes are a backgrounding `&` followed by a
+      // separate `>` redirect. The exemption therefore covers only the shape
+      // where BOTH readings are harmless: the redirect target is the last
+      // word of the command. `make &>/dev/null` is one command under bash and
+      // `make &` plus a bare `>/dev/null` under dash — no second command
+      // either way, and a target that is a real file is caught by
+      // `detectWriteTargets` regardless.
+      //
+      // A trailing command word is what makes the two readings diverge:
+      // `cat &>/dev/null rm -rf /` is `cat` with `rm -rf /` as arguments
+      // under bash, but `cat &` then `rm -rf /` under dash. So that shape is
+      // cut and every segment gets judged on its own.
+      //
+      // Narrow rather than unconditional because the shell is NOT guaranteed
+      // to be bash. shell-session and bg-shell do hardcode `/bin/bash`, but
+      // SHELL_TOOLS also gates pi's own `bash` tool, and pi resolves a shell
+      // at runtime — `shellPath` from settings.json, else /bin/bash, else
+      // bash on PATH, else plain `sh`. On an image without bash the
+      // unconditional form was a live bypass, not a theoretical one.
+      if (cmd[i + 1] === ">" && redirectTargetEndsCommand(cmd, i)) return;
+    }
     for (const op of CHAIN_OPERATORS) {
       if (cmd.startsWith(op, i)) {
         // Don't cut inside an already-recorded operator (`&&` must not also
@@ -197,10 +372,17 @@ export function splitCommandChain(raw: string): string[] {
   return segments.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-// `2>`, `>&2`, `&>`, `1>&2` … — file-descriptor plumbing, not a file write.
-// We only care about a redirect whose target is a path.
-function isFdTarget(target: string): boolean {
-  return target.startsWith("&");
+/**
+ * True when the word after a redirect's `&` is fd plumbing rather than a file.
+ *
+ * Bash's rule for `>&word`: it duplicates (or, for `-`, closes) a descriptor
+ * only when the WHOLE word is a number or `-`. Anything else is an ordinary
+ * file write, identical to `&>word`. The match must therefore be anchored at
+ * both ends — verified live, `ls >&2foo` creates a file literally named
+ * `2foo`, so a leading-digit test would wave a real truncation through.
+ */
+function isFdPlumbingWord(word: string): boolean {
+  return word === "" || word === "-" || /^\d+$/.test(word);
 }
 
 // Redirecting to one of the kernel's special character devices destroys no
@@ -243,8 +425,8 @@ export function detectWriteTargets(raw: string): ShellWrite[] {
   const writes: ShellWrite[] = [];
   const redirects: Array<{ at: number; kind: WriteKind }> = [];
 
-  scan(cmd, (ch, i, quoted) => {
-    if (quoted || ch !== ">") return;
+  scan(cmd, (ch, i, quote) => {
+    if (quote || ch !== ">") return;
     // `>>` — record once, on the first angle bracket.
     if (cmd[i - 1] === ">") return;
     // `<>` opens read-write; treat as a write.
@@ -256,12 +438,19 @@ export function detectWriteTargets(raw: string): ShellWrite[] {
     const rest = cmd.slice(at);
     // Process substitution `>(cmd)` is not a file target.
     if (rest.trimStart().startsWith("(")) continue;
-    // fd duplication / close (`2>&1`, `>&2`, `>&-`): no file involved. Checked
-    // on the raw text because `&` is a word break, so `firstWord("&1")` is the
-    // descriptor number alone and no longer looks like fd syntax.
-    if (rest.startsWith("&")) continue;
+    // `>&word` is fd duplication/close (`2>&1`, `>&2`, `>&-`) only when the
+    // word is entirely digits or `-`. Every other word is a genuine file
+    // write — `ls >&backend/app.js` truncates `backend/app.js` exactly as
+    // `ls &>backend/app.js` does. Exempting the whole `&` shape treated that
+    // truncation as plumbing and let it past both guards.
+    if (rest.startsWith("&")) {
+      const word = firstWord(rest.slice(1));
+      if (isFdPlumbingWord(word)) continue;
+      writes.push({ path: unquote(word), kind });
+      continue;
+    }
     const target = firstWord(rest);
-    if (!target || isFdTarget(target)) continue;
+    if (!target) continue;
     writes.push({ path: unquote(target), kind });
   }
 
@@ -302,7 +491,7 @@ export function hasWriteRedirection(cmd: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// detectDeliverableWrites — a broader, tb-finalize-guard-only superset
+// detectDeliverableWrites — a broader superset, for non-gating consumers
 // ---------------------------------------------------------------------------
 // `detectWriteTargets` deliberately only covers redirection (`>`, `>>`,
 // `tee`, `dd of=`) because it also feeds write-guard and permission-gate, and
@@ -314,12 +503,26 @@ export function hasWriteRedirection(cmd: string): boolean {
 // they intentionally let through today (confirmed: permission-gate's own
 // test asserts `isSafeBash("cp a b") === true`).
 //
-// tb-finalize-guard has a different question to answer: not "is this command
-// safe to run," but "did the model do something that plausibly produced its
-// deliverable." For that purpose `cp`/`mv`/`install`/`sed -i`/a compiler's
-// `-o` are all evidence of a write, so this function layers detection for
-// those on top of `detectWriteTargets` — used ONLY by tb-finalize-guard.
-function lastOperandOrTargetFlag(words: string[]): string | undefined {
+// This function's consumers have a different question to answer than
+// write-guard/permission-gate's "is this command safe to run": tb-finalize-
+// guard asks "did the model do something that plausibly produced its
+// deliverable" (evidence-of-work), and checkpoint asks "might this command
+// destroy a file I haven't snapshotted yet" (pre-write backup) — both are
+// non-gating, best-effort consumers where over-detection is acceptable, unlike
+// the two write-permission gates above. For those purposes `cp`/`mv`/
+// `install`/`sed -i`/a compiler's `-o` are all evidence of a write, so this
+// function layers detection for those on top of `detectWriteTargets`.
+// Short flags of `cp`/`mv`/`install` whose value is a SEPARATE word, so the
+// value must be consumed rather than read as an operand: install's `-m` mode,
+// `-o` owner and `-g` group, and the `-S` backup suffix. Skipping only the
+// flag itself made `install -m 644 out.bin /app/bin/` see `644` as a source
+// file. It never affected the target (still the last operand), which is why
+// this went unnoticed while `sources` did not exist.
+const VALUE_FLAGS = new Set(["-m", "-o", "-g", "-S"]);
+
+function lastOperandOrTargetFlag(
+  words: string[],
+): { target: string | undefined; sources: string[] } {
   let tDir: string | undefined;
   const operands: string[] = [];
   for (let i = 1; i < words.length; i++) {
@@ -329,6 +532,10 @@ function lastOperandOrTargetFlag(words: string[]): string | undefined {
       i++;
       continue;
     }
+    if (VALUE_FLAGS.has(w)) {
+      i++; // consume the flag's value word
+      continue;
+    }
     if (w.startsWith("--target-directory=")) {
       tDir = w.slice("--target-directory=".length);
       continue;
@@ -336,7 +543,11 @@ function lastOperandOrTargetFlag(words: string[]): string | undefined {
     if (w.startsWith("-")) continue; // flag — skip
     operands.push(w);
   }
-  return tDir ?? operands[operands.length - 1];
+  // With an explicit `-t DIR` every operand is a source; otherwise the last
+  // operand is the destination and everything before it is a source.
+  return tDir
+    ? { target: tDir, sources: operands }
+    : { target: operands[operands.length - 1], sources: operands.slice(0, -1) };
 }
 
 // `-i`, `-i.bak` (GNU, suffix glued on), `--in-place`, `--in-place=.bak`.
@@ -352,11 +563,13 @@ function hasSedInPlaceFlag(words: string[]): boolean {
 
 /**
  * `detectWriteTargets` plus command-shape coverage that only matters for
- * judging evidence-of-work, never for permission-gating: `cp`/`mv`/`install`
- * (last non-flag operand, or the `-t DIR` argument), `sed -i`/`--in-place`
- * (every non-flag operand after the script), and a compiler's `-o` output
- * flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above for why this
- * is a separate function rather than a change to `detectWriteTargets` itself.
+ * non-gating consumers (tb-finalize-guard's evidence-of-work check, and
+ * checkpoint's pre-write backup), never for permission-gating: `cp`/`mv`/
+ * `install` (last non-flag operand, or the `-t DIR` argument), `sed -i`/
+ * `--in-place` (every non-flag operand after the script), and a compiler's
+ * `-o` output flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above
+ * for why this is a separate function rather than a change to
+ * `detectWriteTargets` itself.
  */
 export function detectDeliverableWrites(raw: string): ShellWrite[] {
   const writes = [...detectWriteTargets(raw)];
@@ -368,8 +581,14 @@ export function detectDeliverableWrites(raw: string): ShellWrite[] {
     const name = words[0];
 
     if (name === "cp" || name === "mv" || name === "install") {
-      const target = lastOperandOrTargetFlag(words);
-      if (target) writes.push({ path: unquote(target), kind: name === "mv" ? "move" : "copy" });
+      const { target, sources } = lastOperandOrTargetFlag(words);
+      if (target) {
+        writes.push({
+          path: unquote(target),
+          kind: name === "mv" ? "move" : "copy",
+          sources: sources.map(unquote),
+        });
+      }
       continue;
     }
 
