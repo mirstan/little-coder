@@ -133,7 +133,18 @@ export function hasBareBackgroundAmpersand(raw: string): boolean {
 // specifically what makes it able to see the current command's own wrapper
 // text; `pkill somename` alone (no `-f`) only matches on the short process
 // name and doesn't have this hazard.
-const PKILL_FULL_FLAG_RE = /^-[A-Za-z]*f[A-Za-z]*$/;
+//
+// The leading class deliberately excludes lowercase `f` (`A-Za-eg-z`, not
+// `A-Za-z`): with `f` included, a run of N `f`s followed by a non-matching
+// character forces the engine to retry the mandatory `f` at every position
+// before failing -- O(n^2) on adversarial input (empirically ~3.7s on a
+// 50KB all-`f` string). Excluding `f` from the leading class makes the
+// first `f` in the word the only possible pivot, so a failure is detected
+// in one linear pass. Language-equivalent: any `-X` with X containing a
+// lowercase f can be written as prefix (f-free) + f + suffix, which the new
+// pattern still matches; capital `F` alone (no lowercase f) is correctly
+// still rejected either way.
+const PKILL_FULL_FLAG_RE = /^-[A-Za-eg-z]*f[A-Za-z]*$/;
 
 // Wrapper commands that just re-exec their remaining argv as the real
 // command — skipped (along with their own flags) so e.g. `sudo pkill -f x`

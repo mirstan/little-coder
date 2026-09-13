@@ -137,6 +137,12 @@ describe("hasPkillOrKillall (pure)", () => {
   it("still handles the existing pkill cluster-flag case", () => {
     expect(hasPkillOrKillall("pkill -xf name")).toBe(true);
   });
+  it("stays linear-time on an adversarial all-f flag cluster (ReDoS regression)", () => {
+    const bad = "pkill -" + "f".repeat(50_000) + "! target";
+    const t0 = Date.now();
+    hasPkillOrKillall(bad);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
 });
 
 describe("shell-contract-nudge extension", () => {
