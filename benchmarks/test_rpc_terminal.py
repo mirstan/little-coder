@@ -506,6 +506,35 @@ def test_prompt_with_error_retry_recovers_on_the_same_session(fake_pi, tmp_path)
     assert "second answer" in outcome.result.assistant_text
 
 
+# ── a completion that coincides with pi's death ──────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["error_end_then_exit", "empty_end_then_exit"])
+def test_a_completion_coincident_with_exit_is_process_exit(fake_pi, tmp_path, mode):
+    """Both error-synthesis paths, each with pi exiting right behind the
+    agent_end. The agent_end puts the drain in SETTLING, so the settle
+    branch wins on ordering and used to report a retryable "error" about a
+    session that no longer existed."""
+    with fake_pi(mode, tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert r.stop_reason == "process_exit"
+    assert r.error_message == ""
+
+
+@pytest.mark.parametrize("mode", ["error_end_then_exit", "empty_end_then_exit"])
+def test_retry_helper_does_not_reprompt_a_session_that_exited(fake_pi, tmp_path, mode):
+    """The regression test for the whole fix. Classified as "error", these
+    two shapes sent prompt_with_error_retry at a dead process, and the
+    PiProcessExited it raised escaped the trial before its metadata was
+    written."""
+    with fake_pi(mode, tmp_path) as rpc:
+        outcome = rpc_client.prompt_with_error_retry(
+            rpc, "go", 600, sleep=lambda _s: None,
+        )
+    assert outcome.n_error_retries == 0
+    assert outcome.result.stop_reason == "process_exit"
+
+
 def test_promptresult_still_constructible_with_no_args():
     r = rpc_client.PromptResult()
     assert r.agent_ended is False

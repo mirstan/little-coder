@@ -425,6 +425,32 @@ def main():
         serve_requests()
         return
 
+    if mode == "error_end_then_exit":
+        # error_end, except pi EXITS instead of settling. The whole reason
+        # this fix exists: the agent_end puts the drain in SETTLING, so the
+        # settle branch of the stop_reason derivation wins on ordering even
+        # though the process is already gone, and the errored turn used to
+        # be reported as a retryable "error" against a dead session.
+        # Deliberately no emit_text(): a fixture that says something dodges
+        # nothing here, but this shape is the measured one.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="upstream 500 from provider")
+        emit({"type": "agent_end", "willRetry": False})
+        os._exit(0)
+
+    if mode == "empty_end_then_exit":
+        # Same race reached through the other synthesis path: a CLEAN
+        # turn_end (stopReason "stop") that produced no text and no tool
+        # calls, then exit. Nothing on the wire says "error" -- only the
+        # empty-completion fingerprint fires, and it must defer to the dead
+        # process exactly as the flagged path does.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        os._exit(0)
+
     if mode == "error_then_clean_same_call":
         # TWO agent_end events in ONE prompt_and_collect call: the first turn
         # errors, then a genuine continuation (agent_start -> ... ->

@@ -864,6 +864,15 @@ def _run_exercise(
                 # normal retry instead of aborting the rest of the budget on
                 # a failure mode that didn't actually consume an attempt's
                 # worth of the model's effort.
+                #
+                # One shape did move between those two branches: now that
+                # rpc_client only synthesizes "error"/"empty completion"
+                # while pi is still alive, an empty completion COINCIDENT
+                # with pi's death reports "process_exit" and stops here,
+                # where it used to classify as "empty_response" and get a
+                # fresh-session retry. Kept deliberately -- a dead pi is a
+                # harness fault worth surfacing, not one to quietly retry
+                # past. An empty completion from a live pi is unaffected.
                 break
             if agent == "pi":
                 # Repeats the original prompt in full, not just the failure

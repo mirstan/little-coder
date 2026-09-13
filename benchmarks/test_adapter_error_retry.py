@@ -41,13 +41,16 @@ class _StubRpc:
 
     `consume_sec` makes each attempt cost wall-clock time on the injected
     clock, which is what lets the remaining-budget assertions below be real
-    rather than vacuous.
+    rather than vacuous. A scripted entry that is an Exception is raised
+    instead of returned, and `alive` is what the helper's pre-retry
+    liveness check sees.
     """
 
-    def __init__(self, results, clock=None, consume_sec=0.0):
+    def __init__(self, results, clock=None, consume_sec=0.0, alive=True):
         self._results = list(results)
         self._clock = clock
         self._consume_sec = consume_sec
+        self.alive = alive
         self.calls = []  # [(message, timeout)]
 
     def prompt_and_collect(self, message, timeout=900, on_event=None):
@@ -55,7 +58,13 @@ class _StubRpc:
         if self._clock is not None:
             self._clock.t += self._consume_sec
         assert self._results, "prompt_and_collect called more often than scripted"
-        return self._results.pop(0)
+        nxt = self._results.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    def is_alive(self):
+        return self.alive
 
 
 def _err(message="upstream 500"):
@@ -217,6 +226,118 @@ def test_backoff_grows_between_retries():
     rpc = _StubRpc([_err("one"), _err("two"), _ok()], clock)
     _run(rpc, clock)
     assert clock.now() - start == pytest.approx(sum(rpc_client.ERROR_RETRY_BACKOFF_SEC))
+
+
+def test_the_first_attempt_is_clamped_to_the_deadline_too():
+    """Not just the retries: the adapters take their deadline before their
+    own setup work, so `timeout` can already overshoot it before a retry is
+    even in question."""
+    clock = _Clock()
+    rpc = _StubRpc([_ok()], clock)
+    _run(rpc, clock, timeout=3600.0, deadline=clock.now() + 900.0)
+    assert rpc.calls[0][1] == pytest.approx(900.0)
+
+
+def test_a_first_attempt_already_past_the_deadline_gets_no_budget():
+    """The clamp floors at zero rather than handing pi a negative timeout."""
+    clock = _Clock()
+    rpc = _StubRpc([_ok()], clock)
+    _run(rpc, clock, timeout=3600.0, deadline=clock.now() - 10.0)
+    assert rpc.calls[0][1] == 0.0
+
+
+# ── a pi that went away ──────────────────────────────────────────────────
+
+
+def test_a_dead_pi_is_not_re_prompted():
+    """rpc_client's own derivation catches a death visible when the result
+    was built; this catches one in the gap between attempts. Re-prompting
+    then raises PiProcessExited out of the trial."""
+    clock = _Clock()
+    lines = []
+    rpc = _StubRpc([_err()], clock, alive=False)
+    outcome = _run(rpc, clock, log=lines.append)
+    assert len(rpc.calls) == 1
+    assert outcome.n_error_retries == 0
+    assert outcome.error_message == "upstream 500"
+    assert "pi process is gone" in "\n".join(lines)
+
+
+def test_an_exception_from_a_retry_keeps_what_earlier_attempts_produced():
+    """A retry is extra credit: the tool calls and tokens the attempts that
+    DID finish already spent are worth more to the caller than the
+    exception."""
+    clock = _Clock()
+    first = PromptResult(
+        stop_reason="error", error_message="upstream 500", turn_count=3,
+        tool_calls=[{"name": "read"}], assistant_text="partial work",
+    )
+    rpc = _StubRpc([first, rpc_client.PiProcessExited("pi died")], clock)
+    outcome = _run(rpc, clock)
+    assert len(rpc.calls) == 2, "the retry was issued and blew up"
+    assert outcome.result.turn_count == 3
+    assert outcome.result.tool_calls == [{"name": "read"}]
+    assert outcome.result.assistant_text == "partial work"
+    assert outcome.error_message == "upstream 500"
+
+
+def test_an_exception_from_the_first_attempt_still_propagates():
+    """Wrapping a call site in this helper must not swallow a failure the
+    bare prompt_and_collect() it replaces would have raised."""
+    clock = _Clock()
+    rpc = _StubRpc([rpc_client.PiProcessExited("pi died")], clock)
+    with pytest.raises(rpc_client.PiProcessExited):
+        _run(rpc, clock)
+
+
+# ── one result across every attempt ──────────────────────────────────────
+
+
+def test_the_result_is_merged_across_attempts():
+    """Returning only the last attempt's result silently discards every tool
+    call, turn and token the earlier ones spent -- which the trial was
+    charged for either way."""
+    clock = _Clock()
+    first = PromptResult(
+        stop_reason="error", error_message="upstream 500", turn_count=2,
+        tool_calls=[{"name": "read"}], assistant_text="first",
+        compaction_events=1,
+        usage={"input": 100, "output": 10, "cache_read": 0, "cache_write": 0,
+               "cost": 0.5},
+    )
+    second = PromptResult(
+        stop_reason="agent_end", turn_count=3, agent_ended=True, settled=True,
+        tool_calls=[{"name": "write"}], assistant_text="second",
+        compaction_events=2,
+        usage={"input": 40, "output": 5, "cache_read": 0, "cache_write": 0,
+               "cost": 0.25},
+    )
+    merged = _run(_StubRpc([first, second], clock), clock).result
+    assert merged.turn_count == 5
+    assert [t["name"] for t in merged.tool_calls] == ["read", "write"]
+    assert merged.compaction_events == 3
+    assert merged.usage["input"] == 140
+    assert merged.usage["output"] == 15
+    assert merged.usage["cost"] == pytest.approx(0.75)
+    assert merged.assistant_text == "first\nsecond"
+    assert merged.agent_ended is True
+
+
+def test_the_merged_verdict_comes_from_the_last_attempt_alone():
+    """stop_reason / error_message / settled say how the CALL ended; summing
+    or latching them would report a recovered call as still failing."""
+    clock = _Clock()
+    merged = _run(_StubRpc([_err("upstream 500"), _ok()], clock), clock).result
+    assert merged.stop_reason == "agent_end"
+    assert merged.error_message == ""
+
+
+def test_a_call_that_never_retried_returns_that_attempt_untouched():
+    """The no-retry path must stay byte-identical to a bare
+    prompt_and_collect(), not hand back a reconstructed copy."""
+    clock = _Clock()
+    only = _ok()
+    assert _run(_StubRpc([only], clock), clock).result is only
 
 
 # ── plumbing ─────────────────────────────────────────────────────────────
