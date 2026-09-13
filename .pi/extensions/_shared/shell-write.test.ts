@@ -214,32 +214,44 @@ describe("detectDeliverableWrites — commands detectWriteTargets misses", () =>
 
   it("catches cp's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("cp deliverable.txt /app/out/")).toEqual([
-      { path: "/app/out/", kind: "copy" },
+      { path: "/app/out/", kind: "copy", sources: ["deliverable.txt"] },
     ]);
     // Multiple sources: only the final operand is the target.
     expect(detectDeliverableWrites("cp -r a.txt b.txt /app/dest")).toEqual([
-      { path: "/app/dest", kind: "copy" },
+      { path: "/app/dest", kind: "copy", sources: ["a.txt", "b.txt"] },
     ]);
   });
 
   it("catches mv's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("mv -f draft.txt /app/answer.txt")).toEqual([
-      { path: "/app/answer.txt", kind: "move" },
+      { path: "/app/answer.txt", kind: "move", sources: ["draft.txt"] },
     ]);
   });
 
   it("catches install's last non-flag operand as the target", () => {
     expect(detectDeliverableWrites("install -m 644 out.bin /app/bin/out")).toEqual([
-      { path: "/app/bin/out", kind: "copy" },
+      { path: "/app/bin/out", kind: "copy", sources: ["out.bin"] },
+    ]);
+  });
+
+  it("consumes a separate-word flag value instead of reading it as a source", () => {
+    // `644` is -m's value, not a file. It never affected the target (the last
+    // operand either way), but it did land in `sources`, which checkpoint uses
+    // to work out what `install … /app/bin/` clobbers inside that directory.
+    expect(detectDeliverableWrites("install -m 644 out.bin /app/bin/")).toEqual([
+      { path: "/app/bin/", kind: "copy", sources: ["out.bin"] },
+    ]);
+    expect(detectDeliverableWrites("install -o root -g wheel a.bin /app/bin/")).toEqual([
+      { path: "/app/bin/", kind: "copy", sources: ["a.bin"] },
     ]);
   });
 
   it("prefers -t DIR / --target-directory over the last operand", () => {
     expect(detectDeliverableWrites("cp -t /app/out a.txt b.txt")).toEqual([
-      { path: "/app/out", kind: "copy" },
+      { path: "/app/out", kind: "copy", sources: ["a.txt", "b.txt"] },
     ]);
     expect(detectDeliverableWrites("mv --target-directory=/app/out a.txt")).toEqual([
-      { path: "/app/out", kind: "move" },
+      { path: "/app/out", kind: "move", sources: ["a.txt"] },
     ]);
   });
 

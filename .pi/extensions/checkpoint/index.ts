@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectDeliverableWrites } from "../_shared/shell-write.ts";
 import { normalizeWritePath } from "../write-guard/index.ts";
@@ -49,19 +49,78 @@ export function resolveShellTarget(p: string, cwd: string): string {
   let out = p;
   if (out === "~") out = homedir();
   else if (out.startsWith("~/")) out = join(homedir(), out.slice(2));
-  return isAbsolute(out) ? out : join(cwd, out);
+  // `resolve` (not a bare isAbsolute/join branch) so `/a/./f`, `/a//f`, and
+  // `/a/x/../f` all collapse to the same key as their canonical spelling —
+  // otherwise two shell redirects to the "same" file under different
+  // spellings double-track it, and first-write-wins captures whichever
+  // spelling happened to run second, not the true original.
+  return resolve(cwd, out);
 }
 
-// Checkpoint-only filter (not part of _shared/shell-write.ts): a detected
-// target that still contains unexpanded shell syntax means the real path is
-// unknowable statically — backing up a literal `$OUT`-named key would be
-// noise, not a useful checkpoint. This is deliberately NOT added inside
-// detectDeliverableWrites itself: tb-finalize-guard (the function's other
-// consumer) legitimately treats a `$VAR` target as evidence-of-work and must
-// not lose that signal.
-const DYNAMIC_TARGET = /[$`*?[{]/;
+// Checkpoint-only filter (not part of _shared/shell-write.ts): `$`/backtick
+// mean genuine shell substitution — the real path is unknowable statically,
+// so backing up a literal `$OUT`-named key would be noise, not a useful
+// checkpoint. Deliberately NOT added inside detectDeliverableWrites itself:
+// tb-finalize-guard (the function's other consumer) legitimately treats a
+// `$VAR` target as evidence-of-work and must not lose that signal.
+const SUBSTITUTION_TARGET = /[$`]/;
+
+// `[`, `*`, `?`, `{` are unexpanded-glob shapes in MOST contexts, but they
+// are also ordinary, common filename characters in web-framework routing
+// conventions (`routes/[id].tsx`, `app/[...slug]/page.tsx` — Next.js, Remix,
+// SvelteKit). Treating them as unconditionally dynamic silently excludes
+// exactly the kind of file little-coder's small-model target audience edits
+// constantly. So: only skip when the literal, resolved path does NOT exist —
+// a real file on disk is never "unknowable," bracket in its name or not.
+const GLOB_LIKE_TARGET = /[*?[{]/;
+
+function isUnbackupable(rawPath: string, cwd: string): boolean {
+  if (SUBSTITUTION_TARGET.test(rawPath)) return true;
+  if (!GLOB_LIKE_TARGET.test(rawPath)) return false;
+  // Existence alone, not specifically isFile: a glob-shaped DIRECTORY
+  // destination (e.g. `output/[locale]/`) must still reach
+  // shellWriteTargets' own directory-expansion logic rather than being
+  // rejected here before it gets the chance.
+  try {
+    statSync(resolveShellTarget(rawPath, cwd));
+    return false;
+  } catch {
+    return true; // doesn't exist (or unreadable parent) -- still unknowable
+  }
+}
 
 export const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // exported for tests
+
+function isExistingDir(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every path a detected shell write can clobber, resolved against `cwd`.
+ *
+ * `cp a.md docs/` names `docs` as its target, but the bytes it destroys are
+ * `docs/a.md`. `backupIfNeeded` correctly refuses to snapshot a directory, so
+ * keying only on the target would silently back up *nothing* for the single
+ * most common copy shape a model writes. When the destination is a directory
+ * on disk, each source contributes `<dir>/<basename(source)>` instead — which
+ * is what `cp`/`mv`/`install` actually overwrite there.
+ */
+export function shellWriteTargets(
+  write: { path: string; sources?: string[] },
+  cwd: string,
+): string[] {
+  const dest = resolveShellTarget(write.path, cwd);
+  if (!write.sources?.length || !isExistingDir(dest)) return [dest];
+  // A directory destination is never itself the clobbered file, so it is not
+  // in the returned list — only the per-source paths landing inside it.
+  return write.sources
+    .filter((src) => src && !isUnbackupable(src, cwd))
+    .map((src) => join(dest, basename(src)));
+}
 
 function backupIfNeeded(sessionId: string, filePath: string): void {
   if (!sessionId || !filePath) return;
@@ -102,8 +161,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const name = (event as any).toolName;
     const input: any = (event as any).input ?? (event as any).args;
+    // Case-folded, matching how write-guard and read-guard-edit select these
+    // same two tools (`toolName.toLowerCase() !== "write"` / `"edit"`). The
+    // enumerated spellings this replaces covered only `write`/`Write`/`edit`/
+    // `Edit`, so any other casing was still guarded by those two but silently
+    // never snapshotted. SHELL_TOOLS membership below stays case-sensitive:
+    // that set is a shared security-gate list, matched verbatim by
+    // permission-gate and write-guard.
+    const lower = String(name ?? "").toLowerCase();
 
-    if (name === "write" || name === "Write" || name === "edit" || name === "Edit") {
+    if (lower === "write" || lower === "edit") {
       const raw = checkpointPath(input ?? {});
       if (raw) {
         const cwd = ctx?.cwd ?? process.cwd();
@@ -135,6 +202,13 @@ export default function (pi: ExtensionAPI) {
     //   `open(path).write(...)`). This closes the shell-command-shaped gap,
     //   not a general backstop against every way a subprocess can modify a
     //   file.
+    // - Commands that destroy a file without *writing* one are out of scope:
+    //   `rm`, `truncate`, `patch`, `tar -x`, `git checkout --`, `sort -o`.
+    //   detectDeliverableWrites answers "did this produce a deliverable",
+    //   and none of those do, so folding them in would change its meaning for
+    //   tb-finalize-guard (a deletion is not evidence of work). Covering them
+    //   needs a separate destructive-command detector, not a widening of this
+    //   one.
     // - A target containing unexpanded shell syntax (`$OUT`, `$DEST/b.txt`,
     //   a glob, …) is skipped: the real path is unknowable statically, so
     //   backing up the literal placeholder text would be noise, not a
@@ -158,8 +232,10 @@ export default function (pi: ExtensionAPI) {
     if (!command) return;
     const cwd = ctx?.cwd ?? process.cwd();
     for (const write of detectDeliverableWrites(command)) {
-      if (DYNAMIC_TARGET.test(write.path)) continue;
-      backupIfNeeded(currentSessionId, resolveShellTarget(write.path, cwd));
+      if (isUnbackupable(write.path, cwd)) continue;
+      for (const target of shellWriteTargets(write, cwd)) {
+        backupIfNeeded(currentSessionId, target);
+      }
     }
   });
 }

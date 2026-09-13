@@ -262,6 +262,76 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     expect(files).toEqual([expectedSentinel]);
   });
 
+  it("normalizes an absolute path so ./ and // spellings key on the same physical file", async () => {
+    const h = setup();
+    const abs = join(home, "norm.txt");
+    writeFileSync(abs, "NORM-ORIGINAL");
+    const dotted = join(home, ".", "norm.txt");
+    const doubled = home + "//norm.txt";
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u5.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo a > ${dotted}` } }, { cwd: home });
+    writeFileSync(abs, "CLOBBERED-BY-FIRST-WRITE");
+    await h.tool_call({ toolName: "bash", input: { command: `echo b > ${doubled}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u5.json");
+    const files = readdirSync(dir);
+    // Unnormalized, these three spellings would be three distinct tracking
+    // keys -- the second "backup" would actually capture the already-
+    // clobbered bytes under a different filename, silently lying about what
+    // the original content was.
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("NORM-ORIGINAL");
+  });
+
+  it("backs up a bracket-named file that exists on disk (Next.js/Remix-style routes)", async () => {
+    const h = setup();
+    const routesDir = join(home, "routes");
+    mkdirSync(routesDir, { recursive: true });
+    const target = join(routesDir, "[id].tsx");
+    writeFileSync(target, "ORIGINAL-ROUTE-CONTENT");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u6.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > routes/[id].tsx` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u6.json");
+    const files = readdirSync(dir);
+    // Before the fix, the bare presence of `[`/`]` unconditionally excluded
+    // this target as "unexpanded glob syntax" -- silently backing up nothing
+    // for a real, existing file.
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIGINAL-ROUTE-CONTENT");
+  });
+
+  it("still skips a genuinely nonexistent bracket-shaped path (can't tell glob from literal)", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u7.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > routes/[slug].tsx` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u7.json");
+    expect(existsSync(dir) ? readdirSync(dir).length : 0).toBe(0);
+  });
+
+  it("still skips a target containing real shell substitution", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u8.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > "$OUT"` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u8.json");
+    expect(existsSync(dir) ? readdirSync(dir).length : 0).toBe(0);
+  });
+
   it("backs up a `cp` destination's pre-existing bytes, not the source's", async () => {
     const h = setup();
     const src = join(home, "src4.txt");
@@ -306,6 +376,97 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     const files = readdirSync(dir);
     expect(files.length).toBe(1);
     expect(readFileSync(join(dir, files[0]), "utf8")).toBe("MOVE-DST-ORIGINAL");
+  });
+
+  it("backs up the clobbered file inside a directory destination for `cp dir/`", async () => {
+    const h = setup();
+    const src = join(home, "report.md");
+    const destDir = join(home, "docs");
+    mkdirSync(destDir);
+    const clobbered = join(destDir, "report.md");
+    writeFileSync(src, "NEW-REPORT");
+    writeFileSync(clobbered, "DOCS-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d1.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `cp ${src} ${destDir}/` } }, { cwd: home });
+
+    // The destination *directory* is not a file and must not be snapshotted;
+    // the file it actually overwrites, docs/report.md, must be.
+    const dir = ckptDir("sess-d1.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("DOCS-ORIGINAL");
+  });
+
+  it("backs up every clobbered file for a multi-source `mv` into a directory", async () => {
+    const h = setup();
+    const destDir = join(home, "dest");
+    mkdirSync(destDir);
+    for (const n of ["a.md", "b.md"]) {
+      writeFileSync(join(home, n), `SRC-${n}`);
+      writeFileSync(join(destDir, n), `DEST-ORIGINAL-${n}`);
+    }
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d2.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `mv ${join(home, "a.md")} ${join(home, "b.md")} ${destDir}/` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-d2.json");
+    const contents = readdirSync(dir)
+      .map((f) => readFileSync(join(dir, f), "utf8"))
+      .sort();
+    expect(contents).toEqual(["DEST-ORIGINAL-a.md", "DEST-ORIGINAL-b.md"]);
+  });
+
+  it("handles `cp -t DIR` (every operand is a source)", async () => {
+    const h = setup();
+    const destDir = join(home, "tdest");
+    mkdirSync(destDir);
+    writeFileSync(join(home, "c.md"), "SRC-C");
+    writeFileSync(join(destDir, "c.md"), "TDEST-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d3.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `cp -t ${destDir} ${join(home, "c.md")}` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-d3.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("TDEST-ORIGINAL");
+  });
+
+  it("still keys on the destination itself when it is a plain file, not a directory", async () => {
+    const h = setup();
+    const src = join(home, "s7.md");
+    const dst = join(home, "d7.md");
+    writeFileSync(src, "SRC7");
+    writeFileSync(dst, "DST7-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d4.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `cp ${src} ${dst}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-d4.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("DST7-ORIGINAL");
+  });
+
+  it("matches the write/edit tool name case-insensitively, like write-guard does", async () => {
+    const h = setup();
+    const file = join(home, "cased.md");
+    writeFileSync(file, "CASED-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d5.json" } });
+
+    await h.tool_call({ toolName: "EDIT", input: { path: file } }, { cwd: home });
+
+    const dir = ckptDir("sess-d5.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("CASED-ORIGINAL");
   });
 
   it("skips a target that still contains unexpanded shell syntax", async () => {

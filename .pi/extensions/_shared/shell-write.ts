@@ -62,6 +62,17 @@ export interface ShellWrite {
   /** The (possibly relative) path the command writes to. */
   path: string;
   kind: WriteKind;
+  /**
+   * For `copy`/`move` only: the source operands, in command order.
+   *
+   * `cp a.md docs/` writes `docs/a.md`, not `docs` — `path` alone cannot say
+   * which file gets clobbered, because that depends on whether `path` is a
+   * directory on disk, which this pure string module deliberately does not
+   * look at. Consumers that care (checkpoint, deciding what to snapshot) stat
+   * `path` themselves and recombine it with these basenames. Purely additive:
+   * every existing consumer reads only `path`/`kind` and is unaffected.
+   */
+  sources?: string[];
 }
 
 // Operators that chain one command into the next. Splitting on these lets the
@@ -318,7 +329,17 @@ export function hasWriteRedirection(cmd: string): boolean {
 // the two write-permission gates above. For those purposes `cp`/`mv`/
 // `install`/`sed -i`/a compiler's `-o` are all evidence of a write, so this
 // function layers detection for those on top of `detectWriteTargets`.
-function lastOperandOrTargetFlag(words: string[]): string | undefined {
+// Short flags of `cp`/`mv`/`install` whose value is a SEPARATE word, so the
+// value must be consumed rather than read as an operand: install's `-m` mode,
+// `-o` owner and `-g` group, and the `-S` backup suffix. Skipping only the
+// flag itself made `install -m 644 out.bin /app/bin/` see `644` as a source
+// file. It never affected the target (still the last operand), which is why
+// this went unnoticed while `sources` did not exist.
+const VALUE_FLAGS = new Set(["-m", "-o", "-g", "-S"]);
+
+function lastOperandOrTargetFlag(
+  words: string[],
+): { target: string | undefined; sources: string[] } {
   let tDir: string | undefined;
   const operands: string[] = [];
   for (let i = 1; i < words.length; i++) {
@@ -328,6 +349,10 @@ function lastOperandOrTargetFlag(words: string[]): string | undefined {
       i++;
       continue;
     }
+    if (VALUE_FLAGS.has(w)) {
+      i++; // consume the flag's value word
+      continue;
+    }
     if (w.startsWith("--target-directory=")) {
       tDir = w.slice("--target-directory=".length);
       continue;
@@ -335,7 +360,11 @@ function lastOperandOrTargetFlag(words: string[]): string | undefined {
     if (w.startsWith("-")) continue; // flag — skip
     operands.push(w);
   }
-  return tDir ?? operands[operands.length - 1];
+  // With an explicit `-t DIR` every operand is a source; otherwise the last
+  // operand is the destination and everything before it is a source.
+  return tDir
+    ? { target: tDir, sources: operands }
+    : { target: operands[operands.length - 1], sources: operands.slice(0, -1) };
 }
 
 // `-i`, `-i.bak` (GNU, suffix glued on), `--in-place`, `--in-place=.bak`.
@@ -369,8 +398,14 @@ export function detectDeliverableWrites(raw: string): ShellWrite[] {
     const name = words[0];
 
     if (name === "cp" || name === "mv" || name === "install") {
-      const target = lastOperandOrTargetFlag(words);
-      if (target) writes.push({ path: unquote(target), kind: name === "mv" ? "move" : "copy" });
+      const { target, sources } = lastOperandOrTargetFlag(words);
+      if (target) {
+        writes.push({
+          path: unquote(target),
+          kind: name === "mv" ? "move" : "copy",
+          sources: sources.map(unquote),
+        });
+      }
       continue;
     }
 
