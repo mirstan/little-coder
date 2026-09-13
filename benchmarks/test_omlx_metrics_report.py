@@ -54,11 +54,11 @@ def _reclaim(clock, gb, day="2026-09-13"):
     )
 
 
-def _reject(clock, kv_len=81920, source="omlx.scheduler - ERROR", day="2026-09-13"):
+def _reject(clock, kv_len=81920, chunk=4096, cap_gb="34.2", source="omlx.scheduler - ERROR", day="2026-09-13"):
     return (
         f"{day} {clock},000 - {source} - [-] - Chunked prefill capacity rejected for 87d801cb: "
-        f"Prefill context too large for available memory (pre-chunk guard at 4096 tokens, kv_len={kv_len}): "
-        "predicted peak would exceed prefill safety cap 34.2GB (90% of static/metal_cap ceiling 38.0GB). "
+        f"Prefill context too large for available memory (pre-chunk guard at {chunk} tokens, kv_len={kv_len}): "
+        f"predicted peak would exceed prefill safety cap {cap_gb}GB (90% of static/metal_cap ceiling 38.0GB). "
         "Raise kernel iogpu.wired_limit_mb in Terminal, or reduce context length."
     )
 
@@ -71,21 +71,25 @@ def _mtp(clock, rounds=12, accepted=30, proposed=48, tpr=2.5, block=4, day="2026
     )
 
 
-def _trial(tmp_path, lines, turns=1, started="09:00:00", finished="09:30:00", day="2026-09-13"):
+def _trial(
+    tmp_path,
+    lines,
+    started="09:00:00",
+    finished="09:30:00",
+    day="2026-09-13",
+    finished_day=None,
+):
     trial_dir = tmp_path / "sometask__abc1234"
-    (trial_dir / "agent").mkdir(parents=True)
+    trial_dir.mkdir(parents=True)
     (trial_dir / "result.json").write_text(
         json.dumps(
             {
                 "agent_execution": {
                     "started_at": _local(day, started).isoformat().replace("+00:00", "Z"),
-                    "finished_at": _local(day, finished).isoformat().replace("+00:00", "Z"),
+                    "finished_at": _local(finished_day or day, finished).isoformat().replace("+00:00", "Z"),
                 }
             }
         )
-    )
-    (trial_dir / "agent" / "little_coder.live.log").write_text(
-        "".join(f"=== turn {n} start ===\nsome trajectory text\n" for n in range(1, turns + 1))
     )
     server_log = tmp_path / "server.log"
     server_log.write_text("\n".join(lines) + "\n")
@@ -179,7 +183,6 @@ def test_throttles_and_reclaims_are_attributed_to_the_turn_they_fall_in(tmp_path
             _chat("09:04:00", 200, 10.0, 20.0, 2000),
             _chat("09:05:00", 300, 10.0, 30.0, 3000),
         ],
-        turns=3,
     )
     R.report(trial_dir, server_log)
     rows = _rows(trial_dir)
@@ -191,7 +194,6 @@ def test_turn_wall_s_spans_from_the_previous_completion(tmp_path):
     trial_dir, server_log = _trial(
         tmp_path,
         [_chat("09:02:00", 100, 10.0, 10.0, 1000), _chat("09:05:30", 200, 10.0, 20.0, 2000)],
-        turns=2,
     )
     R.report(trial_dir, server_log)
     rows = _rows(trial_dir)
@@ -215,6 +217,7 @@ def test_mtp_columns_are_blank_not_zero_when_mtp_never_ran(tmp_path):
     row = _rows(trial_dir)[0]
     assert row["mtp_rounds"] == ""
     assert row["mtp_accepted"] == ""
+    assert row["mtp_proposed"] == ""
     assert row["mtp_tokens_per_round"] == ""
     assert row["mtp_block_size"] == ""
 
@@ -227,7 +230,6 @@ def test_mtp_stats_are_attached_to_the_completion_that_follows_them(tmp_path):
             _chat("09:02:00", 100, 10.0, 10.0, 1000),
             _chat("09:03:00", 100, 10.0, 10.0, 2000),
         ],
-        turns=2,
     )
     R.report(trial_dir, server_log)
     rows = _rows(trial_dir)
@@ -269,7 +271,8 @@ def test_no_rejection_is_reported_as_none(tmp_path, capsys):
     assert "prefill rejections: none" in capsys.readouterr().out
 
 
-def test_turn_idx_uses_live_log_labels_when_they_line_up_one_per_completion(tmp_path):
+def test_turn_idx_numbers_completions_by_their_position_in_the_window(tmp_path):
+    """One agent-loop turn can drive several completions; turn_idx counts rows, not turns."""
     trial_dir, server_log = _trial(
         tmp_path,
         [
@@ -277,38 +280,57 @@ def test_turn_idx_uses_live_log_labels_when_they_line_up_one_per_completion(tmp_
             _chat("09:03:00", 100, 10.0, 10.0, 2000),
             _chat("09:04:00", 100, 10.0, 10.0, 3000),
         ],
-        turns=3,
     )
     R.report(trial_dir, server_log)
     assert [r["turn_idx"] for r in _rows(trial_dir)] == ["1", "2", "3"]
-
-
-def test_turn_idx_falls_back_to_position_when_one_turn_spans_many_completions(tmp_path):
-    trial_dir, server_log = _trial(
-        tmp_path,
-        [
-            _chat("09:02:00", 100, 10.0, 10.0, 1000),
-            _chat("09:03:00", 100, 10.0, 10.0, 2000),
-            _chat("09:04:00", 100, 10.0, 10.0, 3000),
-        ],
-        turns=1,
-    )
-    R.report(trial_dir, server_log)
-    assert [r["turn_idx"] for r in _rows(trial_dir)] == ["1", "2", "3"]
-
-
-def test_a_missing_live_log_does_not_stop_the_report(tmp_path):
-    trial_dir, server_log = _trial(tmp_path, [_chat("09:02:00", 100, 10.0, 10.0, 1000)])
-    (trial_dir / "agent" / "little_coder.live.log").unlink()
-    R.report(trial_dir, server_log)
-    assert [r["turn_idx"] for r in _rows(trial_dir)] == ["1"]
 
 
 def test_csv_has_the_agreed_columns_in_order(tmp_path):
     trial_dir, server_log = _trial(tmp_path, [_chat("09:02:00", 100, 10.0, 10.0, 1000)])
     R.report(trial_dir, server_log)
+    expected = [
+        "turn_idx",
+        "prompt_tokens",
+        "output_tokens",
+        "reused_tokens",
+        "reprefill_tokens",
+        "decode_tok_s",
+        "turn_wall_s",
+        "throttle_events",
+        "reclaimed_gb",
+        "finish_reason",
+        "mtp_rounds",
+        "mtp_accepted",
+        "mtp_proposed",
+        "mtp_tokens_per_round",
+        "mtp_block_size",
+    ]
+    assert R.CSV_COLUMNS == expected
     with (trial_dir / R.CSV_FILENAME).open(newline="") as handle:
-        assert next(csv.reader(handle)) == R.CSV_COLUMNS
+        assert next(csv.reader(handle)) == expected
+
+
+def test_output_tokens_reach_the_csv(tmp_path):
+    """build_turns has always counted them; only CSV_COLUMNS kept them out of the file."""
+    trial_dir, server_log = _trial(tmp_path, [_chat("09:02:00", 7825, 530.46, 21.6, 1000)])
+    R.report(trial_dir, server_log)
+    assert _rows(trial_dir)[0]["output_tokens"] == "7825"
+
+
+def test_mtp_accepted_is_reported_with_the_proposed_denominator(tmp_path):
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [
+            _mtp("09:01:59", accepted=30, proposed=48),
+            _chat("09:02:00", 100, 10.0, 10.0, 1000),
+            _chat("09:03:00", 100, 10.0, 10.0, 2000),
+        ],
+    )
+    R.report(trial_dir, server_log)
+    rows = _rows(trial_dir)
+    assert rows[0]["mtp_accepted"] == "30"
+    assert rows[0]["mtp_proposed"] == "48"
+    assert rows[1]["mtp_proposed"] == ""
 
 
 def test_summary_reports_median_decode_and_max_prompt(tmp_path, capsys):
@@ -319,7 +341,6 @@ def test_summary_reports_median_decode_and_max_prompt(tmp_path, capsys):
             _chat("09:02:00", 100, 10.0, 30.0, 9000),
             _chat("09:03:00", 100, 10.0, 20.0, 5000),
         ],
-        turns=3,
     )
     R.report(trial_dir, server_log)
     out = capsys.readouterr().out
@@ -346,3 +367,144 @@ def test_cli_writes_the_csv_for_an_explicit_rotated_server_log(tmp_path):
     rotated.write_text(server_log.read_text())
     assert R.main(["--trial-dir", str(trial_dir), "--server-log", str(rotated)]) == 0
     assert (trial_dir / R.CSV_FILENAME).exists()
+
+
+def test_throttles_after_the_last_completion_are_reported_not_dropped(tmp_path, capsys):
+    """A window ending in a rejection or a kill leaves events with no turn row to land in."""
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [
+            _chat("09:02:00", 100, 10.0, 10.0, 1000),
+            _throttle("09:03:00"),
+            _reclaim("09:03:01", "4.01"),
+            _throttle("09:04:00"),
+            _reject("09:05:00"),
+        ],
+    )
+    R.report(trial_dir, server_log)
+    assert [r["throttle_events"] for r in _rows(trial_dir)] == ["0"]
+    out = capsys.readouterr().out
+    assert "after the last completion: 2 throttle events, 4.01GB reclaimed" in out
+
+
+def test_nothing_trailing_is_reported_when_every_event_landed_in_a_turn(tmp_path, capsys):
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [_throttle("09:01:00"), _chat("09:02:00", 100, 10.0, 10.0, 1000)],
+    )
+    R.report(trial_dir, server_log)
+    assert "after the last completion" not in capsys.readouterr().out
+
+
+def test_build_turns_returns_trailing_counts_alongside_turns_and_rejections(tmp_path):
+    started = _local("2026-09-13", "09:00:00")
+    events = [
+        (_local("2026-09-13", "09:03:00"), "throttle", {}),
+        (_local("2026-09-13", "09:03:30"), "reclaim", {"gb": "2.5"}),
+    ]
+    turns, rejections, trailing = R.build_turns(events, started)
+    assert (turns, rejections) == ([], [])
+    assert trailing == {"throttle_events": 1, "reclaimed_gb": 2.5}
+
+
+def test_a_rejected_requests_cache_stats_do_not_attach_to_a_later_completion(tmp_path):
+    """The rejected request never completes; a later turn can share its prompt length by chance."""
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [
+            _prefix("09:01:00", 8280, 163928, 155648),
+            _mtp("09:01:05", rounds=12, accepted=30, proposed=48),
+            _reject("09:01:10", kv_len=163928),
+            _chat("09:02:00", 100, 10.0, 10.0, 163928),
+        ],
+    )
+    R.report(trial_dir, server_log)
+    row = _rows(trial_dir)[0]
+    assert row["reused_tokens"] == ""
+    assert row["reprefill_tokens"] == ""
+    assert row["mtp_rounds"] == ""
+    assert row["mtp_accepted"] == ""
+
+
+def test_two_rejections_differing_only_in_chunk_size_are_both_counted(tmp_path, capsys):
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [
+            _reject("09:03:00", kv_len=81920, chunk=4096),
+            _reject("09:03:00", kv_len=81920, chunk=8192),
+        ],
+    )
+    R.report(trial_dir, server_log)
+    assert "prefill rejections: 2" in capsys.readouterr().out
+
+
+def test_two_rejections_differing_only_in_the_safety_cap_are_both_counted(tmp_path, capsys):
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [
+            _reject("09:03:00", kv_len=81920, cap_gb="34.2"),
+            _reject("09:03:00", kv_len=81920, cap_gb="30.0"),
+        ],
+    )
+    R.report(trial_dir, server_log)
+    assert "prefill rejections: 2" in capsys.readouterr().out
+
+
+def test_a_window_crossing_local_midnight_warns_about_the_rotated_sibling(tmp_path, capsys):
+    trial_dir, server_log = _trial(
+        tmp_path,
+        [_chat("23:50:00", 100, 10.0, 10.0, 1000, day="2026-09-12")],
+        started="23:30:00",
+        day="2026-09-12",
+        finished="00:30:00",
+        finished_day="2026-09-13",
+    )
+    R.report(trial_dir, server_log)
+    err = capsys.readouterr().err
+    assert "2026-09-12 and 2026-09-13" in err
+    assert str(tmp_path / "server.log.2026-09-12") in err
+
+
+def test_a_same_day_window_says_nothing_about_rotation(tmp_path, capsys):
+    trial_dir, server_log = _trial(tmp_path, [_chat("09:02:00", 100, 10.0, 10.0, 1000)])
+    R.report(trial_dir, server_log)
+    assert capsys.readouterr().err == ""
+
+
+def test_the_log_being_read_is_not_suggested_back_to_the_user(tmp_path):
+    """Pointed at the pre-midnight rotated file, the gap is the live log, not itself."""
+    siblings = R.rotated_siblings(
+        tmp_path / "server.log.2026-09-12",
+        _local("2026-09-12", "23:30:00"),
+        _local("2026-09-13", "00:30:00"),
+    )
+    assert siblings == [tmp_path / "server.log"]
+
+
+def test_a_trial_that_died_before_agent_execution_gets_a_clear_error(tmp_path):
+    trial_dir = tmp_path / "sometask__abc1234"
+    trial_dir.mkdir()
+    (trial_dir / "result.json").write_text(json.dumps({"id": "sometask__abc1234", "agent_execution": None}))
+    with pytest.raises(SystemExit) as excinfo:
+        R.read_window(trial_dir)
+    assert "no agent_execution timing" in str(excinfo.value)
+
+
+def test_a_run_directory_mistaken_for_a_trial_directory_gets_the_same_error(tmp_path):
+    run_dir = tmp_path / "2026-09-13__00-27-39"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(
+        json.dumps({"id": "run", "started_at": "2026-09-13T00:27:39Z", "n_total_trials": 89})
+    )
+    server_log = tmp_path / "server.log"
+    server_log.write_text("")
+    with pytest.raises(SystemExit) as excinfo:
+        R.main(["--trial-dir", str(run_dir), "--server-log", str(server_log)])
+    assert "no agent_execution timing" in str(excinfo.value)
+
+
+def test_cli_rejects_a_trial_dir_that_does_not_exist(tmp_path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text("")
+    with pytest.raises(SystemExit):
+        R.main(["--trial-dir", str(tmp_path / "typo"), "--server-log", str(server_log)])

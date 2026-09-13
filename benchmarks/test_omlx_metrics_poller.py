@@ -6,6 +6,7 @@ the 5-minute persistence window is exercised without sleeping through it.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -95,6 +96,29 @@ def test_sample_records_host_fields_and_null_status_when_server_is_down(monkeypa
 
 def test_fetch_status_returns_none_rather_than_raising_when_unreachable():
     assert P.fetch_status("http://127.0.0.1:1/api/status", timeout=0.5) is None
+
+
+def test_fetch_status_survives_a_half_dead_server_hanging_up_mid_response(monkeypatch):
+    """HTTPException is neither OSError nor ValueError, so it would escape and lose the row."""
+    def hangs_up(url, timeout=None):
+        raise http.client.IncompleteRead(b"{\"active_re")
+
+    monkeypatch.setattr(P.urllib.request, "urlopen", hangs_up)
+    assert P.fetch_status("http://127.0.0.1:8000/api/status") is None
+
+
+def test_a_status_failure_still_leaves_the_swap_figure_the_tripwire_needs(monkeypatch, tmp_path):
+    def hangs_up(url, timeout=None):
+        raise http.client.BadStatusLine("")
+
+    monkeypatch.setattr(P.urllib.request, "urlopen", hangs_up)
+    monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
+
+    with pytest.raises(_ClockExhausted):
+        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0))
+
+    rows = [json.loads(line) for line in (tmp_path / P.METRICS_FILENAME).read_text().splitlines()]
+    assert [(r["api_status"], r["swap_used_mb"]) for r in rows] == [(None, 1626.0)]
 
 
 def test_tripwire_first_sample_only_sets_the_baseline():

@@ -4,7 +4,13 @@
 Typically launched alongside benchmarks/harbor_pilot.sh, backgrounded, and killed
 when the run finishes:
 
-    benchmarks/omlx_metrics_poller.py --run-dir benchmarks/harbor_runs/<ts> &
+    benchmarks/omlx_metrics_poller.py --run-dir <dir> &
+
+harbor_pilot.sh only points harbor at benchmarks/harbor_runs as its --jobs-dir;
+harbor names the per-job directory under it, and the names vary by job type
+(harbor_status.sh looks for tb2-*, leaderboard-*, full-* and harbor-* alongside
+plain launch timestamps), so no fixed path can be given here. Any directory
+works -- it is created if missing.
 
 Writes one JSON object per sample to <run-dir>/omlx_metrics.jsonl, and raises a
 SWAP_TRIPWIRE_FIRED sentinel in the run dir when host swap stays far above where
@@ -13,13 +19,13 @@ it started. Detect-and-flag only: it never restarts omlx or edits any config.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import signal
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
@@ -72,12 +78,15 @@ def fetch_status(url: str = STATUS_URL, timeout: float = 5.0):
     """Return the parsed /api/status body, or None if omlx is not answering.
 
     omlx gets restarted mid-run often enough that an unreachable server is a
-    normal sample, not an error -- the caller keeps polling either way.
+    normal sample, not an error -- the caller keeps polling either way. A
+    half-started server answering with a truncated or malformed response raises
+    HTTPException, which is outside OSError/ValueError; letting it out would
+    lose the whole sample row, including the swap figure the tripwire runs on.
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
 
 
