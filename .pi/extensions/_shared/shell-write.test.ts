@@ -3,6 +3,7 @@ import {
   SHELL_TOOLS,
   detectDeliverableWrites,
   detectWriteTargets,
+  hasCommandSubstitution,
   hasWriteRedirection,
   isScratchPath,
   splitCommandChain,
@@ -270,6 +271,145 @@ describe("stripHeredocBodies", () => {
   it("handles more than one heredoc", () => {
     const cmd = "cat > a << 'E1'\nx\nE1\ncat > b << 'E2'\ny\nE2";
     expect(splitCommandChain(cmd)).toEqual(["cat > a", "cat > b"]);
+  });
+
+  // The deletion ran from the `<<DELIM` token straight through the body, so
+  // anything between that token and the newline — the rest of the opening
+  // line, where real shell syntax lives — went with it.
+  it("keeps the rest of the opening line after the <<DELIM token", () => {
+    expect(stripHeredocBodies("cat <<EOF & rm -rf /\nbody\nEOF")).toBe("cat  & rm -rf /");
+    expect(stripHeredocBodies("cat << 'EOF' > backend/app.js\nX\nEOF")).toBe(
+      "cat  > backend/app.js",
+    );
+  });
+
+  it("sees the commands and writes that used to be swallowed with the body", () => {
+    expect(splitCommandChain("cat <<EOF & rm -rf /\nbody\nEOF")).toEqual([
+      "cat",
+      "rm -rf /",
+    ]);
+    expect(detectWriteTargets("cat << 'EOF' > backend/app.js\nX\nEOF")).toEqual([
+      { path: "backend/app.js", kind: "redirect" },
+    ]);
+  });
+});
+
+// ── `>&PATH` ───────────────────────────────────────────────────────────────
+// Any redirect target starting with `&` was waved through as fd duplication.
+// Bash only reads it that way when the whole word is digits or `-`; otherwise
+// it truncates a file, exactly as `&>word` does.
+
+describe("detectWriteTargets — >&word is only plumbing when word is a fd", () => {
+  it("reports a >& redirect whose target is a path", () => {
+    expect(detectWriteTargets("cat README.md >&backend/app.js")).toEqual([
+      { path: "backend/app.js", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls >&/etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls >& /etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls 2>&/etc/passwd")).toEqual([
+      { path: "/etc/passwd", kind: "redirect" },
+    ]);
+    expect(detectWriteTargets("ls 1>&/tmp/victim.txt")).toEqual([
+      { path: "/tmp/victim.txt", kind: "redirect" },
+    ]);
+  });
+
+  // Verified against real bash: `ls >&2foo` creates a file named `2foo`. A
+  // leading-digit test would call that plumbing and miss the truncation.
+  it("requires the WHOLE word to be digits, not merely to start with one", () => {
+    expect(detectWriteTargets("ls >&2foo")).toEqual([{ path: "2foo", kind: "redirect" }]);
+    expect(detectWriteTargets("ls >&1x")).toEqual([{ path: "1x", kind: "redirect" }]);
+  });
+
+  it("leaves genuine descriptor plumbing alone", () => {
+    for (const cmd of [
+      "make 2>&1",
+      "echo err >&2",
+      "cmd 1>&2",
+      "cmd 2>&-",
+      "cmd 2>&1; echo done",
+      "cmd 2>&1 | grep x",
+      ">& 2",
+      "ls >& 2",
+      "cmd >&",
+    ]) {
+      expect(detectWriteTargets(cmd), cmd).toEqual([]);
+    }
+  });
+
+  it("still drops a >& redirect aimed at a non-destructive device", () => {
+    expect(detectWriteTargets("ls >&/dev/null")).toEqual([]);
+  });
+});
+
+// ── Command substitution ───────────────────────────────────────────────────
+// `$(…)`, backticks and `<(…)`/`>(…)` run a whole command line that the
+// prefix whitelist never sees: `echo $(rm -rf /)` is judged as `echo`.
+
+describe("hasCommandSubstitution", () => {
+  it("catches every substitution spelling", () => {
+    for (const cmd of [
+      "echo $(touch X)",
+      "echo `touch X`",
+      'echo "$(touch X)"',
+      "cat <(touch X)",
+      "echo hi >(touch X)",
+      "echo ${x:-$(touch X)}",
+      "echo $((1+1))",
+    ]) {
+      expect(hasCommandSubstitution(cmd), cmd).toBe(true);
+    }
+  });
+
+  // Bash expands `$(…)` and backticks inside a heredoc body whose delimiter is
+  // unquoted. Scanning only the stripped string misses it (the body is gone);
+  // scanning only the raw string misses it too, because an apostrophe in the
+  // body leaves the quote tracker open and every later operator looks literal.
+  it("catches substitution inside an unquoted-delimiter heredoc body", () => {
+    expect(hasCommandSubstitution("cat <<EOF\n$(touch PWNED)\nEOF")).toBe(true);
+    expect(hasCommandSubstitution("cat <<EOF\n`touch PWNED`\nEOF")).toBe(true);
+  });
+
+  it("catches it even when an apostrophe in the body poisons quote tracking", () => {
+    expect(hasCommandSubstitution("cat <<EOF\ndon't worry\n$(touch PWNED)\nEOF")).toBe(true);
+  });
+
+  it("does not flag a quoted delimiter, which suppresses expansion", () => {
+    expect(hasCommandSubstitution("cat <<'EOF'\n$(not expanded)\nEOF")).toBe(false);
+    expect(hasCommandSubstitution('cat <<"EOF"\n$(not expanded)\nEOF')).toBe(false);
+    expect(hasCommandSubstitution("cat << EOF\nplain body\nEOF")).toBe(false);
+  });
+
+  it("does not flag text that merely looks like substitution", () => {
+    for (const cmd of [
+      "echo $HOME",
+      "echo '$(x)'",
+      "awk '{print $1}'",
+      'echo "$var"',
+      'grep foo <<< "$var"',
+      "ls -la",
+      "git status",
+      "cat README.md",
+      "make 2>&1",
+      "sed -n '1,20p' file.ts",
+      "wc -l < input.txt",
+    ]) {
+      expect(hasCommandSubstitution(cmd), cmd).toBe(false);
+    }
+  });
+});
+
+describe("scan — backslash escaping inside double quotes", () => {
+  // `\"` does not close a double quote in bash. The tracker used to think it
+  // did, so everything after it read as unquoted and this `>` looked like a
+  // redirect into a file named `b"`.
+  it("does not let an escaped quote close the quote", () => {
+    expect(detectWriteTargets('echo "a \\" > b"')).toEqual([]);
+    expect(hasCommandSubstitution('echo "a \\" $(touch X)"')).toBe(true);
   });
 });
 
