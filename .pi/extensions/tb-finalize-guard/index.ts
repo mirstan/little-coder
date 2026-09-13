@@ -89,20 +89,36 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 // is different in kind — an errored or empty last message is never a sign of
 // healthy progress, so it fires regardless of remaining budget.
 //
-// This evaluates at `agent_settled` rather than `turn_end` or `agent_end`
-// deliberately: `turn_end` fires on every turn, including ones a mid-run
-// retry papers over, so judging "the run is dead" from a single turn_end
-// would misfire on transient errors the harness already recovered from.
-// `agent_settled` is pi's event fired "after an agent run has fully settled
-// and no automatic retry, compaction, or queued continuation will run" — a
-// transient error that pi's own internal retry recovers from never reaches
-// Trigger C at all, so there's no redundant-steer-on-successful-retry
-// tradeoff to accept here. Because `AgentSettledEvent` carries no `messages`
-// field (unlike `agent_end`), the run's final assistant message is instead
-// snapshotted from `turn_end` into the run-scoped `lastTurnMessage` below,
-// and read back here when the run settles. A side benefit: at settled time
-// the session is no longer streaming, so `sendUserMessage` starts a fresh
-// prompt directly rather than depending on queue-drain timing.
+// This evaluates at `agent_end` rather than `turn_end` deliberately:
+// `turn_end` fires on every turn, including ones a mid-run retry papers
+// over, so judging "the run is dead" from a single turn_end would misfire
+// on transient errors the harness already recovered from. `agent_end`
+// reports the run's actual last message once the agent loop segment has
+// ended, so this only reacts to a turn that stayed erroring/empty.
+//
+// A prior version of this fired at `agent_settled` instead (pi's event for
+// "after an agent run has fully settled and no automatic retry, compaction,
+// or queued continuation will run"), on the theory that a transient error
+// pi's own internal retry recovers from would never reach this trigger at
+// all. That's true in isolation, but `sendUserMessage` called at settle time
+// starts a genuinely FRESH run (the session is no longer streaming), and the
+// benchmark harness (`benchmarks/rpc_client.py`) treats `agent_settled` as
+// unconditionally terminal — it stops draining events and the adapter closes
+// the pi process within a few seconds, killing that fresh run before the
+// model ever sees the nudge. `agent_end` is the hook pi actually supports for
+// this: while the session is still streaming, `sendUserMessage` queues into
+// the SAME run's steering queue, and `_handlePostAgentRun`'s
+// `hasQueuedMessages()` check turns that into a real continuation the
+// harness already waits for. The accepted cost of firing at `agent_end`
+// instead of `agent_settled`: since the extension-facing `agent_end` event
+// doesn't carry `willRetry`, this can occasionally queue a redundant steer
+// on a turn pi's own internal retry was about to recover on its own — bounded
+// by `MAX_TRIGGER_C_FIRES` and harmless (the steer just rides along).
+//
+// `AgentEndEvent` also carries no reliably-shaped `messages` array to read
+// the last assistant message from in every case, so it's still snapshotted
+// from `turn_end` into the run-scoped `lastTurnMessage` below and read back
+// here — this mechanism didn't need to change when the firing hook reverted.
 //
 // An "aborted" last message is excluded before the shape check even runs —
 // see `maybeFireTriggerC`'s own comment on why (in short: an abort is a
@@ -266,12 +282,9 @@ export default function (pi: ExtensionAPI) {
     maybeAdvanceTriggerB(pi, ctx, toolCalls);
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     if (!isTerminalBench()) return;
     maybeFireTriggerC(pi, ctx);
-    // One evaluation per run: a run settles exactly once, and the snapshot is
-    // re-seeded by the next run's turns anyway.
-    lastTurnMessage = undefined;
   });
 }
 

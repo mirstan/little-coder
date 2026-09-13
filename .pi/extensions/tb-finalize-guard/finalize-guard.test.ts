@@ -103,8 +103,12 @@ async function turn(h: ReturnType<typeof makeHarness>, event: any) {
   await fire(h.pi, "turn_end", event, h.ctx);
 }
 
+// Named `settle` for historical/test-readability reasons (Trigger C used to
+// fire on `agent_settled`) -- it now fires the `agent_end` event the
+// extension actually listens on, since agent_settled proved undeliverable
+// against the real Python harness (see index.ts's Trigger C comment).
 async function settle(h: ReturnType<typeof makeHarness>) {
-  await fire(h.pi, "agent_settled", {}, h.ctx);
+  await fire(h.pi, "agent_end", {}, h.ctx);
 }
 
 const REAL_NOW = Date.now;
@@ -506,7 +510,20 @@ describe("tb-finalize-guard", () => {
     });
   });
 
-  describe("Trigger C — dead run: errored or empty final message on agent_settled", () => {
+  describe("Trigger C — dead run: errored or empty final message on agent_end", () => {
+    it("does not fire when a mid-run retry recovers before agent_end (the whole point of snapshotting from turn_end)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      // An errored turn, papered over by pi's own internal retry, followed by
+      // a healthy turn before the run actually ends -- lastTurnMessage must
+      // reflect the LAST turn_end, not the errored one.
+      await turn(h, assistantTurn({ text: "oops", stopReason: "error" }));
+      await turn(h, assistantTurn({ text: "All done.", toolCalls: 1, stopReason: "stop" }));
+      await settle(h);
+      expect(h.sent).toHaveLength(0);
+    });
+
     it("fires on stopReason error", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
