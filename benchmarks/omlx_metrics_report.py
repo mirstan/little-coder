@@ -7,7 +7,9 @@ to it, and writes <trial-dir>/omlx_turns.csv plus a short stdout summary:
     benchmarks/omlx_metrics_report.py --trial-dir benchmarks/harbor_runs/<job>/<task>__<id>
 
 server.log rotates daily, so an older trial needs --server-log pointed at the
-matching ~/.omlx/logs/server.log.<date>. Nothing here talks to a live server.
+matching ~/.omlx/logs/server.log.<date>; a window crossing local midnight is
+read from the given file and its rotated siblings together. Nothing here talks
+to a live server.
 """
 from __future__ import annotations
 
@@ -112,6 +114,10 @@ def rotated_siblings(server_log: Path, started_at: datetime, finished_at: dateti
     split across files: each past day lands in a server.log.<date> sibling,
     while the newest day is normally still in the live server.log. Empty for a
     same-day window, and never names the file already being read.
+
+    Only files still on disk are returned. ~/.omlx/settings.json sets
+    logging.retention_days, so a day in an old window may have been deleted
+    already; the rest of the window is still worth reporting on.
     """
     first = started_at.astimezone().date()
     last = finished_at.astimezone().date()
@@ -122,21 +128,7 @@ def rotated_siblings(server_log: Path, started_at: datetime, finished_at: dateti
     holders = [server_log.parent / f"{base}.{day}" for day in days]
     if not holders[-1].exists():
         holders[-1] = server_log.parent / base
-    return [path for path in holders if path != server_log]
-
-
-def warn_on_rotation_gap(server_log: Path, started_at: datetime, finished_at: datetime) -> None:
-    siblings = rotated_siblings(server_log, started_at, finished_at)
-    if not siblings:
-        return
-    first = started_at.astimezone().date()
-    last = finished_at.astimezone().date()
-    named = ", ".join(str(path) for path in siblings)
-    print(
-        f"warning: trial window spans {first} and {last} locally -- server.log rotates at local "
-        f"midnight, consider also passing --server-log for {named} and merging results",
-        file=sys.stderr,
-    )
+    return [path for path in holders if path != server_log and path.exists()]
 
 
 def collect_events(server_log: Path, started_at: datetime, finished_at: datetime) -> list[tuple[datetime, str, dict]]:
@@ -168,6 +160,33 @@ def collect_events(server_log: Path, started_at: datetime, finished_at: datetime
                 continue
             if _THROTTLE_RE.search(line):
                 events.append((ts, "throttle", {}))
+    return events
+
+
+def collect_window_events(
+    server_log: Path, started_at: datetime, finished_at: datetime
+) -> list[tuple[datetime, str, dict]]:
+    """Events from every log holding part of the window, oldest first.
+
+    build_turns walks the list statefully -- pending prefix/MTP stats and the
+    throttle tally carry forward to the next completion -- so events merged out
+    of several files are re-sorted by timestamp rather than left in file order.
+    """
+    siblings = rotated_siblings(server_log, started_at, finished_at)
+    logs = [server_log, *siblings]
+    if siblings:
+        first = started_at.astimezone().date()
+        last = finished_at.astimezone().date()
+        named = ", ".join(str(path) for path in logs)
+        print(
+            f"trial window spans {first} to {last} locally and server.log rotates at local "
+            f"midnight, so reading {len(logs)} log files to cover it: {named}",
+            file=sys.stderr,
+        )
+    events: list[tuple[datetime, str, dict]] = []
+    for log in logs:
+        events.extend(collect_events(log, started_at, finished_at))
+    events.sort(key=lambda event: event[0])
     return events
 
 
@@ -293,10 +312,12 @@ def print_summary(turns: list[dict], rejections: list[dict], trailing: dict, csv
         print(f"max prompt: {max(t['prompt_tokens'] for t in turns)} tokens")
         print(f"throttle events: {sum(t['throttle_events'] for t in turns)}")
     if trailing["throttle_events"] or trailing["reclaimed_gb"]:
-        print(
-            f"after the last completion: {trailing['throttle_events']} throttle events, "
-            f"{trailing['reclaimed_gb']}GB reclaimed (no turn row in {csv_path.name} holds these)"
-        )
+        counts = f"{trailing['throttle_events']} throttle events, {trailing['reclaimed_gb']}GB reclaimed"
+        if turns:
+            print(f"after the last completion: {counts} (no turn row in {csv_path.name} holds these)")
+        else:
+            # "after the last completion" would name a completion that never happened.
+            print(f"{counts} (no completions in this window at all)")
     if rejections:
         print(f"prefill rejections: {len(rejections)}")
         for rejection in rejections:
@@ -310,8 +331,7 @@ def print_summary(turns: list[dict], rejections: list[dict], trailing: dict, csv
 
 def report(trial_dir: Path, server_log: Path) -> int:
     started_at, finished_at = read_window(trial_dir)
-    warn_on_rotation_gap(server_log, started_at, finished_at)
-    events = collect_events(server_log, started_at, finished_at)
+    events = collect_window_events(server_log, started_at, finished_at)
     turns, rejections, trailing = build_turns(events, started_at)
     csv_path = trial_dir / CSV_FILENAME
     write_csv(csv_path, turns)

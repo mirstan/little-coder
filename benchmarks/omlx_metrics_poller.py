@@ -106,7 +106,12 @@ class SwapTripwire:
         self.fired = False
 
     def observe(self, now: float, swap_used_mb: float) -> bool:
-        """Feed one sample; returns True on the sample that first trips it."""
+        """Feed one sample; returns True on the sample that first trips it.
+
+        `now` measures elapsed time, so it must come from a monotonic clock: an
+        NTP correction or a DST shift in the middle of a run would otherwise
+        lengthen or shorten the hold window by that jump.
+        """
         if self.baseline_mb is None:
             self.baseline_mb = swap_used_mb
             return False
@@ -154,7 +159,16 @@ def poll(
     status_url: str = STATUS_URL,
     run: Callable[[list[str]], str] = run_command,
     clock: Callable[[], float] = time.time,
+    monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> int:
+    """Sample until signalled. Two clocks, because they answer different questions.
+
+    `clock` is wall-clock and only ever gets recorded: the JSONL `ts` has to line
+    up with server.log's wall-clock stamps for the report to correlate them, and
+    the sentinel states a date an operator can read. Everything measuring elapsed
+    time -- the tripwire's hold window, the gap between samples -- runs off
+    `monotonic_clock` so a clock adjustment mid-run cannot stretch or collapse it.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / METRICS_FILENAME
     sentinel_path = run_dir / SENTINEL_FILENAME
@@ -173,17 +187,18 @@ def poll(
     with metrics_path.open("a", encoding="utf-8") as handle:
         while not stopping:
             now = clock()
+            elapsed = monotonic_clock()
             try:
                 row = sample(now, run=run, status_url=status_url)
             except Exception as exc:  # a bad sample must not end the run's monitoring
                 print(f"sample failed: {exc}", flush=True)
-                _sleep_until(now + interval, lambda: stopping, clock)
+                _sleep_until(elapsed + interval, lambda: stopping, monotonic_clock)
                 continue
 
             handle.write(json.dumps(row) + "\n")
             handle.flush()
 
-            if tripwire.observe(now, row["swap_used_mb"]):
+            if tripwire.observe(elapsed, row["swap_used_mb"]):
                 print(
                     f"SWAP TRIPWIRE: swap {row['swap_used_mb']:.0f}MB is "
                     f"{row['swap_used_mb'] - tripwire.baseline_mb:.0f}MB above the "
@@ -197,16 +212,18 @@ def poll(
                     write_sentinel(sentinel_path, now, tripwire.baseline_mb, row["swap_used_mb"], tripwire.hold_s)
                     print(f"wrote {sentinel_path}", flush=True)
 
-            _sleep_until(now + interval, lambda: stopping, clock)
+            _sleep_until(elapsed + interval, lambda: stopping, monotonic_clock)
 
     print("stopped", flush=True)
     return 0
 
 
-def _sleep_until(deadline: float, stopping: Callable[[], bool], clock: Callable[[], float] = time.time) -> None:
+def _sleep_until(
+    deadline: float, stopping: Callable[[], bool], monotonic_clock: Callable[[], float] = time.monotonic
+) -> None:
     """Nap in short slices so a signal is acted on promptly, not `interval` later."""
     while not stopping():
-        remaining = deadline - clock()
+        remaining = deadline - monotonic_clock()
         if remaining <= 0:
             return
         time.sleep(min(remaining, 1.0))
@@ -218,6 +235,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=float, default=30.0, help="seconds between samples (default: 30)")
     parser.add_argument("--status-url", default=STATUS_URL, help=f"omlx status endpoint (default: {STATUS_URL})")
     args = parser.parse_args(argv)
+    # Zero or negative leaves _sleep_until with nothing to wait for, turning the
+    # loop into an unthrottled hammering of /api/status and the subprocesses.
+    if args.interval <= 0:
+        parser.error("--interval must be a positive number of seconds")
     return poll(args.run_dir, args.interval, status_url=args.status_url)
 
 

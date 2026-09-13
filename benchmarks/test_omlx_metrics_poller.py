@@ -1,8 +1,9 @@
 """Tests for omlx_metrics_poller.
 
-Nothing here touches a live omlx server, a real `sysctl`/`vm_stat`, or the clock:
-the subprocess runner is injected and the tripwire takes `now` as an argument, so
-the 5-minute persistence window is exercised without sleeping through it.
+Nothing here touches a live omlx server, a real `sysctl`/`vm_stat`, or either
+clock: the subprocess runner is injected and both the wall-clock and the
+monotonic reading are scripted, so the 5-minute persistence window is exercised
+without sleeping through it -- and a wall-clock jump can be staged at will.
 """
 from __future__ import annotations
 
@@ -94,7 +95,11 @@ def test_sample_records_host_fields_and_null_status_when_server_is_down(monkeypa
     }
 
 
-def test_fetch_status_returns_none_rather_than_raising_when_unreachable():
+def test_fetch_status_returns_none_rather_than_raising_when_unreachable(monkeypatch):
+    def unreachable(url, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", unreachable)
     assert P.fetch_status("http://127.0.0.1:1/api/status", timeout=0.5) is None
 
 
@@ -115,7 +120,7 @@ def test_a_status_failure_still_leaves_the_swap_figure_the_tripwire_needs(monkey
     monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
 
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0))
+        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0), monotonic_clock=_clock(0.0))
 
     rows = [json.loads(line) for line in (tmp_path / P.METRICS_FILENAME).read_text().splitlines()]
     assert [(r["api_status"], r["swap_used_mb"]) for r in rows] == [(None, 1626.0)]
@@ -180,7 +185,13 @@ def test_poll_writes_one_flushed_jsonl_line_per_sample(monkeypatch, tmp_path):
     monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
 
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0, 200.0, 300.0))
+        P.poll(
+            tmp_path,
+            interval=1.0,
+            run=_runner(),
+            clock=_clock(100.0, 200.0, 300.0),
+            monotonic_clock=_clock(0.0, 100.0, 200.0),
+        )
 
     rows = [json.loads(line) for line in (tmp_path / P.METRICS_FILENAME).read_text().splitlines()]
     assert [r["ts"] for r in rows] == [100.0, 200.0, 300.0]
@@ -202,7 +213,7 @@ def test_poll_keeps_going_after_a_failing_sample(monkeypatch, tmp_path):
         return _runner()(argv)
 
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=flaky, clock=_clock(100.0, 200.0))
+        P.poll(tmp_path, interval=1.0, run=flaky, clock=_clock(100.0, 200.0), monotonic_clock=_clock(0.0, 100.0))
 
     rows = (tmp_path / P.METRICS_FILENAME).read_text().splitlines()
     assert len(rows) == 1
@@ -215,32 +226,67 @@ def test_poll_appends_rather_than_truncating_an_existing_file(monkeypatch, tmp_p
     monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
 
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0))
+        P.poll(tmp_path, interval=1.0, run=_runner(), clock=_clock(100.0), monotonic_clock=_clock(0.0))
 
     assert len((tmp_path / P.METRICS_FILENAME).read_text().splitlines()) == 2
 
 
-def test_poll_writes_the_sentinel_when_swap_stays_elevated(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(P, "fetch_status", lambda url, **kw: None)
-    monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
+ELEVATING_SWAPS = [
+    "vm.swapusage: total = 8192.00M  used = 1000.00M  free = 7192.00M",
+    "vm.swapusage: total = 8192.00M  used = 5000.00M  free = 3192.00M",
+    "vm.swapusage: total = 8192.00M  used = 5200.00M  free = 2992.00M",
+]
 
-    swaps = iter(
-        [
-            "vm.swapusage: total = 8192.00M  used = 1000.00M  free = 7192.00M",
-            "vm.swapusage: total = 8192.00M  used = 5000.00M  free = 3192.00M",
-            "vm.swapusage: total = 8192.00M  used = 5200.00M  free = 2992.00M",
-        ]
-    )
+
+def _elevating_runner():
+    swaps = iter(ELEVATING_SWAPS)
+
     def run(argv):
         return next(swaps) if argv[0] == "sysctl" else VM_STAT
 
+    return run
+
+
+def test_poll_writes_the_sentinel_when_swap_stays_elevated(monkeypatch, tmp_path, capsys):
+    """The hold window is timed off the monotonic clock, which is the one that advances here."""
+    monkeypatch.setattr(P, "fetch_status", lambda url, **kw: None)
+    monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
+
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=run, clock=_clock(0.0, 30.0, 400.0))
+        P.poll(
+            tmp_path,
+            interval=1.0,
+            run=_elevating_runner(),
+            clock=_clock(1757740000.0, 1757740001.0, 1757740002.0),
+            monotonic_clock=_clock(0.0, 30.0, 400.0),
+        )
 
     sentinel = tmp_path / P.SENTINEL_FILENAME
     assert sentinel.exists()
-    assert "5200.00" in sentinel.read_text()
+    text = sentinel.read_text()
+    assert "5200.00" in text
+    # fired_at is a calendar time an operator reads, so it comes from the wall clock.
+    assert "epoch 1757740002" in text
     assert "SWAP TRIPWIRE" in capsys.readouterr().out
+
+
+def test_a_wall_clock_jump_does_not_move_the_tripwires_hold_window(monkeypatch, tmp_path):
+    """NTP or DST can shift wall-clock time by hours mid-run; only elapsed time may count."""
+    monkeypatch.setattr(P, "fetch_status", lambda url, **kw: None)
+    monkeypatch.setattr(P, "_sleep_until", lambda *a, **kw: None)
+
+    with pytest.raises(_ClockExhausted):
+        P.poll(
+            tmp_path,
+            interval=1.0,
+            run=_elevating_runner(),
+            # Six hours forward between the second and third sample: timed off
+            # this clock the 5-minute hold window would look long since elapsed.
+            clock=_clock(1757740000.0, 1757740001.0, 1757761601.0),
+            monotonic_clock=_clock(0.0, 30.0, 100.0),
+        )
+
+    assert not (tmp_path / P.SENTINEL_FILENAME).exists()
 
 
 def test_an_existing_sentinel_is_not_rewritten(monkeypatch, tmp_path):
@@ -255,7 +301,13 @@ def test_an_existing_sentinel_is_not_rewritten(monkeypatch, tmp_path):
         return next(swaps) if argv[0] == "sysctl" else VM_STAT
 
     with pytest.raises(_ClockExhausted):
-        P.poll(tmp_path, interval=1.0, run=run, clock=_clock(0.0, 30.0, 400.0))
+        P.poll(
+            tmp_path,
+            interval=1.0,
+            run=run,
+            clock=_clock(1757740000.0, 1757740030.0, 1757740400.0),
+            monotonic_clock=_clock(0.0, 30.0, 400.0),
+        )
 
     assert sentinel.read_text() == "fired earlier, hands off\n"
 
@@ -263,3 +315,11 @@ def test_an_existing_sentinel_is_not_rewritten(monkeypatch, tmp_path):
 def test_cli_requires_a_run_dir():
     with pytest.raises(SystemExit):
         P.main([])
+
+
+@pytest.mark.parametrize("interval", ["0", "-5"])
+def test_cli_rejects_a_non_positive_interval(tmp_path, interval):
+    """Without a wait between samples poll() spins, hammering the server and sysctl."""
+    with pytest.raises(SystemExit) as excinfo:
+        P.main(["--run-dir", str(tmp_path), "--interval", interval])
+    assert excinfo.value.code != 0

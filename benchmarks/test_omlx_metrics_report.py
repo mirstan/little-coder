@@ -11,6 +11,7 @@ import csv
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -102,9 +103,15 @@ def _rows(trial_dir):
 
 
 def test_log_timestamps_are_localized_before_comparison():
-    """A naive local stamp must land on the same instant result.json's Z stamp means."""
+    """A naive local stamp must land on the same instant result.json's Z stamp means.
+
+    The expectation is built through time.mktime rather than _local's
+    strptime().astimezone() chain: that chain is what parse_log_ts does
+    internally, so a test using it passes even if the localization is dropped.
+    """
     line = _chat("09:05:00", 100, 10.0, 10.0, 5000)
-    assert R.parse_log_ts(line) == _local("2026-09-13", "09:05:00")
+    epoch = time.mktime((2026, 9, 13, 9, 5, 0, 0, 0, -1))
+    assert R.parse_log_ts(line) == datetime.fromtimestamp(epoch, timezone.utc)
 
 
 def test_log_timestamps_carry_milliseconds():
@@ -387,6 +394,15 @@ def test_throttles_after_the_last_completion_are_reported_not_dropped(tmp_path, 
     assert "after the last completion: 2 throttle events, 4.01GB reclaimed" in out
 
 
+def test_trailing_events_with_no_turns_do_not_claim_a_last_completion(tmp_path, capsys):
+    """Zero turns is zero completions, so there is no "last completion" to be after."""
+    trial_dir, server_log = _trial(tmp_path, [_throttle("09:01:00"), _reclaim("09:01:01", "4.01")])
+    R.report(trial_dir, server_log)
+    out = capsys.readouterr().out
+    assert "after the last completion" not in out
+    assert "1 throttle events, 4.01GB reclaimed (no completions in this window at all)" in out
+
+
 def test_nothing_trailing_is_reported_when_every_event_landed_in_a_turn(tmp_path, capsys):
     trial_dir, server_log = _trial(
         tmp_path,
@@ -450,22 +466,51 @@ def test_two_rejections_differing_only_in_the_safety_cap_are_both_counted(tmp_pa
     assert "prefill rejections: 2" in capsys.readouterr().out
 
 
-def test_a_window_crossing_local_midnight_warns_about_the_rotated_sibling(tmp_path, capsys):
-    trial_dir, server_log = _trial(
+def _midnight_trial(tmp_path, live_lines, first_day="2026-09-12"):
+    """A trial whose window runs from 23:30 on first_day to 00:30 on 2026-09-13."""
+    return _trial(
         tmp_path,
-        [_chat("23:50:00", 100, 10.0, 10.0, 1000, day="2026-09-12")],
+        live_lines,
         started="23:30:00",
-        day="2026-09-12",
+        day=first_day,
         finished="00:30:00",
         finished_day="2026-09-13",
     )
+
+
+def test_a_window_crossing_local_midnight_reads_both_sides_of_the_rotation(tmp_path, capsys):
+    """The rotated sibling holds the pre-midnight half; reporting only the live log loses it."""
+    trial_dir, server_log = _midnight_trial(tmp_path, [_chat("00:10:00", 300, 10.0, 30.0, 3000)])
+    rotated = tmp_path / "server.log.2026-09-12"
+    rotated.write_text(
+        "\n".join(
+            [
+                _chat("23:40:00", 100, 10.0, 10.0, 1000, day="2026-09-12"),
+                _chat("23:50:00", 200, 10.0, 20.0, 2000, day="2026-09-12"),
+            ]
+        )
+        + "\n"
+    )
     R.report(trial_dir, server_log)
+    assert [r["prompt_tokens"] for r in _rows(trial_dir)] == ["1000", "2000", "3000"]
     err = capsys.readouterr().err
-    assert "2026-09-12 and 2026-09-13" in err
-    assert str(tmp_path / "server.log.2026-09-12") in err
+    assert "reading 2 log files" in err
+    assert str(rotated) in err
 
 
-def test_a_same_day_window_says_nothing_about_rotation(tmp_path, capsys):
+def test_merged_events_are_ordered_by_timestamp_not_by_file(tmp_path):
+    """build_turns accumulates statefully, so the file read first must not win."""
+    trial_dir, server_log = _midnight_trial(tmp_path, [_throttle("00:05:00", day="2026-09-13")])
+    (tmp_path / "server.log.2026-09-12").write_text(_throttle("23:40:00", day="2026-09-12") + "\n")
+    started_at, finished_at = R.read_window(trial_dir)
+    events = R.collect_window_events(server_log, started_at, finished_at)
+    assert [ts for ts, _kind, _fields in events] == [
+        _local("2026-09-12", "23:40:00"),
+        _local("2026-09-13", "00:05:00"),
+    ]
+
+
+def test_a_same_day_window_reads_only_the_given_log(tmp_path, capsys):
     trial_dir, server_log = _trial(tmp_path, [_chat("09:02:00", 100, 10.0, 10.0, 1000)])
     R.report(trial_dir, server_log)
     assert capsys.readouterr().err == ""
@@ -473,12 +518,32 @@ def test_a_same_day_window_says_nothing_about_rotation(tmp_path, capsys):
 
 def test_the_log_being_read_is_not_suggested_back_to_the_user(tmp_path):
     """Pointed at the pre-midnight rotated file, the gap is the live log, not itself."""
+    (tmp_path / "server.log").write_text("")
     siblings = R.rotated_siblings(
         tmp_path / "server.log.2026-09-12",
         _local("2026-09-12", "23:30:00"),
         _local("2026-09-13", "00:30:00"),
     )
     assert siblings == [tmp_path / "server.log"]
+
+
+def test_a_sibling_retention_has_already_deleted_is_skipped(tmp_path, capsys):
+    """logging.retention_days removes old rotated logs; naming one sends the reader nowhere."""
+    trial_dir, server_log = _midnight_trial(
+        tmp_path, [_chat("00:10:00", 300, 10.0, 30.0, 3000)], first_day="2026-09-11"
+    )
+    kept = tmp_path / "server.log.2026-09-11"
+    kept.write_text(_chat("23:40:00", 100, 10.0, 10.0, 1000, day="2026-09-11") + "\n")
+    deleted = tmp_path / "server.log.2026-09-12"
+    assert not deleted.exists()
+
+    R.report(trial_dir, server_log)
+
+    assert R.rotated_siblings(server_log, *R.read_window(trial_dir)) == [kept]
+    assert [r["prompt_tokens"] for r in _rows(trial_dir)] == ["1000", "3000"]
+    err = capsys.readouterr().err
+    assert str(deleted) not in err
+    assert str(kept) in err
 
 
 def test_a_trial_that_died_before_agent_execution_gets_a_clear_error(tmp_path):
