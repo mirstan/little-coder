@@ -112,16 +112,59 @@ function followedByWait(strippedCmd: string, ampIndex: number): boolean {
 // the cost is only a spurious advisory, never a functional problem.
 const BOTH_STREAMS_REDIRECTED_RE = /(?:&>>?\s*\S+|>>?\s*\S+\s+2>>?\s*(?:&1|\S+))\s*$/;
 
+// Only this much text before the `&` is handed to the pattern above. Two
+// reasons, both load-bearing:
+//
+//  1. The pattern is anchored at `$` but NOT at `^`, so the engine retries it
+//     at every offset, and `>>?\s*\S+\s+…` costs O(remaining non-space run) per
+//     retry. On a long unbroken run that is quadratic in the prefix length —
+//     the same failure mode as the old `PKILL_FULL_FLAG_RE` below, measured on
+//     a `>A>A>A…` prefix at 5.4s / 80KB and 0.9s / 32KB. A fixed window turns
+//     that into a hard constant ceiling.
+//  2. `slice(0, ampIndex)` alone is O(n) per candidate `&`, so even a cheap
+//     pattern made the whole scan O(n²) on a command with many `&`.
+//
+// 256 chars comfortably covers a real redirect clause (`>> path 2>> path`,
+// both paths ~120 chars). Truncating a longer one can only lose a
+// suppression, i.e. emit a spurious advisory — the same failure direction the
+// quoted-filename gap above is already accepted for.
+const REDIRECT_WINDOW = 256;
+
 function bothStreamsRedirectedBefore(strippedCmd: string, ampIndex: number): boolean {
-  return BOTH_STREAMS_REDIRECTED_RE.test(strippedCmd.slice(0, ampIndex));
+  const from = Math.max(0, ampIndex - REDIRECT_WINDOW);
+  return BOTH_STREAMS_REDIRECTED_RE.test(strippedCmd.slice(from, ampIndex));
 }
 
 /** True when `raw` backgrounds a job with a bare `&` that shares this tool call's pipes. */
 export function hasBareBackgroundAmpersand(raw: string): boolean {
   const stripped = stripHeredocBodies(raw);
-  return bareAmpIndices(stripped).some(
-    (i) => !followedByWait(stripped, i) && !bothStreamsRedirectedBefore(stripped, i),
-  );
+  const amps = bareAmpIndices(stripped);
+  if (amps.length === 0) return false;
+
+  // `followedByWait` re-segments the entire tail after the `&`, so asking it
+  // once per candidate is O(n²) — and the worst case is the *benign*
+  // `job1 & job2 & … & wait` idiom this suppression exists to serve, where
+  // every candidate is suppressed so nothing can short-circuit (measured:
+  // 1.7s on a 16KB command before this change).
+  //
+  // The predicate is monotone in the candidate index: a `wait` segment lying
+  // after amps[k] also lies after every earlier candidate, because an earlier
+  // `&` is still a split point in the longer tail and therefore yields the
+  // same later segments. So the wait-suppressed candidates are exactly a
+  // prefix amps[0..cut-1], and one binary search locates `cut` in O(log k)
+  // calls instead of k.
+  let lo = 0; // every candidate below `lo` is known wait-suppressed
+  let hi = amps.length; // every candidate at/above `hi` is known not to be
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (followedByWait(stripped, amps[mid])) lo = mid + 1;
+    else hi = mid;
+  }
+
+  for (let k = lo; k < amps.length; k++) {
+    if (!bothStreamsRedirectedBefore(stripped, amps[k])) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,11 +222,16 @@ function segmentInvokesPkillOrKillall(segment: string): boolean {
   const words = segment.trim().split(/\s+/).filter(Boolean);
   let i = 0;
   while (i < words.length) {
-    const name = words[i].replace(/^.*\//, ""); // drop a leading path, e.g. /usr/bin/pkill
-    if (/^\w+=/.test(name)) {
+    // Test the assignment shape on the RAW word before stripping any path --
+    // an assignment's value is very often itself a path (PATH=/usr/sbin,
+    // LD_PRELOAD=/x/y.so), and stripping first turns "PATH=/usr/sbin" into
+    // "sbin", which matches neither the assignment test nor any wrapper name,
+    // silently ending the walk one word too early.
+    if (/^\w+=/.test(words[i])) {
       i++; // VAR=val leading assignment (with or without `env`)
       continue;
     }
+    const name = words[i].replace(/^.*\//, ""); // drop a leading path, e.g. /usr/bin/pkill
     if (name === "command" && (words[i + 1] === "-v" || words[i + 1] === "-V")) {
       return false; // pure existence check, runs nothing — do not flag
     }
@@ -297,9 +345,15 @@ export default function (pi: ExtensionAPI) {
           // finalize-warn/quality-monitor's own "don't burn the one-shot latch
           // on a nudge that was never delivered" convention.
         }
-        // harnessIntervention fires only on a successfully-delivered steer —
-        // mirroring tb-finalize-guard's own send-then-intervene ordering — so
-        // it's paired 1:1 with a genuine redirect, not every detection.
+        // Claim the latch and announce the intervention only past the send,
+        // mirroring tb-finalize-guard/gaia-finalize-guard's ordering. Note what
+        // this does and does not buy: `pi.sendUserMessage` returns void and the
+        // runtime binding swallows async failures into its own emitError, so
+        // `sent` is not proof of delivery — only proof that the call itself
+        // didn't throw (a missing binding, or a stale ctx after session
+        // replacement). That is enough to keep a one-shot nudge that never left
+        // the process from burning the latch or printing a misleading
+        // "steering the model…" line.
         if (sent) {
           nudgedBareAmp = true;
           harnessIntervention(

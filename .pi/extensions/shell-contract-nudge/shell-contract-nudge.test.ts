@@ -115,6 +115,16 @@ describe("hasPkillOrKillall (pure)", () => {
     expect(hasPkillOrKillall("env FOO=bar pkill -f x")).toBe(true);
     expect(hasPkillOrKillall("FOO=bar pkill -f x")).toBe(true);
   });
+  it("sees through a path-shaped assignment value (PATH=, LD_PRELOAD=, ...)", () => {
+    // The assignment shape must be tested on the raw word BEFORE the
+    // leading-path stripper runs, or "PATH=/usr/sbin" becomes "sbin" and
+    // matches neither the assignment test nor any wrapper name.
+    expect(hasPkillOrKillall("PATH=/usr/sbin pkill -f foo")).toBe(true);
+    expect(hasPkillOrKillall("LD_PRELOAD=/x/y.so pkill -f foo")).toBe(true);
+    expect(hasPkillOrKillall("env PATH=/usr/sbin pkill -f foo")).toBe(true);
+    expect(hasPkillOrKillall("sudo PATH=/usr/bin pkill -f foo")).toBe(true);
+    expect(hasPkillOrKillall("TMPDIR=/tmp killall x")).toBe(true);
+  });
   it("sees through timeout and its flags/duration operand", () => {
     expect(hasPkillOrKillall("timeout 30 pkill -f x")).toBe(true);
     expect(hasPkillOrKillall("timeout --signal=KILL 30 pkill -f x")).toBe(true);
@@ -142,6 +152,55 @@ describe("hasPkillOrKillall (pure)", () => {
     const t0 = Date.now();
     hasPkillOrKillall(bad);
     expect(Date.now() - t0).toBeLessThan(1000);
+  });
+});
+
+// The bare-`&` scan carries the same class of hazard the pkill flag pattern
+// did: it runs on every shell tool call against model-authored text, so any
+// super-linear growth is a per-call stall. Each case below was quadratic
+// before the fix (timings are the measured "before" on this machine).
+describe("hasBareBackgroundAmpersand complexity regressions", () => {
+  it("stays linear on a long redirect-shaped prefix (ReDoS regression)", () => {
+    // BOTH_STREAMS_REDIRECTED_RE is `$`-anchored but not `^`-anchored, so it
+    // retried at every `>` and each retry scanned the rest of the non-space
+    // run: 5.4s on this input before the window cap.
+    const bad = ">A".repeat(40_000) + " &";
+    const t0 = Date.now();
+    hasBareBackgroundAmpersand(bad);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("stays linear on the benign `job & job & … & wait` idiom", () => {
+    // The suppression path this idiom takes is exactly the one that could not
+    // short-circuit, so the safest possible command was the slowest: 1.7s at
+    // a tenth of this size before the binary search over `followedByWait`.
+    const bad = Array.from({ length: 40_000 }, () => "a &").join(" ") + " wait";
+    const t0 = Date.now();
+    expect(hasBareBackgroundAmpersand(bad)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("stays linear when every `&` is redirect-suppressed", () => {
+    const bad = Array.from({ length: 20_000 }, () => "c >f 2>&1 &").join(" ");
+    const t0 = Date.now();
+    expect(hasBareBackgroundAmpersand(bad)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("stays linear when `wait` appears only as a substring, never as a segment", () => {
+    const bad = Array.from({ length: 20_000 }, () => "echo waiting &").join(" ");
+    const t0 = Date.now();
+    expect(hasBareBackgroundAmpersand(bad)).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("still suppresses/reports correctly around the redirect window boundary", () => {
+    // Inside the 256-char window the suppression holds...
+    expect(hasBareBackgroundAmpersand("cmd > " + "p".repeat(200) + " 2>&1 &")).toBe(false);
+    // ...and past it the clause is truncated, which can only cost a spurious
+    // advisory (never a missed one), the same direction as the documented
+    // quoted-filename gap.
+    expect(hasBareBackgroundAmpersand("cmd > " + "p".repeat(400) + " 2>&1 &")).toBe(true);
   });
 });
 
