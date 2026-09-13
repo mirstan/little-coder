@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectWriteTargets } from "../_shared/shell-write.ts";
@@ -25,7 +25,11 @@ export function checkpointPath(input: Record<string, unknown>): string | undefin
 
 function checkpointDir(sessionId: string): string {
   const dir = join(homedir(), ".little-coder", "checkpoints", sessionId);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Unconditional and idempotent — no existsSync memoization here. Memoizing
+  // "dir exists" would permanently swallow every future backup this session
+  // if the directory were ever deleted mid-session (see the checkpoint-dir
+  // resilience test).
+  mkdirSync(dir, { recursive: true });
   return dir;
 }
 
@@ -33,28 +37,34 @@ function safeName(filePath: string): string {
   return filePath.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200);
 }
 
+export const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // exported for tests
+
 function backupIfNeeded(sessionId: string, filePath: string): void {
   if (!sessionId || !filePath) return;
   let session = tracked.get(sessionId);
-  if (!session) {
-    session = new Set();
-    tracked.set(sessionId, session);
-  }
+  if (!session) { session = new Set(); tracked.set(sessionId, session); }
   if (session.has(filePath)) return;
-  session.add(filePath);
   try {
-    if (existsSync(filePath)) {
-      const content = readFileSync(filePath);
-      writeFileSync(join(checkpointDir(sessionId), safeName(filePath)), content);
-    } else {
-      // Sentinel: file didn't exist before modification
-      writeFileSync(
-        join(checkpointDir(sessionId), safeName(filePath) + ".absent"),
-        "",
-      );
+    let st;
+    try {
+      st = statSync(filePath);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+        writeFileSync(join(checkpointDir(sessionId), safeName(filePath) + ".absent"), "");
+        session.add(filePath);
+      }
+      return; // any other stat failure: leave untracked so a later write can retry
     }
+    if (!st.isFile()) return; // directory/fifo/socket: skip, do NOT track
+    if (st.size > MAX_BACKUP_BYTES) {
+      writeFileSync(join(checkpointDir(sessionId), safeName(filePath) + ".toolarge"), String(st.size));
+      session.add(filePath); // tracked forever: never retry (a later smaller version is a mid-session intermediate, not the original)
+      return;
+    }
+    writeFileSync(join(checkpointDir(sessionId), safeName(filePath)), readFileSync(filePath));
+    session.add(filePath); // only after the backup actually succeeded
   } catch {
-    // Silent — checkpointing is best-effort
+    // best-effort; deliberately NOT tracked so a failed copy doesn't suppress a retry
   }
 }
 
