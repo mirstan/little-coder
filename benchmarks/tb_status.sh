@@ -17,7 +17,18 @@ TB_RUNS="$REPO_ROOT/benchmarks/tb_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  RUN_ID=$(find "$TB_RUNS" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex '.*/(leaderboard|full)-[0-9].*' -printf '%f\n' 2>/dev/null | sort | tail -1)
+  # Portable, no find/printf: -regextype and -printf are GNU-only. Names are
+  # ISO-date-prefixed (leaderboard-YYYY-MM-DD...), so lexicographic string
+  # comparison is correct here -- no mtime lookup needed.
+  NEWEST=""
+  for d in "$TB_RUNS"/leaderboard-[0-9]* "$TB_RUNS"/full-[0-9]*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    if [ -z "$NEWEST" ] || [[ "$base" > "$NEWEST" ]]; then
+      NEWEST="$base"
+    fi
+  done
+  RUN_ID="$NEWEST"
 fi
 if [ -z "$RUN_ID" ] || [ ! -d "$TB_RUNS/$RUN_ID" ]; then
   echo "No run dir found (looked in $TB_RUNS)." >&2

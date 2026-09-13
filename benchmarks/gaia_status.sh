@@ -16,9 +16,29 @@ RUNS_DIR="$REPO_ROOT/benchmarks/gaia_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  RUN_ID=$(find "$RUNS_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %f\n' 2>/dev/null \
-           | grep -vE ' (_pilot_picks\.json)$' \
-           | sort -nr | awk 'NR==1{print $2}')
+  # Portable, no find/printf: -printf is GNU-only. `[ -nt ]` gives
+  # mtime-newest-wins without needing stat/printf on either platform.
+  NEWEST=""
+  # Bare */ skips dot-prefixed dirs (a --run-name can create one); .*/ picks
+  # those up too, at the cost of also matching the literal "." and ".."
+  # entries every glob-of-dotfiles produces, filtered below.
+  for d in "$RUNS_DIR"/*/ "$RUNS_DIR"/.*/; do
+    [ -d "$d" ] || continue
+    base="${d%/}"; base="${base##*/}"
+    case "$base" in
+      .|..) continue ;;
+      # Exact filename only, matching the original regex's literal
+      # ' _pilot_picks.json$' anchor -- a glob prefix (*_pilot_picks.json)
+      # would also wrongly exclude a real run legitimately named e.g.
+      # foo_pilot_picks.json.
+      _pilot_picks.json) continue ;;
+    esac
+    if [ -z "$NEWEST" ] || [ "$d" -nt "$NEWEST" ]; then
+      NEWEST="$d"
+    fi
+  done
+  RUN_ID="${NEWEST%/}"
+  RUN_ID="${RUN_ID##*/}"
 fi
 if [ -z "$RUN_ID" ] || [ ! -d "$RUNS_DIR/$RUN_ID" ]; then
   echo "No run dir found (looked in $RUNS_DIR)." >&2
@@ -27,7 +47,7 @@ fi
 
 DIR="$RUNS_DIR/$RUN_ID"
 
-/home/itay-inbar/miniforge3/envs/local-coder/bin/python - "$RUN_ID" "$DIR" <<'PY'
+python3 - "$RUN_ID" "$DIR" <<'PY'
 import json, os, sys, time, subprocess, statistics, datetime
 from pathlib import Path
 
@@ -172,6 +192,7 @@ def count_pattern(p: str) -> tuple[int, int]:
 
 skill_t, skill_n = count_pattern("skill-inject:")
 research_t, research_n = count_pattern("research-directive")
+temporal_t, temporal_n = count_pattern("temporal-directive")
 quality_t, quality_n = count_pattern("quality-monitor:")
 turncap_t, _ = count_pattern("turn-cap:")
 finalize_t, finalize_n = count_pattern("finalize-warn:")
@@ -253,6 +274,7 @@ if tool_name_counts:
 print(f"\n── extension activity (over {done} tasks) ──")
 print(f"skill-inject       : {skill_n} fires / {skill_t} tasks")
 print(f"research-directive : {research_n} injections / {research_t} tasks")
+print(f"temporal-directive : {temporal_n} injections / {temporal_t} tasks")
 print(f"quality-monitor    : {quality_n} corrections / {quality_t} tasks")
 print(f"thinking-budget    : {budget_n} fires / {budget_t} tasks")
 print(f"turn-cap aborts    : {turncap_t} tasks")

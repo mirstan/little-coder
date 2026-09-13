@@ -29,7 +29,10 @@ describe("benchmark-profiles resolution against real settings.json", () => {
     const p = resolveProfileFrom(settings, "llamacpp/qwen3.6-35b-a3b", "terminal_bench");
     expect(p.thinking_budget).toBe(3000); // benchmark override kept
     expect(p.temperature).toBe(0.2);
-    expect(p.max_turns).toBe(40);
+    // terminal_bench has no max_turns override -- wall-clock (finalize-warn's
+    // deadline), not a turn count, governs TB trials; see
+    // little_coder_agent.py's max_turns=0.
+    expect(p.max_turns).toBeUndefined();
     expect(p.context_limit).toBeUndefined(); // no override → live model window
   });
 
@@ -53,9 +56,15 @@ describe("benchmark-profiles resolution against real settings.json", () => {
     expect(p.max_turns).toBeUndefined();
   });
 
-  it("every shipped per-model profile carries the 4096 budget", () => {
+  it("every shipped per-model profile carries the 4096 budget, except the fixed omlx/rapidmlx real-budget profiles", () => {
+    // omlx/tiel-coder-oq4e and rapidmlx/tiel-coder-oq4e carry a real 32768 budget;
+    // without it they fall through to default_model_profile's 4096 default, which
+    // unconditionally shadows LITTLE_CODER_THINKING_BUDGET. Every other shipped
+    // profile is unaffected.
+    const REAL_BUDGET_PROFILES = new Set(["omlx/tiel-coder-oq4e", "rapidmlx/tiel-coder-oq4e"]);
     for (const key of Object.keys(settings.model_profiles)) {
-      expect(resolveProfileFrom(settings, key).thinking_budget, key).toBe(4096);
+      const expected = REAL_BUDGET_PROFILES.has(key) ? 32768 : 4096;
+      expect(resolveProfileFrom(settings, key).thinking_budget, key).toBe(expected);
     }
   });
 });
