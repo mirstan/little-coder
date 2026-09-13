@@ -1245,7 +1245,8 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     much was dropped, and re-attach the footer verbatim. The footer is taken
     to be the final line when it is bracket-delimited -- the shape both
     adapters' `_format_output()` always produces, and the reason this is a
-    line test rather than a search for "exit=".
+    line test rather than a search for "exit=". A result that is nothing BUT
+    an over-limit footer is that same final line, and is returned whole.
 
     Budget: the whole preview -- kept body, marker, footer -- stays within
     `limit`, with the body giving up whatever room the other two need. The
@@ -1256,12 +1257,23 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     if len(text) <= limit:
         return text
 
-    lines = text.split("\n")
+    head, _sep, last = text.rpartition("\n")
     footer = ""
     body = text
-    if len(lines) > 1 and lines[-1].startswith("[") and lines[-1].endswith("]"):
-        footer = lines[-1]
-        body = "\n".join(lines[:-1])
+    if last.startswith("[") and last.endswith("]"):
+        footer = last
+        # rpartition, not a >1-line test: a footer that IS the whole input
+        # leaves head == "" here, where a line-count test instead left it as
+        # the body and cut it mid-footer -- the one thing this promises not
+        # to do.
+        body = head
+
+    def _with_footer(kept: str) -> str:
+        # `if kept` so a body that gave up all its budget to the footer
+        # doesn't produce a preview opening on a blank line.
+        if not footer:
+            return kept
+        return f"{kept}\n{footer}" if kept else footer
 
     # Reserve room for the marker so the common case stays within `limit`.
     # A fixed reserve, not the marker's exact length, because that length
@@ -1269,7 +1281,7 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     marker_reserve = 40
     body_budget = max(0, limit - marker_reserve - (len(footer) + 1 if footer else 0))
     if len(body) <= body_budget:
-        return f"{body}\n{footer}" if footer else body
+        return _with_footer(body)
 
     cut = body[:body_budget]
     for sep in ("\n", " "):
@@ -1281,10 +1293,8 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # `cut` as the hard slice -- unavoidable, and still better than also
     # losing the footer.
     marker = f"… [+{len(body) - len(cut)} chars truncated]"
-    # `if cut` so a footer wide enough to leave no body budget at all doesn't
-    # produce a preview that opens on a blank line.
     out = f"{cut}\n{marker}" if cut else marker
-    return f"{out}\n{footer}" if footer else out
+    return _with_footer(out)
 
 
 # ── Environment snapshot ────────────────────────────────────────────────────

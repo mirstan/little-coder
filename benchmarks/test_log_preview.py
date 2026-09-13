@@ -118,3 +118,17 @@ def test_unbroken_token_wider_than_the_budget_still_keeps_the_footer():
     out = preview_tool_result(text)
     assert out.endswith(FOOTER)
     assert "truncated" in out
+
+
+def test_a_footer_only_result_over_the_limit_is_kept_whole():
+    """One line, no body, past the limit. Recognising the footer used to
+    require a SECOND line, so this fell through as an ordinary body and got
+    sliced mid-footer -- losing exactly what the function exists to keep."""
+    footer = "[exit=0 cwd=" + "/deep" * 90 + " timed_out=false]"
+    assert len(footer) > 400
+    assert preview_tool_result(footer) == footer
+
+
+def test_a_footer_with_an_empty_body_does_not_open_on_a_blank_line():
+    footer = "[exit=0 cwd=" + "/deep" * 90 + " timed_out=false]"
+    assert preview_tool_result("\n" + footer) == footer
