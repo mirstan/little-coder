@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -177,10 +177,23 @@ class PromptResult:
     #: Why the call returned: "agent_end" (pi finished the turn -- this
     #: covers both a genuine agent_settled and the bounded settle-window
     #: fallback described below; "agent_settled" is deliberately NOT a
-    #: separate value here, see prompt_and_collect()'s docstring), "deadline"
+    #: separate value here, see prompt_and_collect()'s docstring), "error"
+    #: (pi finished the turn, but the final assistant completion was a
+    #: provider error or came back empty -- see error_message), "deadline"
     #: (budget expired), or "process_exit" (pi died mid-run). Callers must not
-    #: infer this from elapsed time -- a crash burns the full budget too,
-    #: because stdout EOF used not to wake the drain.
+    #: infer this from elapsed time.
+    #:
+    #: "error" is a refinement of "agent_end", not of the other two:
+    #: "deadline"/"process_exit" always win over it, because those describe
+    #: how the DRAIN ended and are strictly more informative about a
+    #: truncated trial than what the last completion happened to contain.
+    #: An invariant the derivation enforces in both directions, not one that
+    #: falls out of branch order alone: "deadline" does win by ordering, but
+    #: an `agent_end` immediately followed by EOF lands in the settle branch,
+    #: so both error-synthesis paths re-check whether pi is already gone
+    #: before firing. Without that check an errored or empty final turn from
+    #: a process that no longer existed reported "error", and
+    #: prompt_with_error_retry then re-prompted a dead session.
     #:
     #: NOTE: agent_ended=True with stop_reason="deadline" is a reachable and
     #: meaningful combination as of the ACTIVE/SETTLING rewrite: it means a
@@ -204,6 +217,11 @@ class PromptResult:
     #: Bounded to _MAX_NON_TEXT_DELTAS entries during collection (pure
     #: memory-safety backstop -- see that constant's own comment).
     non_text_deltas: list[dict] = field(default_factory=list)
+    #: Provider error text for stop_reason == "error", and only then: either
+    #: the assistant message's own `errorMessage` from the wire, or the
+    #: synthetic "empty completion" when pi reported no error but produced a
+    #: turn with no text and no tool calls. "" for every other stop_reason.
+    error_message: str = ""
     #: Token usage summed across every `turn_end` seen during this call
     #: (see prompt_and_collect's aggregation loop). Crash-proof but
     #: incomplete: unlike session_stats(), it does not include tool-result
@@ -632,10 +650,60 @@ class PiRpc:
             fallback after an `agent_end` -> "agent_end" (this exact string
             is kept for both cases -- `aider_polyglot.py::_stop_reason` and
             the polyglot metadata tests key on it; "agent_settled" is
-            deliberately NOT introduced as a new value);
+            deliberately NOT introduced as a new value), unless the final
+            completion errored, in which case -> "error" -- or
+            "process_exit" when pi has already exited by then (see below);
           - otherwise, if `self._eof or self._proc.poll() is not None` ->
             "process_exit";
           - otherwise -> "deadline".
+
+        "error" refines ONLY the `agent_end` branch above. Two shapes count,
+        both observed in this repo's own Harbor trajectory logs:
+
+          - the last assistant message carries `stopReason: "error"` (the
+            shape three of three error-truncated TB2.1 trials actually hit:
+            `turn_end stopReason=error hasText=false hasToolCalls=false`).
+            `errorMessage`, when present, lands in `error_message`;
+          - pi reports no error at all but the whole call produced a single
+            turn with no tool calls and no assistant text -- the empty
+            completion `aider_polyglot.py::_is_empty_response` already
+            fingerprints. `error_message` is then the synthetic
+            "empty completion".
+
+        Two rules keep this from over-firing, both load-bearing:
+
+          - LAST `agent_end` WINS. The verdict is recomputed at every
+            `agent_end` in the call, never latched from an earlier one: a
+            single call routinely sees several (continuations, pi's own
+            retries), and a turn that errored before a later one completed
+            cleanly must not poison the clean result. Within an agent run
+            the same rule applies to `turn_end`: the most recent one
+            decides, so a turn pi re-ran successfully overrides the failed
+            attempt that preceded it.
+          - `willRetry` SUPPRESSES. pi's `agent_end` carries a `willRetry`
+            boolean; `true` means pi's own internal retry is about to fire,
+            so the error is already being handled and must not also be
+            reported as ours (the caller would otherwise retry a turn pi is
+            concurrently retrying). `auto_retry_start` / `auto_retry_end`
+            are handled for the same reason: an errored turn pi then retries
+            itself is not an error we own unless that retry also fails. The
+            flag is read off the LAST `agent_end` by plain assignment, never
+            OR-latched across several: a sticky latch would keep suppressing
+            after a later `agent_end` said `willRetry:false`. It gates the
+            empty-completion fingerprint below as well as the flagged-error
+            path -- pi retrying a turn itself makes an empty one just as
+            much not-ours as an errored one.
+          - A DEAD pi OUTRANKS BOTH. pi can emit `agent_end` and then exit
+            within the same settle window, which still exits the loop
+            through the settled/SETTLING branch even though the process is
+            gone. Both error-synthesis paths therefore re-check `self._eof
+            or self._proc.poll() is not None` and report "process_exit"
+            (with no `error_message`, per that value's contract) instead:
+            there is no session left for anyone to retry, and
+            `prompt_with_error_retry` doing it anyway raised
+            `PiProcessExited` out of a Harbor trial before its metadata was
+            ever written. Scoped to those two paths only -- a clean
+            `agent_end` followed by exit still reports "agent_end".
 
         All modes append into one `events` list, so tool calls / text /
         turn_count from a continuation turn are aggregated into the same
@@ -773,22 +841,22 @@ class PiRpc:
 
         result = PromptResult()
         result.settled = settled
-        # Derived from how the loop exited, not from a latched "did we ever
-        # see agent_end" -- see PromptResult.stop_reason's docstring for why
-        # agent_ended=True with stop_reason="deadline" is reachable and
-        # meaningful.
-        if active_timeout_expired:
-            result.stop_reason = "deadline"
-        elif settled or mode == "SETTLING":
-            # Either pi's real idle signal fired, or we exited the bounded
-            # settle window (deadline or EOF) after having seen an
-            # agent_end -- both report the same string for backward
-            # compatibility; see the docstring above.
-            result.stop_reason = "agent_end"
-        elif self._eof or self._proc.poll() is not None:
-            result.stop_reason = "process_exit"
-        else:
-            result.stop_reason = "deadline"
+
+        # ── Error derivation state (see the docstring's "error" section) ──
+        # The verdict, recomputed at EVERY agent_end and never latched: one
+        # call can legitimately see several, and the last one decides.
+        error_flagged = False
+        error_message = ""
+        # The most recent turn_end's own stopReason/errorMessage, i.e. the
+        # state of the turn currently in flight. Last turn_end wins within an
+        # agent run for the same reason last agent_end wins across runs.
+        turn_stop_reason = ""
+        turn_error_message = ""
+        # Whether the LAST agent_end said pi is retrying this itself.
+        # Assigned, never OR-ed: a sticky latch would go on suppressing the
+        # empty-completion fingerprint after a later agent_end said false.
+        last_will_retry = False
+
         pending: dict[str, dict] = {}
         # See PromptResult.non_text_deltas' own docstring and
         # _MAX_NON_TEXT_DELTAS' -- a fixed head plus a bounded ROLLING tail
@@ -829,6 +897,11 @@ class PiRpc:
             elif t == "turn_end":
                 result.turn_count += 1
                 msg = ev.get("message")
+                # Overwritten (not OR-ed) on every turn_end: only the most
+                # recent turn's outcome is in flight, so a turn pi re-ran
+                # successfully clears the failed attempt before it.
+                turn_stop_reason = str(msg.get("stopReason") or "") if isinstance(msg, dict) else ""
+                turn_error_message = str(msg.get("errorMessage") or "") if isinstance(msg, dict) else ""
                 usage = msg.get("usage") if isinstance(msg, dict) else None
                 if isinstance(usage, dict):
                     # Defensive .get(..., 0) + isinstance checks throughout:
@@ -854,9 +927,91 @@ class PiRpc:
                         result.usage["cost"] += cost
             elif t == "compaction_end":
                 result.compaction_events += 1
+            elif t == "auto_retry_start":
+                # pi is re-issuing the failed provider call itself. Drop the
+                # errored turn's verdict so the retry's own turn_end (or the
+                # auto_retry_end below) decides -- without this, an error pi
+                # successfully recovered from could still be the last
+                # turn_end this loop saw before agent_end, since a retried
+                # turn need not emit a second turn_end.
+                turn_stop_reason = ""
+                turn_error_message = str(ev.get("errorMessage") or "")
+            elif t == "auto_retry_end":
+                if ev.get("success"):
+                    turn_stop_reason = ""
+                    turn_error_message = ""
+                else:
+                    turn_stop_reason = "error"
+                    turn_error_message = str(ev.get("finalError") or turn_error_message)
             elif t == "agent_end":
                 result.agent_ended = True
+                last_will_retry = bool(ev.get("willRetry"))
+                if last_will_retry:
+                    # pi's own retry is already queued for this failure --
+                    # reporting it as ours too would have the caller retry a
+                    # turn pi is concurrently retrying.
+                    error_flagged = False
+                    error_message = ""
+                else:
+                    error_flagged = turn_stop_reason == "error"
+                    error_message = turn_error_message if error_flagged else ""
+
         result.non_text_deltas = non_text_delta_head + list(non_text_delta_tail)
+
+        # Derived from how the loop exited, not from a latched "did we ever
+        # see agent_end" -- see PromptResult.stop_reason's docstring for why
+        # agent_ended=True with stop_reason="deadline" is reachable and
+        # meaningful. Deliberately computed AFTER the aggregation loop above
+        # (it needs that loop's error verdict and content totals), but the
+        # loop-exit branches are unchanged and still take precedence: only
+        # the agent_end branch can become "error" -- or, when pi is already
+        # gone, "process_exit".
+        if active_timeout_expired:
+            result.stop_reason = "deadline"
+        elif settled or mode == "SETTLING":
+            # Either pi's real idle signal fired, or we exited the bounded
+            # settle window (deadline or EOF) after having seen an
+            # agent_end -- both report the same string for backward
+            # compatibility; see the docstring above.
+            empty_completion = (
+                # The empty-completion shape, with nothing on the wire saying
+                # so. Same fingerprint aider_polyglot.py::_is_empty_response
+                # uses; kept here too because a provider can return an empty
+                # body with stopReason "stop" rather than "error".
+                not error_flagged
+                and not last_will_retry
+                and result.turn_count <= 1
+                and not result.tool_calls
+                and not result.assistant_text.strip()
+            )
+            if error_flagged or empty_completion:
+                if self._eof or self._proc.poll() is not None:
+                    # agent_end and EOF in the same settle window: this
+                    # branch won on ordering, but there is no session left
+                    # to retry and saying "error" sends the retry helper at
+                    # a dead process. Scoped to the two error-synthesis
+                    # paths on purpose -- a clean agent_end followed by exit
+                    # keeps reporting "agent_end".
+                    result.stop_reason = "process_exit"
+                elif error_flagged:
+                    result.stop_reason = "error"
+                    result.error_message = error_message or "provider error"
+                else:
+                    result.stop_reason = "error"
+                    result.error_message = "empty completion"
+            else:
+                result.stop_reason = "agent_end"
+        elif self._eof or self._proc.poll() is not None:
+            result.stop_reason = "process_exit"
+        else:
+            result.stop_reason = "deadline"
+
+        if result.stop_reason == "error":
+            print(
+                f"WARNING: pi completion ended in a provider error (session "
+                f"{self._session_id!r}): {result.error_message}",
+                file=sys.stderr,
+            )
         return result
 
     def new_session(self):
@@ -940,6 +1095,15 @@ class PiRpc:
         with self._lock:
             return list(self._notifications)
 
+    def is_alive(self) -> bool:
+        """Whether a further prompt could still reach pi.
+
+        The same EOF/exit-status pair stop_reason's "process_exit" is derived
+        from, widened by `_closed`: a session this client already closed has
+        nothing left to prompt either.
+        """
+        return not self._closed and not self._eof and self._proc.poll() is None
+
     def close(self, timeout: float = 5):
         if self._closed:
             return
@@ -986,6 +1150,317 @@ class PiRpc:
 
     def __exit__(self, *a):
         self.close()
+
+
+# ── Bounded retry on a provider-error completion ────────────────────────────
+
+#: Total attempts, i.e. the first prompt plus at most two retries.
+ERROR_RETRY_MAX_ATTEMPTS = 3
+#: Backoff before retry 1 and retry 2. The last entry repeats if
+#: ERROR_RETRY_MAX_ATTEMPTS is ever raised past len(this).
+ERROR_RETRY_BACKOFF_SEC = (5.0, 15.0)
+#: Don't start a retry unless this much budget would still be left after the
+#: backoff -- a retry with seconds on the clock can't do useful work, and
+#: ending the trial normally at least preserves whatever the agent already
+#: wrote.
+ERROR_RETRY_MIN_BUDGET_SEC = 60.0
+#: Stop after this many CONSECUTIVE attempts failing with byte-identical
+#: error text: a non-retryable provider error (a poisoned transcript, an
+#: unsupported request) fails the same way every time, and spending the rest
+#: of the retry budget on it only delays the trial's real ending.
+ERROR_RETRY_IDENTICAL_LIMIT = 2
+#: Short and neutral on purpose. The escape hatch in the last sentence
+#: matters: without it this nudge can goad an agent that genuinely finished
+#: into undoing its own completed work.
+ERROR_RETRY_PROMPT = (
+    "Your previous response ended with a provider error. The task is not "
+    "complete — please continue working on it. If the task is actually "
+    "already complete and verified, say so explicitly and stop."
+)
+
+
+@dataclass
+class ErrorRetryOutcome:
+    """What prompt_with_error_retry() ended up with."""
+    #: One PromptResult covering every attempt: turn_count, tool_calls,
+    #: usage and compaction_events summed, assistant_text joined, agent_ended
+    #: OR-ed. stop_reason / error_message / settled describe the FINAL
+    #: attempt alone -- they are verdicts on how the call ended, not totals.
+    #: A call that never retried hands back that single attempt's own object
+    #: unchanged, exactly as a bare prompt_and_collect() would.
+    result: PromptResult
+    #: Retries actually issued (0 when the first attempt didn't error).
+    n_error_retries: int = 0
+    #: The last provider error seen across ALL attempts, retained even when a
+    #: later attempt then succeeded -- otherwise a recovered trial would
+    #: record n_error_retries > 0 with no trace of what it recovered from.
+    error_message: str = ""
+    #: "TypeName: message" when a RETRY raised and was turned into the merged
+    #: result instead of propagating, "" otherwise. Separate from
+    #: `error_message`, which is a provider verdict: this one is a harness
+    #: fault (a rejected prompt, a dead pipe) that the caller would otherwise
+    #: have seen as a raised exception and now cannot see at all.
+    retry_exception: str = ""
+
+
+def _merged_result(acc: PromptResult, latest: PromptResult) -> PromptResult:
+    """Fold one more attempt into the accumulated PromptResult.
+
+    Returns a new object instead of mutating `acc`, so the first attempt's
+    own result -- the object a never-retried call hands straight back to the
+    caller -- is never rewritten underneath anyone still holding it.
+    """
+    usage = dict(acc.usage)
+    for key, value in (latest.usage or {}).items():
+        usage[key] = usage.get(key, 0) + value
+    texts = [t for t in (acc.assistant_text, latest.assistant_text) if t]
+    return PromptResult(
+        assistant_text="\n".join(texts),
+        tool_calls=list(acc.tool_calls) + list(latest.tool_calls),
+        agent_ended=acc.agent_ended or latest.agent_ended,
+        compaction_events=acc.compaction_events + latest.compaction_events,
+        turn_count=acc.turn_count + latest.turn_count,
+        usage=usage,
+        # Verdicts about how the call ended, so the latest attempt's alone.
+        stop_reason=latest.stop_reason,
+        error_message=latest.error_message,
+        settled=latest.settled,
+    )
+
+
+def prompt_with_error_retry(
+    rpc: PiRpc,
+    message: str,
+    timeout: float,
+    on_event: Optional[Callable[[dict], None]] = None,
+    *,
+    deadline: Optional[float] = None,
+    retry_message: str = ERROR_RETRY_PROMPT,
+    max_attempts: int = ERROR_RETRY_MAX_ATTEMPTS,
+    backoff_sec: tuple = ERROR_RETRY_BACKOFF_SEC,
+    min_remaining_sec: float = ERROR_RETRY_MIN_BUDGET_SEC,
+    identical_error_limit: int = ERROR_RETRY_IDENTICAL_LIMIT,
+    log: Optional[Callable[[str], None]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> ErrorRetryOutcome:
+    """prompt_and_collect(), retried a bounded number of times on `"error"`.
+
+    Motivation, measured: across five failed TB2.1 trials, three ended when a
+    single errored completion made pi emit `agent_end` with 62-81% of the
+    wall-clock budget still unspent. Nothing was wrong with the container or
+    the work already done -- the session simply stopped. Re-prompting the
+    SAME session (never a fresh one: a new session would discard the whole
+    transcript the agent built, which is the only thing that makes continuing
+    cheaper than starting over) recovers that budget.
+
+    Retries only on `stop_reason == "error"`. "deadline" means the budget is
+    already gone and "process_exit" means there is no session left to prompt,
+    so neither is retryable here.
+
+    `deadline` is a `now()`-scale absolute instant; it defaults to
+    `now() + timeout`. Pass the trial's own deadline instead whenever one
+    exists, so the retries can never outlive the budget the agent was
+    actually given. Each retry is issued with the budget REMAINING against
+    that deadline, never the original full `timeout` -- passing the full
+    timeout again is how a retry loop quietly doubles a trial's wall clock.
+
+    Three independent brakes, any of which ends the loop early:
+    `max_attempts`, `identical_error_limit`, and the `min_remaining_sec`
+    budget floor (checked against the budget that would be left AFTER the
+    backoff, since the backoff spends real trial time too). A fourth check
+    is not policy but fact: `rpc.is_alive()` just before the backoff, since
+    pi can die BETWEEN attempts -- after the stop_reason derivation that
+    would have reported "process_exit" has already run.
+
+    Everything the attempts produced is merged into the single returned
+    PromptResult (see ErrorRetryOutcome.result): a retry that then fails
+    must not erase the tool calls and tokens the earlier ones spent. An
+    exception out of a RETRY is caught for the same reason and turned into
+    that merged result; the first attempt's is left to propagate, so
+    wrapping a call site in this helper cannot swallow a failure the bare
+    prompt_and_collect() would have raised. A caught one is still reported
+    three ways, because it is a harness fault the caller can no longer see
+    raised: on stderr, in `ErrorRetryOutcome.retry_exception`, and -- when it
+    left pi dead -- as a "process_exit" stop_reason rather than a retryable
+    "error".
+
+    `sleep`/`now` are injected purely so tests can drive the whole policy
+    without spending real seconds.
+    """
+    if deadline is None:
+        deadline = now() + timeout
+
+    def _log(text: str) -> None:
+        if log is not None:
+            log(text)
+
+    attempts = 0
+    n_retries = 0
+    last_error = ""
+    identical_streak = 0
+    attempt_message = message
+    merged: Optional[PromptResult] = None
+    # Attempt 1 is clamped against the deadline too, not just the retries:
+    # callers pass a deadline taken before their own setup work, so `timeout`
+    # can already overshoot it on the very first prompt.
+    attempt_timeout = min(timeout, max(0.0, deadline - now()))
+
+    while True:
+        attempts += 1
+        if attempts == 1:
+            result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
+        else:
+            try:
+                result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                _log(
+                    f"retry {n_retries} raised {detail} -- keeping what the "
+                    f"first {attempts - 1} attempt(s) produced"
+                )
+                # Unconditionally, not only through `log` -- which defaults to
+                # None. This is the one path that turns a raised failure into
+                # an ordinary return, so a caller without a logger would
+                # otherwise see no trace of it whatsoever.
+                print(
+                    f"WARNING: error retry {n_retries} raised {detail}; "
+                    f"returning the first {attempts - 1} attempt(s) instead",
+                    file=sys.stderr,
+                )
+                if not rpc.is_alive():
+                    # The accumulated verdict still reads "error", the
+                    # RETRYABLE value, for a session that is provably gone --
+                    # the same contradiction the stop_reason derivation
+                    # re-checks liveness to avoid. `replace`, not mutation:
+                    # `merged` can still be attempt 1's own object.
+                    merged = replace(
+                        merged, stop_reason="process_exit", error_message=""
+                    )
+                return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+        merged = result if merged is None else _merged_result(merged, result)
+        if result.stop_reason != "error":
+            return ErrorRetryOutcome(merged, n_retries, last_error)
+
+        err = result.error_message or "provider error"
+        identical_streak = identical_streak + 1 if err == last_error else 1
+        last_error = err
+        _log(
+            f"prompt attempt {attempts}/{max_attempts} ended in a provider "
+            f"error: {err}"
+        )
+
+        if attempts >= max_attempts:
+            _log(f"not retrying: {max_attempts} attempts already used")
+            return ErrorRetryOutcome(merged, n_retries, last_error)
+        if identical_streak >= identical_error_limit:
+            _log(
+                f"not retrying: {identical_streak} consecutive attempts failed "
+                f"with the identical error, treating it as non-retryable"
+            )
+            return ErrorRetryOutcome(merged, n_retries, last_error)
+
+        backoff = backoff_sec[min(n_retries, len(backoff_sec) - 1)] if backoff_sec else 0.0
+        remaining_after_backoff = (deadline - now()) - backoff
+        if remaining_after_backoff < min_remaining_sec:
+            _log(
+                f"not retrying: only {remaining_after_backoff:.0f}s would be "
+                f"left after a {backoff:.0f}s backoff, below the "
+                f"{min_remaining_sec:.0f}s floor"
+            )
+            return ErrorRetryOutcome(merged, n_retries, last_error)
+
+        if not rpc.is_alive():
+            # pi can exit between attempts, once the derivation that would
+            # have said "process_exit" has already run on this result.
+            # Prompting anyway raises PiProcessExited out of the trial.
+            _log("not retrying: pi process is gone")
+            return ErrorRetryOutcome(merged, n_retries, last_error)
+
+        sleep(backoff)
+        n_retries += 1
+        attempt_message = retry_message
+        attempt_timeout = max(0.0, deadline - now())
+        _log(
+            f"retry {n_retries} on the same session with "
+            f"{attempt_timeout:.0f}s of remaining budget"
+        )
+
+
+# ── Log previews ────────────────────────────────────────────────────────────
+
+
+def preview_tool_result(text: str, limit: int = 400) -> str:
+    """Shorten a formatted tool result for a trajectory log, readably.
+
+    A raw `text[:limit]` slice -- what all three call sites used to do --
+    fails a log reader twice over: it lands mid-word, and it drops the
+    trailing `[exit=... cwd=... timed_out=... backend=...]` footer that
+    `_format_output()` appends, which is the single most useful line in the
+    whole result (did the command actually succeed, and where did it run?).
+    Every result longer than `limit` therefore lost exactly the part worth
+    keeping.
+
+    So: cut the BODY at the last newline or space before the budget, mark how
+    much was dropped, and re-attach the footer verbatim. The footer is taken
+    to be the final line when it is bracket-delimited -- the shape both
+    adapters' `_format_output()` always produces, and the reason this is a
+    line test rather than a search for "exit=". A result that is nothing BUT
+    an over-limit footer is that same final line, and is returned whole.
+
+    Budget: the whole preview -- kept body, marker, footer -- stays within
+    `limit`, with the body giving up whatever room the other two need. The
+    one exception is a footer wider than `limit` itself, which is still
+    preserved in full: dropping it is the bug this exists to fix.
+    """
+    # Strip trailing newlines before anything else: `_format_output()` never
+    # emits one, but a caller that does would otherwise make `rpartition`
+    # yield an empty `last` ("[exit=0]\n".rpartition("\n")[2] == ""), which
+    # fails the footer test below and lets the real footer get cut mid-line
+    # by the body-truncation path -- the exact bug this function exists to
+    # prevent.
+    text = (text or "").rstrip("\n")
+    if len(text) <= limit:
+        return text
+
+    head, _sep, last = text.rpartition("\n")
+    footer = ""
+    body = text
+    if last.startswith("[") and last.endswith("]"):
+        footer = last
+        # rpartition, not a >1-line test: a footer that IS the whole input
+        # leaves head == "" here, where a line-count test instead left it as
+        # the body and cut it mid-footer -- the one thing this promises not
+        # to do.
+        body = head
+
+    def _with_footer(kept: str) -> str:
+        # `if kept` so a body that gave up all its budget to the footer
+        # doesn't produce a preview opening on a blank line.
+        if not footer:
+            return kept
+        return f"{kept}\n{footer}" if kept else footer
+
+    # Reserve room for the marker so the common case stays within `limit`.
+    # A fixed reserve, not the marker's exact length, because that length
+    # depends on the omitted count, which depends on where we cut.
+    marker_reserve = 40
+    body_budget = max(0, limit - marker_reserve - (len(footer) + 1 if footer else 0))
+    if len(body) <= body_budget:
+        return _with_footer(body)
+
+    cut = body[:body_budget]
+    for sep in ("\n", " "):
+        idx = cut.rfind(sep)
+        if idx > 0:
+            cut = cut[:idx]
+            break
+    # No boundary at all (one unbroken token wider than the budget) leaves
+    # `cut` as the hard slice -- unavoidable, and still better than also
+    # losing the footer.
+    marker = f"… [+{len(body) - len(cut)} chars truncated]"
+    out = f"{cut}\n{marker}" if cut else marker
+    return _with_footer(out)
 
 
 # ── Environment snapshot ────────────────────────────────────────────────────

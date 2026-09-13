@@ -21,7 +21,9 @@ export function resolveFinalizeMessage(benchmark: string | undefined): string {
       "container's files/state afterward, not by this chat reply). Do not " +
       "run further checks, tests, or verification first — if your answer " +
       "is incomplete or uncertain, save it anyway: a rough answer on disk " +
-      "beats a correct one that never got written. Then stop calling tools."
+      "beats a correct one that never got written. Then stop calling tools. " +
+      "If you accidentally overwrote good work, a snapshot of files you " +
+      "changed as of ~10 minutes ago may exist under /tmp/.lc-snapshot/."
     );
   }
   if (benchmark === "gaia") {

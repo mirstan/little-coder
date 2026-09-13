@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseSkillFile } from "./frontmatter.ts";
 import { injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
+import { SHELL_TOOLS } from "../_shared/shell-write.ts";
 
 // ── Tool-skill registry ─────────────────────────────────────────────────
 // Port of local/skill_augment.py. Loads skills/tools/*.md once, hooks
@@ -335,6 +336,215 @@ function researchDirective(allowed: Set<string> | undefined): string {
   return lines.join("\n");
 }
 
+// Keyword-triggered directive: when the prompt asks about a PAST state of
+// something (a leaderboard "as of" some date, a repo "at the time" of a
+// release, a "historical" snapshot), warn the model against reconstructing
+// that past state by filtering CURRENT data with an unrelated proxy field.
+//
+// This is the mteb-leaderboard trajectory: the model correctly noticed the
+// question named a past date, but then "answered" it by filtering today's
+// live leaderboard by an unrelated proxy field (model release date) instead
+// of finding an actual dated snapshot -- a git commit of the underlying
+// results repo (which the reference solution used) or an archived web page.
+// It never considered a versioned/archived source at all.
+//
+// Deliberately does NOT match on bare "historic" or bare "historically" --
+// "historic building" is a proper-noun/adjective use (an old building), and
+// "historically we used tabs" is a discourse adverb, neither a signal that
+// the task wants a past snapshot of live/versioned data. Only "historical
+// <source noun>" (e.g. "historical rankings") counts as a signal; both bare
+// forms are non-signals -- pinned by non-firing tests in injection.test.ts.
+
+// ── Date/version anchor grammar (building blocks) ──────────────────────
+const MONTH = String.raw`(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)`;
+const YEAR = String.raw`(?:19|20)\d{2}`;
+// Optional "early"/"mid"/"late" qualifier between anchor phrase and date.
+const QUAL = String.raw`(?:(?:early|mid|late)[-\s]+)?`;
+const ISO_DATE = String.raw`${YEAR}-\d{2}-\d{2}`;
+// "August 2025", "May 3, 2024", "June 2024" — month, optional day, year.
+const MONTH_DATE = String.raw`${MONTH}\.?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?${YEAR}`;
+// Day-first ("1 March 2024", "3rd May 2024", "21 Aug. 2025"). Same anchor
+// strength as MONTH_DATE -- a bare day number is only read as a date when a
+// month name and year follow it, so this cannot pick up loose integers.
+const DAY_MONTH_DATE = String.raw`\d{1,2}(?:st|nd|rd|th)?\s+${MONTH}\.?,?\s+${YEAR}`;
+const FULL_DATE = String.raw`(?:${ISO_DATE}|${MONTH_DATE}|${DAY_MONTH_DATE})`;
+const RELATIVE = String.raw`last\s+(?:year|month|week)`;
+// The `\b` before `v` is load-bearing: without it this matches the `v1.2`
+// inside identifiers like `srv1.2`, `rev1.4`, `conv1.0`, `env1.2`. ANCHOR
+// uses its version branch at a fixed position so it was safe there, but the
+// snapshot trigger and the anaphoric check scan freely and did fire on those.
+const VERSION = String.raw`(?:\bv|\bversion\s+)\d+(?:\.\d+)+`;
+// Single-component versions ("as of v2", "as of version 3") are real temporal
+// anchors, but only behind a strong anchor phrase, where the preceding words
+// already carry the intent. The free-scanning snapshot trigger and the
+// anaphoric whole-prompt check keep the strict 2+-component VERSION on
+// purpose: a bare "v2" is far too common in dev prompts to arm them.
+const VERSION_LOOSE = String.raw`(?:\bv|\bversion\s+)\d+(?:\.\d+)*`;
+const COMMIT = String.raw`commit\s+[0-9a-f]{6,40}\b`;
+// Object of a strong anchor phrase ("as of X", "at the time of X"). The
+// optional leading "the" gates the WHOLE alternation, not just one branch --
+// "as of the March 2024 release" and "as of the 2019 audit" are as ordinary
+// as "as of the v1.2 release", and gating one branch only made them silently
+// miss. Callers must NOT add their own "the": ANCHOR already absorbs it.
+const ANCHOR = String.raw`(?:the\s+)?(?:${QUAL}${FULL_DATE}|${QUAL}${YEAR}\b|${RELATIVE}|${VERSION_LOOSE}|${COMMIT})`;
+
+// Nouns naming an external / versioned / time-varying data source.
+const SOURCE_NOUN = String.raw`(?:leaderboards?|rankings?|standings|repo(?:s|sitor(?:y|ies))?|datasets?|results|stars|prices?)`;
+
+const TEMPORAL_TRIGGERS = [
+  // "as of <date-ish>": permissive object (bare year OK) because "as of" is
+  // itself an unambiguous temporal anchor. today/now/yesterday are absent
+  // from ANCHOR on purpose ("as of today the build is green" is a status
+  // report, not a temporal-research request).
+  new RegExp(String.raw`\bas of\s+${ANCHOR}`, "i"),
+  // "back in <year/date>": same strong-anchor permissiveness.
+  new RegExp(String.raw`\bback in\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b)`, "i"),
+  // "at the time of <date/version-shaped object>". The object must itself be
+  // date-shaped: "at the time of the 2019 audit" fires, "at the time of the
+  // crash/incident/writing" does not.
+  new RegExp(String.raw`\bat the time of\s+${ANCHOR}`, "i"),
+  // "historical <source noun>". Bare "historically" is a discourse adverb
+  // ("historically we used tabs") and no longer fires.
+  new RegExp(String.raw`\bhistorical\s+${SOURCE_NOUN}\b`, "i"),
+  // snapshot + a date/version in the same sentence. Dev-artifact snapshots
+  // (memory, docker, ZFS, snapshot tests) carry no date and do not fire.
+  new RegExp(String.raw`\bsnapshots?\b[^.\n]{0,60}?(?:${FULL_DATE}|\b${YEAR}\b|${VERSION})`, "i"),
+  // source noun ... in/on/during <year>. The gap stops at sentence-ending
+  // punctuation (. ? ! ;) as well as a newline, so the noun in one sentence
+  // cannot bind to a year in the next.
+  //
+  // Weak prepositions also get the structural unit-guard: a year followed by
+  // a unit is a count, not a date, and the unit can lead with a space then an
+  // alphanumeric ("in 2000 chunks", "in 2048 4-byte blocks"), an ATTACHED
+  // hyphen ("in 2048-byte pages"), or a comma then a digit ("in 2048, 4096
+  // chunks"). Each shape is spelled out separately on purpose: a comma, or a
+  // spaced hyphen, followed by an ordinary word is a clause break rather than
+  // a unit ("the standings in 2023, before the reshuffle"), and the shorter
+  // \s*[-,]?\s* form swallowed exactly those. The class runs under /i so it
+  // rejects capitalised units too; deliberately structural, no enumerated
+  // unit list to outgrow. Full dates are exempt.
+  new RegExp(
+    String.raw`\b${SOURCE_NOUN}\b[^.?!;\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s+[a-z0-9]|-[a-z]|,\s*\d))`,
+    "i",
+  ),
+  // past-tense question + weak preposition + FULL date (never a bare year):
+  // "what was the price of bitcoin in March 2023".
+  new RegExp(
+    String.raw`\b(?:what|which|who|how)\b[^.?!;\n]{0,80}?\b(?:was|were|did)\b[^.?!;\n]{0,80}?\b(?:in|on|during)\s+${QUAL}${FULL_DATE}`,
+    "i",
+  ),
+  // date-first, tight adjacency, riskiest-noun list only: "the 2023
+  // leaderboard". NOT dataset/repo/generic nouns — "the 2024 dataset loader"
+  // is an ordinary artifact name (see the pinned non-firing tests).
+  new RegExp(String.raw`\b${YEAR}\s+(?:leaderboards?|rankings?|standings)\b`, "i"),
+];
+
+// Anaphoric check: a bare "at the time" with no date object in its own clause
+// still signals temporal research when the prompt names a real date NEARBY
+// ("The paper came out in June 2024. Which model led the leaderboard at the
+// time?" — the original mteb-leaderboard shape). Bare years are deliberately
+// excluded: a stray "2048" elsewhere must not arm "at the time".
+//
+// Proximity is load-bearing. Scanning the whole prompt independently let any
+// version string anywhere arm the plain English idiom "at the time" ("Pin to
+// v1.26.0 in requirements.txt. It was pinned at the time to avoid a
+// regression." — an ordinary dependency-pinning task), and version strings
+// are ubiquitous in dev prompts. A date or commit hash now counts only within
+// ANAPHORIC_WINDOW characters on either side, sentence boundaries crossable
+// because the motivating shape spans two sentences. A version string is held
+// to the stricter same-sentence rule: a version sitting in its own sentence
+// is naming a dependency, not the past moment "at the time" points back to.
+const ANAPHORIC_WINDOW = 150;
+const AT_THE_TIME = String.raw`\bat the time\b`;
+const NEAR_DATE = String.raw`(?:${FULL_DATE}|${COMMIT})`;
+// Same-sentence filler, the same class the clause-scoped triggers above use.
+const SAME_SENTENCE = String.raw`[^.?!;\n]`;
+const ANAPHORIC_AT_THE_TIME = new RegExp(
+  [
+    String.raw`${NEAR_DATE}[\s\S]{0,${ANAPHORIC_WINDOW}}?${AT_THE_TIME}`,
+    String.raw`${AT_THE_TIME}[\s\S]{0,${ANAPHORIC_WINDOW}}?${NEAR_DATE}`,
+    String.raw`${VERSION}${SAME_SENTENCE}{0,${ANAPHORIC_WINDOW}}?${AT_THE_TIME}`,
+    String.raw`${AT_THE_TIME}${SAME_SENTENCE}{0,${ANAPHORIC_WINDOW}}?${VERSION}`,
+  ].join("|"),
+  "i",
+);
+
+export function looksLikeTemporalTask(text: string): boolean {
+  if (!text) return false;
+  for (const re of TEMPORAL_TRIGGERS) {
+    if (re.test(text)) return true;
+  }
+  return ANAPHORIC_AT_THE_TIME.test(text);
+}
+
+// True when at least one git-capable shell tool (bash / ShellSession /
+// ShellStart -- see SHELL_TOOLS in _shared/shell-write.ts, the same canonical
+// list permission-gate and write-guard share, reused here rather than
+// redefined) is callable. The temporal directive's git-log/git-show advice is
+// dead guidance without one. Intentional coupling -- a new shell tool is by
+// construction git-capable.
+function anyShellToolAvailable(allowed: Set<string> | undefined): boolean {
+  if (!allowed) return true;
+  for (const t of SHELL_TOOLS) if (allowed.has(t)) return true;
+  return false;
+}
+
+// Shared by the gate and the directive builder below, so the two capability
+// checks can't drift apart (Finding 7a).
+function temporalCapabilities(
+  allowed: Set<string> | undefined,
+): { canGit: boolean; canBrowse: boolean } {
+  return {
+    canGit: anyShellToolAvailable(allowed),
+    canBrowse: toolsAvailable(["websearch"], allowed) || toolsAvailable(BROWSER_RESEARCH_PAIR, allowed),
+  };
+}
+
+/** Should the temporal-research directive be injected for this prompt/allow-list?
+ *  Exported for unit testing alongside looksLikeTemporalTask.
+ *
+ *  Gated on either a git-capable shell tool (to read a historical revision)
+ *  or the same browse-tool gate the research directive uses (to reach an
+ *  archived/versioned copy of a live page). Reuses BROWSE_TOOLS /
+ *  BROWSER_RESEARCH_PAIR rather than redefining a second browse gate. */
+export function shouldInjectTemporalDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  const c = temporalCapabilities(allowed);
+  return looksLikeTemporalTask(prompt) && (c.canGit || c.canBrowse);
+}
+
+// Built per-turn (like researchDirective) so the advice only names sources
+// that are actually reachable given this turn's allow-list.
+function temporalDirective(allowed: Set<string> | undefined): string {
+  const { canGit, canBrowse } = temporalCapabilities(allowed);
+  const lines = [
+    "",
+    "## Temporal-research directive",
+    "This task asks about a PAST state, not the current/live state. Do not " +
+      "approximate the past by filtering current data with an unrelated proxy " +
+      "field (e.g. a release date, version string) -- that reconstructs a " +
+      "different thing, not the historical state actually asked about.",
+  ];
+  if (canGit) {
+    lines.push(
+      "- If the data lives in a git repository, use `git log` / " +
+        "`git show <rev>:<path>` to read an actual historical snapshot from " +
+        "around the relevant date.",
+    );
+  }
+  if (canBrowse) {
+    lines.push(
+      "- For live web data, prefer an archived/versioned copy (e.g. " +
+        "web.archive.org) over the current live page.",
+    );
+  }
+  lines.push("State which historical snapshot or archived source you actually used.");
+  lines.push("");
+  return lines.join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
   // `/skills` (issue #118). pi's own `/skill:name` addresses pi skills; these
   // cards are a different mechanism (selected per turn by error-recovery >
@@ -392,8 +602,9 @@ export default function (pi: ExtensionAPI) {
 
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
+    const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
 
-    if (selected.length === 0 && !researchTask) return;
+    if (selected.length === 0 && !researchTask && !temporalTask) return;
 
     const skillBlock = selected.length > 0
       ? (() => {
@@ -410,13 +621,20 @@ export default function (pi: ExtensionAPI) {
         })()
       : "";
 
-    const directive = researchTask ? researchDirective(allowed) : "";
-
-    // Order within the block: [tool skill cards] [research directive]. The
-    // directive comes LAST by design — small models show strong recency bias
-    // and the per-task instruction is what we want freshest in their
-    // attention. Delivered at the conversation tail (see _shared/inject.ts),
-    // which is later still than the end of the system prompt.
+    // Order within the block: [tool skill cards] [research directive]
+    // [temporal directive]. Both directives come after the skill cards by
+    // design — small models show strong recency bias and the per-task
+    // instructions are what we want freshest in their attention. The
+    // temporal directive comes LAST of all: it is the more specific,
+    // corrective one (don't reconstruct a past state from current data),
+    // so it wins the recency argument over the more general research
+    // directive when a prompt trips both (e.g. "research the leaderboard as
+    // of March 2024"). Delivered at the conversation tail (see
+    // _shared/inject.ts), which is later still than the end of the system
+    // prompt.
+    const directive =
+      (researchTask ? researchDirective(allowed) : "") +
+      (temporalTask ? temporalDirective(allowed) : "");
     const block = skillBlock + directive;
 
     // Identical to last turn's block? The previous copy is still in the
@@ -436,6 +654,7 @@ export default function (pi: ExtensionAPI) {
         parts.push(`+${selected.length} ${JSON.stringify(selected.map((s) => s.targetTool))}`);
       }
       if (researchTask) parts.push("+research-directive");
+      if (temporalTask) parts.push("+temporal-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
     } catch {
       // UI unavailable in some run modes — silent best-effort

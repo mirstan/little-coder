@@ -108,24 +108,11 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-#: Per-attempt RPC budget, seconds. 900 suited a fast hosted model, but a
-#: local model with a genuine large thinking budget (PR #17 fixed
-#: omlx/rapidmlx's thinking_budget profile, previously silently stuck at
-#: 4096) needs real headroom -- wordy/transpose already hit 691-722s even
-#: at that broken smaller budget, and GAIA runs under the real 32768 budget
-#: showed single completions taking 200-900+s. Tripled to 2700, matching
-#: the same 3x used for GAIA's --timeout, so a hard multi-turn exercise is
-#: capability-limited rather than clock-limited.
-#: A NAMED constant (not inlined into the _positive_int_env() call below),
-#: importable on its own -- real gap, confirmed by review: live_eval.py's
-#: own per-exercise timeout estimate used to duplicate this as a bare 2700
-#: literal, and the regression test guarding against drift compared that
-#: literal against `_positive_int_env("ATTEMPT_TIMEOUT_S", 2700)` -- i.e.
-#: the SAME hardcoded 2700 passed right back in as the function's default
-#: argument, a tautology that could never detect a real change here.
-#: live_eval.py now imports this constant directly, so the two can never
-#: diverge by construction rather than by a test that re-asserts the
-#: duplicate.
+#: Per-attempt RPC budget, seconds. A local model with a real large thinking
+#: budget needs headroom: wordy/transpose hit 691-722s even at a smaller
+#: budget, and GAIA completions under the 32768 budget ran 200-900+s. 2700
+#: keeps a hard multi-turn exercise capability-limited, not clock-limited.
+#: Named so live_eval.py can read the same default instead of duplicating it.
 _ATTEMPT_TIMEOUT_S_DEFAULT = 2700
 ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", _ATTEMPT_TIMEOUT_S_DEFAULT)
 #: Per-attempt budget for `codex exec`, seconds.
@@ -182,10 +169,8 @@ def _run_python(work: Path, timeout: int):
 # the rest are disabled via Jest's xtest()/xit()/.skip() ("unlock more tests
 # as you pass" -- an interactive-workflow convention, not a runtime gate).
 # Un-skip them all before running, or scoring only checks 1 of up to ~49
-# cases per exercise. Same defect independently found and fixed in Harbor's
-# packaged aider-polyglot verifier (harness/patch_aider_polyglot_xitstrip.py
-# in the qwen36-aa repo) -- confirmed here directly against the raw upstream
-# exercise fixtures (Aider-AI/polyglot-benchmark), not just Harbor's copy.
+# cases per exercise. Confirmed directly against the raw upstream exercise
+# fixtures (Aider-AI/polyglot-benchmark), not just Harbor's copy.
 _JS_UNSKIP_PATTERNS = [
     (re.compile(r"\bxtest\("), "test("),
     (re.compile(r"\bxit\("), "it("),
@@ -569,7 +554,12 @@ def _exit_code(records_written: dict) -> int:
 
 
 def _stop_reason(result) -> str:
-    """Why an attempt ended: agent_end | deadline | process_exit.
+    """Why an attempt ended: agent_end | error | deadline | process_exit.
+
+    "error" (a provider-error or empty completion) is a refinement of
+    "agent_end", not a fourth peer: _attempt_outcome below deliberately does
+    not branch on it, so an errored attempt keeps classifying exactly as it
+    did before the value existed -- see that function.
 
     Shim, deliberately: if rpc_client predates PromptResult.stop_reason (or that
     change is reverted -- it has been once already), fall back to the old signal
@@ -588,6 +578,11 @@ def _is_empty_response(result) -> bool:
     no turn of work and no assistant text. Six of sixteen recorded attempts in
     this repo's log tree look like this. Classified as agent_end they read as
     clean failures, hiding a provider-side fault behind a model-quality number.
+
+    Keyed on the content shape alone, never on the stop_reason string -- which
+    is why rpc_client growing a stop_reason of "error" for this same shape
+    changes nothing here: agent_ended stays True on that path, so an empty
+    completion still classifies as "empty_response" exactly as before.
     """
     return (
         getattr(result, "agent_ended", False)
@@ -598,12 +593,37 @@ def _is_empty_response(result) -> bool:
 
 
 def _attempt_outcome(result) -> str:
-    """One attempt's outcome, independent of whether the tests passed."""
+    """One attempt's outcome, independent of whether the tests passed.
+
+    "error" is intentionally absent from the process_exit/deadline check: it
+    means the session ended on a completion that failed, which is an
+    agent_end at this level. An errored attempt with the empty shape falls to
+    "empty_response" (where it already landed before the value existed); one
+    with real work behind it falls to "completed", same as any other attempt
+    that finished without passing. The retry that makes an errored completion
+    worth reacting to lives in the Harbor/TB adapters, not in this scorer.
+
+    "deadline" always wins regardless of shape: the budget is spent either
+    way, so there is nothing a fresh attempt could do differently. "process_exit"
+    is different -- it means THIS attempt's pi died, but _run_exercise spawns a
+    brand-new PiRpc per attempt (unlike prompt_with_error_retry, which reuses
+    one session and is the actual reason rpc_client's derivation now
+    distinguishes "process_exit" from "error"), so a dead process here is no
+    obstacle to the next attempt. Checking shape FIRST for process_exit lets a
+    process-exit-coincident empty completion keep classifying as
+    "empty_response" (the most retryable outcome) instead of silently losing
+    its retry budget to a reclassification this scorer never asked for. A
+    process_exit with real work behind it (tool calls, assistant text) still
+    reports "process_exit" -- that combination is a genuine harness fault
+    worth abandoning the attempt over, not an empty-completion shape.
+    """
     reason = _stop_reason(result)
-    if reason in ("process_exit", "deadline"):
+    if reason == "deadline":
         return reason
     if _is_empty_response(result):
         return "empty_response"
+    if reason == "process_exit":
+        return reason
     return "completed"
 
 
@@ -690,11 +710,8 @@ def _run_codex_turn(
     """
     # Under log_dir, not work: work is the sandbox's writable root, so a file
     # there is visible to the model (who could delete or overwrite it) and
-    # gets copied into every _score() snapshot. A fixed name under `work`
-    # also went stale across attempts when resume never actually ran (the
-    # bug this whole rewrite fixes) -- attempt 2's read would silently pick
-    # up attempt 1's leftover file. Naming it per-attempt removes that hazard
-    # even now that resume is fixed.
+    # gets copied into every _score() snapshot. Named per-attempt so attempt
+    # 2's read can't pick up attempt 1's leftover file.
     out_file = log_dir / f"codex_last_message_{attempt_name}.txt"
 
     if session_id is None:
@@ -1008,6 +1025,15 @@ def _run_exercise(
                 # normal retry instead of aborting the rest of the budget on
                 # a failure mode that didn't actually consume an attempt's
                 # worth of the model's effort.
+                #
+                # One shape did move between those two branches: now that
+                # rpc_client only synthesizes "error"/"empty completion"
+                # while pi is still alive, an empty completion COINCIDENT
+                # with pi's death reports "process_exit" and stops here,
+                # where it used to classify as "empty_response" and get a
+                # fresh-session retry. Kept deliberately -- a dead pi is a
+                # harness fault worth surfacing, not one to quietly retry
+                # past. An empty completion from a live pi is unaffected.
                 break
             if agent == "pi":
                 # Repeats the original prompt in full, not just the failure

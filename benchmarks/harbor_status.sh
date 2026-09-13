@@ -18,12 +18,10 @@ HB_RUNS="$REPO_ROOT/benchmarks/harbor_runs"
 
 RUN_ID="${1:-${RUN_ID:-}}"
 if [ -z "$RUN_ID" ]; then
-  # Newest matching run dir by mtime, using only bash builtins. Deliberately
-  # no find/stat: `find -E` + `stat -f` are BSD-only and `find -regextype`
-  # + `-printf` are GNU-only, so every previous version of this line was
-  # silently a no-op (2>/dev/null + empty RUN_ID) on the other platform.
-  # `[ -nt ]` needs neither, and this loop is also whitespace-safe, unlike
-  # the `cut`/`xargs -n1 basename` pipeline it replaces.
+  # Newest matching run dir by mtime, using only bash builtins: `find -E` +
+  # `stat -f` are BSD-only and `find -regextype` + `-printf` are GNU-only,
+  # while `[ -nt ]` needs neither. Whitespace-safe, unlike a
+  # `cut`/`xargs -n1 basename` pipeline.
   NEWEST=""
   for d in "$HB_RUNS"/tb2-* "$HB_RUNS"/leaderboard-* "$HB_RUNS"/full-* "$HB_RUNS"/harbor-*; do
     [ -d "$d" ] || continue          # also skips the literal, unmatched glob
