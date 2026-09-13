@@ -39,8 +39,24 @@ def emit(obj):
     sys.stdout.flush()
 
 
-def emit_turn_end(usage=TURN_USAGE):
-    emit({"type": "turn_end", "message": {"usage": usage}, "toolResults": []})
+def emit_turn_end(usage=TURN_USAGE, stop_reason="stop", error_message=None):
+    message = {"usage": usage, "stopReason": stop_reason}
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    emit({"type": "turn_end", "message": message, "toolResults": []})
+
+
+def emit_text(delta):
+    """A turn's assistant text.
+
+    Not decoration: rpc_client reads a turn that produced NO text and NO tool
+    calls as the empty-completion error shape, so a fixture standing in for a
+    turn that DID work has to actually say something, the way a real one
+    would. Fixtures that predate that rule call this purely to stay
+    non-empty; the ones deliberately exercising the empty shape don't.
+    """
+    emit({"type": "message_update",
+          "assistantMessageEvent": {"type": "text_delta", "delta": delta}})
 
 
 def read_prompt():
@@ -112,6 +128,7 @@ def main():
     if mode == "end_then_exit":
         # agent_end and EOF in the same breath -- the ordering hazard
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit_turn_end()
         emit({"type": "agent_end"})
         os._exit(0)
@@ -142,6 +159,7 @@ def main():
         # caller can't hang forever waiting for a settle signal that will
         # never come (e.g. an older pi build without agent_settled at all).
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit_turn_end()
         emit({"type": "agent_end"})
         time.sleep(3600)
@@ -149,6 +167,7 @@ def main():
 
     if mode == "end_then_write":
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit_turn_end()
         emit({"type": "agent_end"})
         deadline = time.time() + 2
@@ -300,6 +319,7 @@ def main():
         # was treated as an ordinary event and Phase 1 waited out the
         # entire remaining timeout for an agent_end that would never come.
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit({"type": "turn_end"})
         emit({"type": "agent_end"})
         emit({"type": "usage_update", "usage": {"tokens": 123}})
@@ -312,9 +332,10 @@ def main():
         # agent_settled must not be mistaken for "a continuation started"
         # (which would re-arm the full remaining timeout).
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit({"type": "turn_end"})
         emit({"type": "agent_end"})
-        emit({"type": "auto_retry_end"})
+        emit({"type": "auto_retry_end", "success": True, "attempt": 1})
         emit({"type": "agent_settled"})
         time.sleep(30)
         return
@@ -345,6 +366,7 @@ def main():
         # must not be treated as renewed work either. pi then hangs forever
         # without ever emitting agent_settled.
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit({"type": "turn_end"})
         emit({"type": "agent_end"})
         emit({"type": "agent_end"})  # stray duplicate while SETTLING
@@ -368,11 +390,141 @@ def main():
         # stream of non-terminal events after agent_end must not extend
         # SETTLING past the settle_deadline computed on entry.
         emit({"type": "response", "id": rid, "success": True})
+        emit_text("done")
         emit({"type": "turn_end"})
         emit({"type": "agent_end"})
         while True:
             emit({"type": "queue_update", "queued": 1})
             time.sleep(0.05)
+
+    if mode == "error_end":
+        # The shape three of three error-truncated TB2.1 trials actually hit
+        # (confirmed from their tb-finalize-guard notifications:
+        # "turn_end stopReason=error hasText=false hasToolCalls=false"). pi
+        # reports the provider error, settles, and the whole session is over
+        # with most of the wall clock unspent. willRetry:false -- pi is NOT
+        # handling this one itself, so it is ours to retry.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="upstream 500 from provider")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
+
+    if mode == "error_empty_completion":
+        # Same silent ending, but nothing on the wire says "error": the turn
+        # simply produced no text and no tool calls. Some providers report
+        # this as a normal stop with an empty body, so the empty-completion
+        # fingerprint has to catch it without an errorMessage to key on.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
+
+    if mode == "error_end_then_exit":
+        # error_end, except pi EXITS instead of settling. The whole reason
+        # this fix exists: the agent_end puts the drain in SETTLING, so the
+        # settle branch of the stop_reason derivation wins on ordering even
+        # though the process is already gone, and the errored turn used to
+        # be reported as a retryable "error" against a dead session.
+        # Deliberately no emit_text(): a fixture that says something dodges
+        # nothing here, but this shape is the measured one.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="upstream 500 from provider")
+        emit({"type": "agent_end", "willRetry": False})
+        os._exit(0)
+
+    if mode == "empty_end_then_exit":
+        # Same race reached through the other synthesis path: a CLEAN
+        # turn_end (stopReason "stop") that produced no text and no tool
+        # calls, then exit. Nothing on the wire says "error" -- only the
+        # empty-completion fingerprint fires, and it must defer to the dead
+        # process exactly as the flagged path does.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        os._exit(0)
+
+    if mode == "error_then_clean_same_call":
+        # TWO agent_end events in ONE prompt_and_collect call: the first turn
+        # errors, then a genuine continuation (agent_start -> ... ->
+        # agent_end) completes cleanly. Pins last-agent-end-wins: a verdict
+        # latched at the first agent_end would report "error" for a call that
+        # demonstrably finished fine. No willRetry involved anywhere here, so
+        # this isolates the ordering rule from the willRetry suppression that
+        # error_but_will_retry covers.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="transient provider error")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_start"})
+        emit_text("recovered answer")
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
+
+    if mode == "error_but_will_retry":
+        # pi's own internal retry: the errored agent_end carries
+        # willRetry:true, and pi immediately re-runs the turn successfully in
+        # the SAME call. Counting this as our error too would have the caller
+        # retry a turn pi was already retrying.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="transient provider error")
+        emit({"type": "agent_end", "willRetry": True})
+        emit({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+              "delayMs": 0, "errorMessage": "transient provider error"})
+        emit({"type": "agent_start"})
+        emit({"type": "auto_retry_end", "success": True, "attempt": 1})
+        emit_text("recovered answer")
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
+
+    if mode == "error_then_continuation_hangs":
+        # An errored turn, then a continuation that never finishes. The call
+        # runs out the outer timeout, so stop_reason must be "deadline" --
+        # "error" refines the agent_end branch only and must never displace a
+        # loop-exit reason that says the budget itself ran out.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="upstream 500 from provider")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_start"})
+        time.sleep(3600)
+        return
+
+    if mode == "error_then_clean":
+        # Two SEPARATE prompt_and_collect calls on the same session, the way
+        # the adapters' retry loop drives it: prompt 1 ends in a provider
+        # error, the re-prompt then completes normally.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit_turn_end(stop_reason="error", error_message="upstream 500 from provider")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        msg2 = read_prompt()
+        if msg2 is None:
+            return
+        rid2 = msg2.get("id")
+        emit({"type": "response", "id": rid2, "success": True})
+        emit({"type": "agent_start"})
+        emit_text("second answer")
+        emit_turn_end(stop_reason="stop")
+        emit({"type": "agent_end", "willRetry": False})
+        emit({"type": "agent_settled"})
+        serve_requests()
+        return
 
     # default: clean single turn with one tool call
     emit({"type": "response", "id": rid, "success": True})

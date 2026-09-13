@@ -94,7 +94,12 @@ from harbor.models.agent.context import AgentContext
 
 # benchmarks/ isn't a package — let the importer resolve by sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rpc_client import PiRpc, capture_environment_snapshot  # noqa: E402
+from rpc_client import (  # noqa: E402
+    PiRpc,
+    capture_environment_snapshot,
+    preview_tool_result,
+    prompt_with_error_retry,
+)
 
 
 DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
@@ -896,7 +901,46 @@ class LittleCoderAgent(BaseAgent):
                 text = "\n".join(
                     c.get("text", "") for c in content if c.get("type") == "text"
                 )
-                live_log_fh.write(f"<< {text[:400]}\n")
+                live_log_fh.write(f"<< {preview_tool_result(text)}\n")
+                live_log_fh.flush()
+            elif t == "turn_end":
+                # A turn that ended in a provider error, logged inline so the
+                # live trajectory shows WHY a session stopped rather than
+                # just stopping. Nothing else about turn_end is logged here;
+                # PromptResult already aggregates the rest.
+                msg = ev.get("message")
+                if isinstance(msg, dict) and (
+                    msg.get("errorMessage") or msg.get("stopReason") == "error"
+                ):
+                    # Drain the streamed text first, as every other marker
+                    # branch does: text still buffered here belongs to the
+                    # turn that just failed, and would otherwise surface
+                    # after the line explaining why it stopped.
+                    if pending_text:
+                        live_log_fh.write("".join(pending_text) + "\n")
+                        pending_text.clear()
+                    live_log_fh.write(
+                        f"=== turn error (stopReason="
+                        f"{msg.get('stopReason')}): "
+                        f"{msg.get('errorMessage') or '(no errorMessage)'} ===\n"
+                    )
+                    live_log_fh.flush()
+            elif t == "auto_retry_start":
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
+                live_log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')}/"
+                    f"{ev.get('maxAttempts')} in {ev.get('delayMs')}ms: "
+                    f"{ev.get('errorMessage', '')} ===\n"
+                )
+                live_log_fh.flush()
+            elif t == "auto_retry_end":
+                live_log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')} finished "
+                    f"success={ev.get('success')} "
+                    f"{ev.get('finalError', '')} ===\n"
+                )
                 live_log_fh.flush()
             elif t == "agent_start":
                 turn_counter += 1
@@ -931,6 +975,11 @@ class LittleCoderAgent(BaseAgent):
                 f"x{timeout_info['multiplier']} -> {effective_timeout_sec:.0f}s"
             )
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
+        # The same instant as deadline_epoch_ms, on the monotonic clock the
+        # error-retry loop measures against. Derived from one shared
+        # effective_timeout_sec rather than re-read later, so a retry can
+        # never outlive the deadline pi itself was handed above.
+        prompt_deadline = time.monotonic() + effective_timeout_sec
 
         # No turn cap: 40 was too tight (train-fasttext hit 41/40, one call
         # from its correct final fix), so it was raised to 80 -- which
@@ -1041,22 +1090,42 @@ class LittleCoderAgent(BaseAgent):
                 },
             )
             try:
-                result = await asyncio.to_thread(
-                    rpc.prompt_and_collect,
+                # Retried in place on a provider-error completion rather than
+                # called bare: a single errored completion used to end the
+                # whole trial with most of the wall clock unspent (measured
+                # at 62-81% unused across three of five failed TB2.1 trials).
+                # Same rpc, same session -- see prompt_with_error_retry.
+                retry_outcome = await asyncio.to_thread(
+                    prompt_with_error_retry,
+                    rpc,
                     prompt,
                     effective_timeout_sec,
                     on_event,
+                    deadline=prompt_deadline,
+                    log=self.logger.warning,
                 )
+                result = retry_outcome.result
                 stop_reason = getattr(result, "stop_reason", "unknown")
                 if log_fh:
                     # Distinguishes a crashed pi from a model that ran long;
                     # both used to look identical here.
                     log_fh.write(f"=== stop_reason: {stop_reason} ===\n")
+                    if retry_outcome.n_error_retries or retry_outcome.error_message:
+                        log_fh.write(
+                            f"=== error retries: {retry_outcome.n_error_retries} "
+                            f"(last error: {retry_outcome.error_message}) ===\n"
+                        )
+                    if retry_outcome.retry_exception:
+                        log_fh.write(
+                            f"=== retry raised (not propagated): "
+                            f"{retry_outcome.retry_exception} ===\n"
+                        )
                     log_fh.write(f"=== assistant text ===\n{result.assistant_text}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
-                        preview = (tc.get("result_text", "") or "")[:400]
-                        log_fh.write(f"<< {preview}\n")
+                        log_fh.write(
+                            f"<< {preview_tool_result(tc.get('result_text', '') or '')}\n"
+                        )
                     notes = rpc.notifications() if hasattr(rpc, "notifications") else []
                     if notes:
                         log_fh.write(f"\n=== pi notifications ({len(notes)}) ===\n")
@@ -1095,6 +1164,16 @@ class LittleCoderAgent(BaseAgent):
 
                 context.metadata = {
                     "stop_reason": stop_reason,
+                    # Both always present, not conditionally, so the field set
+                    # in result.json stays constant across trials: a run that
+                    # never errored reads as 0/"" rather than as a missing key
+                    # indistinguishable from an older adapter build.
+                    "n_error_retries": retry_outcome.n_error_retries,
+                    "error_message": retry_outcome.error_message,
+                    # A retry that raised is turned into a normal return by
+                    # prompt_with_error_retry, so this field is the only place
+                    # a harness fault reaches result.json at all.
+                    "retry_exception": retry_outcome.retry_exception,
                     "n_tool_calls": len(result.tool_calls),
                     "n_turns": result.turn_count,
                     "n_compactions": result.compaction_events,

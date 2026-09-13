@@ -56,9 +56,26 @@ def test_is_empty_response(res, expected):
     # must become empty_response, not completed
     (Res(stop_reason="agent_end", turn_count=1, tool_calls=[], assistant_text=""),
      "empty_response"),
-    # process_exit outranks emptiness -- the process dying is the bigger fact
+    # Emptiness outranks a bare process_exit, deliberately: _run_exercise
+    # spawns a fresh PiRpc per attempt, so a dead process from THIS attempt
+    # is no obstacle to the next one, and an empty completion coincident with
+    # pi exiting is exactly the shape _is_empty_response exists to catch --
+    # it must stay retryable, not silently lose its retry budget to the
+    # process_exit reclassification rpc_client added for the (different)
+    # same-session-reuse case in prompt_with_error_retry.
     (Res(stop_reason="process_exit", turn_count=1, tool_calls=[], assistant_text=""),
+     "empty_response"),
+    # ...but a process_exit WITH real work behind it is a genuine harness
+    # fault worth abandoning the attempt over, not an empty-completion shape.
+    (Res(stop_reason="process_exit", turn_count=3, tool_calls=[{"name": "read"}],
+         assistant_text="did work"),
      "process_exit"),
+    # rpc_client's "error" is a refinement of agent_end, not a fourth peer:
+    # the classification still comes from the content shape, so an errored
+    # attempt lands exactly where it landed before the value existed.
+    (Res(stop_reason="error", turn_count=1, tool_calls=[], assistant_text=""),
+     "empty_response"),
+    (Res(stop_reason="error"), "completed"),
 ])
 def test_attempt_outcome(res, expected):
     assert AP._attempt_outcome(res) == expected

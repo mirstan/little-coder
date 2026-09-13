@@ -435,7 +435,12 @@ def _exit_code(records_written: dict) -> int:
 
 
 def _stop_reason(result) -> str:
-    """Why an attempt ended: agent_end | deadline | process_exit.
+    """Why an attempt ended: agent_end | error | deadline | process_exit.
+
+    "error" (a provider-error or empty completion) is a refinement of
+    "agent_end", not a fourth peer: _attempt_outcome below deliberately does
+    not branch on it, so an errored attempt keeps classifying exactly as it
+    did before the value existed -- see that function.
 
     Shim, deliberately: if rpc_client predates PromptResult.stop_reason (or that
     change is reverted -- it has been once already), fall back to the old signal
@@ -454,6 +459,11 @@ def _is_empty_response(result) -> bool:
     no turn of work and no assistant text. Six of sixteen recorded attempts in
     this repo's log tree look like this. Classified as agent_end they read as
     clean failures, hiding a provider-side fault behind a model-quality number.
+
+    Keyed on the content shape alone, never on the stop_reason string -- which
+    is why rpc_client growing a stop_reason of "error" for this same shape
+    changes nothing here: agent_ended stays True on that path, so an empty
+    completion still classifies as "empty_response" exactly as before.
     """
     return (
         getattr(result, "agent_ended", False)
@@ -464,12 +474,37 @@ def _is_empty_response(result) -> bool:
 
 
 def _attempt_outcome(result) -> str:
-    """One attempt's outcome, independent of whether the tests passed."""
+    """One attempt's outcome, independent of whether the tests passed.
+
+    "error" is intentionally absent from the process_exit/deadline check: it
+    means the session ended on a completion that failed, which is an
+    agent_end at this level. An errored attempt with the empty shape falls to
+    "empty_response" (where it already landed before the value existed); one
+    with real work behind it falls to "completed", same as any other attempt
+    that finished without passing. The retry that makes an errored completion
+    worth reacting to lives in the Harbor/TB adapters, not in this scorer.
+
+    "deadline" always wins regardless of shape: the budget is spent either
+    way, so there is nothing a fresh attempt could do differently. "process_exit"
+    is different -- it means THIS attempt's pi died, but _run_exercise spawns a
+    brand-new PiRpc per attempt (unlike prompt_with_error_retry, which reuses
+    one session and is the actual reason rpc_client's derivation now
+    distinguishes "process_exit" from "error"), so a dead process here is no
+    obstacle to the next attempt. Checking shape FIRST for process_exit lets a
+    process-exit-coincident empty completion keep classifying as
+    "empty_response" (the most retryable outcome) instead of silently losing
+    its retry budget to a reclassification this scorer never asked for. A
+    process_exit with real work behind it (tool calls, assistant text) still
+    reports "process_exit" -- that combination is a genuine harness fault
+    worth abandoning the attempt over, not an empty-completion shape.
+    """
     reason = _stop_reason(result)
-    if reason in ("process_exit", "deadline"):
+    if reason == "deadline":
         return reason
     if _is_empty_response(result):
         return "empty_response"
+    if reason == "process_exit":
+        return reason
     return "completed"
 
 
@@ -845,6 +880,15 @@ def _run_exercise(
                 # normal retry instead of aborting the rest of the budget on
                 # a failure mode that didn't actually consume an attempt's
                 # worth of the model's effort.
+                #
+                # One shape did move between those two branches: now that
+                # rpc_client only synthesizes "error"/"empty completion"
+                # while pi is still alive, an empty completion COINCIDENT
+                # with pi's death reports "process_exit" and stops here,
+                # where it used to classify as "empty_response" and get a
+                # fresh-session retry. Kept deliberately -- a dead pi is a
+                # harness fault worth surfacing, not one to quietly retry
+                # past. An empty completion from a live pi is unaffected.
                 break
             if agent == "pi":
                 # Repeats the original prompt in full, not just the failure
