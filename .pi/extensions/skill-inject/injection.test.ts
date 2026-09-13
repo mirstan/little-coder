@@ -373,6 +373,31 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
       ),
     ).toBe(true);
     expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
+    // A comma or a spaced hyphen after a bare year is a clause break, not the
+    // start of a unit -- the unit-guard must not swallow these.
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023, before the reshuffle?"),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("what were the standings in 2023, and who won?")).toBe(true);
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023 - before the reshuffle"),
+    ).toBe(true);
+    // An optional leading "the" is accepted before EVERY anchor shape, not
+    // just a version -- "as of the v1.2" used to be the only one that fired.
+    expect(looksLikeTemporalTask("as of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("as of the March 2024 release")).toBe(true);
+    expect(looksLikeTemporalTask("as of the last year")).toBe(true);
+    expect(looksLikeTemporalTask("as of the v1.2")).toBe(true);
+    expect(
+      looksLikeTemporalTask("what was the leaderboard as of the March 2024 release"),
+    ).toBe(true);
+    expect(looksLikeTemporalTask("at the time of the 2019 audit")).toBe(true);
+    expect(looksLikeTemporalTask("at the time of the March 2024 release")).toBe(true);
+    // Single-component versions are anchors when a strong phrase precedes
+    // them (the free-scanning triggers still require 2+ components below).
+    expect(looksLikeTemporalTask("what did the API look like as of v2")).toBe(true);
+    expect(looksLikeTemporalTask("what was the config as of version 3")).toBe(true);
+    expect(looksLikeTemporalTask("what did the API look like at the time of v2")).toBe(true);
     // Day-first dates ("1 March 2024") are as real an anchor as "March 1, 2024".
     expect(looksLikeTemporalTask("what was the leaderboard as of 1 March 2024")).toBe(true);
     expect(looksLikeTemporalTask("what was the leaderboard as of 3rd May 2024")).toBe(true);
@@ -438,6 +463,34 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
     expect(
       looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
     ).toBe(false);
+    // A single-component version stays too weak for the free-scanning
+    // snapshot trigger and for the anaphoric check -- only strongly-anchored
+    // "as of"/"at the time of" accept it.
+    expect(looksLikeTemporalTask("take a snapshot of the v2 host")).toBe(false);
+    expect(looksLikeTemporalTask("bump to v2. the config at the time was fine.")).toBe(false);
+    // Accepted collateral of the comma-then-digit unit-guard: a comma'd list
+    // of YEARS reads the same as a comma'd list of sizes, and rejecting
+    // "in 2048, 4096 chunks" necessarily rejects this too.
+    expect(
+      looksLikeTemporalTask("what were the standings in 2023, 2024 and 2025?"),
+    ).toBe(false);
+  });
+
+  // Sentence-ending punctuation ends a trigger's reach. Without this, a
+  // question about something else entirely binds to a date in the NEXT
+  // sentence and fires -- two unrelated sentences read as one temporal ask.
+  it("does not bind a trigger across ? ! or ; into a new sentence", () => {
+    expect(
+      looksLikeTemporalTask(
+        "What should I name this helper? The schema was frozen in March 2024.",
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeTemporalTask("Which dataset is best? Did the crash happen in March 2020?"),
+    ).toBe(false);
+    // Genuine same-sentence phrasings are untouched.
+    expect(looksLikeTemporalTask("what were the repositories' stars in 2021")).toBe(true);
+    expect(looksLikeTemporalTask("what was the price of bitcoin in March 2023")).toBe(true);
   });
 
   // Deliberate near-miss: "historic" (an adjective describing an old
@@ -449,7 +502,7 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
     ).toBe(false);
   });
 
-  it("anaphoric 'at the time' requires a real date/version somewhere in the prompt", () => {
+  it("anaphoric 'at the time' requires a real date NEAR it, not anywhere in the prompt", () => {
     expect(
       looksLikeTemporalTask(
         "The paper came out in June 2024. Which model led the leaderboard at the time?",
@@ -458,6 +511,36 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
     expect(
       looksLikeTemporalTask("allocate 2048 buffers; what was happening at the time?"),
     ).toBe(false);
+    // An unrelated version string plus the ordinary English idiom "at the
+    // time" ("at that point in the process") is a dependency-pinning task,
+    // not temporal research. Versions are held to a same-sentence rule.
+    expect(
+      looksLikeTemporalTask(
+        "Pin to v1.26.0 in requirements.txt. It was pinned at the time to avoid a regression.",
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeTemporalTask(
+        "Pin to v1 in requirements.txt. It was pinned at the time to avoid a regression.",
+      ),
+    ).toBe(false);
+    // A version in the SAME sentence is a genuine back-reference.
+    expect(
+      looksLikeTemporalTask("we were on v2.3.1 and the leaderboard at the time showed X"),
+    ).toBe(true);
+    // A real date far outside the window no longer arms it.
+    expect(
+      looksLikeTemporalTask(
+        "The paper came out in June 2024. " +
+          "We then refactored the loader, renamed a few helpers, deleted the old cache layer, " +
+          "rewrote the config parser, fixed the flaky retry logic, and cleaned up the docs folder. " +
+          "Which model led the leaderboard at the time?",
+      ),
+    ).toBe(false);
+    // ...and it reads in both directions within the window.
+    expect(looksLikeTemporalTask("at the time of interest, June 2024, which model led?")).toBe(
+      true,
+    );
   });
 
   it("does not inject the directive when no git-capable/browse tool is available, even though the trigger matches", async () => {

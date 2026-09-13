@@ -371,12 +371,22 @@ const FULL_DATE = String.raw`(?:${ISO_DATE}|${MONTH_DATE}|${DAY_MONTH_DATE})`;
 const RELATIVE = String.raw`last\s+(?:year|month|week)`;
 // The `\b` before `v` is load-bearing: without it this matches the `v1.2`
 // inside identifiers like `srv1.2`, `rev1.4`, `conv1.0`, `env1.2`. ANCHOR
-// uses VERSION at a fixed position so it was safe there, but the snapshot
-// trigger and PROMPT_DATE scan freely and did fire on those.
+// uses its version branch at a fixed position so it was safe there, but the
+// snapshot trigger and the anaphoric check scan freely and did fire on those.
 const VERSION = String.raw`(?:\bv|\bversion\s+)\d+(?:\.\d+)+`;
+// Single-component versions ("as of v2", "as of version 3") are real temporal
+// anchors, but only behind a strong anchor phrase, where the preceding words
+// already carry the intent. The free-scanning snapshot trigger and the
+// anaphoric whole-prompt check keep the strict 2+-component VERSION on
+// purpose: a bare "v2" is far too common in dev prompts to arm them.
+const VERSION_LOOSE = String.raw`(?:\bv|\bversion\s+)\d+(?:\.\d+)*`;
 const COMMIT = String.raw`commit\s+[0-9a-f]{6,40}\b`;
-// Object of a strong anchor phrase ("as of X", "at the time of X").
-const ANCHOR = String.raw`(?:${QUAL}${FULL_DATE}|${QUAL}${YEAR}\b|${RELATIVE}|(?:the\s+)?${VERSION}|${COMMIT})`;
+// Object of a strong anchor phrase ("as of X", "at the time of X"). The
+// optional leading "the" gates the WHOLE alternation, not just one branch --
+// "as of the March 2024 release" and "as of the 2019 audit" are as ordinary
+// as "as of the v1.2 release", and gating one branch only made them silently
+// miss. Callers must NOT add their own "the": ANCHOR already absorbs it.
+const ANCHOR = String.raw`(?:the\s+)?(?:${QUAL}${FULL_DATE}|${QUAL}${YEAR}\b|${RELATIVE}|${VERSION_LOOSE}|${COMMIT})`;
 
 // Nouns naming an external / versioned / time-varying data source.
 const SOURCE_NOUN = String.raw`(?:leaderboards?|rankings?|standings|repo(?:s|sitor(?:y|ies))?|datasets?|results|stars|prices?)`;
@@ -392,30 +402,35 @@ const TEMPORAL_TRIGGERS = [
   // "at the time of <date/version-shaped object>". The object must itself be
   // date-shaped: "at the time of the 2019 audit" fires, "at the time of the
   // crash/incident/writing" does not.
-  new RegExp(String.raw`\bat the time of\s+(?:the\s+)?${ANCHOR}`, "i"),
+  new RegExp(String.raw`\bat the time of\s+${ANCHOR}`, "i"),
   // "historical <source noun>". Bare "historically" is a discourse adverb
   // ("historically we used tabs") and no longer fires.
   new RegExp(String.raw`\bhistorical\s+${SOURCE_NOUN}\b`, "i"),
   // snapshot + a date/version in the same sentence. Dev-artifact snapshots
   // (memory, docker, ZFS, snapshot tests) carry no date and do not fire.
   new RegExp(String.raw`\bsnapshots?\b[^.\n]{0,60}?(?:${FULL_DATE}|\b${YEAR}\b|${VERSION})`, "i"),
-  // source noun ... in/on/during <year>. Weak prepositions get the
-  // structural unit-guard: a bare year only counts as a date when it sits at
-  // a clause boundary (end / sentence punctuation next). A year followed by a
-  // unit is a count, and the unit can lead with a letter ("in 2000 chunks"),
-  // a digit ("in 2048 4-byte blocks"), a hyphen ("in 2048-byte pages"), or a
-  // list comma ("in 2048, 4096 chunks") — hence [-,]? and [a-z0-9] rather
-  // than a bare \s+[a-z]. The class runs under /i so it rejects capitalised
-  // units too; deliberately structural, no enumerated unit list to outgrow.
-  // Full dates are exempt.
+  // source noun ... in/on/during <year>. The gap stops at sentence-ending
+  // punctuation (. ? ! ;) as well as a newline, so the noun in one sentence
+  // cannot bind to a year in the next.
+  //
+  // Weak prepositions also get the structural unit-guard: a year followed by
+  // a unit is a count, not a date, and the unit can lead with a space then an
+  // alphanumeric ("in 2000 chunks", "in 2048 4-byte blocks"), an ATTACHED
+  // hyphen ("in 2048-byte pages"), or a comma then a digit ("in 2048, 4096
+  // chunks"). Each shape is spelled out separately on purpose: a comma, or a
+  // spaced hyphen, followed by an ordinary word is a clause break rather than
+  // a unit ("the standings in 2023, before the reshuffle"), and the shorter
+  // \s*[-,]?\s* form swallowed exactly those. The class runs under /i so it
+  // rejects capitalised units too; deliberately structural, no enumerated
+  // unit list to outgrow. Full dates are exempt.
   new RegExp(
-    String.raw`\b${SOURCE_NOUN}\b[^.\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s*[-,]?\s*[a-z0-9]))`,
+    String.raw`\b${SOURCE_NOUN}\b[^.?!;\n]{0,40}?\b(?:in|on|during)\s+${QUAL}(?:${FULL_DATE}|${YEAR}\b(?!\s+[a-z0-9]|-[a-z]|,\s*\d))`,
     "i",
   ),
   // past-tense question + weak preposition + FULL date (never a bare year):
   // "what was the price of bitcoin in March 2023".
   new RegExp(
-    String.raw`\b(?:what|which|who|how)\b[^.\n]{0,80}?\b(?:was|were|did)\b[^.\n]{0,80}?\b(?:in|on|during)\s+${QUAL}${FULL_DATE}`,
+    String.raw`\b(?:what|which|who|how)\b[^.?!;\n]{0,80}?\b(?:was|were|did)\b[^.?!;\n]{0,80}?\b(?:in|on|during)\s+${QUAL}${FULL_DATE}`,
     "i",
   ),
   // date-first, tight adjacency, riskiest-noun list only: "the 2023
@@ -424,21 +439,42 @@ const TEMPORAL_TRIGGERS = [
   new RegExp(String.raw`\b${YEAR}\s+(?:leaderboards?|rankings?|standings)\b`, "i"),
 ];
 
-// Anaphoric whole-prompt check: a bare "at the time" with no date object in
-// its own clause still signals temporal research when the prompt names a real
-// date/version ANYWHERE ("The paper came out in June 2024. Which model led
-// the leaderboard at the time?" — the original mteb-leaderboard shape). Bare
-// years are deliberately excluded here: a stray "2048" elsewhere must not arm
-// "at the time".
-const AT_THE_TIME = /\bat the time\b/i;
-const PROMPT_DATE = new RegExp(String.raw`(?:${FULL_DATE}|${VERSION}|${COMMIT})`, "i");
+// Anaphoric check: a bare "at the time" with no date object in its own clause
+// still signals temporal research when the prompt names a real date NEARBY
+// ("The paper came out in June 2024. Which model led the leaderboard at the
+// time?" — the original mteb-leaderboard shape). Bare years are deliberately
+// excluded: a stray "2048" elsewhere must not arm "at the time".
+//
+// Proximity is load-bearing. Scanning the whole prompt independently let any
+// version string anywhere arm the plain English idiom "at the time" ("Pin to
+// v1.26.0 in requirements.txt. It was pinned at the time to avoid a
+// regression." — an ordinary dependency-pinning task), and version strings
+// are ubiquitous in dev prompts. A date or commit hash now counts only within
+// ANAPHORIC_WINDOW characters on either side, sentence boundaries crossable
+// because the motivating shape spans two sentences. A version string is held
+// to the stricter same-sentence rule: a version sitting in its own sentence
+// is naming a dependency, not the past moment "at the time" points back to.
+const ANAPHORIC_WINDOW = 150;
+const AT_THE_TIME = String.raw`\bat the time\b`;
+const NEAR_DATE = String.raw`(?:${FULL_DATE}|${COMMIT})`;
+// Same-sentence filler, the same class the clause-scoped triggers above use.
+const SAME_SENTENCE = String.raw`[^.?!;\n]`;
+const ANAPHORIC_AT_THE_TIME = new RegExp(
+  [
+    String.raw`${NEAR_DATE}[\s\S]{0,${ANAPHORIC_WINDOW}}?${AT_THE_TIME}`,
+    String.raw`${AT_THE_TIME}[\s\S]{0,${ANAPHORIC_WINDOW}}?${NEAR_DATE}`,
+    String.raw`${VERSION}${SAME_SENTENCE}{0,${ANAPHORIC_WINDOW}}?${AT_THE_TIME}`,
+    String.raw`${AT_THE_TIME}${SAME_SENTENCE}{0,${ANAPHORIC_WINDOW}}?${VERSION}`,
+  ].join("|"),
+  "i",
+);
 
 export function looksLikeTemporalTask(text: string): boolean {
   if (!text) return false;
   for (const re of TEMPORAL_TRIGGERS) {
     if (re.test(text)) return true;
   }
-  return AT_THE_TIME.test(text) && PROMPT_DATE.test(text);
+  return ANAPHORIC_AT_THE_TIME.test(text);
 }
 
 // True when at least one git-capable shell tool (bash / ShellSession /
