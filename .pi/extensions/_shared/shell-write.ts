@@ -75,8 +75,13 @@ const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
  * Quote tracking is what keeps every consumer here from firing on text that
  * merely looks like shell syntax — `grep "a > b" file` writes nothing. A
  * backslash escape outside single quotes hides the next character too.
+ *
+ * Exported (not just used internally) so shell-contract-nudge can reuse the
+ * same quote/escape-tracking walk for its own `&`-detection rather than
+ * re-implementing it — one shared copy of security/correctness-sensitive
+ * parsing logic, same rationale as `SHELL_TOOLS` above.
  */
-function scan(
+export function scan(
   cmd: string,
   visit: (ch: string, index: number, quoted: boolean) => void,
 ): void {
