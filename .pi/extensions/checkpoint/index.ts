@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
-import { SHELL_TOOLS, detectWriteTargets } from "../_shared/shell-write.ts";
+import { SHELL_TOOLS, detectDeliverableWrites } from "../_shared/shell-write.ts";
 import { normalizeWritePath } from "../write-guard/index.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
@@ -51,6 +51,15 @@ export function resolveShellTarget(p: string, cwd: string): string {
   else if (out.startsWith("~/")) out = join(homedir(), out.slice(2));
   return isAbsolute(out) ? out : join(cwd, out);
 }
+
+// Checkpoint-only filter (not part of _shared/shell-write.ts): a detected
+// target that still contains unexpanded shell syntax means the real path is
+// unknowable statically — backing up a literal `$OUT`-named key would be
+// noise, not a useful checkpoint. This is deliberately NOT added inside
+// detectDeliverableWrites itself: tb-finalize-guard (the function's other
+// consumer) legitimately treats a `$VAR` target as evidence-of-work and must
+// not lose that signal.
+const DYNAMIC_TARGET = /[$`*?[{]/;
 
 export const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // exported for tests
 
@@ -105,17 +114,35 @@ export default function (pi: ExtensionAPI) {
 
     // Issue: a model's own buggy shell script overwrote a task file in place
     // with garbage, and no backup existed anywhere — the net above only
-    // watches the write/edit tools, not a shell command that redirects output
-    // to a file (`cat > f`, `tee f`, `dd of=f`, …). Reuse the same detector
-    // permission-gate/write-guard already rely on for this exact parsing job
-    // (issue #70) so a shell-redirect write gets the same pre-write snapshot.
+    // watches the write/edit tools, not a shell command that mutates a file
+    // (`cat > f`, `tee f`, `dd of=f`, `cp`/`mv`/`sed -i`, …). Reuse
+    // detectDeliverableWrites (tb-finalize-guard's broader detector, exported
+    // from _shared/shell-write.ts) so this net also catches cp/mv/install/
+    // sed -i/a compiler's -o, which the narrower detectWriteTargets (used by
+    // write-guard/permission-gate for actual write-permission gating) misses
+    // by design. checkpoint is a non-gating, best-effort consumer, so
+    // over-detection here is acceptable in a way it isn't for those two.
     //
-    // Two known limitations of this net:
-    // - `detectWriteTargets` only understands shell-redirection syntax; it
-    //   cannot see a program's own internal file writes (e.g. a Python/C
-    //   script's `open(path).write(...)`). This closes the shell-redirect-
-    //   shaped gap, not a general backstop against every way a subprocess can
-    //   modify a file.
+    // ShellSend (bg-shell) is routed through the same detection here, locally
+    // — it is deliberately NOT added to the shared SHELL_TOOLS set (two
+    // security gates rely on that set's current membership), but its `text`
+    // payload writes to a running job's stdin exactly like a command writes
+    // to a shell, so it deserves the same pre-write snapshot.
+    //
+    // Known limitations of this net:
+    // - The detector only understands shell syntax; it cannot see a
+    //   program's own internal file writes (e.g. a Python/C script's
+    //   `open(path).write(...)`). This closes the shell-command-shaped gap,
+    //   not a general backstop against every way a subprocess can modify a
+    //   file.
+    // - A target containing unexpanded shell syntax (`$OUT`, `$DEST/b.txt`,
+    //   a glob, …) is skipped: the real path is unknowable statically, so
+    //   backing up the literal placeholder text would be noise, not a
+    //   useful checkpoint.
+    // - BSD `sed -i '' 's/a/b/' file` misreports the script text itself as a
+    //   target (no dynamic chars, so the filter above doesn't catch it) —
+    //   pre-existing shared-module behavior; produces one harmless bogus
+    //   `.absent` sentinel. Not fixed here.
     // - `ShellSession`'s persistent working directory (tracked internally by
     //   that tool across calls) isn't visible from this event, so a relative
     //   path after an earlier `cd` may resolve against the wrong base here.
@@ -124,13 +151,15 @@ export default function (pi: ExtensionAPI) {
     //   for uncertain benefit. Resolution below is best-effort against
     //   `ctx.cwd`; if the resolved path doesn't exist, the `.absent` sentinel
     //   in `backupIfNeeded` already handles that gracefully.
-    if (SHELL_TOOLS.has(name)) {
-      const command = typeof input?.command === "string" ? input.command : undefined;
-      if (!command) return;
-      const cwd = ctx?.cwd ?? process.cwd();
-      for (const write of detectWriteTargets(command)) {
-        backupIfNeeded(currentSessionId, resolveShellTarget(write.path, cwd));
-      }
+    const command =
+      SHELL_TOOLS.has(name) && typeof input?.command === "string" ? input.command
+      : name === "ShellSend" && typeof input?.text === "string" ? input.text
+      : undefined;
+    if (!command) return;
+    const cwd = ctx?.cwd ?? process.cwd();
+    for (const write of detectDeliverableWrites(command)) {
+      if (DYNAMIC_TARGET.test(write.path)) continue;
+      backupIfNeeded(currentSessionId, resolveShellTarget(write.path, cwd));
     }
   });
 }

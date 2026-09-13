@@ -297,7 +297,7 @@ export function hasWriteRedirection(cmd: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// detectDeliverableWrites — a broader, tb-finalize-guard-only superset
+// detectDeliverableWrites — a broader superset, for non-gating consumers
 // ---------------------------------------------------------------------------
 // `detectWriteTargets` deliberately only covers redirection (`>`, `>>`,
 // `tee`, `dd of=`) because it also feeds write-guard and permission-gate, and
@@ -309,11 +309,15 @@ export function hasWriteRedirection(cmd: string): boolean {
 // they intentionally let through today (confirmed: permission-gate's own
 // test asserts `isSafeBash("cp a b") === true`).
 //
-// tb-finalize-guard has a different question to answer: not "is this command
-// safe to run," but "did the model do something that plausibly produced its
-// deliverable." For that purpose `cp`/`mv`/`install`/`sed -i`/a compiler's
-// `-o` are all evidence of a write, so this function layers detection for
-// those on top of `detectWriteTargets` — used ONLY by tb-finalize-guard.
+// This function's consumers have a different question to answer than
+// write-guard/permission-gate's "is this command safe to run": tb-finalize-
+// guard asks "did the model do something that plausibly produced its
+// deliverable" (evidence-of-work), and checkpoint asks "might this command
+// destroy a file I haven't snapshotted yet" (pre-write backup) — both are
+// non-gating, best-effort consumers where over-detection is acceptable, unlike
+// the two write-permission gates above. For those purposes `cp`/`mv`/
+// `install`/`sed -i`/a compiler's `-o` are all evidence of a write, so this
+// function layers detection for those on top of `detectWriteTargets`.
 function lastOperandOrTargetFlag(words: string[]): string | undefined {
   let tDir: string | undefined;
   const operands: string[] = [];
@@ -347,11 +351,13 @@ function hasSedInPlaceFlag(words: string[]): boolean {
 
 /**
  * `detectWriteTargets` plus command-shape coverage that only matters for
- * judging evidence-of-work, never for permission-gating: `cp`/`mv`/`install`
- * (last non-flag operand, or the `-t DIR` argument), `sed -i`/`--in-place`
- * (every non-flag operand after the script), and a compiler's `-o` output
- * flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above for why this
- * is a separate function rather than a change to `detectWriteTargets` itself.
+ * non-gating consumers (tb-finalize-guard's evidence-of-work check, and
+ * checkpoint's pre-write backup), never for permission-gating: `cp`/`mv`/
+ * `install` (last non-flag operand, or the `-t DIR` argument), `sed -i`/
+ * `--in-place` (every non-flag operand after the script), and a compiler's
+ * `-o` output flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above
+ * for why this is a separate function rather than a change to
+ * `detectWriteTargets` itself.
  */
 export function detectDeliverableWrites(raw: string): ShellWrite[] {
   const writes = [...detectWriteTargets(raw)];
