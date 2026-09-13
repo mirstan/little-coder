@@ -19,7 +19,7 @@ import json
 import re
 import statistics
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_SERVER_LOG = Path.home() / ".omlx" / "logs" / "server.log"
@@ -108,28 +108,31 @@ def read_window(trial_dir: Path) -> tuple[datetime, datetime]:
 
 
 def rotated_siblings(
-    server_log: Path, started_at: datetime, finished_at: datetime
+    server_log: Path, started_at: datetime, finished_at: datetime, today: date | None = None
 ) -> tuple[list[Path], list]:
     """Logs holding the part of the window the given file cannot, newest last,
     plus any day in the window whose log is simply gone.
 
     omlx rotates server.log at local midnight, so a window crossing midnight is
     split across files: each past day lands in a server.log.<date> sibling,
-    while the newest day is normally still in the live server.log. Empty for a
-    same-day window, and never names the file already being read.
+    while the newest day is normally still in the live server.log -- but only
+    if that day really is today. A trial old enough that even its newest day
+    has rotated out of retention would otherwise get silently substituted with
+    today's live log, which holds none of its events; `today` is injectable so
+    tests don't depend on the real wall-clock date.
 
     Only files still on disk are returned as siblings. ~/.omlx/settings.json
     sets logging.retention_days, so a day in an old window may have been
     deleted already -- the rest of the window is still worth reporting on, but
     the caller needs to know a day is simply missing rather than assume the
-    merge is complete. The newest day is exempt: it always resolves to
-    whatever file is current (server_log itself, or its own dated file), never
-    "missing" in this sense.
+    merge is complete.
     """
     first = started_at.astimezone().date()
     last = finished_at.astimezone().date()
     if last <= first:
         return [], []
+    if today is None:
+        today = datetime.now().astimezone().date()
     base = _ROTATED_SUFFIX_RE.sub("", server_log.name)
     days = [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
     holders = [server_log.parent / f"{base}.{day}" for day in days]
@@ -140,7 +143,13 @@ def rotated_siblings(
         day for day, holder in zip(days[:-1], holders[:-1]) if holder != server_log and not holder.exists()
     ]
     if not holders[-1].exists():
-        holders[-1] = server_log.parent / base
+        if last == today:
+            holders[-1] = server_log.parent / base
+        else:
+            # The newest day's own log is gone and it isn't today, so there is
+            # no live file to fall back to for it either -- it is missing, not
+            # resolved.
+            missing_days.append(last)
     existing = [path for path in holders if path != server_log and path.exists()]
     return existing, missing_days
 
@@ -178,7 +187,7 @@ def collect_events(server_log: Path, started_at: datetime, finished_at: datetime
 
 
 def collect_window_events(
-    server_log: Path, started_at: datetime, finished_at: datetime
+    server_log: Path, started_at: datetime, finished_at: datetime, today: date | None = None
 ) -> list[tuple[datetime, str, dict]]:
     """Events from every log holding part of the window, oldest first.
 
@@ -186,7 +195,7 @@ def collect_window_events(
     throttle tally carry forward to the next completion -- so events merged out
     of several files are re-sorted by timestamp rather than left in file order.
     """
-    siblings, missing_days = rotated_siblings(server_log, started_at, finished_at)
+    siblings, missing_days = rotated_siblings(server_log, started_at, finished_at, today=today)
     logs = [server_log, *siblings]
     if siblings or missing_days:
         first = started_at.astimezone().date()

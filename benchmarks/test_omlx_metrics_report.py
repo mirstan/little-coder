@@ -551,6 +551,37 @@ def test_a_sibling_retention_has_already_deleted_is_skipped(tmp_path, capsys):
     assert "2026-09-12" in err
 
 
+def test_a_newest_day_whose_log_is_also_gone_is_not_mistaken_for_today(tmp_path):
+    """An old trial can rotate out of retention entirely, newest day included --
+    the live-log fallback for the newest day only makes sense if that day IS today,
+    otherwise it would silently substitute an unrelated day's data."""
+    trial_dir, server_log = _trial(tmp_path, [], day="2026-01-01", finished_day="2026-01-02")
+    started_at, finished_at = R.read_window(trial_dir)
+    siblings, missing_days = R.rotated_siblings(
+        server_log, started_at, finished_at, today=datetime.strptime("2026-09-13", "%Y-%m-%d").date()
+    )
+    assert siblings == []
+    assert missing_days == [
+        datetime.strptime("2026-01-01", "%Y-%m-%d").date(),
+        datetime.strptime("2026-01-02", "%Y-%m-%d").date(),
+    ]
+
+
+def test_the_newest_day_still_uses_the_live_log_when_it_really_is_today(tmp_path):
+    """The live-log fallback must still work for the ordinary, common case."""
+    trial_dir, server_log = _midnight_trial(tmp_path, [_chat("00:10:00", 300, 10.0, 30.0, 3000)])
+    older = tmp_path / "server.log.2026-09-12"
+    older.write_text(_chat("23:40:00", 100, 10.0, 10.0, 1000, day="2026-09-12") + "\n")
+    started_at, finished_at = R.read_window(trial_dir)
+    siblings, missing_days = R.rotated_siblings(
+        server_log, started_at, finished_at, today=datetime.strptime("2026-09-13", "%Y-%m-%d").date()
+    )
+    # The newest day (2026-09-13, really today) resolves to server_log itself,
+    # which is excluded as a sibling since the caller is already reading it.
+    assert siblings == [older]
+    assert missing_days == []
+
+
 def test_a_trial_that_died_before_agent_execution_gets_a_clear_error(tmp_path):
     trial_dir = tmp_path / "sometask__abc1234"
     trial_dir.mkdir()
