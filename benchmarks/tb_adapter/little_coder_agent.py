@@ -305,9 +305,10 @@ class LittleCoderAgent(BaseAgent):
             log_fh.write(f"=== {text} ===\n")
             log_fh.flush()
 
-        # Given to pi as an absolute wall-clock deadline (the deadline-aware
-        # extensions -- finalize-warn, thinking-budget -- read this env var
-        # and silently no-op without it), and tracked in parallel on the
+        # Given to pi as an absolute wall-clock deadline (the extensions
+        # built on `_shared/deadline.ts` -- finalize-warn and
+        # tb-finalize-guard -- read this env var through it and silently
+        # no-op without it), and tracked in parallel on the
         # monotonic clock for the error-retry budget. Both from the same
         # constant, taken at the same instant.
         deadline_epoch_ms = int((time.time() + DEFAULT_PROMPT_TIMEOUT_SEC) * 1000)
