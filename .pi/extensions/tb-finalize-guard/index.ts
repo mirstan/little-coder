@@ -4,8 +4,9 @@ import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
 import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
+import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 
-// tb-finalize-guard: a merged guard for Terminal-Bench with two independent
+// tb-finalize-guard: a merged guard for Terminal-Bench with three independent
 // trigger conditions, scoped to LITTLE_CODER_BENCHMARK === "terminal_bench"
 // only. GAIA has its own separate gaia-finalize-guard, and the two must
 // never fire on the same benchmark's sessions.
@@ -29,11 +30,16 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // a "quit" would also be actively harmful here, since MAX_TRIGGER_A_FIRES is
 // session-scoped — burning both fires on turns the model never controlled
 // would leave the guard disarmed for a real early-quit later in the same
-// session. The trade-off is a real limitation: a quit that manifests as a
-// silent stopReason:"error" turn, rather than a toolless one with visible
-// text, is not steerable by this trigger. It remains diagnosable from the
-// run log via the turn_end instrumentation below, which is the point of
-// keeping that logging unconditional.
+// session. The trade-off used to be a real limitation: a quit that manifests
+// as a silent stopReason:"error" turn, rather than a toolless one with
+// visible text, was not steerable by this trigger — turn_end fires on every
+// turn including mid-run retries, so Trigger A can't tell "this turn errored
+// but the run recovered" from "this turn errored and the run is dying" and
+// must stay conservative. That gap is what Trigger C (below) exists to
+// close: it looks at the run's actual last message via agent_settled instead
+// of at every individual turn_end, so it only reacts to a turn that stayed
+// erroring/empty. The turn_end instrumentation below remains useful
+// independently of that, since it's the finer-grained per-turn record.
 //
 // ---------------------------------------------------------------------------
 // Trigger B — post-finalize-warn non-compliance
@@ -70,14 +76,72 @@ import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 // `SHELL_TOOLS` set.
 //
 // ---------------------------------------------------------------------------
+// Trigger C — dead run: errored or empty final message, any time
+// ---------------------------------------------------------------------------
+// Trajectory analysis of failed trials found real deaths that neither
+// Trigger A nor Trigger B can catch: the run's last assistant message came
+// back with stopReason:"error" or with no text and no tool calls, far from
+// any deadline or turn-cap boundary (22-63% of budget used in the observed
+// cases) — nowhere near where Trigger B arms, and excluded from Trigger A's
+// shape check by design (see Trigger A's comment above). Trigger A and B
+// only ever look near a deadline/turn-cap boundary because that's when a
+// slow-but-working run legitimately needs to be told to wrap up; Trigger C
+// is different in kind — an errored or empty last message is never a sign of
+// healthy progress, so it fires regardless of remaining budget.
+//
+// This evaluates at `agent_end` rather than `turn_end` deliberately:
+// `turn_end` fires on every turn, including ones a mid-run retry papers
+// over, so judging "the run is dead" from a single turn_end would misfire
+// on transient errors the harness already recovered from. `agent_end`
+// reports the run's actual last message once the agent loop segment has
+// ended, so this only reacts to a turn that stayed erroring/empty.
+//
+// A prior version of this fired at `agent_settled` instead (pi's event for
+// "after an agent run has fully settled and no automatic retry, compaction,
+// or queued continuation will run"), on the theory that a transient error
+// pi's own internal retry recovers from would never reach this trigger at
+// all. That's true in isolation, but `sendUserMessage` called at settle time
+// starts a genuinely FRESH run (the session is no longer streaming), and the
+// benchmark harness (`benchmarks/rpc_client.py`) treats `agent_settled` as
+// unconditionally terminal — it stops draining events and the adapter closes
+// the pi process within a few seconds, killing that fresh run before the
+// model ever sees the nudge. `agent_end` is the hook pi actually supports for
+// this: while the session is still streaming, `sendUserMessage` queues into
+// the SAME run's steering queue, and `_handlePostAgentRun`'s
+// `hasQueuedMessages()` check turns that into a real continuation the
+// harness already waits for. The accepted cost of firing at `agent_end`
+// instead of `agent_settled`: since the extension-facing `agent_end` event
+// doesn't carry `willRetry`, this can occasionally queue a redundant steer
+// on a turn pi's own internal retry was about to recover on its own — bounded
+// by `MAX_TRIGGER_C_FIRES` and harmless (the steer just rides along).
+//
+// `AgentEndEvent` also carries no reliably-shaped `messages` array to read
+// the last assistant message from in every case, so it's still snapshotted
+// from `turn_end` into the run-scoped `lastTurnMessage` below and read back
+// here — this mechanism didn't need to change when the firing hook reverted.
+//
+// An "aborted" last message is excluded before the shape check even runs —
+// see `maybeFireTriggerC`'s own comment on why (in short: an abort is a
+// harness decision, not a dead run, and a run that aborted with only
+// thinking tokens streamed looks empty to `contentShape`, which is
+// otherwise invisible to thinking blocks). The nudge itself is two-toned:
+// it uses `resolveFinalizeMessage`'s urgency framing only when the run is
+// genuinely near its deadline or turn-cap per Trigger B's `armed` latch (or
+// `finalizeWarnWouldFire` directly, for a deadline crossed since the last
+// turn_start); otherwise it uses calmer recovery framing so it doesn't
+// contradict Trigger A's "you have plenty of time" message in the same
+// session.
+//
+// ---------------------------------------------------------------------------
 // Shared instrumentation
 // ---------------------------------------------------------------------------
 // On every terminal_bench turn_end, log the turn's stopReason and a coarse
 // content-shape summary via ctx.ui.notify at "info"-but-diagnostic framing —
 // NOT a harnessIntervention call, deliberately, so this doesn't inflate the
 // intervention-count metric with pure diagnostics. This makes a silent
-// stopReason:"error" turn — the shape Trigger A can't steer on, see above —
-// diagnosable from the run log instead of invisible.
+// stopReason:"error" turn — a shape Trigger A can't steer on and Trigger C
+// only reacts to once it's the run's final message, see above — diagnosable
+// from the run log instead of invisible.
 
 // WARN_REMAINING_MS lives in _shared/finalize-warn-trigger.ts now — see that
 // module's header for why (this constant used to be hand-copied here and in
@@ -86,6 +150,8 @@ const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WA
 const MAX_TRIGGER_A_FIRES = 2; // per session
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
+
+const MAX_TRIGGER_C_FIRES = 2; // per session
 
 // ---- Trigger A state (session-scoped fire count; run-scoped turn/cap bookkeeping) ----
 let triggerAFireCount = 0;
@@ -102,6 +168,13 @@ let armed = false;
 let armedAtTurn = 0;
 let consecutiveNoWriteTurns = 0;
 let triggerBFired = false;
+
+// ---- Trigger C state ----
+// Fire count is session-scoped, like Trigger A's. The message snapshot is
+// run-scoped: AgentSettledEvent carries no messages (unlike agent_end), so
+// Trigger C reads the last turn_end's assistant message, captured below.
+let triggerCFireCount = 0;
+let lastTurnMessage: any = undefined;
 
 function isTerminalBench(): boolean {
   return process.env.LITTLE_CODER_BENCHMARK === "terminal_bench";
@@ -162,6 +235,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     triggerAFireCount = 0;
     triggerBFired = false;
+    triggerCFireCount = 0;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -171,6 +245,7 @@ export default function (pi: ExtensionAPI) {
     armed = false;
     armedAtTurn = 0;
     consecutiveNoWriteTurns = 0;
+    lastTurnMessage = undefined;
   });
 
   pi.on("turn_start", async () => {
@@ -186,6 +261,7 @@ export default function (pi: ExtensionAPI) {
     if (!isTerminalBench()) return;
     const message: any = (event as any)?.message;
     if (!message) return;
+    lastTurnMessage = message;
 
     const { text, toolCallCount, toolCalls } = contentShape(message);
 
@@ -204,6 +280,11 @@ export default function (pi: ExtensionAPI) {
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
 
     maybeAdvanceTriggerB(pi, ctx, toolCalls);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    if (!isTerminalBench()) return;
+    maybeFireTriggerC(pi, ctx);
   });
 }
 
@@ -298,5 +379,74 @@ function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, toolCalls: any[]): voi
     ctx,
     `${NO_WRITE_TURNS_BEFORE_NUDGE} consecutive turns since finalize-warn fired with no ` +
       "non-scratch write detected — telling the model to write its deliverable now.",
+  );
+}
+
+function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
+  if (triggerCFireCount >= MAX_TRIGGER_C_FIRES) return;
+
+  const last = lastTurnMessage;
+  if (!last) return;
+
+  // Aborted runs are a harness decision (thinking-budget's ctx.abort,
+  // turn-cap, a user Esc), not a dead run — and thinking-budget in
+  // particular queues its own carefully sequenced commit-and-continue
+  // recovery after aborting; stacking a second steer on top would
+  // contradict it. Checked FIRST, before the shape checks: an abort while
+  // only thinking tokens had streamed leaves a message with zero text and
+  // zero tool calls (thinking blocks are invisible to contentShape), which
+  // would otherwise slip through the isEmpty path below.
+  if (last.stopReason === "aborted") return;
+
+  const { text, toolCallCount } = contentShape(last);
+  const isEmpty = text.trim().length === 0 && toolCallCount === 0;
+  const isError = last.stopReason === "error";
+  if (!isEmpty && !isError) return;
+
+  // Turn-cap consistency: at settled time a steer starts a FRESH run
+  // (before_agent_start re-fires, resetting turn-cap's counter), so unlike
+  // Triggers A/B the nudge here WOULD be delivered — but delivering it
+  // would hand a capped-out run an entire new turn budget, overriding
+  // turn-cap's policy decision to end the run. Stand down at the cap, same
+  // clause as Triggers A/B.
+  if (capForRun > 0 && turnsThisRun >= capForRun) return;
+
+  // Near-deadline framing check. `armed` is Trigger B's run-scoped latch,
+  // set at turn_start when finalizeWarnWouldFire is true — reusing it here
+  // matters because finalizeWarnWouldFire's turn trigger is edge-triggered
+  // (exact-turn equality; callers are expected to latch), so re-calling it
+  // at settle time would usually miss a window entered turns ago. The
+  // direct call additionally catches a wall-clock deadline crossed since
+  // the last turn_start (its time trigger is level-triggered).
+  const nearDeadline =
+    armed || finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun });
+
+  const prefix =
+    "Your previous turn ended with an error or an empty response. The task is NOT " +
+    "complete. ";
+  const msg = nearDeadline
+    ? prefix + resolveFinalizeMessage("terminal_bench")
+    : prefix +
+      "You still have ample time and turn budget remaining, so do not wrap up — " +
+      "retry your last action or continue working from where you left off, " +
+      "verifying and testing as you normally would. Remember the task is graded " +
+      "by inspecting the container's files/state afterward, not this chat, so " +
+      "make sure your results end up saved there.";
+
+  try {
+    pi.sendUserMessage(msg, { deliverAs: "steer" });
+  } catch {
+    // Don't burn the fire count or notify for a nudge that was never
+    // actually delivered — mirrors Trigger A/B's own ordering.
+    return;
+  }
+  triggerCFireCount++;
+  harnessIntervention(
+    ctx,
+    `run settled with a final assistant message of stopReason=${String(last.stopReason)} ` +
+      `isEmpty=${isEmpty} — the run ended on an error/empty message; ` +
+      (nearDeadline
+        ? "telling the model to save its best-effort result now."
+        : "telling the model to retry and keep working."),
   );
 }
