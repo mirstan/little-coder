@@ -7,23 +7,19 @@ log_root/<lang>/<exercise>/ populate summarized_transcript and raw_paths from
 the LATEST successfully-parsed attempt, but components_used is a UNION across
 EVERY successfully-parsed attempt (a skill injected on an earlier, failed
 attempt but not re-triggered on the one that ultimately passed still
-genuinely influenced the outcome; docstring corrected per review -- it
-previously said "latest attempt" here too, which stopped matching the
-implementation once that was fixed).
+genuinely influenced the outcome).
 
-Formerly a confirmed gap (TDD_SPEC.md §0/§4.2): aider_polyglot's
-_dump_trajectory did not persist rpc.notifications(), so components_used was
-always empty here. Closed upstream (benchmarks/aider_polyglot.py's
-_dump_trajectory now takes a notifications= kwarg) -- components_used
-populates from each attempt's "notifications" field when present, and
-degrades to [] gracefully for older-format data that predates this field.
+components_used comes from each attempt's "notifications" field, which
+benchmarks/aider_polyglot.py's _dump_trajectory only started persisting
+partway through the project -- older-format data has none, and degrades
+to [] rather than failing.
 
 Result-record schema evolved twice, both handled here with fallback:
 - stop_reason_1/stop_reason_2 (fixed two-attempt fields) -> stop_reasons
   (a list, one entry per attempt, since --max-attempts generalized beyond 2).
 - status "pass_1"/"pass_2" only -> "pass_N" for any N (same reason). A
   hardcoded 2-entry score lookup would silently score any pass_3+ as a
-  failure -- confirmed real bug, fixed via _pass_n_score() below.
+  failure, hence _pass_n_score() below.
 """
 import json
 import logging
@@ -138,9 +134,9 @@ def _build_trajectory(
 
     if ex_dir.is_dir():
         # Sort by the parsed attempt NUMBER, not the filename string --
-        # lexicographic order puts "trajectory_10" before "trajectory_2"
-        # (real bug, confirmed by review: with >=10 attempts the wrong file
-        # supplied summarized_transcript/components_used/raw_paths).
+        # lexicographic order puts "trajectory_10" before "trajectory_2", so
+        # with >=10 attempts the wrong file supplies
+        # summarized_transcript/raw_paths.
         def _attempt_num(p: Path) -> int:
             m = re.search(r"_(\d+)$", p.stem)
             return int(m.group(1)) if m else -1
@@ -155,11 +151,9 @@ def _build_trajectory(
             # components_used is a UNION across every successfully-parsed
             # attempt: a skill injected on an earlier, failed attempt but not
             # re-triggered on the attempt that ultimately passed still
-            # genuinely influenced the outcome -- real gap, confirmed by
-            # review, in previously reading only the latest attempt's
-            # notifications. Present only for trajectories dumped after
-            # aider_polyglot.py's notifications= addition to
-            # _dump_trajectory -- absent for older data, degrades to [].
+            # genuinely influenced the outcome. Absent for data dumped
+            # before aider_polyglot.py persisted notifications at all,
+            # which degrades to [].
             all_notif_lines.extend(
                 f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
                 for n in data.get("notifications", [])

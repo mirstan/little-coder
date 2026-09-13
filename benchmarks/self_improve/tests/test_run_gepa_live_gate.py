@@ -135,7 +135,7 @@ def test_reflection_minibatch_check_does_not_apply_to_baseline_only(monkeypatch)
 
 
 def test_refuses_non_positive_reflection_minibatch_size_even_for_baseline_only(monkeypatch):
-    """Real bug, confirmed by review: unlike the train-pool-compatibility
+    """Unlike the train-pool-compatibility
     check above (genuinely irrelevant to baseline mode), this basic sanity
     bound must apply regardless of --baseline-only -- estimate_cost() is
     called unconditionally in BOTH modes to print the pre-authorization
@@ -159,7 +159,7 @@ def test_refuses_val_count_at_least_exercise_count(monkeypatch):
 
 
 def test_gates_use_the_real_exercises_count_not_exercise_count_when_explicit(monkeypatch):
-    """Real bug, confirmed by review: select_exercises() ignores
+    """Select_exercises() ignores
     --exercise-count entirely when --exercises is given (the real pool size
     is len(explicit)), but the minibatch/val-count gates used to reason from
     the raw --exercise-count flag regardless -- silently passing a
@@ -203,7 +203,7 @@ def test_resolve_components_yaml_absolute_path_under_repo_root():
 
 
 def test_resolve_components_yaml_raises_a_clean_error_when_absolute_path_escapes_repo_root():
-    """Real bug, confirmed by review: an absolute --components-config
+    """An absolute --components-config
     outside --repo-root made Path.relative_to() raise an UNCAUGHT
     ValueError -- a raw traceback instead of a clean CLI refusal."""
     with pytest.raises(ValueError, match="outside --repo-root"):
@@ -252,7 +252,7 @@ def test_check_components_clean_refuses_on_uncommitted_changes(source_repo):
 
 
 def test_check_components_clean_refuses_when_git_status_itself_fails(source_repo, tmp_path):
-    """Real bug, confirmed by review: a nonzero git-status exit (e.g. a
+    """A nonzero git-status exit (e.g. a
     components.yaml entry escaping repo_root, or repo_root not being a git
     checkout at all) was treated identically to "nothing is dirty" -- this
     check must refuse when it can't verify its own invariant, not fail open."""
@@ -336,7 +336,7 @@ def test_missing_gate_flags_refuse_before_touching_anything(source_repo, fake_pr
 def test_refuses_when_a_leftover_stop_file_already_exists(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real bug, confirmed by review: --out-dir defaults to a FIXED path, so
+    """--out-dir defaults to a FIXED path, so
     a gepa.stop left over from a previous (correctly) stopped run would
     otherwise silently no-op the very next run at the first stop check --
     for a real gepa.optimize() call that's AFTER paying for the full seed
@@ -389,7 +389,7 @@ def test_baseline_only_end_to_end_real_pipeline(source_repo, fake_practice, tmp_
 
 
 def test_check_components_clean_catches_dirty_components_yaml_itself(source_repo):
-    """Real bug, confirmed by review: editing components.yaml to point a
+    """Editing components.yaml to point a
     pred_name at a DIFFERENT (already-committed) file left every mapped
     file's own git status clean, so the old check missed that the mapping
     itself -- what the scratch worktree will actually read at its pinned
@@ -404,7 +404,7 @@ def test_check_components_clean_catches_dirty_components_yaml_itself(source_repo
 def test_baseline_only_stops_at_the_exact_max_metric_calls_cap(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real bug, confirmed by review: baseline-only's LiveBudget was
+    """Baseline-only's LiveBudget was
     constructed with est.max_live_runs (max_metric_calls PLUS GEPA's
     2*minibatch+valset overshoot allowance, which baseline mode never uses
     at all), so a small --max-metric-calls cap silently let MORE exercises
@@ -431,7 +431,7 @@ def test_baseline_only_stops_at_the_exact_max_metric_calls_cap(
 
 
 def test_spend_log_zeroes_duration_for_a_cache_hit(source_repo, fake_practice, tmp_path, monkeypatch):
-    """Real bug, confirmed by review: logging a cache hit's ORIGINAL
+    """Logging a cache hit's ORIGINAL
     elapsed_s let SpendLog.summarize()'s total_wall_s double-count the same
     real wall-clock time every time a candidate's result was reused from the
     on-disk memo."""

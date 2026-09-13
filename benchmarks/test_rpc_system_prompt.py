@@ -39,7 +39,7 @@ def test_build_system_prompt_generated_file_is_gitignored_path(tmp_path, monkeyp
 
 
 def test_build_system_prompt_falls_back_to_agents_md_path_when_agents_md_missing(tmp_path, monkeypatch):
-    """Real bug, confirmed by review: the pre-existing "AGENTS.md missing ->
+    """The pre-existing "AGENTS.md missing ->
     degrade gracefully" guard (the caller checks .exists() on this
     function's return value) was bypassed when PRINCIPLES.md was present
     but AGENTS.md was not -- the unconditional agents_md.read_text() raised
@@ -54,7 +54,7 @@ def test_build_system_prompt_falls_back_to_agents_md_path_when_agents_md_missing
 
 
 def test_build_system_prompt_falls_back_to_agents_md_when_write_fails(tmp_path, monkeypatch):
-    """Real gap, confirmed by review: an unguarded write_text()/mkdir() gave
+    """An unguarded write_text()/mkdir() gave
     PiRpc.__init__ a new unguarded OSError surface once PRINCIPLES.md exists
     (e.g. a read-only .pi/ directory) -- must degrade the same way the
     no-PRINCIPLES.md path already does, not crash the whole benchmark run."""
@@ -82,7 +82,7 @@ def test_build_system_prompt_leaves_no_partial_file_visible_mid_write(tmp_path, 
 
 
 def test_build_system_prompt_cleans_up_tmp_file_when_replace_fails(tmp_path, monkeypatch):
-    """Real gap, confirmed by review: if tmp.replace(generated) itself fails
+    """If tmp.replace(generated) itself fails
     AFTER tmp.write_text() already succeeded, the .tmp-* file was left
     behind under .pi/ forever instead of being cleaned up before falling
     back to AGENTS.md alone."""

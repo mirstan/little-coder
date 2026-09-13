@@ -24,7 +24,7 @@ def test_parse_skill_inject_notification_with_tools():
 
 
 def test_parse_skill_inject_notification_resolves_camelcase_target_tool_via_index():
-    """Real bug, confirmed by review: skill-inject notifications report
+    """Skill-inject notifications report
     each card's `target_tool` frontmatter field (.pi/extensions/skill-inject/index.ts:387),
     NOT the file stem -- an earlier version resolved it by blindly
     prefixing the emitted name, correct only when target_tool happens to
@@ -53,8 +53,7 @@ def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_fro
     regressing every caller that hasn't been updated to pass an index.
 
     A REAL (non-None) index that just doesn't contain this name -- as
-    opposed to no index at all -- must log a warning: real gap, confirmed
-    by review, this is the actually-concerning case (e.g. a
+    opposed to no index at all -- must log a warning: this is the actually-concerning case (e.g. a
     renamed/deleted tool skill silently corrupting usage signal)."""
     payload = json.dumps(["bash"])
     with caplog.at_level("WARNING"):
@@ -67,7 +66,7 @@ def test_parse_skill_inject_notification_falls_back_when_target_tool_missing_fro
 
 
 def test_parse_skill_inject_notification_fallback_is_silent_when_no_index_passed_at_all(caplog):
-    """Real gap, confirmed by review: an earlier fix warned on EVERY
+    """An earlier fix warned on EVERY
     fallback unconditionally, which made "no index passed" (every caller
     not yet updated, every test above) indistinguishable in the logs from
     -- and just as noisy as -- the actually-concerning "index passed but
@@ -80,7 +79,7 @@ def test_parse_skill_inject_notification_fallback_is_silent_when_no_index_passed
 
 
 def test_parse_skill_inject_notification_fallback_is_silent_for_the_empty_dict_no_repo_root_sentinel(caplog):
-    """Real gap, confirmed by review: aider_polyglot_ingest.py's and
+    """Aider_polyglot_ingest.py's and
     gaia_ingest.py's own `build_knowledge_topic_index(repo_root) if
     repo_root else {}` pass a genuinely EMPTY dict (not None) as their
     "no repo_root given, no resolution possible" sentinel -- a prior fix
@@ -102,7 +101,7 @@ def test_parse_skill_inject_notification_research_directive_only():
 
 
 def test_parse_knowledge_inject_notification_resolves_via_topic_index():
-    """Real notification format, confirmed by review: knowledge-inject's
+    """knowledge-inject's
     bracketed names are each entry's `topic` FRONTMATTER FIELD (e.g. "Binary
     Search"), an arbitrary human string independent of the file's name/stem
     -- never a slug. pred_name can only be resolved via a topic index built
@@ -129,7 +128,7 @@ def test_parse_knowledge_inject_notification_drops_unresolved_topic():
 
 
 def test_parse_knowledge_inject_notification_resolves_a_protocol_via_its_name_fallback():
-    """Real gap, confirmed by review: `fm.topic` itself falls back to
+    """`fm.topic` itself falls back to
     `fm.name` at the emitting extension (knowledge-inject/index.ts:49-50)
     for a file with no `topic:` field -- confirmed against every real
     skills/protocols/*.md file, none of which declare `topic:`, only
@@ -209,7 +208,7 @@ def _write_tool_skill_file(path, name, target_tool):
 
 
 def test_build_knowledge_topic_index_maps_target_tool_field_to_pred_name(tmp_path):
-    """Real bug, confirmed by review: this index (despite its name) must
+    """This index (despite its name) must
     also cover skills/tools/*.md, keyed by target_tool -- not just
     skills/knowledge and skills/protocols -- since skill-inject
     notifications need the SAME target_tool->pred_name resolution
@@ -242,7 +241,7 @@ def test_build_knowledge_topic_index_handles_missing_directories(tmp_path):
 
 
 def test_build_knowledge_topic_index_skips_non_utf8_file(tmp_path):
-    """Real bug, confirmed by review: UnicodeDecodeError is NOT an OSError
+    """UnicodeDecodeError is NOT an OSError
     subclass -- a non-UTF-8 skill file previously propagated all the way out
     of this function, aborting the whole ingest run instead of just skipping
     the one unreadable file."""
@@ -255,7 +254,7 @@ def test_build_knowledge_topic_index_skips_non_utf8_file(tmp_path):
 
 
 def test_build_knowledge_topic_index_skips_non_mapping_frontmatter(tmp_path):
-    """Real bug, confirmed by review: syntactically valid YAML that isn't a
+    """Syntactically valid YAML that isn't a
     mapping (e.g. a bare list) made frontmatter.get() raise AttributeError,
     aborting the whole ingest run."""
     knowledge_dir = tmp_path / "skills" / "knowledge"
@@ -272,7 +271,7 @@ def test_build_knowledge_topic_index_skips_non_string_topic(tmp_path):
 
 
 def test_build_knowledge_topic_index_namespaces_keys_by_source_to_avoid_collision(tmp_path):
-    """Real gap, confirmed by review: a tool's target_tool and a
+    """A tool's target_tool and a
     knowledge/protocol topic/name are independent human-ish vocabularies
     with no coordination -- if they ever happened to share a raw string
     (constructed here as "Shared" for both), unnamespaced keys would let

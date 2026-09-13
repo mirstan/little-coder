@@ -32,23 +32,20 @@ REPO_ROOT = Path(__file__).parent.parent
 # LITTLE_CODER_PI_BIN_OVERRIDE: integration-testing hook only. Lets a
 # host-side harness (e.g. `tb run`, which runs pi on the host per
 # tb_adapter's own comment) point PI_BIN at a stand-in (fake_pi.py) without
-# modifying any tracked file. Unset -> byte-identical to prior behavior.
+# modifying any tracked file.
 #
-# `or`, not os.environ.get(name, default): .get() returns "" (not the
-# default) when the var is exported EMPTY -- a real risk from a harness
-# script doing `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"`.
-# Path("") == Path("."), whose .exists() is True, silently defeating the
-# "pi not found" FileNotFoundError check below and surfacing later as an
-# opaque Popen error instead (confirmed by review).
+# Tested for truthiness, not just presence: an EMPTY export (a harness
+# script doing `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"`)
+# would otherwise give Path("") == Path("."), whose .exists() is True,
+# defeating the "pi not found" FileNotFoundError check below and surfacing
+# later as an opaque Popen error.
 _pi_bin_override = os.environ.get("LITTLE_CODER_PI_BIN_OVERRIDE")
-# .resolve(): real bug, confirmed by review -- on POSIX, subprocess.Popen
-# with both a RELATIVE executable path and an explicit `cwd=` resolves that
-# path against the CHILD's cwd, not the launcher's. A relative override
-# (e.g. "./fake_pi.py") would exist from the launcher's own cwd at import
-# time, then silently fail to launch once PiRpc is constructed with a
-# task-specific cwd (an aider_polyglot exercise dir, etc). Resolving once
-# here, against the launcher's actual cwd, makes the override
-# cwd-independent from then on.
+# .resolve(): on POSIX, subprocess.Popen with both a RELATIVE executable
+# path and an explicit `cwd=` resolves that path against the CHILD's cwd,
+# not the launcher's. A relative override ("./fake_pi.py") exists from the
+# launcher's cwd at import time, then fails to launch once PiRpc is
+# constructed with a task-specific cwd. Resolving once here makes the
+# override cwd-independent.
 PI_BIN = Path(_pi_bin_override).resolve() if _pi_bin_override else REPO_ROOT / "node_modules" / ".bin" / "pi"
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
@@ -96,13 +93,10 @@ def _build_system_prompt() -> Path:
     """
     agents_md = REPO_ROOT / "AGENTS.md"
     principles_md = REPO_ROOT / "PRINCIPLES.md"
-    # Real bug, confirmed by review: the pre-existing "AGENTS.md missing ->
-    # degrade gracefully" guard (the caller checks system_prompt_path.exists()
-    # after this returns) was bypassed on THIS path -- with PRINCIPLES.md
-    # present but AGENTS.md absent, the read_text() below raised an
-    # uncaught FileNotFoundError inside PiRpc.__init__, killing the whole
-    # benchmark run instead of falling back the same way the no-PRINCIPLES
-    # path already does.
+    # Both must exist, not just PRINCIPLES.md: the caller's "AGENTS.md
+    # missing -> degrade gracefully" guard runs on the returned path, so a
+    # missing AGENTS.md here would instead raise FileNotFoundError out of
+    # PiRpc.__init__ and kill the whole benchmark run.
     if not principles_md.exists() or not agents_md.exists():
         return agents_md
 
@@ -114,8 +108,8 @@ def _build_system_prompt() -> Path:
         # the shared file in place first, so a PiRpc constructed
         # concurrently with another (parallel benchmark attempts, or a
         # before/after comparison run) could read a corrupted, half-written
-        # system prompt -- real gap, confirmed by review. Falls back to
-        # AGENTS.md alone, same as the no-PRINCIPLES.md path above, if the
+        # system prompt. Falls back to AGENTS.md alone, as the
+        # no-PRINCIPLES.md path above does, if the
         # write itself fails (e.g. a read-only .pi/) rather than raising an
         # uncaught OSError out of PiRpc.__init__.
         tmp = generated.with_name(f"{generated.name}.tmp-{os.getpid()}-{threading.get_ident()}")
@@ -123,10 +117,9 @@ def _build_system_prompt() -> Path:
         try:
             tmp.replace(generated)
         except OSError:
-            # Real gap, confirmed by review: if replace() itself fails after
-            # write_text() already succeeded, tmp was left behind under
-            # .pi/ forever -- clean it up before falling through to the
-            # same AGENTS.md-only fallback as any other write failure here.
+            # A replace() failure after a successful write_text() would
+            # strand tmp under .pi/ forever; clean it up before falling
+            # through to the same AGENTS.md-only fallback.
             tmp.unlink(missing_ok=True)
             raise
     except OSError:
@@ -138,27 +131,17 @@ class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
 
 
-#: Real gap, confirmed by review: PromptResult.non_text_deltas grew
-#: unbounded in memory for the ENTIRE attempt (a live model streaming
-#: heavy reasoning can emit thousands of events) -- only ever capped
-#: AFTER the fact, at persist time, by aider_polyglot.py's own
-#: _cap_non_text_deltas(). This is a pure memory-safety backstop for a
-#: pathological run, not the real trimming policy (which stays downstream,
-#: since it needs head+tail retention that isn't knowable mid-stream) --
-#: generous enough that no normal attempt gets anywhere near it.
+#: In-memory backstop so non_text_deltas can't grow unbounded across an
+#: attempt (a model streaming heavy reasoning emits thousands of events);
+#: the real trimming policy stays downstream in aider_polyglot.py's
+#: _cap_non_text_deltas(), which needs head+tail retention that isn't
+#: knowable mid-stream. Generous enough that no normal attempt reaches it.
 #:
-#: Split into a fixed HEAD (_NON_TEXT_DELTA_HEAD_KEEP) plus a rolling TAIL
-#: (the remainder) rather than a single head-only cap -- second real gap,
-#: confirmed by review: a naive "stop appending past _MAX_NON_TEXT_DELTAS"
-#: silently dropped every delta past the cap forever, including the true
-#: end of the stream. That defeated the exact backstop this constant exists
-#: for: aider_polyglot.py's own _cap_non_text_deltas() and
-#: live_eval.py's _reasoning_excerpt_from_trajectory() both specifically
-#: need the LATEST reasoning, and a pathological run long enough to hit
-#: this backstop is precisely the run whose true tail would otherwise be
-#: silently lost. Keeping a rolling tail preserves the most recent entries
-#: at all times, so downstream head+tail trimming still has a genuine tail
-#: to work with even when the raw stream blows past this cap.
+#: Kept as a fixed HEAD (_NON_TEXT_DELTA_HEAD_KEEP) plus a rolling TAIL
+#: rather than a head-only cap: both _cap_non_text_deltas() and
+#: live_eval.py's _reasoning_excerpt_from_trajectory() want the LATEST
+#: reasoning, and a run long enough to hit this backstop is exactly the one
+#: whose true tail a head-only cap would discard.
 _MAX_NON_TEXT_DELTAS = 5_000
 #: Fixed prefix retained even once the rolling tail below is full --
 #: mirrors aider_polyglot.py's own _cap_non_text_deltas() head+tail split
@@ -202,20 +185,17 @@ class PromptResult:
     #: agent_ended alone as "the call completed" -- check stop_reason too.
     stop_reason: str = "agent_end"
     #: Every assistantMessageEvent whose type is anything other than
-    #: "text_delta", captured verbatim. assistant_text only ever accumulates
-    #: "text_delta" content -- any reasoning/thinking-delta stream a model
-    #: like omlx/tiel-coder-oq4e produces at a high thinking level was
-    #: previously silently dropped here with zero record it even existed.
-    #: CONFIRMED (2026-09-06, against a real gepa.optimize() run,
-    #: omlx/tiel-coder-oq4e at thinking=high): the real event type is
-    #: "thinking_delta", carrying incremental text in the same "delta" key
-    #: text_delta uses -- benchmarks/self_improve/live_eval.py's
-    #: _reasoning_excerpt_from_trajectory() reconstructs it the same way
-    #: assistant_text is built above. Other observed types this run:
+    #: "text_delta", captured verbatim -- assistant_text accumulates only
+    #: "text_delta", so a model's reasoning stream reaches nothing else.
+    #: Confirmed against a real run at thinking=high: the reasoning event
+    #: type is "thinking_delta", carrying incremental text in the same
+    #: "delta" key text_delta uses, which
+    #: benchmarks/self_improve/live_eval.py's
+    #: _reasoning_excerpt_from_trajectory() reassembles the same way
+    #: assistant_text is built above. Other types seen in that run:
     #: thinking_start/thinking_end (bracket a reasoning block),
     #: toolcall_start/toolcall_delta/toolcall_end, text_start/text_end.
-    #: Bounded to _MAX_NON_TEXT_DELTAS entries during collection (pure
-    #: memory-safety backstop -- see that constant's own comment).
+    #: Bounded to _MAX_NON_TEXT_DELTAS entries during collection.
     non_text_deltas: list[dict] = field(default_factory=list)
     #: Provider error text for stop_reason == "error", and only then: either
     #: the assistant message's own `errorMessage` from the wire, or the

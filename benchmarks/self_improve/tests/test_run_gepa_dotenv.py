@@ -1,23 +1,18 @@
 """run_gepa.py should load a .env file (via python-dotenv) from its own
 directory so REFLECTION_LM_API_KEY can live in a gitignored file instead of
 requiring the user to export it into every shell they invoke the script
-from. README.md already documents this as the design intent; this closes
-the gap between that documentation and the actual implementation.
+from. README.md documents this as the design intent.
 
-Tested via a real subprocess import (not importlib.reload(), which
+Tested via a real subprocess import, not importlib.reload(), which
 re-executes the module's own `from dotenv import load_dotenv` line and
-clobbers any monkeypatch on it before the effect can be observed) -- this
-is the only reliable way to test an import-time side effect.
+clobbers any monkeypatch on it before the effect can be observed.
 
-CONFIRMED REAL RISK (caught by review, not hypothetical): an earlier version
-of these tests wrote fake content directly into the real, gitignored
-benchmarks/self_improve/.env file (which can hold a real API key) and
-restored it in a `finally` block. `finally` does not survive SIGKILL, a
-hard crash, or parallel test workers -- and the file is untracked, with no
-git history to recover from. A crash mid-test could permanently destroy a
-real key. Fixed by making the loaded path injectable via
-SELF_IMPROVE_DOTENV, so these tests write ONLY to a disposable tmp_path
-fixture and never touch the real file at all.
+These tests write ONLY to a disposable tmp_path, never to the real
+benchmarks/self_improve/.env -- that file is untracked, can hold a real API
+key, and has no git history to recover from, so a `finally`-block restore
+(which does not survive SIGKILL, a hard crash, or parallel workers) is not
+good enough. SELF_IMPROVE_DOTENV exists to make the loaded path injectable
+for exactly that reason.
 """
 import os
 import subprocess

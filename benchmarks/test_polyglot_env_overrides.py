@@ -50,7 +50,7 @@ def test_benchmark_root_uses_override_when_set(monkeypatch, tmp_path):
 
 
 def test_benchmark_root_falls_back_to_default_when_override_is_empty_string(monkeypatch):
-    """Real bug, confirmed by review: os.environ.get(name, default) returns ""
+    """os.environ.get(name, default) returns ""
     (not the default) when the var is exported EMPTY. Path("") == Path("."),
     whose .exists() is True, silently pointing at the wrong directory."""
     monkeypatch.setenv("POLYGLOT_BENCHMARK_ROOT", "")

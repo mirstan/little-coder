@@ -1,9 +1,7 @@
 """Append-only, flush-per-line audit log of every live invocation and GEPA
 iteration during a real live-eval run -- survives a SIGKILL up to the last
 completed exercise, and is the only way to answer "did the run actually
-accept anything, and why" after the fact. The old frozen-data design could
-never answer that question (GEPA could never accept anything, and there was
-no record of individual live runs to inspect since there were none).
+accept anything, and why" after the fact.
 """
 from __future__ import annotations
 

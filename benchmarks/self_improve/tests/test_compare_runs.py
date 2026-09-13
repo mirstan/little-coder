@@ -45,7 +45,7 @@ def test_compare_pass_rates_flags_improvements():
 
 
 def test_compare_pass_rates_does_not_collide_same_task_id_across_benchmarks():
-    """Real bug, confirmed by review: task_id is NOT namespaced per
+    """Task_id is NOT namespaced per
     benchmark (aider uses the exercise key, gaia the task-dir name, harbor/
     tb their own id) -- keying by task_id alone would silently collide two
     DIFFERENT trajectories that happen to share a task_id string in
@@ -76,7 +76,7 @@ def test_compare_pass_rates_raises_on_mismatched_task_sets():
 
 
 def test_compare_pass_rates_raises_on_duplicate_trials_in_before():
-    """Real bug, confirmed by review: a dict comprehension keyed by
+    """A dict comprehension keyed by
     (benchmark, task_id) silently keeps only the LAST of two duplicate
     trials (e.g. a harbor/tb run with multiple trials of the same task) --
     discarding an earlier trial's outcome could hide exactly the regression
@@ -95,7 +95,7 @@ def test_compare_pass_rates_raises_on_duplicate_trials_in_after():
 
 
 def test_compare_pass_rates_raises_mismatch_not_empty_error_for_one_sided_input():
-    """Real follow-up bug, confirmed by review: the empty-input guard fired
+    """The empty-input guard fired
     on `before` alone being empty even when `after` was NOT, misreporting a
     genuinely one-sided input as "both empty" instead of the accurate
     before-only/after-only mismatch diagnostic."""
@@ -104,7 +104,7 @@ def test_compare_pass_rates_raises_mismatch_not_empty_error_for_one_sided_input(
 
 
 def test_compare_pass_rates_raises_on_empty_input_instead_of_reporting_safe():
-    """Real bug, confirmed by review: with both `before` and `after` empty,
+    """With both `before` and `after` empty,
     the set-equality check passed vacuously and n=0 made both pass rates
     default to 0.0 with is_regression=False -- reporting a Layer 5
     comparison as SAFE when nothing was actually compared (e.g. an upstream

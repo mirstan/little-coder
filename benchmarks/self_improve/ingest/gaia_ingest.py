@@ -5,16 +5,13 @@ Layout (confirmed against benchmarks/gaia.py, TDD_SPEC.md §0):
   <log_root>/<task_id>/{prompt.txt, transcript.txt, tool_calls.jsonl,
                         notifications.txt, stderr.log, result.json}
 
-result.json DOES carry a real per-task stop_reason and turn_count (both
-straight from PiRpc's own result, see benchmarks/gaia.py:199,206,235,240) --
-an earlier version of this comment claimed otherwise (stale/incomplete
-research); a computed fallback is used only for older data written before
-gaia.py recorded these fields. "correct" (and therefore success/gold) is
-only present when gaia.py was run with a gold answer to score against
+result.json carries a real per-task stop_reason and turn_count, both
+straight from PiRpc's own result (benchmarks/gaia.py:199,206,235,240); the
+computed fallbacks below are only for older data written before gaia.py
+recorded these fields. "correct" (and therefore success/gold) is only
+present when gaia.py was run with a gold answer to score against
 (score_against_gold=True) -- an unlabeled task has no "correct" key at all
-and is skipped entirely, not treated as a failure (real bug, confirmed by
-review: `result.get("correct", False)` silently turned every unlabeled task
-into a false negative).
+and is skipped entirely rather than counted as a failure.
 """
 import json
 import logging
@@ -48,19 +45,17 @@ def load(log_root: Path, repo_root: Path | None = None) -> list[NormalizedTrajec
     for entry in sorted(log_root.iterdir()):
         # manifest.json/results.json/submission.jsonl are run-level FILES,
         # not directories, so this already excludes them -- no separate
-        # name-based check needed (a prior one here was dead code: it ran
-        # after this same is_dir() filter, so it could never match).
+        # name-based check needed.
         if not entry.is_dir():
             continue
         try:
             traj = _load_task(entry, knowledge_topic_index)
         except (OSError, UnicodeDecodeError) as e:
-            # Real gap, confirmed by review: an unguarded read_text() on
-            # stderr.log/notifications.txt/transcript.txt (e.g. non-UTF-8
-            # content from a crashed run) previously propagated all the way
-            # out of load(), where run_gepa.py's _ingest_all's broad
-            # except-Exception would discard EVERY task from this log_root,
-            # not just the one bad one.
+            # Caught per task: an unguarded read_text() on
+            # stderr.log/notifications.txt/transcript.txt (non-UTF-8 content
+            # from a crashed run, say) would propagate out of load(), where
+            # the caller's broad except-Exception discards EVERY task from
+            # this log_root rather than the one bad one.
             logger.warning("gaia_ingest: skipping %s, failed to read task files: %s", entry, e)
             continue
         if traj is not None:
@@ -80,14 +75,11 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
         logger.warning("gaia_ingest: malformed result.json at %s: %s", result_path, e)
         return None
 
-    # Real bug, confirmed by review against benchmarks/gaia.py:244-249:
-    # "correct" is only added to result.json `if score_against_gold:` -- a
-    # gaia run against tasks with no gold answer (the unlabeled/test split)
-    # produces a result.json with NO "correct" key at all. The previous
-    # `result.get("correct", False)` treated every such unlabeled task as a
-    # hard FAILURE, feeding false negatives into GEPA's scoring. Skip
-    # unscoreable tasks entirely instead -- NormalizedTrajectory.success is
-    # a required bool, there's no honest value to put there.
+    # gaia.py only adds "correct" to result.json `if score_against_gold:`,
+    # so a run against the unlabeled/test split produces result.json with no
+    # such key. Defaulting it to False would feed false negatives into
+    # GEPA's scoring; skip instead, since NormalizedTrajectory.success is a
+    # required bool with no honest value here.
     if "correct" not in result:
         logger.warning("gaia_ingest: skipping %s, no gold answer to score against (no 'correct' key)", task_dir)
         return None
@@ -119,13 +111,10 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
     transcript_path = task_dir / "transcript.txt"
     assistant_text = transcript_path.read_text() if transcript_path.exists() else ""
 
-    # Real bug, confirmed by review against benchmarks/gaia.py:206,240: gaia.py
-    # DOES persist a real per-task stop_reason in result.json (from
-    # PiRpc's actual result, e.g. "agent_end"/"deadline"/"process_exit") --
-    # this module's own prior "gaia doesn't carry stop_reason" comment was
-    # wrong (based on stale/incomplete research). Prefer the persisted value;
-    # only fall back to the computed heuristic for older data written before
-    # gaia.py recorded this field (empty string there too, per gaia.py:183).
+    # gaia.py persists a real per-task stop_reason from PiRpc's own result
+    # (e.g. "agent_end"/"deadline"/"process_exit"), so prefer it. The
+    # computed heuristic is only for older data written before gaia.py
+    # recorded the field -- empty string there too, per gaia.py:183.
     stop_reason = result.get("stop_reason") or (
         "agent_end" if success else ("harness_error" if failure_signals else "unknown")
     )
@@ -142,11 +131,10 @@ def _load_task(task_dir: Path, knowledge_topic_index: dict[str, str] | None = No
         if (task_dir / fname).exists()
     }
 
-    # Real bug, confirmed by review against benchmarks/gaia.py:199,235: gaia.py
-    # persists a real per-task turn_count (from PiRpc's own turn accounting) --
-    # len(tool_calls) is a distinct count of individual tool invocations, not
-    # turns (multiple tool calls can happen in one turn). Prefer the
-    # persisted value; fall back for older data that predates this field.
+    # gaia.py persists a real per-task turn_count from PiRpc's own turn
+    # accounting. The len(tool_calls) fallback (for data predating the
+    # field) counts individual tool invocations instead, which is a
+    # different number -- several can happen in one turn.
     turn_count = result.get("turn_count")
     if not isinstance(turn_count, int):
         turn_count = len(tool_calls)

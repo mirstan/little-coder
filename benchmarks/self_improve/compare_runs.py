@@ -9,36 +9,28 @@ from benchmarks.self_improve.schema import NormalizedTrajectory
 def compare_pass_rates(
     before: list[NormalizedTrajectory], after: list[NormalizedTrajectory]
 ) -> dict:
-    # Keyed by (benchmark, task_id), not task_id alone: real bug, confirmed
-    # by review -- task_id is NOT namespaced per benchmark (aider uses the
-    # exercise key, gaia the task-dir name, harbor/tb their own id), so a
-    # before/after list spanning more than one benchmark could silently
-    # collide two different trajectories onto one dict entry, under-counting
-    # n and corrupting the exact regression signal this layer exists for.
+    # Keyed by (benchmark, task_id), not task_id alone: task_id is NOT
+    # namespaced per benchmark (aider uses the exercise key, gaia the
+    # task-dir name, harbor/tb their own id), so a list spanning more than
+    # one benchmark could collide two different trajectories onto one entry,
+    # under-counting n and corrupting the regression signal.
     before_by_id = {(t.benchmark, t.task_id): t for t in before}
     after_by_id = {(t.benchmark, t.task_id): t for t in after}
 
-    # Real bug, confirmed by review: a dict comprehension silently keeps only
-    # the LAST trajectory for a duplicate (benchmark, task_id) key (e.g. a
-    # harbor/tb run with multiple trials of the same task) -- discarding an
-    # earlier trial's outcome could hide exactly the regression this layer
-    # exists to catch. Reject duplicates outright rather than guess which
-    # trial should win.
+    # The comprehensions above keep only the LAST trajectory for a duplicate
+    # key (e.g. a harbor/tb run with several trials of one task), which could
+    # hide the regression this layer exists to catch. Reject rather than
+    # guess which trial should win.
     if len(before_by_id) != len(before):
         raise ValueError("compare_pass_rates: duplicate (benchmark, task_id) trials in `before`")
     if len(after_by_id) != len(after):
         raise ValueError("compare_pass_rates: duplicate (benchmark, task_id) trials in `after`")
 
-    # Real bug, confirmed by review: with both `before` and `after` empty,
-    # the set-equality check below passes vacuously (set() == set()) and n=0
-    # made both pass rates default to 0.0 with is_regression=False --
-    # reporting a Layer 5 comparison as safe when nothing was actually
-    # compared (e.g. an upstream ingest failure silently produced no
-    # trajectories at all). Real follow-up bug, confirmed by review: the
-    # first version of this guard fired on `before` alone being empty even
-    # when `after` was NOT -- misreporting a genuinely one-sided input as
-    # "both empty" instead of letting the set-mismatch check below report
-    # the accurate before-only/after-only diagnostic.
+    # With both sides empty the set-equality check below passes vacuously,
+    # and a Layer 5 comparison over nothing at all (e.g. an upstream ingest
+    # failure) would report 0.0/0.0 and is_regression=False -- i.e. "safe".
+    # Both, not either: a one-sided input gets the accurate before-only /
+    # after-only diagnostic from the set-mismatch check instead.
     if not before_by_id and not after_by_id:
         raise ValueError("compare_pass_rates: no trajectories to compare (both `before` and `after` are empty)")
 

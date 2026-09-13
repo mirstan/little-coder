@@ -66,7 +66,7 @@ def test_load_defaults_stop_reason_when_absent(gaia_run):
 
 
 def test_load_skips_task_with_malformed_result_json(tmp_path):
-    """Real bug, confirmed by review: an unguarded json.loads() on a
+    """An unguarded json.loads() on a
     truncated/malformed result.json (e.g. harness killed mid-write) crashed
     the whole ingestion run instead of skipping just that one task."""
     good = tmp_path / "task-good"
@@ -82,7 +82,7 @@ def test_load_skips_task_with_malformed_result_json(tmp_path):
 
 
 def test_load_skips_malformed_line_in_tool_calls_jsonl(tmp_path):
-    """Real bug, confirmed by review: a partially-flushed final line in an
+    """A partially-flushed final line in an
     append-only tool_calls.jsonl (the most likely corruption from a crashed
     run) crashed the whole task's ingestion instead of just skipping that
     one line."""
@@ -105,7 +105,7 @@ def test_load_handles_missing_log_root_gracefully(tmp_path):
 
 
 def test_load_resolves_knowledge_inject_usage_when_repo_root_given(tmp_path):
-    """Real bug, confirmed by review: knowledge-inject notification names are
+    """Knowledge-inject notification names are
     the topic FRONTMATTER FIELD (e.g. "Binary Search"), not a slug -- must
     resolve against the REAL skills/knowledge files via repo_root, not the
     naive skills_knowledge_+name prefixing this used to do (which never
@@ -134,11 +134,10 @@ def test_load_drops_knowledge_inject_usage_without_repo_root(tmp_path):
 
 
 def test_load_skips_task_with_no_gold_answer_instead_of_scoring_it_a_failure(tmp_path):
-    """Real bug, confirmed by review against benchmarks/gaia.py:244-249:
-    "correct" is only added to result.json `if score_against_gold:` -- an
-    unlabeled task (gaia's test split, no gold answer) has no "correct" key
-    at all. result.get("correct", False) used to silently score every such
-    task as a hard failure, feeding false negatives into GEPA."""
+    """gaia.py only adds "correct" to result.json `if score_against_gold:`,
+    so an unlabeled task (gaia's test split, no gold answer) has no
+    "correct" key at all. Defaulting it to False would score every such task
+    as a hard failure, feeding false negatives into GEPA."""
     labeled = tmp_path / "task-labeled"
     labeled.mkdir()
     (labeled / "result.json").write_text(json.dumps({"correct": True}))
@@ -152,8 +151,7 @@ def test_load_skips_task_with_no_gold_answer_instead_of_scoring_it_a_failure(tmp
 
 
 def test_load_prefers_persisted_stop_reason_from_result_json(tmp_path):
-    """Real bug, confirmed by review against benchmarks/gaia.py:206,240:
-    gaia.py DOES persist a real per-task stop_reason -- the computed
+    """gaia.py persists a real per-task stop_reason -- the computed
     fallback heuristic must only apply when it's genuinely absent (older
     data), not override a real value that would otherwise be mislabeled
     (e.g. a "deadline" timeout that nonetheless scored correct)."""
@@ -176,8 +174,7 @@ def test_load_falls_back_to_heuristic_stop_reason_when_absent(tmp_path):
 
 
 def test_load_prefers_persisted_turn_count_from_result_json(tmp_path):
-    """Real bug, confirmed by review against benchmarks/gaia.py:199,235:
-    gaia.py persists a real per-task turn_count distinct from
+    """gaia.py persists a real per-task turn_count distinct from
     len(tool_calls) (multiple tool calls can happen within one turn)."""
     task = tmp_path / "task-001"
     task.mkdir()
@@ -201,7 +198,7 @@ def test_load_falls_back_to_tool_call_count_when_turn_count_absent(tmp_path):
 
 
 def test_load_skips_task_with_non_utf8_file_instead_of_crashing_whole_run(tmp_path):
-    """Real gap, confirmed by review: an unguarded read_text() on
+    """An unguarded read_text() on
     stderr.log/notifications.txt/transcript.txt (e.g. non-UTF-8 content from
     a crashed run) previously propagated out of load() entirely, where
     run_gepa.py's _ingest_all broad except-Exception would discard EVERY

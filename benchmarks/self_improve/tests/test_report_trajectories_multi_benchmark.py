@@ -52,7 +52,7 @@ def test_ingest_all_combines_both_benchmarks(tmp_path):
 
 
 def test_ingest_all_records_empty_source_when_a_requested_root_yields_nothing(tmp_path):
-    """Real gap, confirmed by review: a requested source that ingests
+    """A requested source that ingests
     successfully but finds zero trajectories (e.g. a log_root that exists
     but is empty) must be distinguishable from one that was never requested,
     so _real_run() can refuse rather than silently training on a subset."""
@@ -73,14 +73,14 @@ def test_ingest_all_records_empty_source_when_a_requested_root_yields_nothing(tm
 #: empty_sources == ["aider"]) -- so asserting only on those, as the three
 #: tests below used to, can't tell "the comma/empty-segment guard fired"
 #: apart from "load() was reached and failed for some unrelated reason"
-#: (real gap, confirmed by review). Each test below additionally asserts
+#: Each test below additionally asserts
 #: the guard's OWN distinct log message via caplog, which only the guard
 #: branch emits.
 _MISSING_SUFFIX_LOG_FRAGMENT = "required ',<results.json path>' suffix"
 
 
 def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_path, caplog):
-    """Real gap, confirmed by review: `--log-roots aider=<dir>` with no
+    """`--log-roots aider=<dir>` with no
     ',<results.json>' suffix used to make Path("") -> Path(".") -- whose
     .exists() is True -- silently bypass aider_polyglot_ingest.load()'s own
     FileNotFoundError guard and surface as an opaque IsADirectoryError deep
@@ -95,7 +95,7 @@ def test_ingest_all_reports_clear_error_when_aider_log_roots_missing_comma(tmp_p
 
 
 def test_ingest_all_reports_clear_error_when_aider_log_root_segment_is_empty(tmp_path, caplog):
-    """Real follow-up bug, confirmed by review: `--log-roots aider=,results.json`
+    """`--log-roots aider=,results.json`
     (empty segment BEFORE a present comma) still made Path("") -> Path(".")
     for the log_root -- the original fix only checked the comma's presence,
     not that both sides of it were non-empty."""
@@ -145,7 +145,7 @@ def test_dry_run_produces_a_plausible_weighted_aggregate_across_benchmarks(tmp_p
         "tb": str(REAL_TB_FIXTURE),
     }
     real_repo_root = Path(__file__).parent.parent.parent.parent  # little-coder-self-improve/
-    # repo_root: real gap, confirmed by review -- main() always passes
+    # repo_root: main() always passes
     # repo_root through to _ingest_all() (needed to resolve knowledge-inject
     # component usage), so omitting it here made this integration test
     # exercise a calling convention main() never actually uses.

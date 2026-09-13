@@ -158,7 +158,7 @@ def test_harbor_load_components_used_is_empty():
 
 
 def test_harbor_load_handles_explicit_null_rewards(tmp_path):
-    """Real bug, confirmed by review: `.get("rewards", {})` only guards a
+    """`.get("rewards", {})` only guards a
     MISSING key, not an explicit JSON null -- an incomplete verifier write
     can leave "rewards": null, and the old code raised AttributeError
     calling .get("reward") on None. Must degrade to success=False, not crash."""
@@ -193,7 +193,7 @@ def test_tb_load_handles_missing_log_root_gracefully(tmp_path):
 
 
 def test_harbor_load_degrades_gracefully_for_non_object_verifier_result(tmp_path):
-    """Real bug, confirmed by review: this module's own docstring promises
+    """This module's own docstring promises
     'never raise from load() on missing/malformed data', but a
     wrong-TYPED (not just null/missing) nested field -- e.g. verifier_result
     is a list, not an object -- made .get("rewards") raise AttributeError,
@@ -218,7 +218,7 @@ def test_harbor_load_degrades_gracefully_for_non_object_verifier_result(tmp_path
 
 
 def test_harbor_load_falls_back_to_dir_name_when_task_name_is_explicit_null(tmp_path):
-    """Real bug, confirmed by review: task_id = result.get("task_name", ...)
+    """Task_id = result.get("task_name", ...)
     only substitutes the fallback when the key is ABSENT -- an explicit
     "task_name": null (a valid but incomplete write) passed None straight
     into NormalizedTrajectory(task_id=...), which is a required str field,
@@ -248,7 +248,7 @@ def test_harbor_load_skips_trial_with_non_object_json_root(tmp_path):
 
 
 def test_tb_load_treats_non_boolean_is_resolved_as_unresolved(tmp_path):
-    """Hardening, confirmed by review: real captured data always has this as
+    """real captured data always has this as
     a genuine JSON boolean, but bool(...) on a wrong-typed value (e.g. the
     STRING "false") is a classic Python trap -- bool("false") is True. A
     non-boolean value must be treated as unresolved/failed, never trusted."""
@@ -267,7 +267,7 @@ def test_tb_load_skips_trial_with_non_object_json_root(tmp_path):
 
 
 def test_harbor_load_picks_deterministic_log_when_multiple_exist(tmp_path):
-    """Real bug, confirmed by review: glob() order is filesystem-dependent
+    """Glob() order is filesystem-dependent
     -- with more than one *.log file in a trial's agent/ dir, the chosen
     log (and therefore its stop_reason/transcript) must be stable across
     runs on identical input, not whatever order the filesystem returns."""

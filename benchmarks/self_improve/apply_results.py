@@ -91,15 +91,13 @@ def apply_and_open_pr(
 
     from benchmarks.self_improve.components import _resolve_component_path, write_components_back
 
-    # Real gap, confirmed by review: write_components_back() only WARNS and
-    # skips an `optimized` pred_name it doesn't recognize (the right contract
-    # for its own direct callers/tests), but apply_and_open_pr() is the
-    # highest-stakes caller -- it commits (and can open a real PR for)
-    # whatever DID get written as if the whole `optimized` set were applied.
-    # A scope mismatch (e.g. applying a full-scope run's output against a
-    # scoped-down pilot components.yaml, per README's own documented
-    # pilot-then-full-run workflow) would otherwise commit a silently partial
-    # subset with no indication anything was dropped. Abort loudly here,
+    # write_components_back() only warns and skips an `optimized` pred_name
+    # it doesn't recognize, which is the right contract for its direct
+    # callers but not for this one: it commits (and can open a real PR for)
+    # whatever DID get written, as if the whole set had applied. A scope
+    # mismatch (a full-scope run's output against a scoped-down pilot
+    # components.yaml, per README's pilot-then-full-run workflow) would
+    # commit a partial subset with no sign anything was dropped. Abort
     # before any file is written.
     all_mapping = yaml.safe_load(Path(components_yaml_path).read_text()) or {}
     unknown = set(optimized) - set(all_mapping)
@@ -118,14 +116,11 @@ def apply_and_open_pr(
     # caller's `optimized` dict are keyed by pred_name "skills_tools_bash";
     # a bare filename stem would silently never match either).
     # Resolved the same way write_components_back() resolved them, so a
-    # components.yaml entry that would escape repo_root is rejected here too --
-    # restricted to pred_names actually in `optimized` (real bug, confirmed by
-    # review: resolving EVERY components.yaml entry here, including ones
-    # unrelated to this call, meant an unrelated escaping/invalid entry could
-    # raise AFTER write_components_back() already wrote the valid files above,
-    # leaving the working tree dirty with no branch/commit and the PR flow
-    # aborted -- entries write_components_back() never touches don't need to
-    # be (re-)validated here at all).
+    # components.yaml entry that would escape repo_root is rejected here too.
+    # Restricted to pred_names actually in `optimized`: resolving unrelated
+    # entries too would let one invalid entry raise AFTER
+    # write_components_back() had written the valid files, leaving a dirty
+    # tree with no branch or commit.
     path_to_pred_name = {
         _resolve_component_path(repo_root, rel_path): pred_name
         for pred_name, rel_path in all_mapping.items()

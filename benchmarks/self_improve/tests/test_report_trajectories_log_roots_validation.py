@@ -1,10 +1,7 @@
-"""report_trajectories.py main()'s --log-roots KEY=VALUE validation. Real
-bug, confirmed by review: an unrecognized or malformed token was previously
-silently absorbed and then silently never matched any of ingest_all's
-known-source checks -- a real run could believe a source was ingested when
-it was never attempted at all. Moved here from run_gepa.py, which no longer
-has a --log-roots flag at all (see polyglot_adapter.py's module docstring
-for why the frozen-historical-data path was replaced)."""
+"""report_trajectories.py main()'s --log-roots KEY=VALUE validation. Without
+it, an unrecognized or malformed token is absorbed silently and then matches
+none of ingest_all's known-source checks, so a run can believe it ingested a
+source it never attempted."""
 import sys
 from pathlib import Path
 
@@ -45,7 +42,7 @@ def test_main_accepts_known_log_roots_key(monkeypatch, capsys, tmp_path):
 
 
 def test_parse_log_roots_rejects_duplicate_key(tmp_path):
-    """Real bug, confirmed by review: a duplicate key silently overwrote the
+    """A duplicate key silently overwrote the
     earlier value with zero error, so requested data went missing from the
     report with no signal at all."""
     with pytest.raises(ValueError, match="duplicate key"):
@@ -70,7 +67,7 @@ def test_resolve_components_yaml_absolute_path_under_repo_root():
 
 
 def test_resolve_components_yaml_raises_a_clean_error_when_absolute_path_escapes_repo_root():
-    """Real bug, confirmed by review: an absolute --components-config
+    """An absolute --components-config
     outside --repo-root made Path.relative_to() raise an UNCAUGHT
     ValueError before the report ever started."""
     with pytest.raises(ValueError, match="outside --repo-root"):

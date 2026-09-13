@@ -172,13 +172,12 @@ def test_mark_spawn_pending_records_a_recent_timestamp_without_clobbering_other_
 
 
 def test_set_active_pid_clears_spawn_pending_at_on_both_the_pid_and_none_paths(source_repo, tmp_path):
-    """Real gap, confirmed by review: set_active_pid() never cleared
-    spawn_pending_at, so it stayed set from the very first exercise a
-    worktree ever ran and just kept aging -- gepa_scratch_gc.py's
-    spawn-pending check has no way to tell "still mid-spawn" apart from
-    "ran an exercise once, a while back" unless this call clears it every
-    time, on every path (both when a real pid gets recorded, and when it's
-    cleared back to None in live_eval.py's `finally` block)."""
+    """set_active_pid() must clear spawn_pending_at on every path -- both
+    when a real pid is recorded and when it's cleared back to None in
+    live_eval.py's `finally`. Left set, it persists from the first exercise
+    a worktree ever ran, and gepa_scratch_gc.py's spawn-pending check can no
+    longer tell "still mid-spawn" from "ran an exercise once, a while
+    back"."""
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
         marker_path = wt.path / SCRATCH_MARKER_NAME
         wt.mark_spawn_pending()
@@ -199,7 +198,7 @@ def test_set_active_pid_clears_spawn_pending_at_on_both_the_pid_and_none_paths(s
 
 
 def test_set_active_pid_does_not_follow_a_symlink_planted_at_the_marker_path(source_repo, tmp_path):
-    """Real security-relevant bug, confirmed by review: the marker file
+    """The marker file
     lives INSIDE the scratch worktree, which a live exercise subprocess (a
     bash-driven coding agent) has full write access to as its own cwd. A
     plain write_text() through that path would follow a symlink planted

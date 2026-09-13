@@ -41,7 +41,7 @@ def emit(obj):
 
 def _system_prompt_path_from_argv() -> str | None:
     """pi's real argv includes `--system-prompt <path>` whenever
-    rpc_client._build_system_prompt() resolved one (rpc_client.py:205) --
+    rpc_client._build_system_prompt() resolved one, and
     fake_pi.py is launched with the exact same argv via
     LITTLE_CODER_PI_BIN_OVERRIDE, so this is how a test can see what
     candidate text an agent invocation actually received."""
@@ -54,7 +54,7 @@ def _system_prompt_path_from_argv() -> str | None:
 def _write_solution_files():
     """FAKE_PI_WRITE_FILES: JSON {"relative/path.py": "base64 content", ...}.
     Writes each, relative to os.getcwd() (the exercise workdir -- PiRpc is
-    constructed with cwd=str(work), aider_polyglot.py:671-686), and emits a
+    constructed with cwd=str(work) by aider_polyglot.py), and emits a
     realistic tool_execution_start/end pair per file so tool_calls looks real."""
     raw = os.environ.get("FAKE_PI_WRITE_FILES")
     if not raw:
@@ -362,11 +362,9 @@ def main():
 
     if mode == "solve_from_env":
         # Writes FAKE_PI_WRITE_FILES unconditionally, then finishes cleanly.
-        # Exits promptly (no sleep(30)) -- these modes back a real
-        # subprocess-per-exercise e2e test that runs many times per test
-        # session, and a lingering sleep(30) child (harmless since
-        # PiRpc.close() kills it regardless, but needless) has no purpose
-        # here the way it does for the hang/crash regression fixtures above.
+        # Exits promptly, unlike the hang/crash fixtures above: this backs a
+        # real subprocess-per-exercise e2e test run many times per session,
+        # with no reason to leave a sleeping child behind each time.
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
         _write_solution_files()
@@ -420,9 +418,7 @@ def main():
     if mode == "read_system_prompt_echo":
         # Copies the system-prompt file's content to FAKE_PI_ECHO_FILE, so a
         # test can assert a candidate's proposed text actually reached the
-        # agent invocation -- the regression test for the exact bug this
-        # whole live-eval rewrite exists to fix (the old frozen-data design
-        # never let a candidate's text affect anything).
+        # agent invocation.
         echo_file = os.environ["FAKE_PI_ECHO_FILE"]
         system_prompt_path = _system_prompt_path_from_argv()
         with open(echo_file, "w") as fh:
@@ -453,13 +449,9 @@ def main():
 
     if mode == "emit_non_text_delta":
         # Regression fixture for PromptResult.non_text_deltas (rpc_client.py):
-        # emits a message_update whose assistantMessageEvent.type is NOT
-        # "text_delta" (a plausible stand-in for a reasoning/thinking-content
-        # delta -- NOT a confirmed real pi event name; static analysis of
-        # pi's own compiled types could not pin the exact string, see
-        # PromptResult.non_text_deltas' own docstring) before the normal
-        # text_delta, proving the capture mechanism itself works end to end
-        # without depending on knowing pi's real schema.
+        # a message_update whose assistantMessageEvent.type is NOT
+        # "text_delta" before the normal text_delta, so the capture
+        # mechanism is exercised end to end.
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
         emit({"type": "message_update",
@@ -489,9 +481,9 @@ def main():
     if mode == "emit_multi_thinking_delta":
         # Regression fixture for live_eval.py's
         # _reasoning_excerpt_from_trajectory(): emits several thinking_delta
-        # chunks (like a real reasoning stream, which arrives incrementally,
-        # not as one blob -- see the real 162-chunk trace this fixture is
-        # modeled on) interleaved with a tool call and text_delta content,
+        # chunks (a real reasoning stream arrives incrementally, in the
+        # hundreds, not as one blob) interleaved with a tool call and
+        # text_delta content,
         # then writes the real solution so the exercise actually passes.
         # Proves both that the chunks get concatenated IN ORDER and that
         # reasoning content never leaks into transcript_excerpt (which must

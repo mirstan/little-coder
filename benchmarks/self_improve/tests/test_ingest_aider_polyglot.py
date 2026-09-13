@@ -93,9 +93,9 @@ def test_load_maps_status_to_success_and_partial_score(aider_run):
 
 
 def test_load_pass_2_gets_partial_credit_score(tmp_path):
-    """A status of pass_2 (fixed on retry) scores 0.7, per the metric design
-    in the plan -- distinguishes a clean first-try pass from a
-    needed-a-nudge pass without conflating either with a hard failure."""
+    """A status of pass_2 (fixed on retry) scores 0.7 -- distinguishes a
+    clean first-try pass from a needed-a-nudge pass without conflating
+    either with a hard failure."""
     log_root = tmp_path / "logs"
     ex = log_root / "python" / "ex"
     ex.mkdir(parents=True)
@@ -118,9 +118,8 @@ def test_load_uses_stop_reason_2_when_present_else_stop_reason_1(aider_run):
 
 
 def test_load_components_used_degrades_gracefully_for_older_trajectories_without_notifications(aider_run):
-    """The gap this test used to lock in permanently is now closed upstream
-    (aider_polyglot.py's _dump_trajectory takes notifications=), but older
-    trajectory_*.json files written before that change have no
+    """aider_polyglot.py's _dump_trajectory persists notifications now, but
+    older trajectory_*.json files written before that have no
     "notifications" key at all -- must degrade to [], not KeyError."""
     for t in aider_polyglot_ingest.load(aider_run["log_root"], aider_run["results_json"]):
         assert t.components_used == []
@@ -219,7 +218,7 @@ def test_load_falls_back_to_old_stop_reason_fields_when_stop_reasons_absent(tmp_
     ("pass_10", 0.4),
 ])
 def test_load_generalizes_pass_n_scoring_beyond_pass_2(tmp_path, status, expected_score):
-    """Real bug, confirmed against dev's generalized --max-attempts: attempt
+    """attempt
     can now be pass_3, pass_4, ... for higher --max-attempts, not just
     pass_1/pass_2. A hardcoded 2-entry lookup silently treated any pass_3+
     as a FAILURE (score 0.0, success=False) -- scoring a genuine pass as a
@@ -239,7 +238,7 @@ def test_load_generalizes_pass_n_scoring_beyond_pass_2(tmp_path, status, expecte
 
 
 def test_load_picks_latest_attempt_by_numeric_not_lexicographic_order(tmp_path):
-    """Real bug, confirmed by review: sorting trajectory_*.json by filename
+    """Sorting trajectory_*.json by filename
     STRING put "trajectory_10" before "trajectory_2" (lexicographic), so
     with >=10 attempts the wrong (earlier) file supplied
     summarized_transcript/components_used/raw_paths for what should be the
@@ -259,7 +258,7 @@ def test_load_picks_latest_attempt_by_numeric_not_lexicographic_order(tmp_path):
 
 
 def test_load_components_used_is_union_across_all_attempts_not_just_latest(tmp_path):
-    """Real gap, confirmed by review: a skill injected on an earlier, failed
+    """A skill injected on an earlier, failed
     attempt but not re-triggered on the attempt that ultimately passed still
     genuinely influenced the outcome -- reading only the latest attempt's
     notifications silently lost that signal."""
@@ -287,7 +286,7 @@ def test_load_components_used_is_union_across_all_attempts_not_just_latest(tmp_p
 
 
 def test_load_resolves_knowledge_inject_usage_when_repo_root_given(tmp_path):
-    """Real bug, confirmed by review: knowledge-inject notification names are
+    """Knowledge-inject notification names are
     the topic FRONTMATTER FIELD (e.g. "Binary Search"), not a slug -- must
     resolve against the REAL skills/knowledge files via repo_root."""
     log_root = tmp_path / "logs"
@@ -308,7 +307,7 @@ def test_load_resolves_knowledge_inject_usage_when_repo_root_given(tmp_path):
 
 
 def test_load_skips_exercise_key_that_would_escape_log_root(tmp_path):
-    """Real bug (hardening), confirmed by review: a corrupted/malicious
+    """A corrupted/malicious
     "lang/exercise" key containing ".." would otherwise let ex_dir escape
     log_root entirely. results_full_polyglot.json is repo-controlled data
     today, but this is cheap to validate regardless."""

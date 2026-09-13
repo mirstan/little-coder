@@ -122,7 +122,7 @@ def test_find_does_not_auto_remove_prunable_gone_worktree_without_scratch_root(s
 def test_find_does_not_auto_remove_prunable_gone_worktree_with_a_mismatched_name(
     source_repo, tmp_path,
 ):
-    """Real gap, confirmed by review: path containment under a caller-given
+    """Path containment under a caller-given
     --scratch-root is NOT ownership evidence on its own -- an unrelated
     tool's own detached worktree could happen to live under the same
     directory (a shared tmp root, say). Simulate that by creating a
@@ -182,7 +182,7 @@ def test_find_marks_worktree_removable_when_both_pid_and_active_pid_dead(source_
 
 
 def test_find_withholds_removal_while_spawn_pending_at_is_present(source_repo, tmp_path):
-    """Real TOCTOU gap, confirmed by review: PolyglotLiveRunner writes
+    """PolyglotLiveRunner writes
     spawn_pending_at (via mark_spawn_pending()) BEFORE subprocess.Popen(),
     then set_active_pid(proc.pid) only AFTER Popen() returns. A SIGKILL in
     that exact window leaves pid/active_pid both dead but spawn_pending_at
@@ -209,9 +209,8 @@ def test_find_withholds_removal_even_when_spawn_pending_at_is_very_old(source_re
     finally-clause None-cleared path in PolyglotLiveRunner) now always
     clears spawn_pending_at -- so a spawn_pending_at that is still present,
     no matter how old, can only mean the orchestrator crashed before ever
-    reaching that call. There is no time-based expiry back to "orphaned":
-    real gap, confirmed by review, in a previous version of this check that
-    trusted mere elapsed time as evidence of nothing having gone wrong."""
+    reaching that call. There is deliberately no time-based expiry back to
+    "orphaned": elapsed time is not evidence that nothing went wrong."""
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
         scratch_path = wt.path
     marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
@@ -312,7 +311,7 @@ def test_cli_clean_older_than_hours_filters_out_recent_orphans(source_repo, tmp_
 
 
 def test_cli_clean_does_not_prune_prunable_entries_outside_its_own_scratch_root(source_repo, tmp_path):
-    """Real bug, confirmed by review: an unconditional repo-wide `git
+    """An unconditional repo-wide `git
     worktree prune` after a scoped --clean would also deregister OTHER
     prunable worktrees never selected by this invocation's own filters,
     silently expanding a scoped cleanup into a repo-wide one."""
@@ -339,7 +338,7 @@ def test_cli_clean_does_not_prune_prunable_entries_outside_its_own_scratch_root(
         assert str(target_path) not in result.stdout  # the one we asked to clean
         assert str(untouched_path) in result.stdout  # outside scope -- must survive
     finally:
-        # Real leak, confirmed by review: an assertion failure above used to
+        # an assertion failure above used to
         # skip this cleanup entirely, leaking other_root (a sibling of the
         # pytest-managed tmp_path, so not auto-removed by pytest itself).
         subprocess.run(["git", "worktree", "prune"], cwd=source_repo, check=True)

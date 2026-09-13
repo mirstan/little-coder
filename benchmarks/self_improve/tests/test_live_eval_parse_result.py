@@ -20,7 +20,7 @@ def _write_results(results_file, results_key, record):
 
 
 def test_parse_result_caps_cumulative_self_reported_lessons_length(tmp_path):
-    """Real gap, confirmed by review: each individual LESSON: line is capped
+    """Each individual LESSON: line is capped
     at aider_polyglot.py's own LESSON_MAX_CHARS (500) when extracted, but
     with --max-attempts set high the cumulative joined text this adapter
     passes into GEPA reflection feedback had no overall cap -- a long chain

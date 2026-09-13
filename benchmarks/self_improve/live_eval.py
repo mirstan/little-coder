@@ -35,43 +35,26 @@ from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
 
-#: Mirrors aider_polyglot.py's own _ATTEMPT_TIMEOUT_S_DEFAULT -- read
-#: directly out of THAT module's own source text via regex, not a
-#: duplicated bare literal here, so the two can never silently drift apart
-#: the way this harness-level default already did once: it was still 900
-#: when aider_polyglot.py's own default was tripled to 2700 for a local
-#: reasoning model, meaning the OUTER subprocess timeout below would have
-#: fired and killed the exercise via SIGTERM/SIGKILL before even ONE inner
-#: attempt's own (now longer) budget had a chance to time out gracefully --
-#: turning a clean, correctly-classified fail_timeout into an abrupt
-#: harness_error instead.
+#: Mirrors aider_polyglot.py's own _ATTEMPT_TIMEOUT_S_DEFAULT rather than
+#: duplicating the literal: the two already drifted once (900 here vs 2700
+#: there), which would have let the OUTER subprocess timeout below SIGKILL
+#: an exercise before even one inner attempt's own budget expired --
+#: turning a clean fail_timeout into an abrupt harness_error.
 #:
-#: Regex-extracted rather than imported -- two real gaps, confirmed by
-#: review, with an actual `import benchmarks.aider_polyglot`:
-#: 1. A plain `import` executes that module's ENTIRE top level, including
-#:    `CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)` --
-#:    which raises SystemExit on a malformed CODEX_TIMEOUT_S even though
-#:    this module never uses CODEX_TIMEOUT_S at all, crashing e.g. the
-#:    free --estimate-only path (which spawns no subprocess) over an
-#:    unrelated, unused env var.
-#: 2. It reads the SOURCE checkout's copy at THIS process' import time --
-#:    but a PolyglotLiveRunner's actual subprocess runs the WORKTREE's
-#:    pinned base_commit copy, which can differ (an uncommitted local edit
-#:    to aider_polyglot.py itself, mid-development on the harness while a
-#:    live run is in progress). Computing the outer per-exercise timeout
-#:    from the wrong copy's default could make it shorter than the pinned
-#:    copy's actual per-attempt budget, killing the child before its own
-#:    (longer) timeout fires gracefully.
-#: One regex-based reader (_attempt_timeout_default_from_source) fixes
-#: both: it never executes the file (no CODEX_TIMEOUT_S side effect), and
-#: PolyglotLiveRunner.__init__ below calls it against `worktree.path`
-#: specifically, not the source checkout, so the value actually used
-#: always matches what will actually execute. `_ATTEMPT_TIMEOUT_S_DEFAULT`
-#: itself (the source-checkout read, computed once below) remains only as
-#: the --estimate-only / no-worktree fallback and this function's own
-#: default argument. Mirrors components.py's own _TOKEN_COST_LINE_RE
-#: precedent for reading a single declared value out of a companion file
-#: without executing it.
+#: Read by regex rather than `import benchmarks.aider_polyglot` because an
+#: import would:
+#: 1. execute that module's whole top level, including
+#:    `CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)`, which
+#:    raises SystemExit on a malformed CODEX_TIMEOUT_S this module never
+#:    uses -- crashing even the subprocess-free --estimate-only path.
+#: 2. read the SOURCE checkout at this process' import time, while the
+#:    subprocess runs the WORKTREE's pinned base_commit copy; under an
+#:    uncommitted local edit to aider_polyglot.py the two differ, and the
+#:    outer timeout could come out shorter than the pinned copy's actual
+#:    per-attempt budget.
+#: PolyglotLiveRunner.__init__ therefore calls the reader against
+#: `worktree.path`; _ATTEMPT_TIMEOUT_S_DEFAULT (the source-checkout read
+#: below) is only the --estimate-only / no-worktree fallback.
 _ATTEMPT_TIMEOUT_S_DEFAULT_RE = re.compile(r"(?m)^_ATTEMPT_TIMEOUT_S_DEFAULT = (\d+)$")
 #: Last-resort fallback if even the source checkout's own aider_polyglot.py
 #: can't be read/parsed (should not happen in a working checkout) -- a
@@ -85,24 +68,15 @@ def _attempt_timeout_default_from_source(aider_polyglot_py_path: Path) -> int:
     constant from the given copy's file TEXT -- never imports/executes it
     (see the module-level comment above for why). Never raises.
 
-    Real gap, confirmed by review: an earlier version fell back to
-    _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK with NO warning whenever the
-    regex failed to match -- e.g. a benign reformat of aider_polyglot.py
-    (a type annotation, `= 2_700` with an underscore, a trailing comment,
-    changed spacing) would silently stop matching and this would keep
-    returning 2700 with no signal anything had gone wrong, reintroducing
-    exactly the silent-drift failure this whole mechanism exists to
-    prevent. Still never RAISES (this is a budget estimate, not a
-    correctness-critical read -- see the module-level comment), but now
-    always logs so a real drift is at least detectable instead of silent.
+    A benign reformat over there (`= 2_700`, a type annotation, a trailing
+    comment) stops the regex matching, which would silently reintroduce
+    exactly the drift this mechanism exists to prevent -- hence the warning
+    on every fallback. Still doesn't raise: this feeds a budget estimate,
+    not a correctness-critical read.
 
-    Real gap, confirmed by review: UnicodeDecodeError is NOT an OSError
-    subclass (it's a ValueError) -- on a non-UTF-8 locale/file, a bare
-    `except OSError` would let it propagate straight out of this function,
-    aborting live_eval's own module import (this function is called once
-    at module level to compute _ATTEMPT_TIMEOUT_S_DEFAULT) before even
-    --estimate-only could run. Same class of bug build_knowledge_topic_index
-    already guards against for the same reason."""
+    UnicodeDecodeError is a ValueError, not an OSError, so a bare
+    `except OSError` would let a non-UTF-8 file abort live_eval's own
+    module import (this runs at module level)."""
     try:
         text = aider_polyglot_py_path.read_text()
     except (OSError, UnicodeDecodeError) as e:
@@ -131,16 +105,10 @@ _ATTEMPT_TIMEOUT_S_DEFAULT = _attempt_timeout_default_from_source(
 
 
 def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
-    """Real gap, confirmed by review: a malformed or non-positive
-    ATTEMPT_TIMEOUT_S used to be silently swallowed here and replaced with
-    the default, computing a per_exercise_timeout_s estimate as if the run
-    would proceed normally -- but aider_polyglot.py's own
-    _positive_int_env() raises SystemExit on the exact same malformed/
-    non-positive value, so the actual subprocess would crash at import
-    time instead. Mirror that same validate-and-raise contract here so an
-    orchestrator-side budget estimate can never be computed against a
-    value that's actually going to blow up the exercise it's estimating
-    for.
+    """Mirrors aider_polyglot.py's own _positive_int_env() validate-and-raise
+    contract: a malformed or non-positive ATTEMPT_TIMEOUT_S crashes the
+    subprocess at import time, so falling back to the default here would
+    compute a budget estimate for an exercise that is going to blow up.
 
     `default` lets a caller with a specific worktree in hand (see
     _attempt_timeout_default_from_source()) pass that worktree's own
@@ -160,11 +128,10 @@ def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
-#: Reasoning traces run long (a single real bowling attempt hit the 200-entry
-#: non_text_deltas cap in aider_polyglot.py's own trajectory dump, almost
-#: all of it thinking_delta) -- tail-truncate like transcript_excerpt so the
-#: reflection prompt sees the model's LATEST reasoning, not its opening
-#: thoughts truncated mid-sentence.
+#: Reasoning traces run long (one real bowling attempt filled the 200-entry
+#: non_text_deltas cap in aider_polyglot.py's trajectory dump, nearly all
+#: thinking_delta) -- truncated from the TAIL so reflection sees the
+#: model's latest reasoning, not its opening thoughts.
 _MAX_REASONING_CHARS = 4_000
 _ATTEMPT_NUM_RE = re.compile(r"_(\d+)$")
 
@@ -173,15 +140,12 @@ def _reasoning_excerpt_from_trajectory(traj_data: Mapping) -> str:
     """Reconstructs the model's reasoning stream from non_text_deltas the
     same way rpc_client.py's own prompt_and_collect() builds assistant_text
     from text_delta: concatenate each thinking_delta's "delta" field in
-    order. Confirmed against a real gepa.optimize() run (2026-09-06,
-    omlx/tiel-coder-oq4e, thinking=high) that "thinking_delta" is pi's real
-    event type for this -- previously only a guessed stand-in (see
-    PromptResult.non_text_deltas' own docstring in rpc_client.py).
+    order. "thinking_delta" is confirmed to be pi's real event type here,
+    against a live run with thinking=high.
 
-    Entries can be non-dict here: aider_polyglot.py's _dump_trajectory._clip
+    Entries can be non-dict: aider_polyglot.py's _dump_trajectory._clip
     falls back to a truncated JSON string for any single delta that
-    serializes past TRAJECTORY_FIELD_CHARS -- skip those defensively rather
-    than crash on a malformed cache/trajectory entry."""
+    serializes past TRAJECTORY_FIELD_CHARS."""
     chunks = [
         d.get("delta", "")
         for d in traj_data.get("non_text_deltas", [])
@@ -202,8 +166,7 @@ def _strip_leading_frontmatter_block(text: str) -> tuple[str, bool]:
     body text -- reattach_frontmatter() would then concatenate a SECOND
     header after the real one, and skill-inject's parseSkillFile() finds no
     target_tool, silently killing injection for every subsequent candidate
-    while scores just look uniformly bad. Confirmed non-obvious failure mode
-    from planning -- see the live-eval plan doc.
+    while scores just look uniformly bad.
 
     Reuses components.split_frontmatter (same delimiter, same windowing) so
     the two frontmatter-stripping implementations can't drift apart."""
@@ -313,12 +276,10 @@ class PolyglotLiveRunner:
         # _attempt_timeout_s() above) + 90s test budget, times max_attempts,
         # plus headroom -- a belt-and-braces ceiling ABOVE aider_polyglot's
         # own per-attempt budget so a wedged pi session can't stall a run
-        # indefinitely. Default sourced from THIS worktree's own pinned
-        # copy (_attempt_timeout_default_from_source), not the source
-        # checkout's -- real gap, confirmed by review: the two can diverge
-        # under an uncommitted local edit to aider_polyglot.py itself, and
-        # using the wrong one here could compute an outer timeout shorter
-        # than the pinned copy's actual per-attempt budget.
+        # indefinitely. Default read from THIS worktree's pinned copy, not
+        # the source checkout's: an uncommitted local edit makes them
+        # diverge, and the source's value could yield an outer timeout
+        # shorter than the pinned copy's own per-attempt budget.
         worktree_default = _attempt_timeout_default_from_source(
             worktree.path / "benchmarks" / "aider_polyglot.py"
         )
@@ -341,34 +302,22 @@ class PolyglotLiveRunner:
         harness bugfix can't let a stale cache entry poison a later
         comparison.
 
-        aider_polyglot.py/rpc_client.py are hashed from the WORKTREE copy
-        (pinned at base_commit, which is itself already part of this
-        config), not the source repo -- they run as a SUBPROCESS inside the
-        scratch worktree (see this module's own docstring), so that copy is
-        exactly what executes; hashing the source would make an uncommitted
-        debug edit or a branch switch in the source checkout change the
-        cache key without changing a single byte of what actually executes,
-        causing spurious re-runs of already-cached (and possibly still
-        in-flight) work.
+        Each file is hashed from whichever copy actually executes, which
+        differs by file:
 
-        aider_polyglot_ingest.py/components.py/this module itself are the
-        OPPOSITE case, hashed from the module `__file__` this SAME (parent,
-        orchestrator) process actually imported -- confirmed real gap by
-        review: pass_n_score() and write_components_back() run here, in the
-        parent process (imported at the top of this module), never inside
-        the scratch worktree at all, so hashing the worktree's copy of them
-        (as an earlier version of this property did) couldn't detect an
-        uncommitted retune of e.g. _COMPACTION_PENALTY or
-        _estimate_token_cost -- LiveResultCache would keep serving scores
-        computed under the old formula even though the orchestrator's own
-        process had already picked up the edit. This module's own
-        `__file__` is included for the identical reason, confirmed real
-        gap by a second review round: _parse_result() below (the
-        self_reported_lessons cap, pass_n_score() call site, etc.) also
-        runs here in the parent process -- an uncommitted edit to this
-        module's own processing logic used to leave a persistent cache
-        entry computed under the OLD logic being served forever, since
-        nothing in run_config depended on this file's own content."""
+        aider_polyglot.py/rpc_client.py run as a SUBPROCESS inside the
+        scratch worktree, so the worktree's pinned copy is hashed. Hashing
+        the source repo instead would let an uncommitted debug edit or a
+        branch switch there change the cache key without changing a byte of
+        what executes, spuriously re-running already-cached work.
+
+        aider_polyglot_ingest.py/components.py/this module run in the
+        parent orchestrator process (imported at the top of this file), so
+        the `__file__` this process imported is hashed. Hashing the
+        worktree's copy would miss an uncommitted retune of e.g.
+        _COMPACTION_PENALTY, _estimate_token_cost, or _parse_result's own
+        scoring logic, and LiveResultCache would keep serving scores
+        computed under the superseded formula."""
         worktree_executed_files = [
             self.worktree.path / "benchmarks" / "aider_polyglot.py",
             self.worktree.path / "benchmarks" / "rpc_client.py",
@@ -580,10 +529,9 @@ class PolyglotLiveRunner:
         that. start_new_session=True (in _run_one_uncached) makes this
         process its own session AND process group leader, so its pgid is
         exactly proc.pid at creation time -- used directly here rather than
-        looked up via os.getpgid(proc.pid), which can raise ProcessLookupError
-        (and previously caused this whole method to give up) once the direct
-        child has exited even while its process group still has live
-        descendants to reach.
+        looked up via os.getpgid(proc.pid), which raises ProcessLookupError
+        once the direct child has exited even while its process group still
+        has live descendants to reach.
 
         Escalation to SIGKILL is decided from the GROUP's own liveness, not
         proc.wait()'s return: if the direct child exits quickly but a
@@ -641,13 +589,10 @@ class PolyglotLiveRunner:
         success, score = pass_n_score(status, compaction_events=compaction_total) or (False, 0.0)
         stop_reasons = record.get("stop_reasons") or []
         # aider_polyglot.py caps each individual LESSON: line at
-        # LESSON_MAX_CHARS (500) when extracting it, but that's per-attempt --
-        # with --max-attempts set high, the cumulative joined text this
-        # adapter later inserts into GEPA reflection feedback (see
-        # polyglot_adapter.py) had no overall cap. Real gap, confirmed by
-        # review: one evaluated agent's chain of long lessons could still
-        # overflow reflection context or inflate cost. Capped here at the
-        # same budget other reflection-bound fields already use.
+        # LESSON_MAX_CHARS (500) when extracting it, but that's per-attempt:
+        # with --max-attempts set high, the joined text polyglot_adapter.py
+        # inserts into GEPA reflection feedback is otherwise unbounded.
+        # Capped at the same budget other reflection-bound fields use.
         raw_lessons = record.get("lessons")
         self_reported_lessons: list = []
         if isinstance(raw_lessons, list):
@@ -717,9 +662,7 @@ class PolyglotLiveRunner:
         )
 
     def _compute_diff(self, spec: ExerciseSpec, workdir: Path) -> str:
-        """Real diff between the agent's actual code and the pristine stub
-        -- the single most useful thing a reflection LM can see, per the
-        live-eval plan doc.
+        """Real diff between the agent's actual code and the pristine stub.
 
         Python-only: for any other --language this silently returns "" (the
         reflection LM just never sees a diff block for that exercise) rather

@@ -138,21 +138,18 @@ def test_non_text_deltas_are_captured_separately_from_assistant_text(fake_pi, tm
 
 
 def test_non_text_deltas_are_bounded_during_collection(fake_pi, tmp_path, monkeypatch):
-    """Real gap, confirmed by review: PromptResult.non_text_deltas grew
-    unbounded in memory for the entire attempt -- only ever capped AFTER
-    the fact, at persist time, by aider_polyglot.py's own
-    _cap_non_text_deltas(). A pathological reasoning stream emitting more
-    than rpc_client._MAX_NON_TEXT_DELTAS events must not grow the
-    in-memory list past that backstop.
+    """A pathological reasoning stream emitting more than
+    rpc_client._MAX_NON_TEXT_DELTAS events must not grow
+    PromptResult.non_text_deltas past that in-memory backstop, which is
+    otherwise only enforced at persist time by aider_polyglot.py's
+    _cap_non_text_deltas().
 
-    Second real gap, confirmed by review: a naive head-only cap ("stop
-    appending past the limit") silently discarded every delta past the
-    cap forever, including the true END of the stream -- exactly what
-    downstream head+tail trimming (aider_polyglot.py's
-    _cap_non_text_deltas(), live_eval.py's reasoning excerpt) needs most
-    from a pathological run long enough to hit this backstop. The fixed
-    head (_NON_TEXT_DELTA_HEAD_KEEP) plus rolling tail must retain BOTH
-    the opening and the true end, not just the opening."""
+    The fixed head (_NON_TEXT_DELTA_HEAD_KEEP) plus rolling tail must
+    retain BOTH the opening and the true end. A head-only cap would
+    discard everything past the limit, including the end of the stream --
+    exactly what downstream head+tail trimming (_cap_non_text_deltas(),
+    live_eval.py's reasoning excerpt) needs most from a run long enough to
+    hit this backstop."""
     count = rpc_client._MAX_NON_TEXT_DELTAS + 50
     monkeypatch.setenv("FAKE_PI_NON_TEXT_DELTA_COUNT", str(count))
     with fake_pi("emit_more_than_max_non_text_deltas", tmp_path) as rpc:

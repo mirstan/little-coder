@@ -56,35 +56,27 @@ RUN_ID = f"{datetime.datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
 TRAJECTORY_TEXT_CHARS = 200_000
 TRAJECTORY_FIELD_CHARS = 20_000
 #: Combined raw-size budget for non_text_deltas, split between a head slice
-#: and a tail slice (see _cap_non_text_deltas) -- see that function's
-#: docstring for why a flat "first N entries" cutoff was wrong.
+#: and a tail slice (see _cap_non_text_deltas).
 TRAJECTORY_NON_TEXT_DELTA_CHARS = 200_000
 #: Give up if this many exercises fail in a row -- a broken environment,
 #: not broken exercises.
 MAX_CONSECUTIVE_ERRORS = 3
 #: Retry-prompt convention for a between-attempt self-reflection (Reflexion-
 #: style: the agent reflects on why THIS attempt failed before the next one
-#: begins). Mirrors gaia_scorer.py's own proven `Answer:` line convention
-#: (re.match(r"(?i)^(?:final\s+answer|answer)\s*[:\-]\s*(.+)$", s)) rather
+#: begins). Follows gaia_scorer.py's own `Answer:` line convention rather
 #: than inventing a new extraction style. Deliberately supplementary, not
 #: required -- a missing LESSON: line just means no lesson was captured for
 #: that attempt, never a harness error.
-#: \** immediately after the colon (no \s* before it) absorbs a closing
-#: bold marker directly wrapping the label (e.g. "**LESSON:** text") --
-#: the leading strip below handles decoration BEFORE "lesson", this
-#: handles decoration immediately after the colon. Real gap, confirmed by
-#: review (cubic): a \s* between the colon and \** would ALSO swallow the
-#: content's own opening bold if the lesson text itself starts with one
-#: (e.g. "LESSON: **Refactor X** now" -> captured "Refactor X** now",
-#: losing the opening marker) -- anchoring \** immediately post-colon
-#: only matches when there's no space before it, i.e. only the label's
-#: own wrapper, never the content's.
+#: \** sits immediately after the colon, with no \s* before it, so it
+#: absorbs only a closing bold marker wrapping the label ("**LESSON:**
+#: text"); the leading strip below handles decoration before "lesson".
+#: Allowing a space first would also swallow the content's own opening
+#: bold ("LESSON: **Refactor X** now" -> "Refactor X** now").
 _LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\**\s*(.+)$")
-#: Real gap, confirmed by review: every other free-text field on this path
-#: is capped (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpt truncations)
-#: except this one -- r.assistant_text is raw model output (on the codex
-#: path, the entire stdout file), and the matched line was stored verbatim
-#: into results.json and joined verbatim into the reflection LM prompt.
+#: The matched line is raw model output (on the codex path, drawn from the
+#: entire stdout file) and lands verbatim in results.json and the reflection
+#: LM prompt, so it needs the same cap every other free-text field on this
+#: path already has (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpts).
 LESSON_MAX_CHARS = 500
 
 
@@ -309,14 +301,12 @@ def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DE
     rather than truncating the whole tail at that point, so smaller,
     genuinely-recent entries on either side of it still survive.
 
-    The previous policy -- keep the first 200 entries, full stop -- silently
-    dropped the END of a long reasoning stream. Confirmed against a real
-    live run (a ~13min bowling attempt hit exactly the 200-entry cap, almost
-    all thinking_delta): live_eval.py's own _reasoning_excerpt_from_trajectory
-    tail-truncates whatever survives here, on the assumption it's getting
-    the model's LATEST reasoning -- but with a first-N cutoff, "whatever
-    survives" was already truncated to the OLDEST content, so that downstream
-    tail-truncation was operating on the wrong end entirely.
+    The tail matters because live_eval.py's
+    _reasoning_excerpt_from_trajectory tail-truncates whatever survives here,
+    assuming it is the model's LATEST reasoning; a head-only cutoff would
+    hand it the oldest content instead. Long streams really do hit this: a
+    ~13min bowling attempt filled an earlier 200-entry cap, almost all
+    thinking_delta.
 
     A char budget (not a flat entry count) also keeps output size bounded
     regardless of entry size: a handful of toolcall_* deltas (each carrying
@@ -341,13 +331,11 @@ def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DE
         used += sizes[head_end]
         head_end += 1
 
-    # Real gap, confirmed by review: walking backward and stopping at the
-    # FIRST entry that doesn't fit (e.g. a toolcall_delta carrying a full
-    # "partial" state dump, dwarfing the small thinking_delta chunks around
-    # it) discarded every smaller, budget-fitting entry further back too --
-    # even genuinely recent reasoning sitting right before it. Skip an
-    # entry that doesn't fit and keep scanning backward instead of giving
-    # up on the whole tail.
+    # Keeps scanning backward past an entry that doesn't fit rather than
+    # stopping there: one oversized delta (a toolcall_delta carrying a full
+    # "partial" state dump dwarfs the small thinking_delta chunks around it)
+    # would otherwise discard every smaller, budget-fitting entry behind it,
+    # including genuinely recent reasoning.
     tail = []
     used = 0
     for i in range(len(deltas) - 1, head_end - 1, -1):
@@ -415,8 +403,7 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
             # "text_delta" -- confirmed to be real reasoning/thinking content
             # (thinking_delta, mostly) for a thinking-enabled model, plus
             # toolcall_*/text_start/text_end bracketing events. Head+tail
-            # capped by _cap_non_text_deltas (see its docstring for why a
-            # flat first-N cutoff was wrong), then each surviving entry
+            # capped by _cap_non_text_deltas, then each surviving entry
             # clipped to TRAJECTORY_FIELD_CHARS, same policy as tool_calls.
             "non_text_deltas": [
                 _clip(d, TRAJECTORY_FIELD_CHARS)
@@ -980,22 +967,16 @@ def _run_exercise(
             compaction_total += getattr(r, "compaction_events", 0) or 0
             # Only an attempt whose prompt actually asked for one can have a
             # LESSON: line, and the ask lives in the retry prompt built at the
-            # BOTTOM of this loop -- so it reaches attempts 2..N and never
-            # attempt 1. Real gap, confirmed by review: that was previously
-            # just a consequence of where the ask lives, not an enforced
-            # guarantee -- assistant_text on attempt 1 includes ALL of the
-            # model's text, so an unrelated but coincidentally-matching line
-            # (e.g. a `# LESSON: ...` code comment) would still get picked
-            # up and fed into reflection as if it were a genuine
-            # self-reflection. Gate extraction to i > 1 explicitly rather
-            # than relying on the model never happening to emit a matching
-            # line unprompted. First match only -- one lesson per attempt,
-            # not one per mention.
+            # Gated on i > 1 explicitly, not just by where the retry prompt
+            # asking for a LESSON: line happens to live: attempt 1's
+            # assistant_text is all of the model's unprompted output, where a
+            # coincidental match (a `# LESSON: ...` code comment) would be
+            # fed to reflection as a genuine self-reflection. First match
+            # only -- one lesson per attempt, not one per mention.
             for line in (getattr(r, "assistant_text", "") or "").splitlines():
-                # Strip common markdown decoration (bullets, headings, bold,
-                # blockquote) a model might wrap the line in -- real gap,
-                # confirmed by review: "**LESSON:** ...", "- LESSON: ...",
-                # "## LESSON: ..." all silently matched nothing before this.
+                # Strip leading markdown decoration a model may wrap the line
+                # in: "**LESSON:** ...", "- LESSON: ...", "## LESSON: ..."
+                # otherwise match nothing.
                 stripped = re.sub(r"^[\s>#*\-]+", "", line.strip()) if i > 1 else ""
                 m = _LESSON_RE.match(stripped)
                 if m:

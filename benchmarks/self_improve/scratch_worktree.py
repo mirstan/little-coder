@@ -1,7 +1,7 @@
 """Disposable git worktree for live candidate evaluation.
 
 benchmarks/rpc_client.py binds REPO_ROOT = Path(__file__).parent.parent at
-IMPORT time (rpc_client.py:29), and .pi/extensions/skill-inject/index.ts
+IMPORT time, and .pi/extensions/skill-inject/index.ts
 resolves skills/tools from its own import.meta.url. Both mean the ONLY way
 to make a candidate's proposed text reach a live agent is to run the harness
 as a SUBPROCESS from a tree whose files are the candidate's -- pointing
@@ -18,12 +18,11 @@ Design choices, all deliberate:
   run against a repo that has several other real worktrees checked out --
   the GC utility must never touch anything without this marker present.
 - The pi binary is resolved to an ABSOLUTE path once and handed to the
-  worktree via LITTLE_CODER_PI_BIN_OVERRIDE (rpc_client.py:41-50 already
-  resolves this override to absolute at import time specifically so it
-  survives being handed to a subprocess with an arbitrary cwd) -- symlinking
-  node_modules into the scratch tree was considered and rejected: it's
-  gitignored, so a bare `git clean -fdx` during reset() would delete it,
-  and the symlink itself would show up as an untracked entry complicating
+  worktree via LITTLE_CODER_PI_BIN_OVERRIDE (rpc_client.py already resolves
+  that override to absolute at import time, so it survives being handed to
+  a subprocess with an arbitrary cwd). Symlinking node_modules into the
+  scratch tree instead would be deleted by reset()'s own `git clean -fdx`
+  (it's gitignored) and show up as an untracked entry complicating
   `worktree remove`.
 """
 from __future__ import annotations
@@ -169,18 +168,12 @@ class ScratchWorktree:
     def set_active_pid(self, pid: int | None) -> None:
         """Record (or clear) the pid of the exercise subprocess currently
         running against this worktree, in the marker file. Also clears
-        spawn_pending_at (see mark_spawn_pending()) -- real gap, confirmed
-        by review: it never did, so every worktree that had ever run even
-        one exercise carried a permanently stale spawn_pending_at for the
-        rest of its life. That's what let gepa_scratch_gc.py's grace-window
-        check silently do the wrong thing (see _SPAWN_GRACE_SECONDS's own
-        comment): the window it actually needs to protect is "between
-        mark_spawn_pending() and this call finishing", not "since the very
-        first exercise this worktree ever ran". Called from every reachable
-        path after mark_spawn_pending() (a `finally`, per live_eval.py), so
-        after this fix spawn_pending_at can only still be set if the
-        orchestrator died before ever reaching here at all -- exactly the
-        crash window this mechanism exists to protect.
+        spawn_pending_at, which gepa_scratch_gc.py treats as permanent
+        proof of a crash mid-spawn: without the clear, every worktree that
+        had ever run one exercise would carry it forever. live_eval.py calls
+        this from a `finally` on every path after mark_spawn_pending(), so a
+        still-set spawn_pending_at can only mean the orchestrator died
+        before reaching here.
 
         Without active_pid tracking at all, gepa_scratch_gc.py can only see
         the ORCHESTRATOR's own pid (the "pid" field, set once at creation)
@@ -203,7 +196,7 @@ class ScratchWorktree:
 
     def reset(self) -> None:
         """Hard-reset to base_commit and remove every untracked file except
-        the node_modules symlink and the scratch marker. Idempotent -- safe
+        node_modules and the scratch marker. Idempotent -- safe
         to call before every single candidate evaluation, including the
         first (a plain `git reset --hard` on an already-clean detached-HEAD
         checkout is a no-op)."""

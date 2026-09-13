@@ -20,7 +20,7 @@ def test_resolve_contained_path_rejects_absolute_path_outside_base(tmp_path):
 
 
 def test_resolve_contained_path_rejects_absolute_path_even_when_it_resolves_inside_base(tmp_path):
-    """Real bug, confirmed by review: an absolute rel_path that HAPPENS to
+    """An absolute rel_path that HAPPENS to
     point inside base used to be accepted, even though a caller building a
     second path from the same (base, rel_path) inputs differently (e.g.
     separate path components instead of one combined string) can resolve

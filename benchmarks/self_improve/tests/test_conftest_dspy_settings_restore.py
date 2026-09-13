@@ -1,7 +1,6 @@
 """Directly drives conftest.py's autouse _restore_dspy_settings fixture to
 confirm it actually snapshots and restores dspy.settings' backing dict,
-rather than trusting yield-based teardown blindly. Real gap, confirmed by
-review: dspy.settings is a process-wide singleton, and every test that
+rather than trusting yield-based teardown blindly. dspy.settings is a process-wide singleton, and every test that
 reaches _real_run()'s dspy.settings.configure(lm=DummyLM(...)) call
 permanently left the global LM as DummyLM for the rest of the pytest
 session with no fixture undoing it."""
@@ -26,7 +25,7 @@ def test_restore_dspy_settings_fixture_restores_prior_state():
 
 
 def test_restore_dspy_settings_fixture_undoes_in_place_mutation_of_nested_values():
-    """Real follow-up gap, confirmed by review: a shallow dict() copy shares
+    """A shallow dict() copy shares
     references to nested mutable values -- dspy.settings.trace is a list
     DSPy mutates in-place (append) during a real forward pass, not by
     reassignment, so clear()+update() with a shallow snapshot would restore

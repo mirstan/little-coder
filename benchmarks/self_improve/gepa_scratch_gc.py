@@ -3,8 +3,8 @@ SIGKILLed live-eval run.
 
 Never touches anything without scratch_worktree.SCRATCH_MARKER_NAME present
 and a matching flag inside it -- that's what makes this safe to run against
-a repo with several other real worktrees checked out (this repo currently
-has ~10). A branch-having (non-detached) worktree is never even considered,
+a repo with several other real worktrees checked out. A branch-having
+(non-detached) worktree is never even considered,
 regardless of marker content: scratch worktrees are always created detached
 (scratch_worktree.py), so a branch means "not ours."
 
@@ -28,34 +28,10 @@ from typing import Optional
 from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, prune_stale
 
 #: scratch_worktree.py's own real naming scheme: f"gepa-scratch-{pid}-{uuid4().hex[:8]}".
-#: Used as a second piece of evidence (alongside --scratch-root containment)
-#: before trusting a directory-gone-but-prunable entry as ours -- containment
-#: under a caller-given --scratch-root is not ownership proof by itself (an
-#: unrelated tool's own detached worktree could happen to live under the same
-#: shared directory), but the two together make a coincidental match
-#: practically impossible, while still letting the tool's actual, common
-#: purpose -- cleaning up ITS OWN crashed scratch checkouts -- keep working.
+#: Second piece of evidence, alongside --scratch-root containment, before
+#: trusting a directory-gone-but-prunable entry as ours (see
+#: find_scratch_worktrees).
 _SCRATCH_DIR_NAME_RE = re.compile(r"^gepa-scratch-\d+-[0-9a-f]{8}$")
-
-#: A lingering spawn_pending_at (written by PolyglotLiveRunner.mark_spawn_pending()
-#: just before subprocess.Popen()) closes a real TOCTOU gap, confirmed by
-#: review: set_active_pid(proc.pid) can only run AFTER Popen() returns, so a
-#: SIGKILL in that window would otherwise leave no marker evidence a
-#: subprocess was ever started, and this tool would wrongly call the
-#: worktree removable while that just-spawned subprocess is still alive and
-#: writing into it. Originally this was a time-based grace window (a
-#: worktree was trusted as orphaned again once spawn_pending_at was old
-#: enough) -- but that was itself a real bug, confirmed by review:
-#: set_active_pid() never cleared spawn_pending_at, so EVERY worktree that
-#: had ever run even a single exercise carried a permanently stale
-#: spawn_pending_at, and once it aged past the window it went right back to
-#: being treated as orphaned by mere elapsed time, with no actual evidence
-#: of anything. Now that set_active_pid() clears spawn_pending_at on every
-#: call (both the pid-recorded and the finally-clause None-cleared path),
-#: its mere presence here can only mean the orchestrator died before ever
-#: reaching that call -- i.e. a genuine crash mid-spawn -- so it is treated
-#: as permanently non-removable, the same as a live pid, rather than on any
-#: time-based expiry.
 
 
 def _pid_alive(pid: object) -> bool:
@@ -131,9 +107,9 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
             # matches our exact naming scheme (_SCRATCH_DIR_NAME_RE): path
             # containment alone is NOT real ownership evidence (an unrelated
             # tool's own detached worktree could happen to live under the
-            # same --scratch-root, e.g. a shared tmp directory -- real gap,
-            # confirmed by review), but containment PLUS an exact name match
-            # makes a coincidental false positive practically impossible.
+            # same --scratch-root, e.g. a shared tmp directory), but
+            # containment PLUS an exact name match makes a coincidental
+            # false positive practically impossible.
             # Without both, honor the stated "never touch without a marker"
             # invariant literally and leave it for a plain `git worktree
             # prune` (safe regardless, since the directory is already gone).
@@ -189,6 +165,12 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
             results.append(info)
             continue
 
+        # mark_spawn_pending() writes spawn_pending_at just before Popen()
+        # and set_active_pid() clears it on every path afterwards, so a
+        # lingering one means the orchestrator was killed in the window
+        # where a subprocess may have started without its pid ever being
+        # recorded. Non-removable permanently, not on a time-based expiry:
+        # there is no evidence here that would ever arrive later.
         spawn_pending_at = marker.get("spawn_pending_at")
         if isinstance(spawn_pending_at, (int, float)):
             age_s = time.time() - spawn_pending_at

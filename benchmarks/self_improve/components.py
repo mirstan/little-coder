@@ -36,21 +36,14 @@ def _estimate_token_cost(old_cost: int, old_body: str, new_body: str) -> int:
     proportionally to how much the body's length changed, rather than
     deriving an absolute chars/token estimate from scratch.
 
-    Real bug, confirmed by review (and independently verified against
-    every real skills/**/*.md file): there is no single reliable
-    chars/token ratio for this corpus -- measured token_cost/body_len
-    ratios range 3.59-11.16 (median 6.23, mean 6.44) across all 31 files.
-    An earlier version of this function used a flat 3.5 (borrowed from
-    .pi/extensions/'s chars-to-TOKEN-BUDGET estimator, calibrated for a
-    different purpose entirely), which inflated most real files' cost by
-    roughly 1.78x even for an UNCHANGED-length body -- pushing several
-    skills (edit.md, write.md, dispatch.md, shell_start.md) permanently
-    past skill-inject's real injection budget the moment GEPA touched them,
-    so a mutation could score as if the skill had vanished from context
-    entirely. Rescaling from each file's own baseline sidesteps
-    miscalibration by construction: a same-length edit leaves cost
-    unchanged, and only genuine growth/shrinkage moves it, in proportion to
-    that file's own already-correct human calibration."""
+    There is no single reliable chars/token ratio for this corpus: measured
+    token_cost/body_len ratios span 3.59-11.16 (median 6.23) across all 31
+    skills/**/*.md files. A flat ratio inflates most files' cost even for an
+    unchanged-length body, which can push a skill past skill-inject's real
+    injection budget the moment GEPA touches it -- scoring the mutation as
+    if the skill had vanished from context. Rescaling from each file's own
+    baseline sidesteps that by construction: a same-length edit leaves cost
+    unchanged."""
     if not old_body:
         return old_cost
     return max(1, round(old_cost * len(new_body) / len(old_body)))
@@ -86,9 +79,9 @@ def _resolve_component_path(repo_root: Path, rel_path: str) -> Path:
     """Join rel_path onto repo_root and verify the result stays inside it.
 
     components.yaml is repo-controlled data today, but that alone provides no
-    containment (confirmed hardening gap by review) -- this is the only thing
-    standing between a components.yaml edit and an arbitrary file
-    read/overwrite. See path_safety.resolve_contained_path for the shared
+    containment -- this is the only thing standing between a components.yaml
+    edit and an arbitrary file read/overwrite. See
+    path_safety.resolve_contained_path for the shared
     resolve+validate logic (also used by aider_polyglot_ingest.py).
     """
     try:
@@ -147,11 +140,10 @@ def write_components_back(
     for pred_name, new_body in optimized.items():
         rel_path = mapping.get(pred_name)
         if rel_path is None:
-            # Real gap, confirmed by review: silently dropping this with no
-            # signal is how a mismatched components.yaml (e.g. applying a
-            # full-scope optimized set against a scoped-down pilot yaml)
-            # loses most of a run's results with zero error -- `changed`
-            # just comes back shorter than the caller expects.
+            # A mismatched components.yaml (e.g. a full-scope optimized set
+            # applied against a scoped-down pilot yaml) otherwise loses most
+            # of a run's results with no error at all -- `changed` just
+            # comes back shorter than the caller expects.
             logging.getLogger(__name__).warning(
                 "write_components_back: %r is not in %s -- skipping (optimized "
                 "and components.yaml were likely generated from different scopes)",

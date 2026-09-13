@@ -83,9 +83,8 @@ def test_num_metric_calls_zero_when_all_cached():
 
 
 def test_evaluate_passes_the_full_candidate_dict_to_the_runner():
-    """The regression test this whole rewrite exists for: the runner must
-    actually RECEIVE the candidate text -- under the old frozen-data design
-    the equivalent metric() call never read `pred` at all."""
+    """The runner must actually RECEIVE the candidate text; a scoring path
+    that never reads it scores every candidate identically."""
     specs = [ExerciseSpec("a")]
     candidate = {"agents_md": "distinctive text", "skills_tools_bash": "other text"}
     runner = FakeRunner({"python/a": _result("python/a", "a")})
@@ -215,7 +214,7 @@ def test_reflective_dataset_feedback_omits_lessons_disclaimer_when_none_reported
 def test_reflective_dataset_generated_outputs_includes_token_cost_for_a_tool_skill():
     """Rescaled from the seed's own hand-calibrated cost (20) proportionally
     to the body's length change (2x, 100 chars -> 200), not derived from an
-    absolute chars/token ratio -- real bug, confirmed by review: no single
+    absolute chars/token ratio -- no single
     ratio is reliable across the real skills/ corpus (3.59-11.16 chars/token)."""
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result("python/a", "a")})
@@ -272,7 +271,7 @@ def test_reflective_dataset_generated_outputs_uses_knowledge_budget_for_a_knowle
         candidate, batch, ["skills_knowledge_binary_search"],
     )["skills_knowledge_binary_search"][0]
     assert record["Generated Outputs"]["shared_token_budget"] == 200
-    # Real gap, confirmed by review: knowledge-inject's PER_ENTRY_CAP (150)
+    # Knowledge-inject's PER_ENTRY_CAP (150)
     # binds before the shared 200 total does -- reporting only the shared
     # budget invited growing a single entry into the 150-200 range, where
     # the excess is silently discarded.
@@ -280,7 +279,7 @@ def test_reflective_dataset_generated_outputs_uses_knowledge_budget_for_a_knowle
 
 
 def test_reflective_dataset_generated_outputs_caps_knowledge_token_cost_at_per_entry_cap():
-    """Real gap, confirmed by review: knowledge-inject's PER_ENTRY_CAP (150)
+    """Knowledge-inject's PER_ENTRY_CAP (150)
     silently discards everything past it for a single entry, no matter how
     much of the shared 200 total remains. Reporting the raw, uncapped
     estimate (e.g. 180) would mislead reflection about the actual selection

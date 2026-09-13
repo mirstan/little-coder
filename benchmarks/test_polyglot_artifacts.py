@@ -202,11 +202,9 @@ class _FakeRpcWithCompactions(_FakeRpc):
 
 
 def test_run_exercise_sums_compaction_events_across_every_attempt(tmp_path, monkeypatch):
-    """Real gap, confirmed by review: compaction_events was discarded
-    entirely -- turn_total accumulates across attempts (turn_total +=
-    r.turn_count) but there was no compaction_total equivalent, so a
-    candidate's context-bloat symptom never reached the results record at
-    all, let alone the live GEPA loop reading it."""
+    """compaction_total must accumulate across attempts the way turn_total
+    already does; without it a candidate's context-bloat symptom never
+    reaches the results record, let alone the live GEPA loop reading it."""
     src = tmp_path / "practice" / "ex"
     src.mkdir(parents=True)
     (src / "ex.py").write_text("stub")
@@ -300,12 +298,10 @@ class _FakeRpcWithLessonOnAttemptOneOnly(_FakeRpc):
 
 
 def test_run_exercise_never_captures_a_lesson_from_attempt_one_even_if_a_line_matches(tmp_path, monkeypatch):
-    """Real gap, confirmed by review: extraction previously relied on
-    attempt 1's prompt simply never ASKING for a LESSON: line as its only
-    guarantee that attempt 1 wouldn't contribute one -- but assistant_text
-    includes ALL of the model's text on every attempt, so a coincidentally
-    matching line (e.g. a code comment) would still get picked up. Gating
-    extraction to i > 1 explicitly closes that."""
+    """Extraction is gated on i > 1 explicitly, not just on attempt 1's
+    prompt never ASKING for a LESSON: line: assistant_text carries ALL of
+    the model's text on every attempt, so a coincidentally matching line
+    (a code comment, say) would otherwise be picked up."""
     src = tmp_path / "practice" / "ex"
     src.mkdir(parents=True)
     (src / "ex.py").write_text("stub")
@@ -380,8 +376,8 @@ def test_run_exercise_captures_one_lesson_per_retried_attempt(tmp_path, monkeypa
 
 class _FakeRpcWithDecoratedLesson(_FakeRpc):
     """Attempt 2's LESSON: line is wrapped in common markdown decoration a
-    model might reasonably use -- real gap, confirmed by review: a bullet,
-    heading, or leading bold wrapper used to silently match nothing."""
+    model might reasonably use -- a bullet, heading, or leading bold
+    wrapper, none of which the bare regex matches."""
 
     def prompt_and_collect(self, message, timeout=900):
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
@@ -421,10 +417,9 @@ def test_run_exercise_captures_a_lesson_wrapped_in_markdown_decoration(tmp_path,
 
 
 class _FakeRpcWithLessonContentStartingBold(_FakeRpc):
-    """Attempt 2's LESSON content itself starts with its own bold markup
-    (not the label wrapper) -- real gap, confirmed by review (cubic): an
-    earlier version of _LESSON_RE also swallowed the CONTENT's own opening
-    bold marker here, not just a label wrapper's closing one."""
+    """Attempt 2's LESSON content itself starts with its own bold markup,
+    which _LESSON_RE must leave intact -- it may only strip a label
+    wrapper's own closing marker."""
 
     def prompt_and_collect(self, message, timeout=900):
         (self.cwd / "solution.py").write_text(f"written by attempt {self.n}")
@@ -579,11 +574,10 @@ def test_cap_non_text_deltas_keeps_head_and_tail_drops_middle():
 
 
 def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
-    """Real gap, confirmed by review: the original version of this test only
-    asserted isinstance(result, list) -- true even if the huge entry were
-    echoed back unbounded, so a regression that stopped capping oversized
-    entries would still pass. Assert the actual boundedness and dropping
-    behavior instead."""
+    """Asserts actual boundedness and dropping, not just
+    isinstance(result, list) -- that stays true even if the huge entry is
+    echoed back unbounded, so it would pass through a regression that
+    stopped capping oversized entries."""
     huge = {"type": "toolcall_delta", "delta": "x" * 1_000_000}
     result = AP._cap_non_text_deltas([huge, {"type": "thinking_delta", "delta": "short"}], char_budget=1_000)
     assert len(json.dumps(result, default=str)) < 1_000  # nowhere near the huge entry's own size
@@ -592,10 +586,10 @@ def test_cap_non_text_deltas_does_not_crash_on_a_single_oversized_entry():
 
 
 def test_cap_non_text_deltas_skips_an_oversized_tail_entry_instead_of_stopping():
-    """Real gap, confirmed by review: the old backward-walk stopped at the
-    FIRST tail entry that didn't fit (e.g. a huge toolcall_delta), silently
-    discarding every smaller, budget-fitting entry further back too --
-    including genuinely recent reasoning sitting right before it. Padded so
+    """A backward walk that stopped at the FIRST tail entry too big to fit
+    (a huge toolcall_delta, say) would discard every smaller,
+    budget-fitting entry behind it, including genuinely recent reasoning.
+    Padded so
     NEITHER small entry is claimed by the head slice -- the only way either
     survives is via the tail walk actually skipping past huge_middle."""
     huge_at_start = {"type": "toolcall_delta", "delta": "x" * 500_010}  # too big for head_budget alone

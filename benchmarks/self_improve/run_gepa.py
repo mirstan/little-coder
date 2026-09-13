@@ -18,7 +18,7 @@ constructing a worktree or an adapter -- provably free.
 reflection LM needed, but still behind the live-rollout gate) to validate
 the whole pipeline and pre-warm the cache before any reflection spend.
 
-See the live-eval plan doc and VALIDATION_PLAN.md for the full design.
+See VALIDATION_PLAN.md for the full design.
 Historical-log ingestion + frozen-data reporting (VALIDATION_PLAN Layers
 2-3) lives in report_trajectories.py -- a separate, free pipeline this file
 no longer touches.
@@ -60,8 +60,8 @@ REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
 NO_LIVE_ROLLOUTS_ENV = "SELF_IMPROVE_NO_LIVE_ROLLOUTS"
 DEFAULT_BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
 
-# See test_run_gepa_dotenv.py for why SELF_IMPROVE_DOTENV exists (never
-# touch the real .env from a test) -- unchanged from the old design.
+# SELF_IMPROVE_DOTENV exists so a test never touches the real .env
+# (test_run_gepa_dotenv.py).
 load_dotenv(Path(os.environ.get("SELF_IMPROVE_DOTENV", str(Path(__file__).parent / ".env"))))
 
 

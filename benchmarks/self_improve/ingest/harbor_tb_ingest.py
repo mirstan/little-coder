@@ -76,12 +76,11 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
         return None
 
     if not isinstance(result, dict):
-        # Real gap, confirmed by review: this module's own docstring promises
-        # "never raise from load() on missing/malformed data" -- valid JSON
-        # with a non-object ROOT (e.g. a bare list) made every .get() below
-        # raise AttributeError. Validated explicitly at each level instead of
-        # relying on a broad except around the whole function, which risked
-        # masking a genuine coding bug as "malformed data".
+        # Valid JSON with a non-object ROOT (a bare list, say) would make
+        # every .get() below raise AttributeError, breaking this module's
+        # never-raise-from-load() contract. Validated at each level rather
+        # than under one broad except, which would also mask a genuine
+        # coding bug as "malformed data".
         logger.warning("harbor_tb_ingest: result.json root is not an object in %s", result_path)
         return None
 
@@ -142,12 +141,11 @@ def _load_harbor_trial(trial_dir: Path) -> NormalizedTrajectory | None:
             raw_paths=raw_paths,
         )
     except ValidationError as e:
-        # Real gap, confirmed by review: a wrong-TYPED (not missing/null)
-        # value that survives the isinstance guards above (e.g. task_name is
-        # a non-string truthy value) fails NormalizedTrajectory's own field
-        # validation -- narrowly caught here, at the one place it's actually
-        # expected, rather than a broad except around the whole function
-        # that could also mask a genuine coding bug.
+        # A wrong-TYPED (not missing/null) value surviving the isinstance
+        # guards above -- a non-string truthy task_name, say -- fails
+        # NormalizedTrajectory's own field validation. Caught narrowly here,
+        # the one place it's expected, so a broad except can't mask a
+        # genuine coding bug.
         logger.warning("harbor_tb_ingest: invalid trajectory fields in %s: %s", result_path, e)
         return None
 
@@ -192,10 +190,9 @@ def _load_tb_trial(trial_dir: Path, benchmark: Literal["harbor", "tb"]) -> Norma
     task_id = result.get("task_id") or trial_dir.parent.name
     is_resolved = result.get("is_resolved", False)
     if not isinstance(is_resolved, bool):
-        # Hardening, confirmed by review: real captured data has this as a
-        # genuine JSON boolean (tests/fixtures/real_tb_run), but bool(...) on
-        # any OTHER type is a classic Python trap -- bool("false") is True.
-        # Treat a wrong-typed value as unresolved/failed rather than trust it.
+        # Real captured data has this as a genuine JSON boolean
+        # (tests/fixtures/real_tb_run); a wrong-typed value is treated as
+        # unresolved rather than coerced, since bool("false") is True.
         logger.warning("harbor_tb_ingest: non-boolean is_resolved %r in %s, treating as unresolved",
                         is_resolved, results_path)
         is_resolved = False

@@ -18,8 +18,8 @@ class ExerciseSpec:
 
     @property
     def results_key(self) -> str:
-        """Matches aider_polyglot.py:861's `f"{agent}/{language}/{name}"` key
-        format for the pi agent (the only agent live-eval drives)."""
+        """Matches aider_polyglot.py's own `f"{agent}/{language}/{name}"`
+        results key, for the pi agent (the only one live-eval drives)."""
         return f"pi/{self.language}/{self.exercise}"
 
 
@@ -65,9 +65,8 @@ def select_exercises(
 def split_train_val(
     specs: list[ExerciseSpec], *, val_count: int, seed: int,
 ) -> tuple[list[ExerciseSpec], list[ExerciseSpec]]:
-    """A genuine held-out split -- there is no success label to stratify on
-    before any exercise has actually run, unlike the old design's
-    stratify-by-(benchmark,success) over historical trajectories."""
+    """A genuine held-out split, unstratified: there is no success label to
+    stratify on before any exercise has actually run."""
     if val_count <= 0 or val_count >= len(specs):
         raise ValueError(f"val_count must be between 1 and {len(specs) - 1}, got {val_count}")
     shuffled = sorted(specs)

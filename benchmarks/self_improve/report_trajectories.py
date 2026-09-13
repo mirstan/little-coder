@@ -1,9 +1,7 @@
 """Historical-log ingestion + free trajectory-scoring report
-(VALIDATION_PLAN.md Layers 2-3) -- moved out of run_gepa.py, which no
-longer scores from frozen historical data at all (see
-polyglot_adapter.py's module docstring for why that design was replaced by
-a live-execution GEPAAdapter). This module still serves real ingestion
-validation and reporting, independent of the live-eval loop.
+(VALIDATION_PLAN.md Layers 2-3). Independent of the live-eval loop, which
+scores from real runs rather than frozen historical data: nothing here
+feeds GEPA.
 
 Usage:
     python -m benchmarks.self_improve.report_trajectories \\
@@ -31,11 +29,9 @@ DEFAULT_WEIGHTS = {"aider_polyglot": 0.4, "gaia": 0.3, "harbor": 0.15, "tb": 0.1
 
 def parse_log_roots(entries: list[str]) -> dict[str, str]:
     """Parse --log-roots KEY=VALUE tokens, validating both the key and that
-    a value is present. Real bug, confirmed by review: a malformed or
-    unrecognized token was previously silently absorbed into log_roots under
-    whatever partition() produced, then silently never matched any real
-    source, with zero warning -- a confirmed run could believe a source was
-    ingested when it was never even attempted."""
+    a value is present. An unvalidated token would be absorbed into
+    log_roots under whatever partition() produced and then match no real
+    source, letting a run believe it ingested something never attempted."""
     log_roots: dict[str, str] = {}
     for entry in entries:
         key, sep, value = entry.partition("=")

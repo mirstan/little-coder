@@ -101,7 +101,7 @@ def test_write_components_back_reports_changed_files(tmp_path):
         components_yaml, repo_root=tmp_path,
         optimized={"skills_tools_bash": "## `bash` Tool (v2)\nRevised.\n"},
     )
-    # .resolve(): real brittleness, confirmed by review -- write_components_back
+    # .resolve(): write_components_back
     # returns paths resolved through resolve_contained_path (which .resolve()s
     # both base and result), so on a platform where pytest's tmp_path goes
     # through a symlink (e.g. macOS /var -> /private/var), an unresolved
@@ -113,7 +113,7 @@ def test_write_components_back_reports_changed_files(tmp_path):
 
 
 def test_write_components_back_recomputes_token_cost_when_body_changes(tmp_path):
-    """Real gap, confirmed by review: skill-inject's real per-turn injection
+    """Skill-inject's real per-turn injection
     budget selects entries against each file's DECLARED token_cost -- a
     GEPA-grown body left the old, understated number in place forever,
     silently letting a candidate exceed the real budget with no guardrail
@@ -148,7 +148,7 @@ def test_write_components_back_token_cost_rewrite_touches_only_that_one_line(tmp
     # Order-sensitive comparison (not membership) -- catches reordering, a
     # duplicated line, an appended extra field, or a YAML re-dump reformatting
     # keys/quotes, none of which a plain "each line is somewhere in there"
-    # membership check would notice. Real gap, confirmed by review: this was
+    # Membership check would notice. this was
     # the only test covering the token_cost rewrite path, so any of those
     # would have gone unflagged.
     written_lines = [line for line in written_frontmatter.splitlines() if not line.startswith("token_cost:")]
@@ -179,7 +179,7 @@ def _make_repo_with_escaping_entry(tmp_path, rel_path):
 
 @pytest.mark.parametrize("rel_path", ["../../etc/passwd", "/etc/passwd"])
 def test_load_components_rejects_path_that_escapes_repo_root(tmp_path, rel_path):
-    """Real hardening gap, confirmed by review: a components.yaml entry with
+    """A components.yaml entry with
     an absolute path or '../' traversal must be rejected, not silently read
     from outside repo_root."""
     components_yaml = _make_repo_with_escaping_entry(tmp_path, rel_path)
@@ -197,7 +197,7 @@ def test_write_components_back_rejects_path_that_escapes_repo_root(tmp_path, rel
 
 
 def test_write_components_back_warns_on_pred_name_missing_from_components_yaml(tmp_path, caplog):
-    """Real gap, confirmed by review: applying an `optimized` dict against a
+    """Applying an `optimized` dict against a
     components.yaml with a smaller/different scope (e.g. a full-scope run's
     output applied against a scoped-down pilot yaml, per README.md's
     documented pilot-then-full-run workflow) used to silently drop every

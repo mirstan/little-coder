@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 @pytest.fixture(autouse=True)
 def _restore_top_level_rpc_client_module():
-    """Real leak, confirmed by review: _reload_rpc_client() below replaces
+    """_reload_rpc_client() below replaces
     sys.modules["rpc_client"] with a fresh top-level module object -- a
     DIFFERENT identity than benchmarks.rpc_client (this file's sys.path
     insertion above makes benchmarks/ importable as a top-level location
@@ -53,7 +53,7 @@ def test_pi_bin_uses_override_when_set(monkeypatch, tmp_path):
 
 
 def test_pi_bin_resolves_relative_override_to_absolute(monkeypatch, tmp_path):
-    """Real bug, confirmed by review: on POSIX, subprocess.Popen with both a
+    """On POSIX, subprocess.Popen with both a
     RELATIVE executable path and an explicit cwd= resolves that path against
     the CHILD's cwd, not the launcher's. A relative override would exist
     from the launcher's own cwd at import time, then silently fail to launch
@@ -69,7 +69,7 @@ def test_pi_bin_resolves_relative_override_to_absolute(monkeypatch, tmp_path):
 
 
 def test_pi_bin_falls_back_to_default_when_override_is_empty_string(monkeypatch):
-    """Real bug, confirmed by review: os.environ.get(name, default) returns
+    """os.environ.get(name, default) returns
     "" (not the default) when the var is exported EMPTY, e.g. via
     `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"` in a harness
     script. Path("") == Path("."), whose .exists() is True, which silently

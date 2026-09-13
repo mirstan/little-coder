@@ -166,7 +166,7 @@ def test_summarized_transcript_surfaces_a_recoverable_tool_error(runner_factory,
 
 
 def test_compaction_total_is_captured_and_lowers_the_score(runner_factory, monkeypatch):
-    """Real gap, confirmed by review: compaction_events was discarded
+    """Compaction_events was discarded
     entirely between aider_polyglot.py and the live GEPA loop -- a
     candidate whose injected text forces context compaction (real prompt
     bloat) never affected its score or reflection feedback at all."""
@@ -243,13 +243,11 @@ def test_candidate_text_actually_reaches_the_agent(runner_factory, tmp_path, mon
 
 
 def test_two_candidates_that_differ_only_in_text_get_different_scores(runner_factory, monkeypatch):
-    """THE regression test for the bug this entire live-execution rewrite
-    exists to fix: under the old frozen-historical-data design, metric()
-    never read the candidate's actual text, so every candidate scored
-    identically and GEPA's acceptance criterion could never fire. Here, two
-    candidates differing ONLY in instruction text produce genuinely
-    different real outcomes, because fake_pi decides whether to solve based
-    on what it actually reads from the live system prompt."""
+    """Two candidates differing ONLY in instruction text must produce
+    genuinely different scores -- fake_pi decides whether to solve based on
+    what it reads from the live system prompt. A scoring path that never
+    reads the candidate's text scores every candidate identically, and
+    GEPA's acceptance criterion can then never fire."""
     monkeypatch.setenv("FAKE_PI_MODE", "solve_if_prompt_contains")
     monkeypatch.setenv("FAKE_PI_MAGIC_TOKEN", "OPEN-SESAME-42")
     monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
@@ -292,7 +290,7 @@ def test_cache_hit_skips_the_subprocess_entirely(runner_factory, tmp_path, monke
 
 
 def test_materialize_raises_when_candidate_has_a_component_not_in_components_yaml(runner_factory):
-    """Real bug, confirmed by review: write_components_back() only logs a
+    """Write_components_back() only logs a
     warning and silently skips a pred_name absent from the pinned
     components.yaml -- every candidate variant of an unmapped component
     would then materialize to IDENTICAL worktree content and score
@@ -309,7 +307,7 @@ def test_run_config_includes_the_pi_binary(runner_factory):
 
 
 def test_run_config_pi_bin_changes_with_a_different_binary(runner_factory, tmp_path):
-    """Real bug, confirmed by review: the pi binary IS the agent under
+    """The pi binary IS the agent under
     test -- omitting it from run_config meant a cache entry produced via
     LITTLE_CODER_PI_BIN_OVERRIDE (e.g. a fake_pi.py smoke run) could be read
     back as a genuine result by a later real run with the same model/etc."""
@@ -353,7 +351,7 @@ def test_run_config_harness_hash_changes_when_the_worktree_executed_files_change
 def test_run_config_harness_hash_changes_when_the_parent_processs_own_scoring_module_changes(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real gap, confirmed by review: pass_n_score() (aider_polyglot_ingest.py,
+    """Pass_n_score() (aider_polyglot_ingest.py,
     the compaction penalty formula) and write_components_back() (components.py,
     the token_cost estimator) run in the PARENT (orchestrator) process --
     imported once at the top of live_eval.py -- never inside the scratch
@@ -419,7 +417,7 @@ def test_run_config_harness_hash_is_unaffected_by_editing_the_worktree_copy_of_t
 
 
 def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, monkeypatch, tmp_path):
-    """Real bug, confirmed by review: clamping the subprocess timeout to
+    """Clamping the subprocess timeout to
     the remaining wall-clock budget, then treating the resulting kill as an
     ordinary subprocess timeout, fabricated a real-looking harness_error/0.0
     score for a run that was killed for budget reasons -- violating
@@ -443,7 +441,7 @@ def test_budget_clamp_raises_instead_of_faking_a_timeout_score(runner_factory, m
 def test_on_result_still_fires_for_exercises_completed_before_a_later_budget_exceeded(
     runner_factory, fake_practice, monkeypatch,
 ):
-    """Real bug, confirmed by review: the audit callback used to be invoked
+    """The audit callback used to be invoked
     only after run_batch() returned the WHOLE batch, so a later exercise
     hitting LiveBudget's backstop lost the audit record for every exercise
     that already genuinely ran earlier in the same batch."""
@@ -474,7 +472,7 @@ def test_on_result_still_fires_for_exercises_completed_before_a_later_budget_exc
 def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real bug, confirmed by review: this default used to hardcode a bare
+    """This default used to hardcode a bare
     900 literal for aider_polyglot's own per-attempt budget, independent of
     the ATTEMPT_TIMEOUT_S env var that module actually reads. When
     aider_polyglot.py's own default was tripled to 2700s for a local
@@ -487,7 +485,7 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
-    # Real gap, confirmed by review (twice, then a third round): the first
+    # The first
     # fix here kept a duplicated literal and asserted against
     # aider_polyglot._positive_int_env("ATTEMPT_TIMEOUT_S", 2700) -- a
     # tautology, since with the env var unset that just returns the SAME
@@ -526,7 +524,7 @@ def test_per_exercise_timeout_default_tracks_attempt_timeout_s_env_var(
 def test_per_exercise_timeout_default_uses_the_worktrees_own_pinned_copy(
     source_repo, fake_practice, tmp_path, monkeypatch,
 ):
-    """Real gap, confirmed by review: the outer per-exercise timeout
+    """The outer per-exercise timeout
     default used to be read from the SOURCE checkout (this process' own
     aider_polyglot.py, at import time) -- but the subprocess that actually
     RUNS an exercise executes the scratch worktree's PINNED base_commit
@@ -543,7 +541,7 @@ def test_per_exercise_timeout_default_uses_the_worktrees_own_pinned_copy(
     from benchmarks.self_improve.live_eval import PolyglotLiveRunner
     from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
-    # Real gap, confirmed by review: an earlier version of this test
+    # An earlier version of this test
     # hardcoded the bare 2700 literal in both this guard and the replace()
     # call below -- the exact duplication the whole change exists to
     # eliminate. Ground truth comes from aider_polyglot.py itself, same as
@@ -573,7 +571,7 @@ def test_per_exercise_timeout_default_uses_the_worktrees_own_pinned_copy(
 
 @pytest.mark.parametrize("bad_value", ["not-a-number", "0", "-5"])
 def test_attempt_timeout_s_raises_on_malformed_or_non_positive_value(bad_value, monkeypatch):
-    """Real gap, confirmed by review: a malformed/non-positive
+    """A malformed/non-positive
     ATTEMPT_TIMEOUT_S used to be silently swallowed and replaced with the
     default here, computing a per_exercise_timeout_s estimate as if the
     run would proceed normally -- but aider_polyglot.py's own
@@ -588,7 +586,7 @@ def test_attempt_timeout_s_raises_on_malformed_or_non_positive_value(bad_value, 
 
 
 def test_attempt_timeout_default_from_source_warns_when_regex_does_not_match(tmp_path, caplog):
-    """Real gap, confirmed by review: a benign reformat of aider_polyglot.py
+    """A benign reformat of aider_polyglot.py
     (a type annotation, `= 2_700` with an underscore, a trailing comment,
     changed spacing) makes the regex stop matching -- must not silently
     degrade to the hardcoded fallback with no signal, or a real default
@@ -622,7 +620,7 @@ def test_attempt_timeout_default_from_source_warns_when_file_missing(tmp_path, c
 
 
 def test_attempt_timeout_default_from_source_warns_on_non_utf8_file(tmp_path, caplog):
-    """Real gap, confirmed by review: UnicodeDecodeError is NOT an OSError
+    """UnicodeDecodeError is NOT an OSError
     subclass (it's a ValueError) -- a bare `except OSError` let it
     propagate straight out of this function, aborting live_eval's own
     module import (this function runs once at module level) on a

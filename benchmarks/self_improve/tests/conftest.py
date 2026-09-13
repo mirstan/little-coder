@@ -6,19 +6,14 @@ from pathlib import Path
 
 import pytest
 
-# Real bug, confirmed by CI failure on this branch's PR: benchmarks/self_improve
-# is an opt-in subsystem (its own pyproject.toml, installed via
-# `pip install -e benchmarks/self_improve[dev]`) deliberately kept out of the
-# existing dependency-free benchmarks/*.py scripts' footprint -- CI's
-# `benchmarks pytest` job only `pip install`s `pytest` itself. Every test file here imports
-# benchmarks.self_improve modules at collection time, which import yaml/
-# pydantic/dspy unconditionally, so without this guard collection fails HARD
-# for the whole job (14 errors), not just for this directory -- breaking CI for
-# the entire repo, not only for self_improve. importorskip in conftest.py skips
-# collection of this whole directory when the optional deps aren't installed,
-# matching this subsystem's own documented "CI: manual-only for v1" design
-# (README.md / architecture plan) that these tests were always meant to
-# self-skip rather than run unconditionally.
+# benchmarks/self_improve is an opt-in subsystem with its own pyproject.toml,
+# deliberately outside the dependency-free benchmarks/*.py scripts' footprint
+# -- CI's `benchmarks pytest` job installs only pytest. Every test file here
+# imports benchmarks.self_improve modules at collection time, which import
+# yaml/pydantic/dspy unconditionally, so without this guard collection fails
+# for the whole job, not just this directory, breaking CI repo-wide.
+# importorskip here skips collection of the whole directory when the optional
+# deps are absent, matching README.md's "CI: manual-only for v1" design.
 pytest.importorskip("dspy")
 pytest.importorskip("pydantic")
 pytest.importorskip("yaml")
@@ -47,17 +42,12 @@ def _dspy_settings_snapshot_and_restore():
     kept separate from @pytest.fixture so test_conftest_dspy_settings_restore.py
     can drive it directly (pytest fixtures can't be called directly).
 
-    Real gap, confirmed by review: dspy.settings is a process-wide
-    singleton backed by a module-level dict (dspy.dsp.utils.settings's
-    main_thread_config) -- _real_run() (and any other code exercised here)
-    calls dspy.settings.configure(lm=DummyLM(...)) directly, which is never
-    undone. Every test in this directory that reaches that call permanently
-    leaves the global LM as DummyLM for the REST of the pytest session, so a
-    later test asserting on dspy's default settings could pass or fail based
-    on prior test order rather than its own behavior, and a future
-    regression that removed the configure() call from _real_run() could go
-    uncaught by any test that reads dspy.settings.lm back instead of
-    asserting on what was actually passed to configure().
+    dspy.settings is a process-wide singleton backed by a module-level dict
+    (dspy.dsp.utils.settings's main_thread_config), and a
+    dspy.settings.configure(lm=DummyLM(...)) call is never undone. Without
+    this restore, every test that reaches one leaves the global LM as
+    DummyLM for the REST of the session, so a later test asserting on dspy's
+    defaults passes or fails on test order rather than its own behavior.
 
     dspy.dsp.utils.settings.settings (the singleton instance) has no public
     "reset" API and overrides __setattr__ to route through configure()
@@ -67,8 +57,7 @@ def _dspy_settings_snapshot_and_restore():
     INSTANCE, not the module (the package's __init__ shadows the name), so
     importlib.import_module() is used to reach the actual module object.
 
-    Real follow-up gap, confirmed by review: a shallow dict() copy shares
-    references to nested mutable values (e.g. the list-valued "trace"
+    A shallow dict() copy shares references to nested mutable values (e.g. the list-valued "trace"
     setting -- components.py's own HarnessProgram docstring documents GEPA
     inspecting dspy.settings.trace after a forward pass, which DSPy mutates
     in-place via append, not reassignment) -- clear()+update() would restore
@@ -96,14 +85,13 @@ def _restore_dspy_settings():
 @pytest.fixture(scope="session", autouse=True)
 def _no_stray_real_worktrees():
     """Session-scoped backstop for the live-eval rewrite: scratch_worktree.py
-    creates/destroys REAL git worktrees, and this repo currently has ~10
-    other real worktrees checked out (main, dev, self-improve/gepa-loop,
-    several feature branches). Every scratch-worktree test must operate
+    creates/destroys REAL git worktrees, and this repo keeps several other
+    real worktrees checked out. Every scratch-worktree test must operate
     against a THROWAWAY `git init` repo, never the real checkout -- this
     snapshots `git worktree list` on the REAL repo before and after the
     whole test session and fails loudly if it ever changes.
 
-    Limitation, confirmed by review: this only detects a NET change across
+    Limitation: this only detects a NET change across
     the whole session. A test that calls `scratch_worktree(REAL_REPO_ROOT,
     ...)` -- the exact "touches real repo state instead of a fixture repo"
     bug this fixture exists to catch -- both creates AND destroys that real

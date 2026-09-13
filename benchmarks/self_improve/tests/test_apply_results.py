@@ -93,12 +93,12 @@ def test_create_branch_and_commit_raises_when_no_changed_files(scratch_repo):
 
 
 def test_create_branch_and_commit_rejects_malformed_branch_name(scratch_repo):
-    """Real hardening gap, confirmed by review: an unvalidated branch_name
+    """An unvalidated branch_name
     passed straight to `git checkout -b` could be misparsed as a git option
     (e.g. a name starting with '-'). check-ref-format catches this before
     any git subprocess that could mutate the repo runs."""
     (scratch_repo / "file.md").write_text("changed\n")
-    # Real brittleness, confirmed by review: git init's default branch name
+    # Git init's default branch name
     # inherits init.defaultBranch from the environment (global/CI config
     # could set e.g. "trunk"), not always "main" or "master" -- the real
     # intent is only "the branch was not switched," so capture and compare
@@ -116,7 +116,7 @@ def test_create_branch_and_commit_rejects_malformed_branch_name(scratch_repo):
 
 
 def test_create_branch_and_commit_handles_path_starting_with_dash(scratch_repo):
-    """Real hardening gap, confirmed by review: `git add` without a `--`
+    """`git add` without a `--`
     path-terminator would parse a changed file name starting with '-' as a
     git option instead of a path."""
     dash_file = scratch_repo / "-weird-name.md"
@@ -241,7 +241,7 @@ def test_apply_and_open_pr_returns_none_and_touches_nothing_when_unchanged(tmp_p
 
 
 def test_apply_and_open_pr_aborts_on_optimized_pred_name_unknown_to_components_yaml(tmp_path):
-    """Real gap, confirmed by review: write_components_back() only WARNS and
+    """Write_components_back() only WARNS and
     skips an unrecognized pred_name (the right contract for its own direct
     callers), but apply_and_open_pr() is the highest-stakes caller -- it
     commits (and can open a real PR for) whatever DID get written as if the
@@ -266,12 +266,11 @@ def test_apply_and_open_pr_aborts_on_optimized_pred_name_unknown_to_components_y
 
 
 def test_apply_and_open_pr_ignores_unrelated_escaping_entry_in_components_yaml(tmp_path):
-    """Real bug, confirmed by review: apply_and_open_pr() used to re-resolve
-    EVERY components.yaml entry (not just the ones in `optimized`) to build
-    its path->pred_name lookup, so an unrelated escaping/invalid entry
-    elsewhere in the file raised AFTER write_components_back() already wrote
-    the real, valid changes to disk -- leaving the working tree dirty with
-    no branch/commit. An entry this call never touches must not block it."""
+    """apply_and_open_pr() must resolve only the components.yaml entries
+    named in `optimized` when building its path->pred_name lookup.
+    Resolving every entry lets an unrelated escaping/invalid one raise
+    AFTER write_components_back() has written the real changes to disk,
+    leaving a dirty tree with no branch or commit."""
     components_yaml = _make_component_repo(tmp_path)
     mapping = yaml.safe_load(components_yaml.read_text())
     mapping["unrelated_escaping_entry"] = "../../etc/passwd"
@@ -291,7 +290,7 @@ def test_apply_and_open_pr_ignores_unrelated_escaping_entry_in_components_yaml(t
 
 
 def test_apply_and_open_pr_rejects_component_path_that_escapes_repo_root(tmp_path):
-    """Real hardening gap, confirmed by review: a components.yaml entry
+    """A components.yaml entry
     resolving outside repo_root must be rejected before any git operation
     runs, not silently written to disk elsewhere."""
     components_yaml = _make_component_repo(tmp_path)
