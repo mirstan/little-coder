@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import subprocess
@@ -28,7 +29,24 @@ from pathlib import Path
 from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).parent.parent
-PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
+# LITTLE_CODER_PI_BIN_OVERRIDE: integration-testing hook only. Lets a
+# host-side harness (e.g. `tb run`, which runs pi on the host per
+# tb_adapter's own comment) point PI_BIN at a stand-in (fake_pi.py) without
+# modifying any tracked file.
+#
+# Tested for truthiness, not just presence: an EMPTY export (a harness
+# script doing `export LITTLE_CODER_PI_BIN_OVERRIDE="$SOME_UNSET_VAR"`)
+# would otherwise give Path("") == Path("."), whose .exists() is True,
+# defeating the "pi not found" FileNotFoundError check below and surfacing
+# later as an opaque Popen error.
+_pi_bin_override = os.environ.get("LITTLE_CODER_PI_BIN_OVERRIDE")
+# .resolve(): on POSIX, subprocess.Popen with both a RELATIVE executable
+# path and an explicit `cwd=` resolves that path against the CHILD's cwd,
+# not the launcher's. A relative override ("./fake_pi.py") exists from the
+# launcher's cwd at import time, then fails to launch once PiRpc is
+# constructed with a task-specific cwd. Resolving once here makes the
+# override cwd-independent.
+PI_BIN = Path(_pi_bin_override).resolve() if _pi_bin_override else REPO_ROOT / "node_modules" / ".bin" / "pi"
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
 # capture_environment_snapshot()'s config sources -- module-level constants
@@ -64,8 +82,71 @@ def _extension_paths() -> list[str]:
     return paths
 
 
+def _build_system_prompt() -> Path:
+    """Resolve the file passed to pi's --system-prompt flag.
+
+    If PRINCIPLES.md exists alongside AGENTS.md, concatenate them into a
+    generated file (gitignored, rewritten on every call so edits to either
+    source file are always picked up) and point at that instead. If
+    PRINCIPLES.md is absent, behavior is unchanged: point straight at
+    AGENTS.md, matching pre-existing behavior exactly.
+    """
+    agents_md = REPO_ROOT / "AGENTS.md"
+    principles_md = REPO_ROOT / "PRINCIPLES.md"
+    # Both must exist, not just PRINCIPLES.md: the caller's "AGENTS.md
+    # missing -> degrade gracefully" guard runs on the returned path, so a
+    # missing AGENTS.md here would instead raise FileNotFoundError out of
+    # PiRpc.__init__ and kill the whole benchmark run.
+    if not principles_md.exists() or not agents_md.exists():
+        return agents_md
+
+    generated = REPO_ROOT / ".pi" / ".system-prompt.generated.md"
+    content = agents_md.read_text() + "\n\n# Principles\n\n" + principles_md.read_text()
+    try:
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write via tmp-file + rename: a plain write_text() truncates
+        # the shared file in place first, so a PiRpc constructed
+        # concurrently with another (parallel benchmark attempts, or a
+        # before/after comparison run) could read a corrupted, half-written
+        # system prompt. Falls back to AGENTS.md alone, as the
+        # no-PRINCIPLES.md path above does, if the
+        # write itself fails (e.g. a read-only .pi/) rather than raising an
+        # uncaught OSError out of PiRpc.__init__.
+        tmp = generated.with_name(f"{generated.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp.write_text(content)
+        try:
+            tmp.replace(generated)
+        except OSError:
+            # A replace() failure after a successful write_text() would
+            # strand tmp under .pi/ forever; clean it up before falling
+            # through to the same AGENTS.md-only fallback.
+            tmp.unlink(missing_ok=True)
+            raise
+    except OSError:
+        return agents_md
+    return generated
+
+
 class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
+
+
+#: In-memory backstop so non_text_deltas can't grow unbounded across an
+#: attempt (a model streaming heavy reasoning emits thousands of events);
+#: the real trimming policy stays downstream in aider_polyglot.py's
+#: _cap_non_text_deltas(), which needs head+tail retention that isn't
+#: knowable mid-stream. Generous enough that no normal attempt reaches it.
+#:
+#: Kept as a fixed HEAD (_NON_TEXT_DELTA_HEAD_KEEP) plus a rolling TAIL
+#: rather than a head-only cap: both _cap_non_text_deltas() and
+#: live_eval.py's _reasoning_excerpt_from_trajectory() want the LATEST
+#: reasoning, and a run long enough to hit this backstop is exactly the one
+#: whose true tail a head-only cap would discard.
+_MAX_NON_TEXT_DELTAS = 5_000
+#: Fixed prefix retained even once the rolling tail below is full --
+#: mirrors aider_polyglot.py's own _cap_non_text_deltas() head+tail split
+#: philosophy (never drop ALL early context, even under a hard budget).
+_NON_TEXT_DELTA_HEAD_KEEP = 500
 
 
 @dataclass
@@ -103,6 +184,19 @@ class PromptResult:
     #: never finished before the outer timeout expired. Do not read
     #: agent_ended alone as "the call completed" -- check stop_reason too.
     stop_reason: str = "agent_end"
+    #: Every assistantMessageEvent whose type is anything other than
+    #: "text_delta", captured verbatim -- assistant_text accumulates only
+    #: "text_delta", so a model's reasoning stream reaches nothing else.
+    #: Confirmed against a real run at thinking=high: the reasoning event
+    #: type is "thinking_delta", carrying incremental text in the same
+    #: "delta" key text_delta uses, which
+    #: benchmarks/self_improve/live_eval.py's
+    #: _reasoning_excerpt_from_trajectory() reassembles the same way
+    #: assistant_text is built above. Other types seen in that run:
+    #: thinking_start/thinking_end (bracket a reasoning block),
+    #: toolcall_start/toolcall_delta/toolcall_end, text_start/text_end.
+    #: Bounded to _MAX_NON_TEXT_DELTAS entries during collection.
+    non_text_deltas: list[dict] = field(default_factory=list)
     #: Provider error text for stop_reason == "error", and only then: either
     #: the assistant message's own `errorMessage` from the wire, or the
     #: synthetic "empty completion" when pi reported no error but produced a
@@ -187,16 +281,17 @@ class PiRpc:
         # handles execution-level blocking for defense in depth.
         if allowed_tools:
             cmd.extend(["--tools", ",".join(allowed_tools)])
-        # Use AGENTS.md as THE system prompt, not as appended Project Context.
-        # Pi's --system-prompt resolves an existing path to file content
-        # (resource-loader.js::resolvePromptInput). --no-context-files prevents
-        # AGENTS.md from also being auto-discovered and double-appended under
-        # `# Project Context`. Effect: pi's hardcoded "You are an expert coding
-        # assistant operating inside pi…" identity and the "Pi documentation"
-        # block both go away; AGENTS.md alone defines the agent.
-        agents_md = REPO_ROOT / "AGENTS.md"
-        if agents_md.exists():
-            cmd.extend(["--no-context-files", "--system-prompt", str(agents_md)])
+        # Use AGENTS.md (plus PRINCIPLES.md, if present) as THE system prompt,
+        # not as appended Project Context. Pi's --system-prompt resolves an
+        # existing path to file content (resource-loader.js::resolvePromptInput).
+        # --no-context-files prevents AGENTS.md from also being auto-discovered
+        # and double-appended under `# Project Context`. Effect: pi's hardcoded
+        # "You are an expert coding assistant operating inside pi…" identity and
+        # the "Pi documentation" block both go away; AGENTS.md (+ PRINCIPLES.md)
+        # alone defines the agent.
+        system_prompt_path = _build_system_prompt()
+        if system_prompt_path.exists():
+            cmd.extend(["--no-context-files", "--system-prompt", str(system_prompt_path)])
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -743,12 +838,27 @@ class PiRpc:
         last_will_retry = False
 
         pending: dict[str, dict] = {}
+        # See PromptResult.non_text_deltas' own docstring and
+        # _MAX_NON_TEXT_DELTAS' -- a fixed head plus a bounded ROLLING tail
+        # (evicts its own oldest entry once full, O(1) amortized) rather
+        # than a single head-only cap, so a pathological run long past this
+        # backstop still keeps its true tail, not just its opening. Local
+        # to this call (not on `result` itself) so PromptResult.non_text_deltas
+        # stays a plain list for every other caller/consumer.
+        non_text_delta_head: list[dict] = []
+        non_text_delta_tail: collections.deque = collections.deque(
+            maxlen=_MAX_NON_TEXT_DELTAS - _NON_TEXT_DELTA_HEAD_KEEP
+        )
         for ev in events:
             t = ev.get("type")
             if t == "message_update":
                 delta = ev.get("assistantMessageEvent", {})
                 if delta.get("type") == "text_delta":
                     result.assistant_text += delta.get("delta", "")
+                elif len(non_text_delta_head) < _NON_TEXT_DELTA_HEAD_KEEP:
+                    non_text_delta_head.append(delta)
+                else:
+                    non_text_delta_tail.append(delta)
             elif t == "tool_execution_start":
                 pending[ev.get("toolCallId", "")] = {
                     "name": ev.get("toolName", ""),
@@ -825,6 +935,8 @@ class PiRpc:
                 else:
                     error_flagged = turn_stop_reason == "error"
                     error_message = turn_error_message if error_flagged else ""
+
+        result.non_text_deltas = non_text_delta_head + list(non_text_delta_tail)
 
         # Derived from how the loop exited, not from a latched "did we ever
         # see agent_end" -- see PromptResult.stop_reason's docstring for why

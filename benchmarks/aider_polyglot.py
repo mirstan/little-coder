@@ -34,10 +34,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import PiRpc, PromptResult, capture_environment_snapshot  # noqa: E402
 
-BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
+# `or`, not os.environ.get(name, default): an exported-but-empty override
+# must still fall back -- Path("") normalizes to Path("."), whose .exists()
+# is True, silently pointing at the wrong directory instead of the intended
+# default (same trap documented for LITTLE_CODER_PI_BIN_OVERRIDE in
+# rpc_client.py). These three exist so a live-eval test harness can point
+# an isolated subprocess invocation of this script at a synthetic benchmark
+# root/results file/log dir, without which none of that machinery is
+# testable without a real paid model run (BENCHMARK_ROOT feeds
+# LANG_DESCRIPTORS below at IMPORT time).
+BENCHMARK_ROOT = Path(os.environ.get("POLYGLOT_BENCHMARK_ROOT") or (Path.home() / "Documents" / "polyglot-benchmark"))
 REPO_ROOT = Path(__file__).parent.parent
-RESULTS_FILE = Path(__file__).parent / "results_full_polyglot.json"
-LOG_ROOT = Path(__file__).parent / "full_polyglot_logs"
+RESULTS_FILE = Path(os.environ.get("POLYGLOT_RESULTS_FILE") or (Path(__file__).parent / "results_full_polyglot.json"))
+LOG_ROOT = Path(os.environ.get("POLYGLOT_LOG_ROOT") or (Path(__file__).parent / "full_polyglot_logs"))
 #: Identifies one invocation, so records and artifacts can be traced back to the
 #: run that produced them. RESULTS_FILE and LOG_ROOT are both deterministic and
 #: shared across runs, which has already caused artifacts from different runs to
@@ -46,9 +55,31 @@ RUN_ID = f"{datetime.datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
 #: Caps applied to persisted trajectories -- see _dump_trajectory.
 TRAJECTORY_TEXT_CHARS = 200_000
 TRAJECTORY_FIELD_CHARS = 20_000
+#: Combined raw-size budget for non_text_deltas, split between a head slice
+#: and a tail slice (see _cap_non_text_deltas).
+TRAJECTORY_NON_TEXT_DELTA_CHARS = 200_000
 #: Give up if this many exercises fail in a row -- a broken environment,
 #: not broken exercises.
 MAX_CONSECUTIVE_ERRORS = 3
+#: Retry-prompt convention for a between-attempt self-reflection (Reflexion-
+#: style: the agent reflects on why THIS attempt failed before the next one
+#: begins). Follows gaia_scorer.py's own `Answer:` line convention rather
+#: than inventing a new extraction style. Deliberately supplementary, not
+#: required -- a missing LESSON: line just means no lesson was captured for
+#: that attempt, never a harness error.
+#: \** sits immediately after the colon, with no \s* before it, so it
+#: absorbs only a closing bold marker wrapping the label ("**LESSON:**
+#: text"); the leading strip below handles decoration before "lesson".
+#: Allowing a space first would also swallow the content's own opening
+#: bold ("LESSON: **Refactor X** now" -> "Refactor X** now").
+_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\**\s*(.+)$")
+#: The matched line is raw model output (on the codex path, drawn from the
+#: entire stdout file) and lands verbatim in results.json and the reflection
+#: LM prompt, so it needs the same cap every other free-text field on this
+#: path already has (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpts).
+LESSON_MAX_CHARS = 500
+
+
 def _positive_int_env(name: str, default: int) -> int:
     """Parse a positive-integer env var, failing with a readable message.
 
@@ -73,7 +104,9 @@ def _positive_int_env(name: str, default: int) -> int:
 #: budget needs headroom: wordy/transpose hit 691-722s even at a smaller
 #: budget, and GAIA completions under the 32768 budget ran 200-900+s. 2700
 #: keeps a hard multi-turn exercise capability-limited, not clock-limited.
-ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
+#: Named so live_eval.py can read the same default instead of duplicating it.
+_ATTEMPT_TIMEOUT_S_DEFAULT = 2700
+ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", _ATTEMPT_TIMEOUT_S_DEFAULT)
 #: Per-attempt budget for `codex exec`, seconds.
 CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
@@ -260,6 +293,63 @@ def _clip(value, limit: int):
     return value if len(text) <= limit else text[:limit]
 
 
+def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DELTA_CHARS) -> list:
+    """Keep a HEAD slice and a TAIL region of `deltas`, dropping the
+    middle, splitting char_budget evenly between the two ends. The tail
+    region is budget-fit, not necessarily contiguous with the true end --
+    an oversized entry within it (e.g. one huge toolcall_delta) is skipped
+    rather than truncating the whole tail at that point, so smaller,
+    genuinely-recent entries on either side of it still survive.
+
+    The tail matters because live_eval.py's
+    _reasoning_excerpt_from_trajectory tail-truncates whatever survives here,
+    assuming it is the model's LATEST reasoning; a head-only cutoff would
+    hand it the oldest content instead. Long streams really do hit this: a
+    ~13min bowling attempt filled an earlier 200-entry cap, almost all
+    thinking_delta.
+
+    A char budget (not a flat entry count) also keeps output size bounded
+    regardless of entry size: a handful of toolcall_* deltas (each carrying
+    a full "partial" state dump) can dwarf hundreds of small thinking_delta
+    chunks, so counting entries alone doesn't bound bytes.
+
+    Sizes are measured on the RAW (pre-_clip) entries -- close enough for a
+    budget, and avoids serializing twice. If nothing needs dropping, returns
+    `deltas` unchanged (no synthetic marker)."""
+    if not deltas:
+        return []
+    sizes = [len(json.dumps(d, default=str)) for d in deltas]
+    if sum(sizes) <= char_budget:
+        return deltas
+
+    head_budget = char_budget // 2
+    tail_budget = char_budget - head_budget
+
+    head_end = 0
+    used = 0
+    while head_end < len(deltas) and used + sizes[head_end] <= head_budget:
+        used += sizes[head_end]
+        head_end += 1
+
+    # Keeps scanning backward past an entry that doesn't fit rather than
+    # stopping there: one oversized delta (a toolcall_delta carrying a full
+    # "partial" state dump dwarfs the small thinking_delta chunks around it)
+    # would otherwise discard every smaller, budget-fitting entry behind it,
+    # including genuinely recent reasoning.
+    tail = []
+    used = 0
+    for i in range(len(deltas) - 1, head_end - 1, -1):
+        if used + sizes[i] <= tail_budget:
+            tail.append(deltas[i])
+            used += sizes[i]
+    tail.reverse()
+
+    omitted = len(deltas) - head_end - len(tail)
+    if omitted <= 0:
+        return deltas
+    return deltas[:head_end] + [{"type": "_omitted", "omitted_count": omitted}] + tail
+
+
 def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
     """Persist what the harness otherwise discards.
 
@@ -275,6 +365,12 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     it live with rpc.notifications() to compare (this is exactly how the
     thinking-budget intervention was first discovered, on a real `bowling`
     failure -- nothing in the persisted trajectory said so).
+
+    notifications: this attempt's OWN rpc.notifications(). Each attempt opens
+    a fresh PiRpc session (see _run_exercise), so this is already scoped to
+    just this attempt -- no delta-slicing across attempts needed or possible
+    anymore. Extension activity (skill-inject, knowledge-inject,
+    quality-monitor, etc.) otherwise invisible in this dump.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -302,6 +398,16 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
             "notifications": [
                 {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
                 for n in (notifications or [])
+            ],
+            # Every assistantMessageEvent delta whose type wasn't
+            # "text_delta" -- confirmed to be real reasoning/thinking content
+            # (thinking_delta, mostly) for a thinking-enabled model, plus
+            # toolcall_*/text_start/text_end bracketing events. Head+tail
+            # capped by _cap_non_text_deltas, then each surviving entry
+            # clipped to TRAJECTORY_FIELD_CHARS, same policy as tool_calls.
+            "non_text_deltas": [
+                _clip(d, TRAJECTORY_FIELD_CHARS)
+                for d in _cap_non_text_deltas(getattr(result, "non_text_deltas", None) or [])
             ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
@@ -781,6 +887,8 @@ def _run_exercise(
         outcomes: list[str] = []
         stop_reasons: list[str] = []
         turn_total = 0
+        compaction_total = 0
+        lessons: list[str] = []
         current_prompt = prompt
         codex_session_id = None
         for i in range(1, effective_attempts + 1):
@@ -856,6 +964,24 @@ def _run_exercise(
             else:
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
+            compaction_total += getattr(r, "compaction_events", 0) or 0
+            # Only an attempt whose prompt actually asked for one can have a
+            # LESSON: line, and the ask lives in the retry prompt built at the
+            # Gated on i > 1 explicitly, not just by where the retry prompt
+            # asking for a LESSON: line happens to live: attempt 1's
+            # assistant_text is all of the model's unprompted output, where a
+            # coincidental match (a `# LESSON: ...` code comment) would be
+            # fed to reflection as a genuine self-reflection. First match
+            # only -- one lesson per attempt, not one per mention.
+            for line in (getattr(r, "assistant_text", "") or "").splitlines():
+                # Strip leading markdown decoration a model may wrap the line
+                # in: "**LESSON:** ...", "- LESSON: ...", "## LESSON: ..."
+                # otherwise match nothing.
+                stripped = re.sub(r"^[\s>#*\-]+", "", line.strip()) if i > 1 else ""
+                m = _LESSON_RE.match(stripped)
+                if m:
+                    lessons.append(m.group(1).strip()[:LESSON_MAX_CHARS])
+                    break
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
             stop_reasons.append(_stop_reason(r))
@@ -907,7 +1033,10 @@ def _run_exercise(
                       "your previous attempt's code (read the current state "
                       "before editing). The tests failed with this output:\n\n```\n"
                     + out[-4000:]
-                    + "\n```\n\nFix the implementation and try again."
+                    + "\n```\n\nBefore continuing: on a single line starting with "
+                      "'LESSON:', state in one sentence what tool, skill, or "
+                      "information would have most helped you get here faster or "
+                      "more reliably. Then fix the implementation and try again."
                 )
             else:
                 # codex resumes its own session (see above), so it already
@@ -922,7 +1051,11 @@ def _run_exercise(
                     "The tests failed. Output:\n\n```\n"
                     + out[-4000:]
                     + "\n```\n\nThe test file(s) are for reference only -- "
-                      "do not edit them. Fix the implementation and try again."
+                      "do not edit them. Before continuing: on a single line "
+                      "starting with 'LESSON:', state in one sentence what tool, "
+                      "skill, or information would have most helped you get here "
+                      "faster or more reliably. Then fix the implementation and "
+                      "try again."
                 )
 
         elapsed = time.time() - t0
@@ -936,6 +1069,8 @@ def _run_exercise(
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
+            "compaction_total": compaction_total,
+            "lessons": lessons,
         }
         return record
 

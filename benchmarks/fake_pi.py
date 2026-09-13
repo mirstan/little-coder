@@ -8,7 +8,7 @@ expressed against a real agent anyway: it needs a process that exits on cue.
 Mode comes from FAKE_PI_MODE. Reads JSONL requests on stdin, emits JSONL on
 stdout, exactly as rpc_client expects.
 """
-import json, os, sys, time
+import base64, json, os, sys, time
 
 # Canned get_session_stats data (docs/rpc.md's documented shape) -- distinct
 # from any single turn_end's usage so tests can tell the two sources apart
@@ -37,6 +37,39 @@ TURN_USAGE = {"input": 100, "output": 20, "cacheRead": 10, "cacheWrite": 0,
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def _system_prompt_path_from_argv() -> str | None:
+    """pi's real argv includes `--system-prompt <path>` whenever
+    rpc_client._build_system_prompt() resolved one, and
+    fake_pi.py is launched with the exact same argv via
+    LITTLE_CODER_PI_BIN_OVERRIDE, so this is how a test can see what
+    candidate text an agent invocation actually received."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--system-prompt" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+def _write_solution_files():
+    """FAKE_PI_WRITE_FILES: JSON {"relative/path.py": "base64 content", ...}.
+    Writes each, relative to os.getcwd() (the exercise workdir -- PiRpc is
+    constructed with cwd=str(work) by aider_polyglot.py), and emits a
+    realistic tool_execution_start/end pair per file so tool_calls looks real."""
+    raw = os.environ.get("FAKE_PI_WRITE_FILES")
+    if not raw:
+        return
+    files = json.loads(raw)
+    for i, (rel_path, content_b64) in enumerate(files.items()):
+        content = base64.b64decode(content_b64).decode("utf-8")
+        target = os.path.join(os.getcwd(), rel_path)
+        emit({"type": "tool_execution_start", "toolCallId": f"w{i}", "toolName": "write",
+              "args": {"path": rel_path}})
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)  # matches the real pi write tool
+        with open(target, "w") as fh:
+            fh.write(content)
+        emit({"type": "tool_execution_end", "toolCallId": f"w{i}", "toolName": "write",
+              "result": {"content": [{"type": "text", "text": "ok"}]}, "isError": False})
 
 
 def emit_turn_end(usage=TURN_USAGE, stop_reason="stop", error_message=None):
@@ -325,6 +358,188 @@ def main():
         emit({"type": "usage_update", "usage": {"tokens": 123}})
         emit({"type": "agent_settled"})
         time.sleep(30)
+        return
+
+    if mode == "solve_from_env":
+        # Writes FAKE_PI_WRITE_FILES unconditionally, then finishes cleanly.
+        # Exits promptly, unlike the hang/crash fixtures above: this backs a
+        # real subprocess-per-exercise e2e test run many times per session,
+        # with no reason to leave a sleeping child behind each time.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "noop_then_solve":
+        # Solves only on the SECOND invocation. Attempts are separate
+        # PROCESSES -- aider_polyglot.py opens a fresh PiRpc (and therefore a
+        # fresh fake_pi.py subprocess) per attempt, deliberately (its own
+        # comment: reusing one session across attempts ballooned context and
+        # wedged pi) -- so "which attempt is this" must be tracked
+        # out-of-process via FAKE_PI_STATE_FILE, not an in-memory counter.
+        state_file = os.environ["FAKE_PI_STATE_FILE"]
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if os.path.exists(state_file):
+            _write_solution_files()
+        else:
+            with open(state_file, "w") as fh:
+                fh.write("attempt-1-done\n")
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "fail_then_report_lesson_then_solve":
+        # Attempt 1: fails (writes nothing). Attempt 2: emits a LESSON: line
+        # via text_delta (mirroring a real model following aider_polyglot.py's
+        # retry-prompt LESSON: instruction), then solves for real. Same
+        # cross-process attempt tracking as noop_then_solve -- see its own
+        # comment for why an in-memory counter can't work here.
+        state_file = os.environ["FAKE_PI_STATE_FILE"]
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if os.path.exists(state_file):
+            emit({"type": "message_update",
+                  "assistantMessageEvent": {"type": "text_delta",
+                                             "delta": "LESSON: needed clearer guidance\n"}})
+            _write_solution_files()
+        else:
+            with open(state_file, "w") as fh:
+                fh.write("attempt-1-done\n")
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "read_system_prompt_echo":
+        # Copies the system-prompt file's content to FAKE_PI_ECHO_FILE, so a
+        # test can assert a candidate's proposed text actually reached the
+        # agent invocation.
+        echo_file = os.environ["FAKE_PI_ECHO_FILE"]
+        system_prompt_path = _system_prompt_path_from_argv()
+        with open(echo_file, "w") as fh:
+            fh.write(open(system_prompt_path).read() if system_prompt_path else "")
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "solve_if_prompt_contains":
+        # Solves only if the RECEIVED system prompt contains
+        # FAKE_PI_MAGIC_TOKEN -- lets a test feed two candidates that differ
+        # only in instruction text and assert they score differently,
+        # without needing a real model to "decide" based on the text.
+        token = os.environ["FAKE_PI_MAGIC_TOKEN"]
+        system_prompt_path = _system_prompt_path_from_argv()
+        prompt_text = open(system_prompt_path).read() if system_prompt_path else ""
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        if token in prompt_text:
+            _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "emit_non_text_delta":
+        # Regression fixture for PromptResult.non_text_deltas (rpc_client.py):
+        # a message_update whose assistantMessageEvent.type is NOT
+        # "text_delta" before the normal text_delta, so the capture
+        # mechanism is exercised end to end.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "thinking_delta", "delta": "reasoning about the problem..."}})
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "final answer"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "emit_more_than_max_non_text_deltas":
+        # Regression fixture for rpc_client.py's _MAX_NON_TEXT_DELTAS
+        # backstop: a pathological reasoning stream emitting more than the
+        # cap must not grow PromptResult.non_text_deltas past it.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        count = int(os.environ.get("FAKE_PI_NON_TEXT_DELTA_COUNT", "1"))
+        for i in range(count):
+            emit({"type": "message_update",
+                  "assistantMessageEvent": {"type": "thinking_delta", "delta": f"chunk {i}"}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "emit_multi_thinking_delta":
+        # Regression fixture for live_eval.py's
+        # _reasoning_excerpt_from_trajectory(): emits several thinking_delta
+        # chunks (a real reasoning stream arrives incrementally, in the
+        # hundreds, not as one blob) interleaved with a tool call and
+        # text_delta content,
+        # then writes the real solution so the exercise actually passes.
+        # Proves both that the chunks get concatenated IN ORDER and that
+        # reasoning content never leaks into transcript_excerpt (which must
+        # only ever accumulate text_delta).
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        for chunk in ("Let me read the stub", " and the test file first.", " Now I understand the task."):
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "delta": chunk}})
+        _write_solution_files()
+        emit({"type": "message_update",
+              "assistantMessageEvent": {"type": "text_delta", "delta": "Implemented and tests pass."}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "emit_tool_error_then_solve":
+        # Regression fixture for live_eval.py's summarized_transcript
+        # (summarize_for_reflection): a recoverable tool failure mid-run,
+        # followed by a real solve -- proves the error still reaches
+        # reflection even though the attempt ultimately passes.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "tool_execution_start", "toolCallId": "e1", "toolName": "bash",
+              "args": {"command": "chmod +x ./run.sh"}})
+        emit({"type": "tool_execution_end", "toolCallId": "e1", "toolName": "bash",
+              "result": {"content": [{"type": "text", "text": "chmod: run.sh: Permission denied"}]},
+              "isError": True})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "emit_compactions_then_solve":
+        # Regression fixture for aider_polyglot.py's compaction_total
+        # accumulator and live_eval.py's compaction-aware scoring: emits two
+        # compaction_end events (rpc_client.py's PromptResult.compaction_events
+        # increments on this exact event type), then solves for real.
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "compaction_end"})
+        emit({"type": "compaction_end"})
+        _write_solution_files()
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "sleep_forever":
+        # Like hang_after_ack, but the sleep duration is configurable so a
+        # deadline/timeout test doesn't have to wait out a hardcoded 3600s.
+        sleep_s = float(os.environ.get("FAKE_PI_SLEEP_S", "3600"))
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        time.sleep(sleep_s)
         return
 
     if mode == "retry_then_settled":
