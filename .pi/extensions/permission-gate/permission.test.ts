@@ -143,6 +143,157 @@ describe("isSafeBash — env is not a safe prefix", () => {
   });
 });
 
+// ── Command substitution ───────────────────────────────────────────────────
+// `$(…)`, backticks and `<(…)` run a command line the prefix check never
+// sees — `echo $(rm -rf /)` is judged as `echo`.
+
+describe("isSafeBash — command substitution is refused outright", () => {
+  it("refuses every substitution spelling behind a whitelisted command", () => {
+    for (const cmd of [
+      "echo $(touch X)",
+      "echo `touch X`",
+      'echo "$(touch X)"',
+      "cat <(touch X)",
+      "echo hi >(touch X)",
+      "echo ${x:-$(touch X)}",
+      "ls $(rm -rf /)",
+    ]) {
+      expect(isSafeBash(cmd), cmd).toBe(false);
+    }
+  });
+
+  it("refuses substitution smuggled into an unquoted-delimiter heredoc body", () => {
+    expect(isSafeBash("cat <<EOF\n$(touch PWNED)\nEOF")).toBe(false);
+    // An apostrophe in the body leaves the quote tracker open, which used to
+    // make everything after it look literal.
+    expect(isSafeBash("cat <<EOF\ndon't worry\n$(touch PWNED)\nEOF")).toBe(false);
+  });
+
+  it("runs before prefix matching, so no allow-entry can lift it", () => {
+    expect(isSafeBash("echo $(touch X)", ["echo ", "echo $(touch X)"])).toBe(false);
+  });
+
+  it("still allows commands that only look like substitution", () => {
+    expect(isSafeBash("echo $HOME")).toBe(true);
+    expect(isSafeBash("echo '$(x)'")).toBe(true);
+    expect(isSafeBash('echo "$var"')).toBe(true);
+    expect(isSafeBash("grep foo <<< \"$var\"")).toBe(true);
+    expect(isSafeBash("cat <<'EOF'\n$(not expanded)\nEOF")).toBe(true);
+  });
+});
+
+// ── Heredoc opening line ───────────────────────────────────────────────────
+// Stripping a heredoc deleted the rest of its opening line along with the
+// body, hiding the chain operators and redirects that sit there.
+
+describe("isSafeBash — the heredoc opening line is not swallowed", () => {
+  it("sees a command chained after the <<DELIM token", () => {
+    expect(isSafeBash("cat <<EOF & rm -rf /\nbody\nEOF")).toBe(false);
+  });
+
+  it("sees a redirect placed after the <<DELIM token", () => {
+    expect(isSafeBash("cat << 'EOF' > backend/app.js\nX\nEOF")).toBe(false);
+  });
+});
+
+// ── `>&PATH` ───────────────────────────────────────────────────────────────
+
+describe("isSafeBash — >&word is only plumbing when word is a fd", () => {
+  it("refuses a >& redirect that truncates a real file", () => {
+    for (const cmd of [
+      "cat README.md >&backend/app.js",
+      "ls >&/etc/passwd",
+      "ls >& /etc/passwd",
+      "ls 2>&/etc/passwd",
+      "ls 1>&/tmp/victim.txt",
+    ]) {
+      expect(isSafeBash(cmd), cmd).toBe(false);
+    }
+  });
+
+  it("keeps allowing genuine descriptor plumbing", () => {
+    expect(isSafeBash("make 2>&1", ["make "])).toBe(true);
+    expect(isSafeBash("echo err >&2")).toBe(true);
+    expect(isSafeBash("make 2>&-", ["make "])).toBe(true);
+    expect(isSafeBash("make >& 2", ["make "])).toBe(true);
+  });
+});
+
+// ── Prefix word boundaries ─────────────────────────────────────────────────
+// Most entries had no trailing space, so they matched by bare `startsWith`:
+// `ls` matched `lsof`, and `git diff` matched `git difftool`, whose `-x` flag
+// runs an arbitrary command (verified executing against real git).
+
+describe("isSafeBash — safe prefixes end on a word boundary", () => {
+  it("refuses a longer binary that merely starts with a whitelisted name", () => {
+    for (const cmd of [
+      "lsof -i",
+      "catman x",
+      "idle",
+      "typeset -f",
+      "dateutils.dadd",
+      "echoevil",
+      "tailscale up",
+      "whoamid",
+      "printenvx",
+      "headers",
+    ]) {
+      expect(isSafeBash(cmd), cmd).toBe(false);
+    }
+  });
+
+  it("refuses a longer SUBCOMMAND that starts with a whitelisted one", () => {
+    // `git difftool -y -x CMD` executes CMD — this was arbitrary code
+    // execution through a whitelist of read-only git subcommands.
+    expect(isSafeBash("git difftool -y -x 'touch PWNED' HEAD~1")).toBe(false);
+    expect(isSafeBash("git logfoo")).toBe(false);
+    expect(isSafeBash("git statuses")).toBe(false);
+    expect(isSafeBash("pip showoff")).toBe(false);
+    expect(isSafeBash("npm listen")).toBe(false);
+    expect(isSafeBash("cargo metadatax")).toBe(false);
+  });
+
+  it("still allows a bare command with no arguments", () => {
+    for (const cmd of ["ls", "pwd", "printenv", "git log", "git status", "git stash list"]) {
+      expect(isSafeBash(cmd), cmd).toBe(true);
+    }
+  });
+
+  it("still allows the ordinary argument forms", () => {
+    for (const cmd of [
+      "ls -la",
+      "git log --oneline",
+      "git diff --stat",
+      "printenv PATH",
+      "cp a b",
+      "ls && git status",
+      "npm list",
+      "pip list",
+    ]) {
+      expect(isSafeBash(cmd), cmd).toBe(true);
+    }
+  });
+
+  it("keeps the glued-flag entries matching their flag forms", () => {
+    // `top -bn` / `curl -I` are prefixes of a flag, not whole commands, so
+    // they deliberately carry no trailing space.
+    expect(isSafeBash("top -bn1")).toBe(true);
+    expect(isSafeBash("curl -I url")).toBe(true);
+    expect(isSafeBash("curl -IL url")).toBe(true);
+    expect(isSafeBash("curl --head url")).toBe(true);
+  });
+
+  it("allows a bare interpreter — an intended, understood delta", () => {
+    // The exact-match clause newly admits these, which today are refused only
+    // because `"python3 "` cannot match a bare segment. It grants nothing new:
+    // `python3 -c '…'` is already whitelisted, a separate and documented
+    // interpreter hole. Pinned so it reads as a decision, not a regression.
+    expect(isSafeBash("python3")).toBe(true);
+    expect(isSafeBash("sed")).toBe(true);
+    expect(isSafeBash("node")).toBe(true);
+  });
+});
+
 describe("permission-gate tool_call interceptor", () => {
   function getHandler() {
     let handler: ((event: any, ctx: any) => any) | undefined;
@@ -201,6 +352,22 @@ describe("permission-gate tool_call interceptor", () => {
       expect(result?.block).toBe(true);
       expect(result.reason).toContain("npm");
       expect(result.reason).not.toContain('"ls"');
+    });
+  });
+
+  it("explains a substitution refusal without offering an override that cannot work", async () => {
+    const handler = getHandler();
+    await withMode("auto", async () => {
+      const result = await handler(
+        { toolName: "bash", input: { command: "echo $(rm -rf /)" } },
+        {},
+      );
+      expect(result?.block).toBe(true);
+      expect(result.reason).toMatch(/substitution/);
+      // Must not fall through to the generic prefix message, which would send
+      // the model hunting for an allow-entry that this check runs ahead of.
+      expect(result.reason).not.toContain("SAFE_PREFIXES");
+      expect(result.reason).toContain("LITTLE_CODER_BASH_ALLOW cannot override this");
     });
   });
 
@@ -302,7 +469,7 @@ describe("getSafePrefixes", () => {
     process.env.LITTLE_CODER_BASH_ALLOW = "make ,docker compose ps";
     try {
       const all = getSafePrefixes();
-      expect(all).toContain("ls"); // builtin still present
+      expect(all).toContain("ls "); // builtin still present (with its word boundary)
       expect(all).toContain("make ");
       expect(all).toContain("docker compose ps");
     } finally {

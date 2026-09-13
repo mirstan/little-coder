@@ -76,16 +76,25 @@ export interface ShellWrite {
 // `&&` before the lone `&` entry can see the second one.
 const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n", "&"];
 
+// The only characters a backslash escapes inside double quotes. Everything
+// else keeps both the backslash and the character literally ("\d" is "\d").
+const ESCAPABLE_IN_DOUBLE_QUOTES = new Set(["$", "`", '"', "\\"]);
+
 /**
  * Walk `cmd` once, tracking quote state, and hand each character to `visit`.
  *
  * Quote tracking is what keeps every consumer here from firing on text that
  * merely looks like shell syntax — `grep "a > b" file` writes nothing. A
  * backslash escape outside single quotes hides the next character too.
+ *
+ * `visit` receives the OPEN QUOTE CHARACTER, not a boolean, because the two
+ * quotes are not interchangeable: a single quote makes its contents wholly
+ * literal, while a double quote still expands `$(…)` and backticks. A
+ * consumer that only cares whether it is quoted at all can test truthiness.
  */
 function scan(
   cmd: string,
-  visit: (ch: string, index: number, quoted: boolean) => void,
+  visit: (ch: string, index: number, quote: '"' | "'" | null) => void,
 ): void {
   let quote: '"' | "'" | null = null;
   for (let i = 0; i < cmd.length; i++) {
@@ -96,7 +105,15 @@ function scan(
     }
     if (quote === "'" && ch === "\\") {
       // Backslash is literal inside single quotes — no escaping happens.
-      visit(ch, i, true);
+      visit(ch, i, quote);
+      continue;
+    }
+    if (quote === '"' && ch === "\\" && ESCAPABLE_IN_DOUBLE_QUOTES.has(cmd[i + 1])) {
+      // Bash's real escaping rule inside double quotes. Without it a `\"`
+      // closed the quote tracker, and `echo "a \" > b"` reported a write to a
+      // file named `b"`.
+      i++;
+      visit(cmd[i], i, quote); // the escaped character, as a quoted literal
       continue;
     }
     if (quote === null && (ch === '"' || ch === "'")) {
@@ -107,7 +124,7 @@ function scan(
       quote = null;
       continue;
     }
-    visit(ch, i, quote !== null);
+    visit(ch, i, quote);
   }
 }
 
@@ -116,18 +133,30 @@ function scan(
 // a third `<` at the call site.
 const HEREDOC_START = /<<-?[ \t]*(?:'([^']*)'|"([^"]*)"|([A-Za-z_][A-Za-z0-9_]*))/;
 
+/** One heredoc body found by `parseHeredocs`, with how its delimiter was written. */
+interface HeredocBody {
+  /** The body text, data only — never the opening line. */
+  text: string;
+  /**
+   * True for `<<'EOF'` / `<<"EOF"`. Bash performs parameter, command and
+   * arithmetic expansion inside a body whose delimiter is UNQUOTED, and none
+   * at all when it is quoted — the distinction `hasCommandSubstitution` needs
+   * to know whether a `$(…)` in the body actually runs.
+   */
+  delimiterQuoted: boolean;
+}
+
 /**
- * Remove heredoc bodies, leaving the command line that opened them.
+ * Strip every heredoc body out of `cmd`, returning the remaining command text
+ * alongside the bodies that were removed.
  *
- * A heredoc body is data, not shell syntax, and analyzing it produces noise in
- * both directions: a `>` in the payload (`if a > b:`) looks like a redirect,
- * and an apostrophe (`don't`) leaves the quote scanner stuck mid-string for
- * everything after it. The redirect we actually care about — the `>` in
- * `cat > main.py << 'EOF'` — always sits on the opening line, so dropping the
- * body loses nothing and removes every one of those false readings.
+ * `stripHeredocBodies` is the string half of this; `hasCommandSubstitution`
+ * needs the bodies too, and both must agree character-for-character about
+ * where a body starts and ends — hence one parser rather than two.
  */
-export function stripHeredocBodies(cmd: string): string {
+function parseHeredocs(cmd: string): { stripped: string; bodies: HeredocBody[] } {
   let out = cmd;
+  const bodies: HeredocBody[] = [];
   let searchFrom = 0;
   // One pass per heredoc; a command can open several.
   for (let guard = 0; guard < 32; guard++) {
@@ -141,10 +170,13 @@ export function stripHeredocBodies(cmd: string): string {
       continue;
     }
     const delim = m[1] ?? m[2] ?? m[3] ?? "";
-    const bodyStart = out.indexOf("\n", at + m[0].length);
+    // Groups 1 and 2 are the `'DELIM'` / `"DELIM"` spellings; group 3 is bare.
+    const delimiterQuoted = m[1] !== undefined || m[2] !== undefined;
+    const openEnd = at + m[0].length;
+    const bodyStart = out.indexOf("\n", openEnd);
     if (bodyStart === -1 || !delim) {
       // Body never started (single-line command) — nothing to remove.
-      searchFrom = at + m[0].length;
+      searchFrom = openEnd;
       continue;
     }
     const lines = out.slice(bodyStart + 1).split("\n");
@@ -161,10 +193,83 @@ export function stripHeredocBodies(cmd: string): string {
     const bodyEnd = closed
       ? Math.min(bodyStart + consumed, out.length)
       : out.length; // unterminated heredoc: the rest of the string is body
-    out = out.slice(0, at) + out.slice(bodyEnd);
+    bodies.push({ text: out.slice(bodyStart + 1, bodyEnd), delimiterQuoted });
+    // The span between the `<<DELIM` token and the body is the rest of the
+    // opening line, where real shell syntax lives. Deleting straight through
+    // to `bodyEnd` took it too, so `cat <<EOF & rm -rf /` reached the gate as
+    // a lone `cat`, and `cat << 'EOF' > app.js` lost the very redirect this
+    // module exists to catch.
+    out = out.slice(0, at) + out.slice(openEnd, bodyStart) + out.slice(bodyEnd);
     searchFrom = at;
   }
-  return out;
+  return { stripped: out, bodies };
+}
+
+/**
+ * Remove heredoc bodies, leaving the command line that opened them.
+ *
+ * A heredoc body is data, not shell syntax, and analyzing it produces noise in
+ * both directions: a `>` in the payload (`if a > b:`) looks like a redirect,
+ * and an apostrophe (`don't`) leaves the quote scanner stuck mid-string for
+ * everything after it. The redirect we actually care about — the `>` in
+ * `cat > main.py << 'EOF'` — always sits on the opening line, so dropping the
+ * body loses nothing and removes every one of those false readings.
+ */
+export function stripHeredocBodies(cmd: string): string {
+  return parseHeredocs(cmd).stripped;
+}
+
+/**
+ * True when `text` contains a substitution operator at top level — `$(…)`,
+ * backticks, or `<(…)`/`>(…)`. `text` must already have heredoc bodies
+ * removed: an apostrophe in a body (`don't`) opens a quote the tracker never
+ * sees closed, and every operator after it would be dismissed as literal.
+ */
+function scanForSubstitution(text: string): boolean {
+  let found = false;
+  scan(text, (ch, i, quote) => {
+    if (quote === "'") return; // wholly literal
+    // Backticks run even inside double quotes.
+    if (ch === "`") found = true;
+    // `$(…)` and `$((…))` alike — arithmetic can itself embed a `$(…)`, and
+    // one check covers both spellings.
+    if (ch === "$" && text[i + 1] === "(") found = true;
+    // Process substitution is not performed inside double quotes.
+    if (quote === null && (ch === "<" || ch === ">") && text[i + 1] === "(") found = true;
+  });
+  return found;
+}
+
+/**
+ * True when running `cmd` would execute a nested command through substitution.
+ *
+ * Substitution runs an arbitrary command with no trace of it in the outer
+ * command's prefix, so a prefix whitelist cannot see it at all: `echo $(rm -rf
+ * /)` is judged as `echo`. The whole shape is refused rather than analyzed,
+ * because the nested text is itself a full command line.
+ *
+ * Heredocs are handled in two halves, and both are load-bearing. The outer
+ * structure is scanned with bodies stripped, since a stray apostrophe in a
+ * body otherwise poisons quote tracking for everything after it. Each body
+ * whose delimiter was UNQUOTED is then scanned separately, with no quote
+ * tracking at all — bash expands `$(…)` and backticks inside those bodies and
+ * a body has no quote syntax of its own, every character being literal except
+ * the substitution operators. `<<'EOF'` suppresses expansion entirely, so
+ * those bodies are skipped and stay allowed.
+ *
+ * KNOWN GAP, deliberate: only permission-gate consults this. write-guard's
+ * accept-all/benchmark mode has a different threat model, where `$(…)` appears
+ * in ubiquitous legitimate commands (`cd $(git rev-parse --show-toplevel)`)
+ * and a blanket refusal would break benchmark runs wholesale; closing it there
+ * needs detection of redirects INSIDE the substituted text, which is a
+ * separate design. Not closed — out of scope, not overlooked.
+ */
+export function hasCommandSubstitution(cmd: string): boolean {
+  const { stripped, bodies } = parseHeredocs(cmd);
+  if (scanForSubstitution(stripped)) return true;
+  return bodies.some(
+    (b) => !b.delimiterQuoted && (b.text.includes("$(") || b.text.includes("`")),
+  );
 }
 
 /**
@@ -199,10 +304,10 @@ export function splitCommandChain(raw: string): string[] {
   // skips escaped characters outright and flags quoted ones, so neither can
   // land here and neither can pose as the redirect that suppresses a cut.
   let prevUnquoted: { ch: string; at: number } | undefined;
-  scan(cmd, (ch, i, quoted) => {
+  scan(cmd, (ch, i, quote) => {
     const prev = prevUnquoted;
-    if (!quoted) prevUnquoted = { ch, at: i };
-    if (quoted) return;
+    if (!quote) prevUnquoted = { ch, at: i };
+    if (quote) return;
     if (ch === "&" && !cmd.startsWith("&&", i)) {
       // `>&`/`<&` is always fd-duplication syntax in bash, never a real chain
       // separator — suppressing here can never hide a genuine bare `&`.
@@ -251,10 +356,17 @@ export function splitCommandChain(raw: string): string[] {
   return segments.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-// `2>`, `>&2`, `&>`, `1>&2` … — file-descriptor plumbing, not a file write.
-// We only care about a redirect whose target is a path.
-function isFdTarget(target: string): boolean {
-  return target.startsWith("&");
+/**
+ * True when the word after a redirect's `&` is fd plumbing rather than a file.
+ *
+ * Bash's rule for `>&word`: it duplicates (or, for `-`, closes) a descriptor
+ * only when the WHOLE word is a number or `-`. Anything else is an ordinary
+ * file write, identical to `&>word`. The match must therefore be anchored at
+ * both ends — verified live, `ls >&2foo` creates a file literally named
+ * `2foo`, so a leading-digit test would wave a real truncation through.
+ */
+function isFdPlumbingWord(word: string): boolean {
+  return word === "" || word === "-" || /^\d+$/.test(word);
 }
 
 // Redirecting to one of the kernel's special character devices destroys no
@@ -297,8 +409,8 @@ export function detectWriteTargets(raw: string): ShellWrite[] {
   const writes: ShellWrite[] = [];
   const redirects: Array<{ at: number; kind: WriteKind }> = [];
 
-  scan(cmd, (ch, i, quoted) => {
-    if (quoted || ch !== ">") return;
+  scan(cmd, (ch, i, quote) => {
+    if (quote || ch !== ">") return;
     // `>>` — record once, on the first angle bracket.
     if (cmd[i - 1] === ">") return;
     // `<>` opens read-write; treat as a write.
@@ -310,12 +422,19 @@ export function detectWriteTargets(raw: string): ShellWrite[] {
     const rest = cmd.slice(at);
     // Process substitution `>(cmd)` is not a file target.
     if (rest.trimStart().startsWith("(")) continue;
-    // fd duplication / close (`2>&1`, `>&2`, `>&-`): no file involved. Checked
-    // on the raw text because `&` is a word break, so `firstWord("&1")` is the
-    // descriptor number alone and no longer looks like fd syntax.
-    if (rest.startsWith("&")) continue;
+    // `>&word` is fd duplication/close (`2>&1`, `>&2`, `>&-`) only when the
+    // word is entirely digits or `-`. Every other word is a genuine file
+    // write — `ls >&backend/app.js` truncates `backend/app.js` exactly as
+    // `ls &>backend/app.js` does. Exempting the whole `&` shape treated that
+    // truncation as plumbing and let it past both guards.
+    if (rest.startsWith("&")) {
+      const word = firstWord(rest.slice(1));
+      if (isFdPlumbingWord(word)) continue;
+      writes.push({ path: unquote(word), kind });
+      continue;
+    }
     const target = firstWord(rest);
-    if (!target || isFdTarget(target)) continue;
+    if (!target) continue;
     writes.push({ path: unquote(target), kind });
   }
 
