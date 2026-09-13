@@ -83,6 +83,66 @@ describe("isSafeBash hardening (issue #70)", () => {
   });
 });
 
+// ── Bare `&` ───────────────────────────────────────────────────────────────
+// `&` backgrounds a job and runs the next command, but it was absent from the
+// chain-operator list: `ls & rm -rf /` was judged as the single segment `ls`
+// and allowed, while the `&&` spelling of the same thing was refused.
+
+describe("isSafeBash — a bare & separates commands", () => {
+  it("refuses a non-whitelisted command backgrounded behind a safe one", () => {
+    expect(isSafeBash("ls & rm -rf /")).toBe(false);
+    expect(isSafeBash("ls & npm install foo")).toBe(false);
+    expect(isSafeBash("cat f & sudo tee /etc/hosts")).toBe(false);
+  });
+
+  it("judges both sides of a bare & on their own", () => {
+    expect(isSafeBash("ls & echo hi")).toBe(true);
+    expect(isSafeBash("echo hi & rm -rf /")).toBe(false);
+    expect(isSafeBash("sleep 1 &", ["sleep "])).toBe(true);
+  });
+
+  it("leaves && behaving exactly as before", () => {
+    expect(isSafeBash("ls && rm -rf /")).toBe(false);
+    expect(isSafeBash("ls && git status")).toBe(true);
+  });
+
+  it("does not read fd duplication or an &> redirect as backgrounding", () => {
+    expect(isSafeBash("make 2>&1", ["make "])).toBe(true);
+    expect(isSafeBash("make >&2", ["make "])).toBe(true);
+    expect(isSafeBash("make 2>&-", ["make "])).toBe(true);
+    expect(isSafeBash("make <&3", ["make "])).toBe(true);
+    expect(isSafeBash("make &>/dev/null", ["make "])).toBe(true);
+    expect(isSafeBash("make &>>/dev/null", ["make "])).toBe(true);
+  });
+
+  it("refuses an &> redirect used to smuggle a trailing command", () => {
+    // Harmless under bash (`rm -rf /` are arguments to `cat`), but a real
+    // second command under /bin/sh or dash — and pi's own `bash` tool falls
+    // back to `sh` when no bash is on the image, so the gate must not assume.
+    expect(isSafeBash("cat &>/dev/null rm -rf /")).toBe(false);
+    expect(isSafeBash("ls &>>/dev/null rm -rf /")).toBe(false);
+  });
+
+  it("does not read a quoted or escaped & as an operator", () => {
+    expect(isSafeBash('echo "a & b"')).toBe(true);
+    expect(isSafeBash("echo a \\& b")).toBe(true);
+  });
+});
+
+describe("isSafeBash — env is not a safe prefix", () => {
+  it("refuses env, whose argument runs verbatim past the prefix check", () => {
+    expect(isSafeBash("env rm -rf /")).toBe(false);
+    expect(isSafeBash("env ls")).toBe(false);
+    expect(isSafeBash("env FOO=1 npm install foo")).toBe(false);
+  });
+
+  it("keeps printenv, the read-only use env was covering", () => {
+    expect(isSafeBash("printenv")).toBe(true);
+    expect(isSafeBash("printenv PATH")).toBe(true);
+    expect(getSafePrefixes()).not.toContain("env");
+  });
+});
+
 describe("permission-gate tool_call interceptor", () => {
   function getHandler() {
     let handler: ((event: any, ctx: any) => any) | undefined;

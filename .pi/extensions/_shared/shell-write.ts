@@ -67,7 +67,14 @@ export interface ShellWrite {
 // Operators that chain one command into the next. Splitting on these lets the
 // whitelist judge every segment rather than only the first one, so
 // `ls && rm -rf /` can't ride in on `ls`.
-const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
+//
+// Bare `&` backgrounds a job and starts the next command, exactly like `;`.
+// Leaving it out meant `ls & rm -rf /` passed the gate as one `ls`-prefixed
+// segment while `ls && rm -rf /` was correctly refused. It must stay AFTER
+// `&&`: the scanner is first-match-wins per position and skips positions a
+// longer match already consumed, so `&&` claims both characters of a real
+// `&&` before the lone `&` entry can see the second one.
+const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n", "&"];
 
 /**
  * Walk `cmd` once, tracking quote state, and hand each character to `visit`.
@@ -161,15 +168,67 @@ export function stripHeredocBodies(cmd: string): string {
 }
 
 /**
+ * True when the `&>`/`&>>` starting at `at` is followed by its redirect
+ * target and nothing more before the command ends or the next chain operator
+ * begins — the only shape in which bash's "redirect both streams" reading and
+ * a POSIX shell's "background, then redirect" reading agree that no second
+ * command runs. Anything past the next chain operator belongs to a different
+ * command and is judged on its own, so it is not counted here.
+ *
+ * Quoted whitespace inside the target (`&>"my file"`) counts as two words and
+ * so declines the exemption. That only ever costs a cut that produces a
+ * redirect-only segment, which `detectWriteTargets` already refuses as a file
+ * write — the conservative direction.
+ */
+function redirectTargetEndsCommand(cmd: string, at: number): boolean {
+  const opLen = cmd[at + 2] === ">" ? 3 : 2;
+  const tail = cmd.slice(at + opLen).split(/[;|\n&]/, 1)[0];
+  return tail.trim().split(/\s+/).filter(Boolean).length <= 1;
+}
+
+/**
  * Split a command line into the individual commands it runs, on unquoted
- * `&&`, `||`, `;`, `|` and newlines. Heredoc bodies are stripped first so
+ * `&&`, `||`, `;`, `|`, `&` and newlines. Heredoc bodies are stripped first so
  * their contents are never mistaken for commands.
  */
 export function splitCommandChain(raw: string): string[] {
   const cmd = stripHeredocBodies(raw);
   const cuts: Array<{ at: number; len: number }> = [];
-  scan(cmd, (_ch, i, quoted) => {
+  // The unquoted character immediately before the one being visited — the only
+  // thing that separates a backgrounding `&` from the `&` of `2>&1`. `scan`
+  // skips escaped characters outright and flags quoted ones, so neither can
+  // land here and neither can pose as the redirect that suppresses a cut.
+  let prevUnquoted: { ch: string; at: number } | undefined;
+  scan(cmd, (ch, i, quoted) => {
+    const prev = prevUnquoted;
+    if (!quoted) prevUnquoted = { ch, at: i };
     if (quoted) return;
+    if (ch === "&" && !cmd.startsWith("&&", i)) {
+      // `>&`/`<&` is always fd-duplication syntax in bash, never a real chain
+      // separator — suppressing here can never hide a genuine bare `&`.
+      if (prev && prev.at === i - 1 && (prev.ch === ">" || prev.ch === "<")) return;
+      // `&>`/`&>>` redirect stdout and stderr together under bash — but under
+      // /bin/sh or dash the same bytes are a backgrounding `&` followed by a
+      // separate `>` redirect. The exemption therefore covers only the shape
+      // where BOTH readings are harmless: the redirect target is the last
+      // word of the command. `make &>/dev/null` is one command under bash and
+      // `make &` plus a bare `>/dev/null` under dash — no second command
+      // either way, and a target that is a real file is caught by
+      // `detectWriteTargets` regardless.
+      //
+      // A trailing command word is what makes the two readings diverge:
+      // `cat &>/dev/null rm -rf /` is `cat` with `rm -rf /` as arguments
+      // under bash, but `cat &` then `rm -rf /` under dash. So that shape is
+      // cut and every segment gets judged on its own.
+      //
+      // Narrow rather than unconditional because the shell is NOT guaranteed
+      // to be bash. shell-session and bg-shell do hardcode `/bin/bash`, but
+      // SHELL_TOOLS also gates pi's own `bash` tool, and pi resolves a shell
+      // at runtime — `shellPath` from settings.json, else /bin/bash, else
+      // bash on PATH, else plain `sh`. On an image without bash the
+      // unconditional form was a live bypass, not a theoretical one.
+      if (cmd[i + 1] === ">" && redirectTargetEndsCommand(cmd, i)) return;
+    }
     for (const op of CHAIN_OPERATORS) {
       if (cmd.startsWith(op, i)) {
         // Don't cut inside an already-recorded operator (`&&` must not also

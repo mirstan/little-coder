@@ -19,7 +19,13 @@ import { SHELL_TOOLS, detectWriteTargets, splitCommandChain } from "../_shared/s
 
 const BUILTIN_SAFE_PREFIXES: readonly string[] = [
   "ls", "cat", "head", "tail", "wc", "pwd", "echo", "printf", "date",
-  "which", "type", "env", "printenv", "uname", "whoami", "id",
+  // `env` removed: `env <cmd>` runs `<cmd>` verbatim while the prefix match
+  // only ever sees `env`, so `env rm -rf /tmp/x` was whitelisted. Its one
+  // common read-only use is already covered by `printenv` below.
+  // `find`/`sed`/`python`/`node` share that run-something-verbatim shape and
+  // stay — dropping them costs real interactive usability, dropping `env`
+  // cost none. They remain a known, accepted hole in prefix whitelisting.
+  "which", "type", "printenv", "uname", "whoami", "id",
   "git log", "git status", "git diff", "git show", "git branch",
   "git remote", "git stash list", "git tag",
   "find ", "grep ", "rg ", "ag ", "fd ", "sed ",
