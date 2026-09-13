@@ -519,12 +519,13 @@ def test_a_same_day_window_reads_only_the_given_log(tmp_path, capsys):
 def test_the_log_being_read_is_not_suggested_back_to_the_user(tmp_path):
     """Pointed at the pre-midnight rotated file, the gap is the live log, not itself."""
     (tmp_path / "server.log").write_text("")
-    siblings = R.rotated_siblings(
+    siblings, missing_days = R.rotated_siblings(
         tmp_path / "server.log.2026-09-12",
         _local("2026-09-12", "23:30:00"),
         _local("2026-09-13", "00:30:00"),
     )
     assert siblings == [tmp_path / "server.log"]
+    assert missing_days == []
 
 
 def test_a_sibling_retention_has_already_deleted_is_skipped(tmp_path, capsys):
@@ -539,11 +540,15 @@ def test_a_sibling_retention_has_already_deleted_is_skipped(tmp_path, capsys):
 
     R.report(trial_dir, server_log)
 
-    assert R.rotated_siblings(server_log, *R.read_window(trial_dir)) == [kept]
+    siblings, missing_days = R.rotated_siblings(server_log, *R.read_window(trial_dir))
+    assert siblings == [kept]
+    assert missing_days == [datetime.strptime("2026-09-12", "%Y-%m-%d").date()]
     assert [r["prompt_tokens"] for r in _rows(trial_dir)] == ["1000", "3000"]
     err = capsys.readouterr().err
     assert str(deleted) not in err
     assert str(kept) in err
+    assert "INCOMPLETE" in err
+    assert "2026-09-12" in err
 
 
 def test_a_trial_that_died_before_agent_execution_gets_a_clear_error(tmp_path):

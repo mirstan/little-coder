@@ -237,8 +237,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # Zero or negative leaves _sleep_until with nothing to wait for, turning the
     # loop into an unthrottled hammering of /api/status and the subprocesses.
-    if args.interval <= 0:
-        parser.error("--interval must be a positive number of seconds")
+    # `<= 0` alone lets nan through -- every comparison against nan is False,
+    # so it would reach time.sleep(nan) and raise ValueError mid-run instead
+    # of failing at the CLI.
+    if not (0 < args.interval < float("inf")):
+        parser.error("--interval must be a positive, finite number of seconds")
     return poll(args.run_dir, args.interval, status_url=args.status_url)
 
 

@@ -317,9 +317,14 @@ def test_cli_requires_a_run_dir():
         P.main([])
 
 
-@pytest.mark.parametrize("interval", ["0", "-5"])
+@pytest.mark.parametrize("interval", ["0", "-5", "nan", "inf"])
 def test_cli_rejects_a_non_positive_interval(tmp_path, interval):
-    """Without a wait between samples poll() spins, hammering the server and sysctl."""
+    """Without a wait between samples poll() spins, hammering the server and sysctl.
+
+    nan/inf are included because `<= 0` alone lets them through -- every
+    comparison against nan is False, so a lone `<= 0` guard would still hand
+    poll() a value that later raises ValueError out of time.sleep(nan).
+    """
     with pytest.raises(SystemExit) as excinfo:
         P.main(["--run-dir", str(tmp_path), "--interval", interval])
     assert excinfo.value.code != 0
