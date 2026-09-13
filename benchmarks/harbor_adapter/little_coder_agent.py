@@ -912,6 +912,13 @@ class LittleCoderAgent(BaseAgent):
                 if isinstance(msg, dict) and (
                     msg.get("errorMessage") or msg.get("stopReason") == "error"
                 ):
+                    # Drain the streamed text first, as every other marker
+                    # branch does: text still buffered here belongs to the
+                    # turn that just failed, and would otherwise surface
+                    # after the line explaining why it stopped.
+                    if pending_text:
+                        live_log_fh.write("".join(pending_text) + "\n")
+                        pending_text.clear()
                     live_log_fh.write(
                         f"=== turn error (stopReason="
                         f"{msg.get('stopReason')}): "
@@ -919,6 +926,9 @@ class LittleCoderAgent(BaseAgent):
                     )
                     live_log_fh.flush()
             elif t == "auto_retry_start":
+                if pending_text:
+                    live_log_fh.write("".join(pending_text) + "\n")
+                    pending_text.clear()
                 live_log_fh.write(
                     f"=== pi auto-retry {ev.get('attempt')}/"
                     f"{ev.get('maxAttempts')} in {ev.get('delayMs')}ms: "
@@ -1105,6 +1115,11 @@ class LittleCoderAgent(BaseAgent):
                             f"=== error retries: {retry_outcome.n_error_retries} "
                             f"(last error: {retry_outcome.error_message}) ===\n"
                         )
+                    if retry_outcome.retry_exception:
+                        log_fh.write(
+                            f"=== retry raised (not propagated): "
+                            f"{retry_outcome.retry_exception} ===\n"
+                        )
                     log_fh.write(f"=== assistant text ===\n{result.assistant_text}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
@@ -1155,6 +1170,10 @@ class LittleCoderAgent(BaseAgent):
                     # indistinguishable from an older adapter build.
                     "n_error_retries": retry_outcome.n_error_retries,
                     "error_message": retry_outcome.error_message,
+                    # A retry that raised is turned into a normal return by
+                    # prompt_with_error_retry, so this field is the only place
+                    # a harness fault reaches result.json at all.
+                    "retry_exception": retry_outcome.retry_exception,
                     "n_tool_calls": len(result.tool_calls),
                     "n_turns": result.turn_count,
                     "n_compactions": result.compaction_events,

@@ -132,3 +132,15 @@ def test_a_footer_only_result_over_the_limit_is_kept_whole():
 def test_a_footer_with_an_empty_body_does_not_open_on_a_blank_line():
     footer = "[exit=0 cwd=" + "/deep" * 90 + " timed_out=false]"
     assert preview_tool_result("\n" + footer) == footer
+
+
+def test_a_trailing_newline_after_the_footer_does_not_defeat_detection():
+    """`text.rpartition("\\n")` on input ending in "\\n" yields an empty
+    `last`, which fails the footer test and lets the real footer get cut
+    mid-line by the body-truncation path -- rstrip before anything else."""
+    footer = "[exit=0 cwd=" + "/deep" * 90 + " timed_out=false]"
+    body = "x" * 500
+    assert preview_tool_result(body + "\n" + footer + "\n") == preview_tool_result(
+        body + "\n" + footer
+    )
+    assert preview_tool_result(body + "\n" + footer + "\n").endswith(footer)

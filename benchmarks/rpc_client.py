@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -1063,6 +1063,12 @@ class ErrorRetryOutcome:
     #: later attempt then succeeded -- otherwise a recovered trial would
     #: record n_error_retries > 0 with no trace of what it recovered from.
     error_message: str = ""
+    #: "TypeName: message" when a RETRY raised and was turned into the merged
+    #: result instead of propagating, "" otherwise. Separate from
+    #: `error_message`, which is a provider verdict: this one is a harness
+    #: fault (a rejected prompt, a dead pipe) that the caller would otherwise
+    #: have seen as a raised exception and now cannot see at all.
+    retry_exception: str = ""
 
 
 def _merged_result(acc: PromptResult, latest: PromptResult) -> PromptResult:
@@ -1141,7 +1147,11 @@ def prompt_with_error_retry(
     exception out of a RETRY is caught for the same reason and turned into
     that merged result; the first attempt's is left to propagate, so
     wrapping a call site in this helper cannot swallow a failure the bare
-    prompt_and_collect() would have raised.
+    prompt_and_collect() would have raised. A caught one is still reported
+    three ways, because it is a harness fault the caller can no longer see
+    raised: on stderr, in `ErrorRetryOutcome.retry_exception`, and -- when it
+    left pi dead -- as a "process_exit" stop_reason rather than a retryable
+    "error".
 
     `sleep`/`now` are injected purely so tests can drive the whole policy
     without spending real seconds.
@@ -1172,12 +1182,30 @@ def prompt_with_error_retry(
             try:
                 result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
             except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
                 _log(
-                    f"retry {n_retries} raised "
-                    f"{type(exc).__name__}: {exc} -- keeping what the first "
-                    f"{attempts - 1} attempt(s) produced"
+                    f"retry {n_retries} raised {detail} -- keeping what the "
+                    f"first {attempts - 1} attempt(s) produced"
                 )
-                return ErrorRetryOutcome(merged, n_retries, last_error)
+                # Unconditionally, not only through `log` -- which defaults to
+                # None. This is the one path that turns a raised failure into
+                # an ordinary return, so a caller without a logger would
+                # otherwise see no trace of it whatsoever.
+                print(
+                    f"WARNING: error retry {n_retries} raised {detail}; "
+                    f"returning the first {attempts - 1} attempt(s) instead",
+                    file=sys.stderr,
+                )
+                if not rpc.is_alive():
+                    # The accumulated verdict still reads "error", the
+                    # RETRYABLE value, for a session that is provably gone --
+                    # the same contradiction the stop_reason derivation
+                    # re-checks liveness to avoid. `replace`, not mutation:
+                    # `merged` can still be attempt 1's own object.
+                    merged = replace(
+                        merged, stop_reason="process_exit", error_message=""
+                    )
+                return ErrorRetryOutcome(merged, n_retries, last_error, detail)
         merged = result if merged is None else _merged_result(merged, result)
         if result.stop_reason != "error":
             return ErrorRetryOutcome(merged, n_retries, last_error)
@@ -1253,7 +1281,13 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     one exception is a footer wider than `limit` itself, which is still
     preserved in full: dropping it is the bug this exists to fix.
     """
-    text = text or ""
+    # Strip trailing newlines before anything else: `_format_output()` never
+    # emits one, but a caller that does would otherwise make `rpartition`
+    # yield an empty `last` ("[exit=0]\n".rpartition("\n")[2] == ""), which
+    # fails the footer test below and lets the real footer get cut mid-line
+    # by the body-truncation path -- the exact bug this function exists to
+    # prevent.
+    text = (text or "").rstrip("\n")
     if len(text) <= limit:
         return text
 

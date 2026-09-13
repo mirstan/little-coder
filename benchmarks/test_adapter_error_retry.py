@@ -281,6 +281,55 @@ def test_an_exception_from_a_retry_keeps_what_earlier_attempts_produced():
     assert outcome.error_message == "upstream 500"
 
 
+def test_a_swallowed_retry_exception_is_still_recorded():
+    """Caught instead of raised is not the same as never happened: a rejected
+    prompt or a dead pipe is a HARNESS fault, and `error_message` only ever
+    carries the provider's verdict."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), rpc_client.PiProcessExited("pi died")], clock)
+    outcome = _run(rpc, clock)
+    assert "PiProcessExited" in outcome.retry_exception
+    assert "pi died" in outcome.retry_exception
+    assert outcome.error_message == "upstream 500", "the provider error is untouched"
+
+
+def test_a_retry_that_left_pi_dead_no_longer_reports_a_retryable_error():
+    """"error" is the value the whole helper treats as retryable, so leaving
+    it on a session that is provably gone is the same contradiction the
+    stop_reason derivation re-checks liveness to avoid."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), rpc_client.PiProcessExited("pi died")], clock,
+                   alive=True)
+    original_prompt = rpc.prompt_and_collect
+
+    def _die(*a, **kw):
+        # Alive at the pre-retry liveness check, dead by the time the retry
+        # itself blows up -- the window the check cannot cover.
+        try:
+            return original_prompt(*a, **kw)
+        except Exception:
+            rpc.alive = False
+            raise
+
+    rpc.prompt_and_collect = _die
+    outcome = _run(rpc, clock)
+    assert len(rpc.calls) == 2
+    assert outcome.result.stop_reason == "process_exit"
+    assert outcome.result.error_message == ""
+
+
+def test_a_retry_exception_with_pi_still_alive_keeps_the_error_verdict():
+    """The correction above is scoped to a dead pi: a retry that raised for
+    some other reason leaves a live session whose last verdict really was a
+    provider error."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), RuntimeError("pi rejected prompt: busy")], clock,
+                   alive=True)
+    outcome = _run(rpc, clock)
+    assert outcome.result.stop_reason == "error"
+    assert "pi rejected prompt" in outcome.retry_exception
+
+
 def test_an_exception_from_the_first_attempt_still_propagates():
     """Wrapping a call site in this helper must not swallow a failure the
     bare prompt_and_collect() it replaces would have raised."""

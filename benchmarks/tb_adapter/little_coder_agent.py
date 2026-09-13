@@ -348,6 +348,10 @@ class LittleCoderAgent(BaseAgent):
                     log_fh.write(
                         f"=== error retries: {retry_outcome.n_error_retries} "
                         f"(last error: {retry_outcome.error_message}) ===\n")
+                    if retry_outcome.retry_exception:
+                        log_fh.write(
+                            f"=== retry raised (not propagated): "
+                            f"{retry_outcome.retry_exception} ===\n")
                     log_fh.write(f"=== assistant text ===\n{text_out}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")

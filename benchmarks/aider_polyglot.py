@@ -483,12 +483,28 @@ def _attempt_outcome(result) -> str:
     with real work behind it falls to "completed", same as any other attempt
     that finished without passing. The retry that makes an errored completion
     worth reacting to lives in the Harbor/TB adapters, not in this scorer.
+
+    "deadline" always wins regardless of shape: the budget is spent either
+    way, so there is nothing a fresh attempt could do differently. "process_exit"
+    is different -- it means THIS attempt's pi died, but _run_exercise spawns a
+    brand-new PiRpc per attempt (unlike prompt_with_error_retry, which reuses
+    one session and is the actual reason rpc_client's derivation now
+    distinguishes "process_exit" from "error"), so a dead process here is no
+    obstacle to the next attempt. Checking shape FIRST for process_exit lets a
+    process-exit-coincident empty completion keep classifying as
+    "empty_response" (the most retryable outcome) instead of silently losing
+    its retry budget to a reclassification this scorer never asked for. A
+    process_exit with real work behind it (tool calls, assistant text) still
+    reports "process_exit" -- that combination is a genuine harness fault
+    worth abandoning the attempt over, not an empty-completion shape.
     """
     reason = _stop_reason(result)
-    if reason in ("process_exit", "deadline"):
+    if reason == "deadline":
         return reason
     if _is_empty_response(result):
         return "empty_response"
+    if reason == "process_exit":
+        return reason
     return "completed"
 
 
