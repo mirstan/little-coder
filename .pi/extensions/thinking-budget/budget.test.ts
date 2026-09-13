@@ -553,6 +553,12 @@ describe("thinking-budget adaptive-off latch", () => {
     await latchAdaptiveOff(h);
     expect(h.level()).toBe("off");
 
+    // A turn on from the latch, so the level "off" has actually reached the
+    // model and a breach means over-thinking rather than a pending change —
+    // without this the just-latched suppression below would skip the check.
+    vi.advanceTimersByTime(1_000_000);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+
     // Budget is 0, so any thinking at all breaches. forcedOff takes ownership.
     await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
     expect(h.level()).toBe("off");
@@ -560,6 +566,29 @@ describe("thinking-budget adaptive-off latch", () => {
     // If the handoff captured "off" instead of the adaptive latch's "high",
     // this restores to "off" and thinking is lost for the session.
     await fire(h.pi, "input", { text: "next task", source: "interactive" }, h.ctx);
+    expect(h.level()).toBe("high");
+  });
+
+  // The latch's whole design is self-restoring, but it was unreachable: the
+  // zeroed budget binds on the turn already in flight while the "off" it was
+  // paired with only binds on the next one, so the first thinking char of that
+  // turn breached and promoted the transient latch into permanent forcedOff.
+  it("does not escalate into permanent forcedOff on the turn it latches", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await latchAdaptiveOff(h);
+    expect(h.level()).toBe("off");
+
+    // Pre-fix this breached (tokens=1 > budget=0) and ran the full recovery.
+    await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
+    expect(h.calls).not.toContain("abort");
+    expect(h.followUps).toHaveLength(0);
+
+    // And because forcedOff never took over, the latch can still self-restore
+    // once a fast turn pulls the estimate back down. Pre-fix this stayed "off"
+    // for the rest of the session: the adaptive block is gated on !forcedOff.
+    vi.advanceTimersByTime(100);
+    await fire(h.pi, "turn_start", {}, h.ctx);
     expect(h.level()).toBe("high");
   });
 
@@ -669,5 +698,229 @@ describe("thinking-budget wall-clock guard gating", () => {
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
 
     expect(h.calls).toEqual([]);
+  });
+});
+
+// ── The wall-clock guard's forcedOff releases on headroom, not only on input ─
+// The guard needs a deadline, and the only thing that sets one is the harbor
+// adapter — which issues exactly one rpc.prompt_and_collect per trial. So in
+// the one context where the guard can fire, neither of forcedOff's releases
+// (session_start, a genuine input) ever comes again, and a single trip used to
+// disable thinking for every remaining turn of the trial.
+describe("thinking-budget wall-clock guard forcedOff release", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "1000";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 60 * 1000);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+    delete process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS;
+  });
+
+  async function tripGuard(h: ReturnType<typeof makeHarness>) {
+    await startRun(h);
+    vi.advanceTimersByTime(1500); // past the 1000ms hard cap
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+  }
+
+  it("restores thinking at the next turn_start once headroom is back", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await tripGuard(h);
+    expect(h.level()).toBe("off");
+
+    // An hour of deadline remains and the turn that tripped was 1.5s, so the
+    // headroom check that governs adaptiveOff says there is no problem now.
+    // Pre-fix the level stayed "off" here and for every turn after it.
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    expect(h.level()).toBe("high");
+
+    // Twenty more healthy turns: thinking stays on, and nothing re-forces it.
+    for (let i = 0; i < 20; i++) {
+      vi.advanceTimersByTime(100);
+      await fire(h.pi, "turn_start", {}, h.ctx);
+    }
+    expect(h.level()).toBe("high");
+  });
+
+  it("keeps thinking off while the headroom problem persists", async () => {
+    // A floor no run can clear keeps resolveAdaptiveBudget pinned at 0, which
+    // is the "deadline pressure is still on" signal the release consults.
+    process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS = String(1e9);
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await tripGuard(h);
+
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    expect(h.level()).toBe("off");
+  });
+
+  it("a token-budget breach's forcedOff does NOT self-release", async () => {
+    // Only the guard flavor self-releases: a token-budget breach means this
+    // task over-thought, which remaining clock does not disprove.
+    process.env.LITTLE_CODER_THINKING_BUDGET = "10";
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "message_update", thinkingDelta("x".repeat(1000)), h.ctx);
+    expect(h.level()).toBe("off");
+
+    vi.advanceTimersByTime(100);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    expect(h.level()).toBe("off");
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+  });
+});
+
+// ── Both breach triggers stand down in the finalize-warn window ─────────────
+// Near the deadline resolveAdaptiveBudget resolves to 0 by design, so the
+// token-budget path fires on the first thinking token of what is very likely
+// the model's final-answer turn. The guard already stood down there; this path
+// did not.
+describe("thinking-budget cap finalize-warn stand-down", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    // Pins the adaptive budget at 0 without needing a slow-turn setup, which
+    // is exactly the state a near-deadline run is in.
+    process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS = String(1e9);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+  });
+
+  // Turn 1 latches adaptive-off; turn 2 is where the budget check is live
+  // again (turn 1 is suppressed as the just-latched turn).
+  async function twoTurnsAtZeroBudget(h: ReturnType<typeof makeHarness>) {
+    await startRun(h);
+    vi.advanceTimersByTime(10);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+  }
+
+  it("does not abort a zero-budget turn inside the window, notifying once", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(5 * 60 * 1000); // inside the 10min window
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await twoTurnsAtZeroBudget(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
+    await fire(h.pi, "message_update", thinkingDelta("more"), h.ctx);
+    await fire(h.pi, "message_update", thinkingDelta("still more"), h.ctx);
+
+    // Pre-fix: ["set:off", "set:off", "send", "notify", "abort"] — the final
+    // answer cut off two thinking tokens in.
+    expect(h.calls).not.toContain("abort");
+    expect(h.followUps).toHaveLength(0);
+    expect(h.notifies).toHaveLength(1);
+    expect(h.notifies[0]).toMatch(/standing down.*finalize-warn window/i);
+  });
+
+  it("stands down on the turn-count trigger too, with clock to spare", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 60 * 1000);
+    process.env.LITTLE_CODER_MAX_TURNS = "10"; // window opens at turn 6
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h); // turn 1
+    for (let i = 0; i < 5; i++) await fire(h.pi, "turn_start", {}, h.ctx); // turns 2-6
+
+    await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
+
+    expect(h.calls).not.toContain("abort");
+    expect(h.notifies[0]).toMatch(/standing down.*finalize-warn window/i);
+    delete process.env.LITTLE_CODER_MAX_TURNS;
+  });
+
+  it("still aborts a zero-budget breach outside the window", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 60 * 1000); // far from any window
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await twoTurnsAtZeroBudget(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
+
+    expect(h.calls).toContain("abort");
+    expect(h.followUps[0]).toMatch(/thinking budget exceeded/i);
+  });
+});
+
+// ── Mid-stream steering is not a new task ──────────────────────────────────
+// pi sets streamingBehavior on the input event only while isStreaming is true
+// (agent-session.js), so its presence is an exact discriminator for "the user
+// typed at a running agent" — which arrives as source "interactive" and used
+// to slip through the extension-source filter.
+describe("thinking-budget mid-stream steer filtering", () => {
+  beforeEach(() => {
+    process.env.LITTLE_CODER_THINKING_BUDGET = "10";
+  });
+  afterEach(() => {
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+  });
+
+  it("a steer during a forced-off task neither restores nor clears the latch", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "message_update", thinkingDelta("x".repeat(1000)), h.ctx);
+    expect(h.level()).toBe("off");
+
+    // Pre-fix this restored "high" mid-task — issue #8's symptom again.
+    await fire(
+      h.pi,
+      "input",
+      { text: "also fix the typo", source: "interactive", streamingBehavior: "steer" },
+      h.ctx,
+    );
+    expect(h.level()).toBe("off");
+
+    // Still latched, so the restart turn is still held off...
+    h.setLevelExternally("high");
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    expect(h.level()).toBe("off");
+
+    // ...and a genuinely new prompt still restores.
+    await fire(h.pi, "input", { text: "new task", source: "interactive" }, h.ctx);
+    expect(h.level()).toBe("high");
+  });
+
+  it("filters a steer regardless of source", async () => {
+    const h = makeHarness("medium");
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await fire(h.pi, "message_update", thinkingDelta("x".repeat(1000)), h.ctx);
+
+    await fire(h.pi, "input", { text: "steer", source: "rpc", streamingBehavior: "interrupt" }, h.ctx);
+    expect(h.level()).toBe("off");
+  });
+});
+
+// sendUserMessage returns void (ExtensionAPI in types.d.ts) and the runtime
+// binding attaches its own .catch — so the only failure this call can present
+// to us is a synchronous throw, which is what the try/catch around it covers.
+describe("thinking-budget recovery when sendUserMessage throws", () => {
+  beforeEach(() => {
+    process.env.LITTLE_CODER_THINKING_BUDGET = "10";
+  });
+  afterEach(() => {
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+  });
+
+  it("still forces thinking off and aborts", async () => {
+    const h = makeHarness("high");
+    h.pi.sendUserMessage = () => {
+      throw new Error("no sendUserMessage on this SDK");
+    };
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("x".repeat(1000)), h.ctx);
+
+    expect(h.calls).toEqual(["set:off", "notify", "abort"]);
+    expect(h.level()).toBe("off");
   });
 });
