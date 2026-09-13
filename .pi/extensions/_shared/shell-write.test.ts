@@ -6,6 +6,7 @@ import {
   hasCommandSubstitution,
   hasWriteRedirection,
   isScratchPath,
+  scan,
   splitCommandChain,
   stripHeredocBodies,
 } from "./shell-write.ts";
@@ -157,6 +158,17 @@ describe("detectWriteTargets: control operators end the target word (issue #107)
     expect(detectWriteTargets("cmd 2>&-")).toEqual([]);
     expect(detectWriteTargets("cmd 2>&1; echo done")).toEqual([]);
     expect(detectWriteTargets("cmd &>/dev/null")).toEqual([]);
+  });
+});
+
+describe("scan", () => {
+  it("visits only the real unquoted, unescaped & (also consumed by shell-contract-nudge)", () => {
+    const cmd = 'echo "a & b" \\& & c';
+    const hits: number[] = [];
+    scan(cmd, (ch, i, quoted) => {
+      if (ch === "&" && !quoted) hits.push(i);
+    });
+    expect(hits.length).toBe(1);
   });
 });
 

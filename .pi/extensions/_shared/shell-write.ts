@@ -102,8 +102,13 @@ const ESCAPABLE_IN_DOUBLE_QUOTES = new Set(["$", "`", '"', "\\"]);
  * quotes are not interchangeable: a single quote makes its contents wholly
  * literal, while a double quote still expands `$(…)` and backticks. A
  * consumer that only cares whether it is quoted at all can test truthiness.
+ *
+ * Exported (not just used internally) so shell-contract-nudge can reuse the
+ * same quote/escape-tracking walk for its own `&`-detection rather than
+ * re-implementing it — one shared copy of security/correctness-sensitive
+ * parsing logic, same rationale as `SHELL_TOOLS` above.
  */
-function scan(
+export function scan(
   cmd: string,
   visit: (ch: string, index: number, quote: '"' | "'" | null) => void,
 ): void {
