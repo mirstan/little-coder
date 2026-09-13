@@ -254,7 +254,12 @@ function runBreachRecovery(
   }
   safeSetThinkingLevel(pi, "off");
   try {
-    pi.sendUserMessage(followUpMessage, { deliverAs: "followUp" });
+    // Not awaited: this must all land before ctx.abort() below. prompt()
+    // rethrows though, so the rejection needs its own handler — the sync
+    // catch never sees it, and Node's default is to crash on it.
+    void Promise.resolve(pi.sendUserMessage(followUpMessage, { deliverAs: "followUp" })).catch(
+      () => {},
+    );
   } catch {
     // SDK without sendUserMessage — abort still forces the turn to end.
   }
