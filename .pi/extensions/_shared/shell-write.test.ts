@@ -211,6 +211,33 @@ describe("splitCommandChain", () => {
     expect(splitCommandChain("cmd &>>/dev/null")).toEqual(["cmd &>>/dev/null"]);
   });
 
+  // Under bash `&>` redirects both streams and any words after the target are
+  // arguments; under /bin/sh or dash the same bytes are `cmd &` followed by a
+  // separate `>` redirect, which makes those "arguments" a second command. The
+  // exemption only holds where the target is the last word, so the two
+  // readings cannot disagree about how many commands run.
+  it("still cuts on &> when a command word follows the redirect target", () => {
+    expect(splitCommandChain("cat &>/dev/null rm -rf /")).toEqual([
+      "cat",
+      ">/dev/null rm -rf /",
+    ]);
+    expect(splitCommandChain("ls &>>/dev/null rm -rf /")).toEqual([
+      "ls",
+      ">>/dev/null rm -rf /",
+    ]);
+  });
+
+  it("keeps the &> exemption when the target ends the command", () => {
+    expect(splitCommandChain("make &>/dev/null; echo hi")).toEqual([
+      "make &>/dev/null",
+      "echo hi",
+    ]);
+    expect(splitCommandChain("make &> /dev/null && echo hi")).toEqual([
+      "make &> /dev/null",
+      "echo hi",
+    ]);
+  });
+
   // `|&` is bash's pipe-stderr-too spelling of `|`. The `|` cut lands first
   // and the `&` cut immediately after it, leaving an empty segment that the
   // trailing filter drops — so it yields the same two commands `|` would.

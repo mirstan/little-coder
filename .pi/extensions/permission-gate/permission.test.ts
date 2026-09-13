@@ -115,6 +115,14 @@ describe("isSafeBash — a bare & separates commands", () => {
     expect(isSafeBash("make &>>/dev/null", ["make "])).toBe(true);
   });
 
+  it("refuses an &> redirect used to smuggle a trailing command", () => {
+    // Harmless under bash (`rm -rf /` are arguments to `cat`), but a real
+    // second command under /bin/sh or dash — and pi's own `bash` tool falls
+    // back to `sh` when no bash is on the image, so the gate must not assume.
+    expect(isSafeBash("cat &>/dev/null rm -rf /")).toBe(false);
+    expect(isSafeBash("ls &>>/dev/null rm -rf /")).toBe(false);
+  });
+
   it("does not read a quoted or escaped & as an operator", () => {
     expect(isSafeBash('echo "a & b"')).toBe(true);
     expect(isSafeBash("echo a \\& b")).toBe(true);
