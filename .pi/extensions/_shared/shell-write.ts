@@ -67,7 +67,14 @@ export interface ShellWrite {
 // Operators that chain one command into the next. Splitting on these lets the
 // whitelist judge every segment rather than only the first one, so
 // `ls && rm -rf /` can't ride in on `ls`.
-const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n"];
+//
+// Bare `&` backgrounds a job and starts the next command, exactly like `;`.
+// Leaving it out meant `ls & rm -rf /` passed the gate as one `ls`-prefixed
+// segment while `ls && rm -rf /` was correctly refused. It must stay AFTER
+// `&&`: the scanner is first-match-wins per position and skips positions a
+// longer match already consumed, so `&&` claims both characters of a real
+// `&&` before the lone `&` entry can see the second one.
+const CHAIN_OPERATORS = ["&&", "||", ";", "|", "\n", "&"];
 
 /**
  * Walk `cmd` once, tracking quote state, and hand each character to `visit`.
@@ -162,14 +169,37 @@ export function stripHeredocBodies(cmd: string): string {
 
 /**
  * Split a command line into the individual commands it runs, on unquoted
- * `&&`, `||`, `;`, `|` and newlines. Heredoc bodies are stripped first so
+ * `&&`, `||`, `;`, `|`, `&` and newlines. Heredoc bodies are stripped first so
  * their contents are never mistaken for commands.
  */
 export function splitCommandChain(raw: string): string[] {
   const cmd = stripHeredocBodies(raw);
   const cuts: Array<{ at: number; len: number }> = [];
-  scan(cmd, (_ch, i, quoted) => {
+  // The unquoted character immediately before the one being visited — the only
+  // thing that separates a backgrounding `&` from the `&` of `2>&1`. `scan`
+  // skips escaped characters outright and flags quoted ones, so neither can
+  // land here and neither can pose as the redirect that suppresses a cut.
+  let prevUnquoted: { ch: string; at: number } | undefined;
+  scan(cmd, (ch, i, quoted) => {
+    const prev = prevUnquoted;
+    if (!quoted) prevUnquoted = { ch, at: i };
     if (quoted) return;
+    if (ch === "&" && !cmd.startsWith("&&", i)) {
+      // `>&`/`<&` is always fd-duplication syntax in bash, never a real chain
+      // separator — suppressing here can never hide a genuine bare `&`.
+      if (prev && prev.at === i - 1 && (prev.ch === ">" || prev.ch === "<")) return;
+      // `&>`/`&>>` redirect stdout and stderr together — but ONLY under bash.
+      // Under /bin/sh or dash the same bytes are a backgrounding `&` followed
+      // by a separate `>` redirect, so `cat &>/dev/null rm -rf /` would run
+      // `cat &`, then `>/dev/null`, then `rm -rf /` as three top-level
+      // commands while this analyzer still reported one safe segment. That is
+      // a real bypass, and the only reason it isn't one today is that both
+      // executors hardcode bash: shell-session/index.ts's
+      // `execSync(command, {shell: "/bin/bash"})` and bg-shell/index.ts's
+      // `spawn(..., {shell: "/bin/bash"})`. Making the shell configurable, or
+      // switching either to /bin/sh, means deleting this exemption.
+      if (cmd[i + 1] === ">") return;
+    }
     for (const op of CHAIN_OPERATORS) {
       if (cmd.startsWith(op, i)) {
         // Don't cut inside an already-recorded operator (`&&` must not also

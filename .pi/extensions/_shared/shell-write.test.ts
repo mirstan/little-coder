@@ -182,6 +182,47 @@ describe("splitCommandChain", () => {
       "cat > f.sh",
     ]);
   });
+
+  // A bare `&` backgrounds the first command and runs the next, separating
+  // them exactly like `;`. It was missing from CHAIN_OPERATORS, so
+  // `ls & rm -rf /` reached the permission gate as one `ls`-prefixed segment.
+  it("splits on a bare backgrounding &", () => {
+    expect(splitCommandChain("ls & rm -rf /")).toEqual(["ls", "rm -rf /"]);
+    expect(splitCommandChain("ls & echo hi")).toEqual(["ls", "echo hi"]);
+    expect(splitCommandChain("sleep 1 &")).toEqual(["sleep 1"]);
+    expect(splitCommandChain("a & b & c")).toEqual(["a", "b", "c"]);
+  });
+
+  it("still treats && as one cut now that a lone & is an operator too", () => {
+    expect(splitCommandChain("ls && rm -rf /")).toEqual(["ls", "rm -rf /"]);
+    expect(splitCommandChain("a && b && c")).toEqual(["a", "b", "c"]);
+    expect(splitCommandChain("ls >/dev/null&& echo hi")).toEqual([
+      "ls >/dev/null",
+      "echo hi",
+    ]);
+  });
+
+  it("does not cut on the & of fd duplication or an &> redirect", () => {
+    expect(splitCommandChain("make 2>&1")).toEqual(["make 2>&1"]);
+    expect(splitCommandChain("cmd >&2")).toEqual(["cmd >&2"]);
+    expect(splitCommandChain("cmd 2>&-")).toEqual(["cmd 2>&-"]);
+    expect(splitCommandChain("cmd <&3")).toEqual(["cmd <&3"]);
+    expect(splitCommandChain("cmd &>/dev/null")).toEqual(["cmd &>/dev/null"]);
+    expect(splitCommandChain("cmd &>>/dev/null")).toEqual(["cmd &>>/dev/null"]);
+  });
+
+  // `|&` is bash's pipe-stderr-too spelling of `|`. The `|` cut lands first
+  // and the `&` cut immediately after it, leaving an empty segment that the
+  // trailing filter drops — so it yields the same two commands `|` would.
+  it("treats |& as the single pipe it is", () => {
+    expect(splitCommandChain("ls |& cat")).toEqual(["ls", "cat"]);
+  });
+
+  it("does not cut on a quoted or escaped &", () => {
+    expect(splitCommandChain('echo "a & b"')).toEqual(['echo "a & b"']);
+    expect(splitCommandChain("echo 'a & b'")).toEqual(["echo 'a & b'"]);
+    expect(splitCommandChain("echo a \\& b")).toEqual(["echo a \\& b"]);
+  });
 });
 
 describe("stripHeredocBodies", () => {
