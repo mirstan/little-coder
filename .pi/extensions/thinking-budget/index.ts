@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
+import { envNumber } from "../_shared/env-number.ts";
+import { WARN_REMAINING, WARN_REMAINING_MS } from "../_shared/finalize-warn-trigger.ts";
 
 // pi's thinking-level union (not re-exported from the package root). Mirrors
 // settings-manager's ThinkingLevel; structurally assignable to pi's own type.
@@ -51,9 +53,11 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 //   1. Turn-boundary adaptive budget (resolveAdaptiveBudget, applied at
 //      turn_start): shrinks or zeroes the *token* budget threshold that the
 //      breach check below already reads, based on wall-clock headroom and
-//      recent turn durations. Re-derived fresh every turn_start, so it's
-//      self-correcting and needs no restore-on-input logic — unlike
-//      forcedOff, it never sets its own persistent latch.
+//      recent turn durations. The threshold itself is re-derived fresh every
+//      turn_start, so it self-corrects as conditions change; a threshold of
+//      zero additionally forces the level to "off" (adaptiveOff), which is a
+//      real latch and carries its own restore-on-input path, kept separate
+//      from forcedOff's.
 //   2. Per-turn wall-clock guard (in message_update, before the
 //      thinking_delta-only early-return): the mechanism that actually
 //      interrupts a hung in-flight generation, since a shrunk token budget
@@ -73,10 +77,9 @@ const DEFAULT_ADAPT_OUTSIZED_FRACTION = 0.15;
 const DEFAULT_GUARD_REMAINING_FRACTION = 0.25;
 const DEFAULT_GUARD_HARD_CAP_MS = 15 * 60 * 1000;
 
-function envNumber(name: string, fallback: number): number {
-  const n = Number(process.env[name]);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
+// Every knob below treats a configured `<= 0` as "disabled", which is why
+// they read through _shared/env-number.ts rather than a local resolver that
+// folds 0 back into the default.
 
 // Per-run rolling state.
 let thinkingChars = 0;
@@ -91,25 +94,62 @@ let forcedOff = false;
 // next user input so a new task is unaffected.
 let priorLevel: ThinkingLevel | undefined;
 
+// The adaptive equivalent of forcedOff/priorLevel, kept deliberately separate:
+// a zero adaptive budget means "no headroom to think right now," which is a
+// different condition from "this task over-thought and was cut off," and the
+// two can end at different moments. Holding one pair of variables for both
+// would make a breach that lands during an adaptive-off window capture "off"
+// as the level to restore later.
+let adaptiveOff = false;
+let adaptivePriorLevel: ThinkingLevel | undefined;
+
 // The raw budget resolved from the profile/env at before_agent_start —
 // `budgetForTurn`'s adaptive-adjusted value is re-derived from this every
 // turn_start, never from its own previous (possibly already-shrunk) value.
 let baseBudgetForRun = DEFAULT_BUDGET;
 // Deadline/turn-cap visibility, resolved the same way finalize-warn and
-// turn-cap already do. `capForRun` isn't consumed by the adaptive math below
-// (turn-cap's own extension owns turn-count exhaustion) — resolved here only
-// for parity with those extensions' before_agent_start bookkeeping.
+// turn-cap already do. `capForRun` feeds the wall-clock guard's
+// finalize-warn-window check (the turn-count half of it); the adaptive math
+// below still doesn't use it, since turn-cap's own extension owns turn-count
+// exhaustion.
 let deadlineForRun = 0;
 let capForRun = 0;
+// Turn counter for this agent run, 1-indexed at the top of turn_start exactly
+// as finalize-warn counts, so the guard's "are we inside finalize-warn's
+// endgame window" test compares like with like.
+let turnsThisRun = 0;
+// One-shot, so a guard that keeps standing down on every delta of a long
+// final turn explains itself once instead of flooding the transcript.
+let guardSuppressionNotified = false;
+// Guard knobs, resolved per run so a 0 in either one disables the guard
+// outright rather than silently collapsing its window to zero (which would
+// abort on the first delta of every turn).
+let guardFractionForRun = DEFAULT_GUARD_REMAINING_FRACTION;
+let guardHardCapMsForRun = DEFAULT_GUARD_HARD_CAP_MS;
+let guardEnabledForRun = false;
 // The wall-clock window between "now" and the deadline as first observed for
-// this run (captured once at before_agent_start; Infinity if no deadline).
-// Used by resolveAdaptiveBudget's outsized-single-turn check, which needs a
-// fixed denominator — unlike the turns-remaining check, which deliberately
-// uses the fresher, shrinking remaining-time figure instead.
+// this run. Used by resolveAdaptiveBudget's outsized-single-turn check, which
+// needs a FIXED denominator — unlike the turns-remaining check, which
+// deliberately uses the fresher, shrinking remaining-time figure instead.
+// Re-captured only when the resolved deadline value itself changes (tracked
+// by capturedDeadlineForTotal): re-capturing on every before_agent_start
+// would shrink the denominator each time one fired, so the same turn duration
+// would read as a progressively larger share of the budget and halve the
+// token budget purely as a side effect of a new prompt arriving.
 let totalBudgetMsForRun = Infinity;
+let capturedDeadlineForTotal: number | undefined;
 // Wall-clock turn timing, for both mechanisms: turnStartedAt anchors the
 // message_update guard's elapsed-this-turn check; lastTurnMs/avgTurnMs feed
 // resolveAdaptiveBudget.
+//
+// Session-scoped, not per-run: turn durations measure this model's throughput
+// on this machine, which doesn't reset just because the user started a second
+// task in the same session — carrying the history over means a later prompt
+// starts with a real throughput estimate instead of zero data. (This is a
+// simplification, not a bug fix: a breach-recovery restart delivers its
+// follow-up through agent.followUp() → agent.continue(), which never re-fires
+// before_agent_start, so per-run scoping was not actually wiping this state
+// mid-recovery.)
 let turnStartedAt: number | undefined;
 let avgTurnMs = 0;
 let lastTurnMs = 0;
@@ -123,8 +163,9 @@ function charsToTokens(chars: number): number {
 /**
  * Turn-boundary adaptive budget (mechanism 1). Pure and stateless: the caller
  * (turn_start) re-derives every field fresh from the clock and its own
- * rolling turn-duration bookkeeping each time, which is what makes this
- * self-correcting without a restore-on-input latch like forcedOff's.
+ * rolling turn-duration bookkeeping each time. Returns 0 to mean "no headroom
+ * to think at all"; acting on that — including the latch needed to restore the
+ * level afterwards — is the caller's job.
  */
 export function resolveAdaptiveBudget(params: {
   baseBudget: number;
@@ -143,7 +184,12 @@ export function resolveAdaptiveBudget(params: {
 
   const turnEstimateMs = Math.max(avgTurnMs, lastTurnMs, 1);
   const predictedTurnsRemaining = remainingMs / turnEstimateMs;
-  if (predictedTurnsRemaining < envNumber("LITTLE_CODER_THINKING_ADAPT_MIN_TURNS", DEFAULT_ADAPT_MIN_TURNS)) {
+  const minTurns = envNumber("LITTLE_CODER_THINKING_ADAPT_MIN_TURNS", DEFAULT_ADAPT_MIN_TURNS);
+  // The `minTurns > 0` half is load-bearing past the deadline: remainingMs
+  // goes negative there and turnEstimateMs is always >= 1, so a bare
+  // `predictedTurnsRemaining < 0` would still hold and zero the budget on a
+  // knob the operator explicitly disabled.
+  if (minTurns > 0 && predictedTurnsRemaining < minTurns) {
     return 0;
   }
 
@@ -153,7 +199,10 @@ export function resolveAdaptiveBudget(params: {
       "LITTLE_CODER_THINKING_ADAPT_OUTSIZED_FRACTION",
       DEFAULT_ADAPT_OUTSIZED_FRACTION,
     );
-    if (turnFraction > outsizedFraction) return Math.floor(baseBudget / 2);
+    // Without `outsizedFraction > 0`, disabling this knob would invert it:
+    // any completed turn makes turnFraction positive, so `> 0` holds on every
+    // turn after the first and the budget halves permanently.
+    if (outsizedFraction > 0 && turnFraction > outsizedFraction) return Math.floor(baseBudget / 2);
   }
 
   return baseBudget;
@@ -190,7 +239,17 @@ function runBreachRecovery(
   notifyMessage: string,
 ): void {
   if (!forcedOff) {
-    priorLevel = safeGetThinkingLevel(pi);
+    if (adaptiveOff) {
+      // Take over the adaptive latch's captured level rather than reading the
+      // current one: adaptive-off has already set the level to "off", so
+      // asking now would record "off" as what to restore, and the user's real
+      // level would be lost for the rest of the session.
+      priorLevel = adaptivePriorLevel;
+      adaptiveOff = false;
+      adaptivePriorLevel = undefined;
+    } else {
+      priorLevel = safeGetThinkingLevel(pi);
+    }
     forcedOff = true;
   }
   safeSetThinkingLevel(pi, "off");
@@ -214,6 +273,16 @@ export default function (pi: ExtensionAPI) {
     aborted = false;
     forcedOff = false;
     priorLevel = undefined;
+    // Bare reset, no restore: a new session re-resolves the thinking level
+    // from the profile, so there is nothing of the old one left to put back.
+    adaptiveOff = false;
+    adaptivePriorLevel = undefined;
+    turnStartedAt = undefined;
+    avgTurnMs = 0;
+    lastTurnMs = 0;
+    turnsObserved = 0;
+    totalBudgetMsForRun = Infinity;
+    capturedDeadlineForTotal = undefined;
   });
 
   // Hard reset of per-turn counters between agent runs. `forcedOff` /
@@ -226,10 +295,31 @@ export default function (pi: ExtensionAPI) {
     aborted = false;
   });
 
-  // A genuinely new user prompt ends the "forced off" window: restore the
-  // level the user actually had before the breach. Programmatic follow-ups
-  // (our nudge) do not emit an `input` event, so the restart turn stays off.
-  pi.on("input", async () => {
+  // A genuinely new user prompt ends both "thinking is off" windows: restore
+  // the level the user actually had, so a new task never inherits a
+  // restriction imposed on the previous one.
+  pi.on("input", async (event) => {
+    // pi.sendUserMessage() — ours AND every other extension's nudge — routes
+    // through prompt(), which emits this event with source "extension" before
+    // queueing the message (agent-session.js). Only a genuine new prompt,
+    // "interactive" (typed) or "rpc" (the harbor adapter's driver), should end
+    // these windows. Without this filter our own breach-recovery follow-up
+    // synchronously undoes the very state it is being sent to deliver, and
+    // finalize-warn's near-deadline nudge re-enables thinking at the worst
+    // possible moment. Filtering out "extension" specifically, rather than
+    // allow-listing the other two, keeps a missing source (older harness, test
+    // fixture) treated as a genuine prompt.
+    if ((event as any)?.source === "extension") return;
+
+    // Restore before clearing, never a bare reset: clearing alone would leave
+    // the level physically "off" with no record of what it had been, and the
+    // next turn_start would then latch "off" as the level to restore — sticking
+    // thinking off for the rest of the session.
+    if (adaptiveOff) {
+      if (adaptivePriorLevel !== undefined) safeSetThinkingLevel(pi, adaptivePriorLevel);
+      adaptiveOff = false;
+      adaptivePriorLevel = undefined;
+    }
     if (forcedOff) {
       if (priorLevel !== undefined) safeSetThinkingLevel(pi, priorLevel);
       forcedOff = false;
@@ -237,6 +327,9 @@ export default function (pi: ExtensionAPI) {
     }
     thinkingChars = 0;
     aborted = false;
+    // Discards only the idle gap between this prompt and the previous turn —
+    // human thinking time, which is not a measurement of model throughput.
+    turnStartedAt = undefined;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -252,18 +345,33 @@ export default function (pi: ExtensionAPI) {
 
     deadlineForRun = resolveDeadlineEpochMs(event);
     capForRun = resolveTurnCap(event);
-    totalBudgetMsForRun = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
+    if (deadlineForRun !== capturedDeadlineForTotal) {
+      capturedDeadlineForTotal = deadlineForRun;
+      totalBudgetMsForRun = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
+    }
 
-    turnStartedAt = undefined;
-    avgTurnMs = 0;
-    lastTurnMs = 0;
-    turnsObserved = 0;
+    guardFractionForRun = envNumber(
+      "LITTLE_CODER_THINKING_GUARD_REMAINING_FRACTION",
+      DEFAULT_GUARD_REMAINING_FRACTION,
+    );
+    guardHardCapMsForRun = envNumber(
+      "LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS",
+      DEFAULT_GUARD_HARD_CAP_MS,
+    );
+    guardEnabledForRun = guardFractionForRun > 0 && guardHardCapMsForRun > 0;
+
+    // Per-run, deliberately not session-scoped like the timing state above:
+    // both exist to mirror finalize-warn's own per-run bookkeeping.
+    turnsThisRun = 0;
+    guardSuppressionNotified = false;
   });
 
   pi.on("turn_start", async () => {
+    turnsThisRun++;
     const now = Date.now();
-    // turnStartedAt is undefined only for the very first turn of a run — no
-    // prior turn to clock yet.
+    // turnStartedAt is undefined on the first turn of a session and on the
+    // first turn after a new user prompt — nothing worth clocking in either
+    // case (the latter would measure the human's idle time, not the model's).
     if (turnStartedAt !== undefined) {
       lastTurnMs = now - turnStartedAt;
       turnsObserved++;
@@ -289,6 +397,28 @@ export default function (pi: ExtensionAPI) {
       now,
       totalBudgetMs: totalBudgetMsForRun,
     });
+
+    // A zero budget means the deadline no longer affords any thinking at all.
+    // The token counter alone can't enforce that: it only reacts once the
+    // model has already emitted thinking deltas, so the level has to actually
+    // go to "off". That makes this a latch — it needs the same
+    // capture-and-restore care as forcedOff — rather than the stateless
+    // re-derivation the rest of mechanism 1 gets. Skipped entirely while
+    // forcedOff owns the level, so the two never fight over it.
+    if (!forcedOff) {
+      if (budgetForTurn <= 0) {
+        if (!adaptiveOff) {
+          adaptivePriorLevel = safeGetThinkingLevel(pi);
+          adaptiveOff = true;
+        }
+        safeSetThinkingLevel(pi, "off");
+      } else if (adaptiveOff) {
+        // Headroom came back (a fast turn pulled the estimate down).
+        if (adaptivePriorLevel !== undefined) safeSetThinkingLevel(pi, adaptivePriorLevel);
+        adaptiveOff = false;
+        adaptivePriorLevel = undefined;
+      }
+    }
   });
 
   pi.on("message_update", async (event, ctx) => {
@@ -305,24 +435,43 @@ export default function (pi: ExtensionAPI) {
     // covers it. (pi's vendored HTTP layer also has its own ~300s idle
     // timeout as a backstop, so that residual case is bounded, just not by
     // this extension.)
-    if (!aborted && turnStartedAt !== undefined) {
+    // Requires a deadline: with none, this would abort any turn merely longer
+    // than the hard cap, which is normal in interactive use and has no budget
+    // to protect. Deadline-less runs get no guard, deliberately.
+    if (!aborted && turnStartedAt !== undefined && guardEnabledForRun && deadlineForRun > 0) {
       const now = Date.now();
       const elapsedThisTurn = now - turnStartedAt;
-      const remainingMs = deadlineForRun > 0 ? deadlineForRun - now : Infinity;
-      const guardMs = Math.min(
-        remainingMs * envNumber("LITTLE_CODER_THINKING_GUARD_REMAINING_FRACTION", DEFAULT_GUARD_REMAINING_FRACTION),
-        envNumber("LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS", DEFAULT_GUARD_HARD_CAP_MS),
-      );
+      const remainingMs = deadlineForRun - now;
+      // Stand down for the whole of finalize-warn's endgame window — both of
+      // its triggers, not just wall-clock. With a turn cap configured,
+      // finalize-warn can fire on turn count with plenty of clock left, and
+      // aborting the model's final-answer turn is precisely what this
+      // suppression exists to prevent.
+      const inFinalizeWarnWindow =
+        remainingMs <= WARN_REMAINING_MS ||
+        (capForRun > WARN_REMAINING && turnsThisRun >= capForRun - WARN_REMAINING + 1);
+      const guardMs = Math.min(remainingMs * guardFractionForRun, guardHardCapMsForRun);
       if (elapsedThisTurn > guardMs) {
-        aborted = true;
-        runBreachRecovery(
-          pi,
-          ctx,
-          "[turn wall-clock guard] This turn has been generating for too long — " +
-            "stop and take one concrete action now: call a tool, write code, or give your answer.",
-          `this turn ran past its wall-clock guard (~${Math.round(guardMs / 1000)}s) — forcing it to act.`,
-        );
-        return;
+        if (inFinalizeWarnWindow) {
+          if (!guardSuppressionNotified) {
+            guardSuppressionNotified = true;
+            harnessIntervention(
+              ctx,
+              "turn wall-clock guard standing down: inside the finalize-warn window, " +
+                "letting the model finish its answer uninterrupted.",
+            );
+          }
+        } else {
+          aborted = true;
+          runBreachRecovery(
+            pi,
+            ctx,
+            "[turn wall-clock guard] This turn has been generating for too long — " +
+              "stop and take one concrete action now: call a tool, write code, or give your answer.",
+            `this turn ran past its wall-clock guard (~${Math.round(guardMs / 1000)}s) — forcing it to act.`,
+          );
+          return;
+        }
       }
     }
 
