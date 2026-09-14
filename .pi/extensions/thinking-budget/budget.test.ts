@@ -1347,4 +1347,69 @@ describe("thinking-budget circuit breaker", () => {
 
     expect(aborts(h)).toBe(2);
   });
+
+  // A turn can stream real content and still get guard-aborted for taking
+  // too long overall (P1 is purely elapsed-time based, independent of
+  // whether content already flowed) — that is still evidence of progress,
+  // not a fruitless retry, and must clear the streak the same as a turn
+  // that ends on its own terms. Gating the reset on "and wasn't aborted
+  // too" (as opposed to content alone) would leave a prior no-content
+  // streak stuck through this turn, one abort away from tripping the
+  // breaker on what is actually a productive turn.
+  it("clears the streak when an aborted turn had already produced real content", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await contentFreeGuardTrip(h);
+    await retryTurn(h);
+    expect(aborts(h)).toBe(1);
+
+    // Second turn streams real content, then still runs past the cap.
+    await fire(h.pi, "message_update", textDelta("writing the file now"), h.ctx);
+    vi.advanceTimersByTime(1500);
+    await fire(h.pi, "message_update", textDelta("still going"), h.ctx);
+    expect(aborts(h)).toBe(2);
+    await retryTurn(h);
+
+    // Third turn is content-free again. This is where an unreset streak
+    // would already sit at 2, but a single content-free abort must still
+    // abort normally rather than hit the breaker.
+    await contentFreeGuardTrip(h);
+    expect(aborts(h)).toBe(3);
+    await retryTurn(h);
+
+    // Fourth turn, also content-free: if the second turn's content hadn't
+    // cleared the streak, this would be the SECOND of an unbroken pair
+    // (turns 3 and 4) and the breaker would hold instead of aborting. It
+    // must instead be treated as only the second of a pair starting at
+    // turn 3, i.e. still just the ordinary case, so this one aborts too.
+    await contentFreeGuardTrip(h);
+    expect(aborts(h)).toBe(4);
+    const breakerNotices = h.notifies.filter((n) =>
+      /standing down.*until a turn makes real progress/i.test(n),
+    );
+    expect(breakerNotices).toHaveLength(0);
+  });
+
+  // A genuine new task (not our own breach-recovery follow-up, filtered via
+  // `source`/`streamingBehavior` — see the `input` handler) must not inherit
+  // an unrelated prior task's abort streak. Without resetting the breaker
+  // state here, two content-free aborts on one task would leave the next,
+  // completely unrelated task starting with the breaker already primed.
+  it("resets the breaker on a genuinely new task, not just a retry", async () => {
+    const h = makeHarness("high");
+    await tripTwice(h);
+    expect(aborts(h)).toBe(2);
+
+    await fire(h.pi, "input", { text: "a new, unrelated task", source: "interactive" }, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await contentFreeGuardTrip(h);
+
+    // First content-free abort of the new task — must not trip the breaker.
+    expect(aborts(h)).toBe(3);
+    const breakerNotices = h.notifies.filter((n) =>
+      /standing down.*until a turn makes real progress/i.test(n),
+    );
+    expect(breakerNotices).toHaveLength(0);
+  });
 });

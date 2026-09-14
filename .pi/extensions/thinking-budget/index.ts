@@ -570,6 +570,13 @@ export default function (pi: ExtensionAPI) {
     // human thinking time, which is not a measurement of model throughput.
     turnStartedAt = undefined;
     resetTurnStreamState();
+    // A genuinely new task is a fresh start, not a continuation of whatever
+    // abort streak the previous task left behind — without this, two
+    // content-free aborts on one task would leave the breaker holding over
+    // into an unrelated task that follows it.
+    lastTurnEndedInExtensionAbort = false;
+    consecutiveNoContentAborts = 0;
+    breakerNotified = false;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -632,10 +639,13 @@ export default function (pi: ExtensionAPI) {
     // Both of these read the turn that just ENDED, so they have to run before
     // the per-turn counters below are cleared.
     foldThroughputSample();
-    // The breaker only stands down runs of aborts that produced nothing. A
-    // turn that ended on its own terms with real content is the signal that
-    // the loop is making progress again, and clears the count.
-    if (!lastTurnEndedInExtensionAbort && turnNonThinkingChars > 0) {
+    // The breaker only stands down runs of aborts that produced nothing. Any
+    // real content is the signal that the loop is making progress again and
+    // clears the count — including a turn the guard eventually aborted after
+    // it had already streamed real output; `runBreachRecovery` only ever
+    // increments the counter for a turn with zero content in the first
+    // place, so this reset is not gated on whether the turn was aborted too.
+    if (turnNonThinkingChars > 0) {
       consecutiveNoContentAborts = 0;
       breakerNotified = false;
     }
