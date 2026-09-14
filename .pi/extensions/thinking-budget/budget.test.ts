@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import setupExtension, { resolveAdaptiveBudget } from "./index.ts";
+import setupExtension, { resolveAdaptiveBudget, resolveGuardMs } from "./index.ts";
 
 // Exercise the char→token conversion (matches local/context_manager.py)
 function charsToTokens(chars: number): number {
@@ -98,6 +98,10 @@ async function fire(pi: any, name: string, event: any, ctx: any) {
 
 function thinkingDelta(s: string) {
   return { assistantMessageEvent: { type: "thinking_delta", delta: s } };
+}
+
+function textDelta(s: string) {
+  return { assistantMessageEvent: { type: "text_delta", delta: s } };
 }
 
 // Always begin from a clean session — resets the extension's module-scoped
@@ -343,6 +347,57 @@ describe("resolveAdaptiveBudget", () => {
   });
 });
 
+// ── P1: the guard's throughput floor ────────────────────────────────────────
+// resolveGuardMs is pure/stateless like resolveAdaptiveBudget, so it's
+// exercised directly. The base window shrinks with the remaining trial time,
+// which is backwards: it tightens fastest exactly when a grown context has
+// halved throughput and turns legitimately need longer.
+describe("resolveGuardMs", () => {
+  // 100 chars/sec ÷ 3.5 = 28.571 tok/sec, the rate measured off a real
+  // completion in the trial this floor was added for (9793 tokens / 509.37s).
+  const base = {
+    remainingMs: 1_200_000, // 20 min left -> a 300s base window at 25%
+    guardFraction: 0.25,
+    guardHardCapMs: 900_000,
+    budgetForTurn: 32768,
+    charsPerSec: 100,
+    minActionTokens: 1024,
+    slack: 1.25,
+  };
+
+  it("falls back to the base window with no throughput estimate yet", () => {
+    expect(resolveGuardMs({ ...base, charsPerSec: 0 })).toBe(300_000);
+  });
+
+  // (32768 + 1024) tokens / 28.571 tok/s = 1182.72s, x1.25 slack = 1478.4s.
+  // The budget alone would be 1432s — omitting minActionTokens buys the turn
+  // exactly enough time to finish thinking and none to act on it.
+  it("floors the window at the time the granted budget actually costs", () => {
+    expect(resolveGuardMs(base) / 1000).toBeCloseTo(1478.4, 1);
+  });
+
+  // The late-game regime: once the adaptive budget is 0 the floor is only the
+  // action headroom, so it cannot let a single turn eat the endgame.
+  it("collapses to the action headroom alone at a zero budget", () => {
+    const guardMs = resolveGuardMs({ ...base, budgetForTurn: 0, remainingMs: 100_000 });
+    expect(guardMs / 1000).toBeCloseTo(44.8, 1);
+  });
+
+  it("never lowers the window below the base one", () => {
+    // A fast model: the floor computes well under the base window.
+    expect(resolveGuardMs({ ...base, charsPerSec: 100_000 })).toBe(300_000);
+  });
+
+  it("a minActionTokens of 0 disables the floor entirely", () => {
+    expect(resolveGuardMs({ ...base, minActionTokens: 0 })).toBe(300_000);
+  });
+
+  it("the slack factor scales the floor", () => {
+    const single = resolveGuardMs({ ...base, slack: 1 });
+    expect(resolveGuardMs({ ...base, slack: 2 })).toBeCloseTo(single * 2, 5);
+  });
+});
+
 // ── Mechanism 2: per-turn wall-clock guard ──────────────────────────────────
 // This is the mechanism that actually interrupts a hung in-flight generation
 // (mechanism 1's shrunk token budget can't stop a request already underway).
@@ -371,8 +426,10 @@ describe("thinking-budget wall-clock guard", () => {
     setupExtension(h.pi as any);
     await startRun(h);
 
+    // The guard clocks generation, not the turn, so a first delta is what
+    // starts its window — see the prefill-exclusion cases below.
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
     vi.advanceTimersByTime(1500); // past the 1000ms hard cap
-
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
 
     expect(h.calls).toEqual(["set:off", "send", "notify", "abort"]);
@@ -389,14 +446,10 @@ describe("thinking-budget wall-clock guard", () => {
     setupExtension(h.pi as any);
     await startRun(h);
 
+    const textDelta = { assistantMessageEvent: { type: "text_delta", delta: "hello there" } };
+    await fire(h.pi, "message_update", textDelta, h.ctx);
     vi.advanceTimersByTime(1500);
-
-    await fire(
-      h.pi,
-      "message_update",
-      { assistantMessageEvent: { type: "text_delta", delta: "hello there" } },
-      h.ctx,
-    );
+    await fire(h.pi, "message_update", textDelta, h.ctx);
 
     expect(h.calls).toEqual(["set:off", "send", "notify", "abort"]);
     expect(h.level()).toBe("off");
@@ -407,11 +460,32 @@ describe("thinking-budget wall-clock guard", () => {
     setupExtension(h.pi as any);
     await startRun(h);
 
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
     vi.advanceTimersByTime(200); // well under the 1000ms hard cap
-
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
 
     expect(h.calls).toEqual([]);
+  });
+
+  // Prefill is dead time the model spends re-reading context, not generating,
+  // and it ran ~118s per cycle in the spiral this guard was reworked for.
+  // message_update cannot fire during it, so the first delta is an exact
+  // boundary — everything before it must be outside the guard's window.
+  it("excludes prefill: a long wait before the first delta does not trip it", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    vi.advanceTimersByTime(118_000); // a full re-prefill, >> the 1000ms cap
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
+    expect(h.calls).toEqual([]);
+
+    // ...and the window then runs from that first delta, not from turn_start.
+    vi.advanceTimersByTime(1500);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
+    expect(h.calls).toEqual(["set:off", "send", "notify", "abort"]);
   });
 });
 
@@ -640,6 +714,7 @@ describe("thinking-budget wall-clock guard gating", () => {
     setupExtension(h.pi as any);
     await startRun(h);
 
+    await fire(h.pi, "message_update", thinkingDelta("w"), h.ctx); // starts the generation clock
     vi.advanceTimersByTime(1500);
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
     await fire(h.pi, "message_update", thinkingDelta("y"), h.ctx);
@@ -660,6 +735,7 @@ describe("thinking-budget wall-clock guard gating", () => {
     await startRun(h); // turn 1
     for (let i = 0; i < 5; i++) await fire(h.pi, "turn_start", {}, h.ctx); // turns 2-6
 
+    await fire(h.pi, "message_update", thinkingDelta("w"), h.ctx); // starts the generation clock
     vi.advanceTimersByTime(1500);
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
     await fire(h.pi, "message_update", thinkingDelta("y"), h.ctx);
@@ -677,6 +753,7 @@ describe("thinking-budget wall-clock guard gating", () => {
     await startRun(h); // turn 1
     for (let i = 0; i < 4; i++) await fire(h.pi, "turn_start", {}, h.ctx); // turns 2-5
 
+    await fire(h.pi, "message_update", thinkingDelta("w"), h.ctx); // starts the generation clock
     vi.advanceTimersByTime(1500);
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
 
@@ -723,6 +800,7 @@ describe("thinking-budget wall-clock guard forcedOff release", () => {
 
   async function tripGuard(h: ReturnType<typeof makeHarness>) {
     await startRun(h);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx); // starts the generation clock
     vi.advanceTimersByTime(1500); // past the 1000ms hard cap
     await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
   }
@@ -836,7 +914,11 @@ describe("thinking-budget cap finalize-warn stand-down", () => {
     delete process.env.LITTLE_CODER_MAX_TURNS;
   });
 
-  it("still aborts a zero-budget breach outside the window", async () => {
+  // Outside the finalize-warn window a zero-budget breach used to abort. It
+  // no longer does, because reaching this point at all means the level is
+  // already "off" and the model thought anyway — see the futility-rule cases
+  // below for why that makes an abort strictly lossy.
+  it("stands down on a zero-budget breach outside the window too (futility)", async () => {
     process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 60 * 1000); // far from any window
     const h = makeHarness("high");
     setupExtension(h.pi as any);
@@ -844,8 +926,79 @@ describe("thinking-budget cap finalize-warn stand-down", () => {
 
     await fire(h.pi, "message_update", thinkingDelta("hm"), h.ctx);
 
-    expect(h.calls).toContain("abort");
-    expect(h.followUps[0]).toMatch(/thinking budget exceeded/i);
+    expect(h.calls).not.toContain("abort");
+    expect(h.followUps).toHaveLength(0);
+    expect(h.notifies[0]).toMatch(/thinking is already off and the model is thinking anyway/i);
+  });
+});
+
+// ── P2: the futility rule ──────────────────────────────────────────────────
+// A model config can pin thinking on regardless of the level (a literal
+// `"enable_thinking": true` in chatTemplateKwargs makes setThinkingLevel("off")
+// a no-op). Once that is happening, the token path's only remedy has already
+// been applied and ignored, so each further abort discards a turn and buys a
+// full re-prefill for nothing — 11 such cycles in the trial that motivated
+// this. The condition is exactly "a latch already says off", not a guess at
+// whether the model is honoring it.
+describe("thinking-budget cap futility rule", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    process.env.LITTLE_CODER_THINKING_BUDGET = "10";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 60 * 1000);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+  });
+
+  it("does not re-abort a forcedOff turn that keeps thinking, notifying once", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    // Turn 1 over-thinks and is aborted normally: forcedOff latches.
+    await fire(h.pi, "message_update", thinkingDelta("x".repeat(1000)), h.ctx);
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(1);
+
+    // The recovery restart. A token-budget forcedOff does not self-release, so
+    // turn 2 runs with the level pinned off and a zero budget.
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+
+    // The model thinks anyway, repeatedly. Pre-fix each burst cost an abort.
+    await fire(h.pi, "message_update", thinkingDelta("y".repeat(1000)), h.ctx);
+    await fire(h.pi, "message_update", thinkingDelta("z".repeat(1000)), h.ctx);
+
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(1);
+    expect(h.followUps).toHaveLength(1);
+    expect(h.notifies.filter((n) => /thinking is already off/i.test(n))).toHaveLength(1);
+  });
+
+  it("leaves the budget path armed when neither latch says off", async () => {
+    // The guard flavor of forcedOff self-releases once headroom is back, and
+    // the budget path must come back armed with it — the futility rule is a
+    // condition on current state, not a latch of its own.
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "1000";
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    vi.advanceTimersByTime(1500);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx); // guard trip
+    expect(h.level()).toBe("off");
+
+    vi.advanceTimersByTime(100);
+    await fire(h.pi, "turn_start", {}, h.ctx); // headroom is back: forcedOff releases
+    expect(h.level()).toBe("high");
+
+    await fire(h.pi, "message_update", thinkingDelta("q".repeat(1000)), h.ctx);
+
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(2);
+    expect(h.followUps[1]).toMatch(/thinking budget exceeded/i);
+    delete process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS;
   });
 });
 
@@ -922,5 +1075,276 @@ describe("thinking-budget recovery when sendUserMessage throws", () => {
 
     expect(h.calls).toEqual(["set:off", "notify", "abort"]);
     expect(h.level()).toBe("off");
+  });
+});
+
+// ── The abort spiral, end to end ────────────────────────────────────────────
+// A real trial burned ~50 minutes in a loop of its own making: 11 instant
+// token-budget aborts (thinking was pinned on by the model config, so the
+// budget was 0 and the first thinking token breached it) interleaved with 8
+// wall-clock aborts whose window shrank 900s → 375s as the trial's remaining
+// time did, each one paying ~118s to re-prefill the context the last abort
+// discarded. P1 and P2 attack different halves of that, so they get separate
+// regression cases rather than one "the trial survives" test.
+describe("thinking-budget abort spiral", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    for (const name of [
+      "LITTLE_CODER_DEADLINE_EPOCH_MS",
+      "LITTLE_CODER_THINKING_BUDGET",
+      "LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS",
+      "LITTLE_CODER_THINKING_GUARD_MIN_ACTION_TOKENS",
+      "LITTLE_CODER_THINKING_ADAPT_MIN_TURNS",
+    ]) {
+      delete process.env[name];
+    }
+  });
+
+  const aborts = (h: ReturnType<typeof makeHarness>) => h.calls.filter((c) => c === "abort").length;
+
+  // A turn generating steadily at `chars / stepMs` — the shape of the real
+  // slow-but-healthy completion (9793 tokens over 509s at ~100 chars/sec).
+  async function generate(
+    h: ReturnType<typeof makeHarness>,
+    opts: { steps: number; stepMs: number; chars: number; kind?: typeof thinkingDelta },
+  ) {
+    const kind = opts.kind ?? thinkingDelta;
+    for (let i = 0; i < opts.steps; i++) {
+      vi.advanceTimersByTime(opts.stepMs);
+      await fire(h.pi, "message_update", kind("x".repeat(opts.chars)), h.ctx);
+    }
+  }
+
+  // Regime (a): budget > 0, the mid-game window before the first guard trip
+  // collapses it. Here the throughput floor alone is what saves the turn — the
+  // futility rule cannot help, since neither latch says "off" yet.
+  describe("P1: the throughput floor, while the budget is still positive", () => {
+    // 25 min of trial. Turn 1 runs 300s, leaving 20 min — a 300s base window,
+    // against a turn that needs 390s of generation to finish.
+    async function slowButProductiveTurn(h: ReturnType<typeof makeHarness>) {
+      process.env.LITTLE_CODER_THINKING_BUDGET = "32768";
+      process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(1_500_000);
+      setupExtension(h.pi as any);
+      await startRun(h);
+      vi.advanceTimersByTime(300_000);
+      await fire(h.pi, "turn_start", {}, h.ctx);
+      // 390s of generation at ~100 chars/sec, the observed degraded rate.
+      await generate(h, { steps: 40, stepMs: 10_000, chars: 1000 });
+    }
+
+    it("lets a 390s turn finish inside a 300s base window", async () => {
+      const h = makeHarness();
+      await slowButProductiveTurn(h);
+
+      expect(h.calls).toEqual([]);
+    });
+
+    // The same turn with the floor switched off, which is also the pre-fix
+    // behavior: the shrinking base window catches it about 240s in.
+    it("aborts that same turn once the floor is disabled", async () => {
+      process.env.LITTLE_CODER_THINKING_GUARD_MIN_ACTION_TOKENS = "0";
+      const h = makeHarness();
+      await slowButProductiveTurn(h);
+
+      expect(aborts(h)).toBe(1);
+      expect(h.followUps[0]).toMatch(/wall-clock guard/i);
+    });
+  });
+
+  // Regime (b): budget pinned at 0, which is where the trial actually spent
+  // its 50 minutes. The floor collapses to the action headroom here and cannot
+  // save the turn on its own — P2 is what ends this one.
+  it("P2 ends the spiral in the zero-budget regime", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(HOUR);
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "100000";
+    // Pins the adaptive budget at 0 for every turn, as the endgame does.
+    process.env.LITTLE_CODER_THINKING_ADAPT_MIN_TURNS = String(1e9);
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    // Turn 1: thinking arrives despite the level being off. The just-latched
+    // suppression covers this one turn; the guard then trips on it.
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    vi.advanceTimersByTime(150_000);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    expect(aborts(h)).toBe(1);
+
+    // Turn 2, on the retry path. The model keeps thinking with the level off
+    // and a budget of 0 — pre-fix, every one of these was an instant abort and
+    // another ~118s re-prefill.
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    expect(aborts(h)).toBe(1);
+    expect(h.notifies.some((n) => /thinking is already off/i.test(n))).toBe(true);
+
+    vi.advanceTimersByTime(150_000);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    expect(aborts(h)).toBe(2); // the second fruitless abort trips the breaker
+
+    // Turn 3: the ~509s completion that actually finished in the real trial,
+    // 40 turns and ~50 minutes after it first tried to.
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await generate(h, { steps: 50, stepMs: 10_000, chars: 1000 });
+    await generate(h, { steps: 5, stepMs: 10_000, chars: 1000, kind: textDelta });
+
+    expect(aborts(h)).toBe(2); // bounded at 2, not 19
+    expect(h.notifies.some((n) => /standing down.*until a turn makes real progress/i.test(n))).toBe(
+      true,
+    );
+  });
+
+  // The estimator's best samples come from turns that were aborted for being
+  // slow, and agent_start fires immediately before turn_start on the retry
+  // path — so resetting the stream counters there would throw away exactly the
+  // measurements the floor depends on.
+  it("carries a turn's throughput sample across agent_start", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(HOUR);
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "6000";
+    process.env.LITTLE_CODER_THINKING_BUDGET = "32768";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    // Turn 1: 6000 chars over 5s — a qualifying sample at ~1200 chars/sec.
+    await fire(h.pi, "message_update", textDelta("x".repeat(1000)), h.ctx);
+    await generate(h, { steps: 5, stepMs: 1000, chars: 1000, kind: textDelta });
+    expect(h.calls).toEqual([]);
+
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+
+    // Turn 2 has no sample of its own yet, so the floor runs off the carried
+    // estimate and 7s of generation stays well inside it.
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    vi.advanceTimersByTime(7000);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    expect(h.calls).toEqual([]);
+
+    // A new session clears the estimate, and the identical turn now trips the
+    // bare 6000ms cap — which is what turn 2 above would have done without it.
+    await startRun(h);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    vi.advanceTimersByTime(7000);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    expect(aborts(h)).toBe(1);
+  });
+});
+
+// ── P2: the circuit breaker ─────────────────────────────────────────────────
+// Two consecutive extension aborts that produced no content mean the recovery
+// is not reaching the model, and every further abort just buys another
+// re-prefill. The reset condition is the subtle part: `aborted` cannot drive
+// it, because agent_start fires immediately before turn_start on the retry
+// path and clears that flag, so turn_start would read false every time and
+// reset the count before it could ever reach the threshold.
+describe("thinking-budget circuit breaker", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS = "1000";
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(HOUR);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_THINKING_GUARD_HARD_CAP_MS;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+  });
+
+  const aborts = (h: ReturnType<typeof makeHarness>) => h.calls.filter((c) => c === "abort").length;
+
+  // One content-free turn: thinking only, then past the 1000ms cap.
+  async function contentFreeGuardTrip(h: ReturnType<typeof makeHarness>) {
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    vi.advanceTimersByTime(1500);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+  }
+
+  // pi's own recovery ordering (agent-loop.js): agent_start, then turn_start.
+  async function retryTurn(h: ReturnType<typeof makeHarness>) {
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+  }
+
+  async function tripTwice(h: ReturnType<typeof makeHarness>) {
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await contentFreeGuardTrip(h);
+    await retryTurn(h);
+    await contentFreeGuardTrip(h);
+    await retryTurn(h);
+  }
+
+  it("stands both triggers down after two content-free aborts, notifying once", async () => {
+    const h = makeHarness("high");
+    await tripTwice(h);
+    expect(aborts(h)).toBe(2);
+
+    // Third turn: the same profile that aborted twice now does not.
+    await contentFreeGuardTrip(h);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
+    expect(aborts(h)).toBe(2);
+    const breakerNotices = h.notifies.filter((n) =>
+      /standing down.*until a turn makes real progress/i.test(n),
+    );
+    expect(breakerNotices).toHaveLength(1);
+  });
+
+  // The stand-down is bounded, not a disarm: with maxTokens at 80,000 and a
+  // model running ~25 tok/s, a fully disarmed guard would let one turn run
+  // ~53 minutes and eat the rest of the trial.
+  it("still aborts rather than let a turn run into the finalize window", async () => {
+    const h = makeHarness("high");
+    await tripTwice(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+    // Far past the 1000ms cap but still ~33 minutes clear of the deadline, so
+    // the finalize-warn stand-down is not what is doing the work here.
+    vi.advanceTimersByTime(1_600_000);
+    await fire(h.pi, "message_update", thinkingDelta("x"), h.ctx);
+
+    expect(aborts(h)).toBe(3);
+    expect(h.followUps[2]).toMatch(/wall-clock guard/i);
+  });
+
+  it("releases once a turn produces real content", async () => {
+    const h = makeHarness("high");
+    await tripTwice(h);
+
+    // The third turn is immune, and this time the model actually acts.
+    await contentFreeGuardTrip(h);
+    expect(aborts(h)).toBe(2);
+    await fire(h.pi, "message_update", textDelta("writing the file now"), h.ctx);
+
+    // A turn that ended on its own terms with content clears the count.
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await contentFreeGuardTrip(h);
+
+    expect(aborts(h)).toBe(3);
+  });
+
+  // The regression for the reset condition itself. Reading `aborted` here
+  // instead of `lastTurnEndedInExtensionAbort` reinstates the spiral: each
+  // agent_start below clears it, so the count resets every turn and the
+  // breaker never trips, leaving the third turn to abort like the first two.
+  it("counts aborts across the agent_start on the retry path", async () => {
+    const h = makeHarness("high");
+    await tripTwice(h);
+
+    await contentFreeGuardTrip(h);
+
+    expect(aborts(h)).toBe(2);
   });
 });

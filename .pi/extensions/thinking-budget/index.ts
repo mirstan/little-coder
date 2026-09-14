@@ -69,6 +69,32 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 //
 // Both breach triggers stand down inside finalize-warn's endgame window
 // (inFinalizeWarnWindow), where an abort would cut off the final answer.
+//
+// ── Trajectory follow-up: the abort spiral ──────────────────────────────────
+// A trial burned ~50 minutes in a self-sustaining abort loop with near-zero
+// forward progress, from three things compounding:
+//
+//   - The guard clocked from turn_start, so the ~118s it took to re-prefill
+//     the suffix an abort had just discarded counted as generation time.
+//   - Its window shrank with the remaining trial time (900s → 375s across the
+//     trial) while the model's throughput collapsed at large context (~25
+//     tok/s against the 50-70 it normally does), so turns that were producing
+//     output perfectly well, just slowly, were aborted for being slow.
+//   - Every guard trip latches forcedOff, zeroing the adaptive budget — and
+//     that model's config pinned thinking on regardless of the level, so the
+//     next turn's first thinking token breached a budget of 0 instantly and
+//     bought another 118s prefill for nothing.
+//
+// Three additions, all reachable only through the two existing triggers:
+//
+//   3. The guard's clock starts at the first streamed delta, not turn_start,
+//      so prefill is excluded (see turnFirstDeltaAt).
+//   4. Its window is floored at the time the currently-granted budget plus one
+//      concrete action actually costs at observed throughput (resolveGuardMs).
+//   5. A futility rule and a circuit breaker (see consecutiveNoContentAborts)
+//      stop the loop where the throughput floor cannot: aborting can't make a
+//      model honor a thinking level it is ignoring, and two fruitless aborts
+//      in a row mean the remedy isn't reaching it at all.
 
 const DEFAULT_BUDGET = 4096;
 
@@ -80,6 +106,27 @@ const DEFAULT_ADAPT_OUTSIZED_FRACTION = 0.15;
 // Wall-clock guard tuning (mechanism 2), same rationale.
 const DEFAULT_GUARD_REMAINING_FRACTION = 0.25;
 const DEFAULT_GUARD_HARD_CAP_MS = 15 * 60 * 1000;
+
+// Throughput-floor tuning. minActionTokens is the headroom past the thinking
+// budget a turn needs in order to actually *do* something once it has finished
+// deliberating — without it the floor would grant exactly enough time to think
+// and none to act. The slack factor absorbs the chars→tokens heuristic's error
+// (dense code and non-Latin text both skew len/3.5).
+const DEFAULT_GUARD_MIN_ACTION_TOKENS = 1024;
+const DEFAULT_GUARD_THROUGHPUT_SLACK = 1.25;
+
+// Bars a throughput sample must clear to be used at all. A short burst of
+// deltas measures the provider's chunking, not the model's rate, and would
+// read as an absurdly high chars/sec — which would collapse the floor to
+// nothing exactly when it is needed.
+const SAMPLE_MIN_SPAN_MS = 5000;
+const SAMPLE_MIN_CHARS = 500;
+
+// Consecutive content-free extension aborts before both breach triggers stand
+// down. Two rather than one: a single fruitless abort is ordinary, a second in
+// a row means the recovery is not reaching the model and further aborts only
+// buy another prefill.
+const BREAKER_ABORT_THRESHOLD = 2;
 
 // Every knob below treats a configured `<= 0` as "disabled", which is why
 // they read through _shared/env-number.ts rather than a local resolver that
@@ -181,9 +228,73 @@ let avgTurnMs = 0;
 let lastTurnMs = 0;
 let turnsObserved = 0;
 
+// Guard knobs for the throughput floor, resolved per run like the two above.
+let guardMinActionTokensForRun = DEFAULT_GUARD_MIN_ACTION_TOKENS;
+let guardSlackForRun = DEFAULT_GUARD_THROUGHPUT_SLACK;
+
+// Per-turn stream observation. The first streamed delta is the prefill/
+// generation boundary: message_update cannot fire during prefill at all (the
+// stream's first event follows the first SSE chunk), so "time since first
+// delta" is an exact generation clock rather than an estimate — which is what
+// lets the guard stop charging a re-prefill to the model.
+let turnFirstDeltaAt: number | undefined;
+let turnLastDeltaAt: number | undefined;
+let turnDeltaChars = 0;
+// Thinking deltas deliberately excluded: a turn that only deliberated and was
+// then cut off produced nothing the circuit breaker should credit as progress.
+let turnNonThinkingChars = 0;
+// Session-scoped, not per-run, for the same reason avgTurnMs above is: it
+// measures this model on this machine, which a new prompt doesn't change.
+let ewmaCharsPerSec = 0;
+
+// Circuit-breaker state. `lastTurnEndedInExtensionAbort` exists because the
+// `aborted` flag cannot serve here: agent_start fires immediately before
+// turn_start on the recovery path (agent-loop.js) and clears `aborted` there,
+// so turn_start would read false on every retry and reset the counter before
+// it could ever reach the threshold.
+let lastTurnEndedInExtensionAbort = false;
+let consecutiveNoContentAborts = 0;
+let breakerNotified = false;
+// One-shot per run, like the two suppression flags above.
+let futilityNotified = false;
+
 function charsToTokens(chars: number): number {
   // Matches local/context_manager.estimate_tokens (len/3.5)
   return Math.ceil(chars / 3.5);
+}
+
+function resetTurnStreamState(): void {
+  turnFirstDeltaAt = undefined;
+  turnLastDeltaAt = undefined;
+  turnDeltaChars = 0;
+  turnNonThinkingChars = 0;
+}
+
+/**
+ * Observed generation rate in characters per second, or 0 for "no estimate".
+ *
+ * The turn in flight is preferred over the rolling estimate because the thing
+ * that moves throughput most is context length, which is a property of this
+ * turn rather than of the run — a pre-compaction EWMA describes a different
+ * context than the one currently generating. The EWMA covers only the window
+ * before the current turn has produced a sample worth trusting.
+ */
+function charsPerSecEstimate(): number {
+  if (turnFirstDeltaAt !== undefined && turnLastDeltaAt !== undefined) {
+    const spanMs = turnLastDeltaAt - turnFirstDeltaAt;
+    if (spanMs >= SAMPLE_MIN_SPAN_MS && turnDeltaChars >= SAMPLE_MIN_CHARS) {
+      return (turnDeltaChars / spanMs) * 1000;
+    }
+  }
+  return ewmaCharsPerSec;
+}
+
+function foldThroughputSample(): void {
+  if (turnFirstDeltaAt === undefined || turnLastDeltaAt === undefined) return;
+  const spanMs = turnLastDeltaAt - turnFirstDeltaAt;
+  if (spanMs < SAMPLE_MIN_SPAN_MS || turnDeltaChars < SAMPLE_MIN_CHARS) return;
+  const sample = (turnDeltaChars / spanMs) * 1000;
+  ewmaCharsPerSec = ewmaCharsPerSec > 0 ? 0.5 * ewmaCharsPerSec + 0.5 * sample : sample;
 }
 
 /**
@@ -235,6 +346,44 @@ export function resolveAdaptiveBudget(params: {
 }
 
 /**
+ * The wall-clock guard's threshold as of this moment (mechanism 2). Pure and
+ * stateless in the same way resolveAdaptiveBudget is: every input is re-derived
+ * by the caller from the clock and the current turn's observed throughput.
+ *
+ * The floor is the whole point. The base window is a fraction of the remaining
+ * trial time, so it shrinks as the trial proceeds — and it shrinks fastest
+ * exactly when context has grown large enough to halve generation throughput,
+ * which is when turns legitimately need MORE time, not less. Left alone it
+ * aborts turns that are producing output perfectly well and throws that output
+ * away. The floor refuses to abort before the turn has had the time its own
+ * granted budget plus one concrete action actually costs at the rate we are
+ * observing. It only ever raises the threshold, so a stale-slow estimate can
+ * delay an abort but never bring one forward.
+ */
+export function resolveGuardMs(params: {
+  remainingMs: number;
+  guardFraction: number;
+  guardHardCapMs: number;
+  budgetForTurn: number;
+  charsPerSec: number;
+  minActionTokens: number;
+  slack: number;
+}): number {
+  const { remainingMs, guardFraction, guardHardCapMs, budgetForTurn } = params;
+  const { charsPerSec, minActionTokens, slack } = params;
+  const baseGuardMs = Math.min(remainingMs * guardFraction, guardHardCapMs);
+
+  // Rate form of charsToTokens — the same /3.5 heuristic without its rounding,
+  // which belongs to counting a total rather than dividing by a duration.
+  const estTokensPerSec = charsPerSec / 3.5;
+  if (!(estTokensPerSec > 0) || minActionTokens <= 0 || slack <= 0) return baseGuardMs;
+
+  const minUsefulTokens = Math.max(budgetForTurn, 0) + minActionTokens;
+  const throughputFloorMs = (minUsefulTokens / estTokensPerSec) * 1000 * slack;
+  return Math.max(baseGuardMs, throughputFloorMs);
+}
+
+/**
  * True while this run is inside finalize-warn's endgame window, by either of
  * finalize-warn's own triggers. Both breach paths in message_update stand down
  * here: near the end of a run the adaptive budget has usually resolved to 0, so
@@ -271,6 +420,16 @@ function safeSetThinkingLevel(pi: ExtensionAPI, level: ThinkingLevel): void {
   }
 }
 
+function notifyBreakerOnce(ctx: any): void {
+  if (breakerNotified) return;
+  breakerNotified = true;
+  harnessIntervention(
+    ctx,
+    `${BREAKER_ABORT_THRESHOLD} consecutive interventions produced no output — standing down ` +
+      "both abort triggers until a turn makes real progress, since retrying only re-prefills.",
+  );
+}
+
 // The exact recovery sequence both breach triggers (token-budget below, and
 // the wall-clock guard) run: capture + force off, queue the follow-up, notify,
 // THEN abort — in that order, and synchronously, for the reason in the Issue
@@ -283,6 +442,11 @@ function runBreachRecovery(
   notifyMessage: string,
   triggeredByWallClockGuard: boolean,
 ): void {
+  // Breaker bookkeeping first: ctx.abort() below replaces the session, and
+  // turn_start reads both of these before resetting the per-turn counters.
+  lastTurnEndedInExtensionAbort = true;
+  if (turnNonThinkingChars === 0) consecutiveNoContentAborts++;
+
   if (!forcedOff) {
     if (adaptiveOff) {
       // Take over the adaptive latch's captured level rather than reading the
@@ -332,6 +496,12 @@ export default function (pi: ExtensionAPI) {
     turnsObserved = 0;
     totalBudgetMsForRun = Infinity;
     capturedDeadlineForTotal = undefined;
+    resetTurnStreamState();
+    ewmaCharsPerSec = 0;
+    lastTurnEndedInExtensionAbort = false;
+    consecutiveNoContentAborts = 0;
+    breakerNotified = false;
+    futilityNotified = false;
   });
 
   // Hard reset of per-turn counters between agent runs. `forcedOff` /
@@ -339,6 +509,15 @@ export default function (pi: ExtensionAPI) {
   // the recovery restart turn, and clearing the force there would let thinking
   // come straight back on — exactly the bug. They are cleared on `input`
   // (a genuinely new user task) or `session_start`.
+  //
+  // The stream-observation counters are deliberately NOT reset here either:
+  // agent_start fires immediately before turn_start on the recovery path, so
+  // clearing them would destroy the just-aborted turn's throughput sample
+  // before turn_start's EWMA fold could use it — and a slow turn that got
+  // aborted is precisely the sample the estimator most needs. It would also
+  // wipe `turnNonThinkingChars` out from under the circuit breaker's reset
+  // check, which is the other half of why `lastTurnEndedInExtensionAbort`
+  // exists.
   pi.on("agent_start", async () => {
     thinkingChars = 0;
     aborted = false;
@@ -390,6 +569,7 @@ export default function (pi: ExtensionAPI) {
     // Discards only the idle gap between this prompt and the previous turn —
     // human thinking time, which is not a measurement of model throughput.
     turnStartedAt = undefined;
+    resetTurnStreamState();
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -419,12 +599,21 @@ export default function (pi: ExtensionAPI) {
       DEFAULT_GUARD_HARD_CAP_MS,
     );
     guardEnabledForRun = guardFractionForRun > 0 && guardHardCapMsForRun > 0;
+    guardMinActionTokensForRun = envNumber(
+      "LITTLE_CODER_THINKING_GUARD_MIN_ACTION_TOKENS",
+      DEFAULT_GUARD_MIN_ACTION_TOKENS,
+    );
+    guardSlackForRun = envNumber(
+      "LITTLE_CODER_THINKING_GUARD_THROUGHPUT_SLACK",
+      DEFAULT_GUARD_THROUGHPUT_SLACK,
+    );
 
     // Per-run, deliberately not session-scoped like the timing state above:
     // both exist to mirror finalize-warn's own per-run bookkeeping.
     turnsThisRun = 0;
     guardSuppressionNotified = false;
     budgetSuppressionNotified = false;
+    futilityNotified = false;
   });
 
   pi.on("turn_start", async () => {
@@ -439,6 +628,19 @@ export default function (pi: ExtensionAPI) {
       avgTurnMs += (lastTurnMs - avgTurnMs) / turnsObserved;
     }
     turnStartedAt = now;
+
+    // Both of these read the turn that just ENDED, so they have to run before
+    // the per-turn counters below are cleared.
+    foldThroughputSample();
+    // The breaker only stands down runs of aborts that produced nothing. A
+    // turn that ended on its own terms with real content is the signal that
+    // the loop is making progress again, and clears the count.
+    if (!lastTurnEndedInExtensionAbort && turnNonThinkingChars > 0) {
+      consecutiveNoContentAborts = 0;
+      breakerNotified = false;
+    }
+    lastTurnEndedInExtensionAbort = false;
+    resetTurnStreamState();
 
     thinkingChars = 0;
     aborted = false;
@@ -500,6 +702,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_update", async (event, ctx) => {
+    const ev: any = (event as any).assistantMessageEvent;
+
+    // Stream observation, ahead of both breach triggers because both now read
+    // it. Only the three `*_delta` members of AssistantMessageEvent carry a
+    // string `delta` (`*_start` carries none, `*_end` carries `content` /
+    // `toolCall`), so this type-tests rather than enumerating the names.
+    const deltaText: string = typeof ev?.delta === "string" ? ev.delta : "";
+    if (deltaText.length > 0) {
+      const deltaAt = Date.now();
+      turnFirstDeltaAt ??= deltaAt;
+      turnLastDeltaAt = deltaAt;
+      turnDeltaChars += deltaText.length;
+      if (ev.type !== "thinking_delta") turnNonThinkingChars += deltaText.length;
+    }
+
+    const breakerHolding = consecutiveNoContentAborts >= BREAKER_ABORT_THRESHOLD;
+
     // ── Mechanism 2: per-turn wall-clock guard ──────────────────────────────
     // Runs before the thinking_delta-only early-return below (and before the
     // `!ev`/type checks entirely) so it also catches a hang during plain,
@@ -510,18 +729,39 @@ export default function (pi: ExtensionAPI) {
     // Residual limitation: a provider that stalls with literally zero
     // streamed deltas never reaches this handler at all, so this guard can't
     // fire for that case — only the adapter's own outer request timeout
-    // covers it. (pi's vendored HTTP layer also has its own ~300s idle
-    // timeout as a backstop, so that residual case is bounded, just not by
-    // this extension.)
+    // covers it. pi's vendored HTTP layer has a 300s idle timeout
+    // (DEFAULT_HTTP_IDLE_TIMEOUT_MS, http-dispatcher.js) as the sole backstop
+    // there, so "stuck" stays bounded while this guard handles only "slow".
     // Requires a deadline: with none, this would abort any turn merely longer
     // than the hard cap, which is normal in interactive use and has no budget
     // to protect. Deadline-less runs get no guard, deliberately.
-    if (!aborted && turnStartedAt !== undefined && guardEnabledForRun && deadlineForRun > 0) {
+    //
+    // Gated on turnFirstDeltaAt rather than turnStartedAt: before the first
+    // delta the model is prefilling, and a re-prefill of the context an abort
+    // just discarded ran ~118s in the observed spiral — charging that to the
+    // model is what made each abort guarantee the next one.
+    if (!aborted && turnFirstDeltaAt !== undefined && guardEnabledForRun && deadlineForRun > 0) {
       const now = Date.now();
-      const elapsedThisTurn = now - turnStartedAt;
+      const generationElapsedMs = now - turnFirstDeltaAt;
       const remainingMs = deadlineForRun - now;
-      const guardMs = Math.min(remainingMs * guardFractionForRun, guardHardCapMsForRun);
-      if (elapsedThisTurn > guardMs) {
+      const guardMs = resolveGuardMs({
+        remainingMs,
+        guardFraction: guardFractionForRun,
+        guardHardCapMs: guardHardCapMsForRun,
+        budgetForTurn,
+        charsPerSec: charsPerSecEstimate(),
+        minActionTokens: guardMinActionTokensForRun,
+        slack: guardSlackForRun,
+      });
+      // While the breaker holds, the guard is raised rather than disarmed: at
+      // 25 tok/s the configured maxTokens alone would let one turn run ~53
+      // minutes, so standing down completely would replace a spiral with a
+      // single turn that eats the rest of the trial. "Run to completion, but
+      // never into the finalize window" is the bound.
+      const breakerGuardMs = breakerHolding
+        ? Math.max(guardMs, remainingMs - WARN_REMAINING_MS)
+        : guardMs;
+      if (generationElapsedMs > guardMs) {
         if (inFinalizeWarnWindow(now)) {
           if (!guardSuppressionNotified) {
             guardSuppressionNotified = true;
@@ -531,6 +771,8 @@ export default function (pi: ExtensionAPI) {
                 "letting the model finish its answer uninterrupted.",
             );
           }
+        } else if (generationElapsedMs <= breakerGuardMs) {
+          notifyBreakerOnce(ctx);
         } else {
           aborted = true;
           runBreachRecovery(
@@ -546,11 +788,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const ev: any = (event as any).assistantMessageEvent;
     if (!ev) return;
     if (ev.type !== "thinking_delta") return;
-    const delta = typeof ev.delta === "string" ? ev.delta : "";
-    thinkingChars += delta.length;
+    thinkingChars += deltaText.length;
     if (aborted) return;
     // The level "off" that latched this turn hasn't reached the in-flight turn
     // yet, but its zeroed budget has — see adaptiveOffJustLatchedThisTurn.
@@ -569,6 +809,36 @@ export default function (pi: ExtensionAPI) {
           ctx,
           "thinking-budget cap standing down: inside the finalize-warn window, " +
             "letting the model finish its answer uninterrupted.",
+        );
+      }
+      return;
+    }
+
+    if (breakerHolding) {
+      notifyBreakerOnce(ctx);
+      return;
+    }
+
+    // Futility rule. Thinking is already supposed to be off and the model is
+    // emitting thinking deltas regardless — a chatTemplateKwargs entry that
+    // pins `enable_thinking` to a literal `true` makes setThinkingLevel("off")
+    // a no-op, and the model config is not something the harness can fix from
+    // here. The remedy this path has to offer has already been applied and
+    // ignored, so aborting cannot improve anything; it only discards the turn
+    // and buys another full re-prefill. The wall-clock guard stays the sole
+    // abort authority for such a turn.
+    //
+    // The turn that SET either latch is already excluded upstream (`aborted`
+    // for forcedOff, adaptiveOffJustLatchedThisTurn for adaptiveOff), so this
+    // needs no "which turn set it" tracking. It is not a latch of its own
+    // either: it lapses whenever forcedOff/adaptiveOff do.
+    if (forcedOff || adaptiveOff) {
+      if (!futilityNotified) {
+        futilityNotified = true;
+        harnessIntervention(
+          ctx,
+          "thinking-budget cap standing down: thinking is already off and the model is " +
+            "thinking anyway, so aborting would only cost a re-prefill.",
         );
       }
       return;
