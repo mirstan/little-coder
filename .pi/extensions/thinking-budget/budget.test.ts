@@ -1335,10 +1335,11 @@ describe("thinking-budget circuit breaker", () => {
     expect(aborts(h)).toBe(3);
   });
 
-  // The regression for the reset condition itself. Reading `aborted` here
-  // instead of `lastTurnEndedInExtensionAbort` reinstates the spiral: each
-  // agent_start below clears it, so the count resets every turn and the
-  // breaker never trips, leaving the third turn to abort like the first two.
+  // The regression for the counter surviving the agent_start/retry boundary
+  // at all: gating it on the `aborted` flag (which agent_start clears before
+  // turn_start ever reads it) would reset the count every retry and the
+  // breaker would never trip, leaving the third turn to abort like the first
+  // two.
   it("counts aborts across the agent_start on the retry path", async () => {
     const h = makeHarness("high");
     await tripTwice(h);

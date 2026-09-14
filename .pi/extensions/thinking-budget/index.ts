@@ -247,12 +247,11 @@ let turnNonThinkingChars = 0;
 // measures this model on this machine, which a new prompt doesn't change.
 let ewmaCharsPerSec = 0;
 
-// Circuit-breaker state. `lastTurnEndedInExtensionAbort` exists because the
-// `aborted` flag cannot serve here: agent_start fires immediately before
-// turn_start on the recovery path (agent-loop.js) and clears `aborted` there,
-// so turn_start would read false on every retry and reset the counter before
-// it could ever reach the threshold.
-let lastTurnEndedInExtensionAbort = false;
+// Circuit-breaker state. The counter is read/reset by content alone
+// (turnNonThinkingChars), not by whether the turn was aborted — the `aborted`
+// flag itself couldn't have served that purpose anyway: agent_start fires
+// immediately before turn_start on the recovery path (agent-loop.js) and
+// clears `aborted` there, so turn_start would read false on every retry.
 let consecutiveNoContentAborts = 0;
 let breakerNotified = false;
 // One-shot per run, like the two suppression flags above.
@@ -443,8 +442,7 @@ function runBreachRecovery(
   triggeredByWallClockGuard: boolean,
 ): void {
   // Breaker bookkeeping first: ctx.abort() below replaces the session, and
-  // turn_start reads both of these before resetting the per-turn counters.
-  lastTurnEndedInExtensionAbort = true;
+  // turn_start reads turnNonThinkingChars before resetting it.
   if (turnNonThinkingChars === 0) consecutiveNoContentAborts++;
 
   if (!forcedOff) {
@@ -498,7 +496,6 @@ export default function (pi: ExtensionAPI) {
     capturedDeadlineForTotal = undefined;
     resetTurnStreamState();
     ewmaCharsPerSec = 0;
-    lastTurnEndedInExtensionAbort = false;
     consecutiveNoContentAborts = 0;
     breakerNotified = false;
     futilityNotified = false;
@@ -515,9 +512,8 @@ export default function (pi: ExtensionAPI) {
   // clearing them would destroy the just-aborted turn's throughput sample
   // before turn_start's EWMA fold could use it — and a slow turn that got
   // aborted is precisely the sample the estimator most needs. It would also
-  // wipe `turnNonThinkingChars` out from under the circuit breaker's reset
-  // check, which is the other half of why `lastTurnEndedInExtensionAbort`
-  // exists.
+  // wipe `turnNonThinkingChars` out from under the circuit breaker's own
+  // reset check in turn_start.
   pi.on("agent_start", async () => {
     thinkingChars = 0;
     aborted = false;
@@ -574,7 +570,6 @@ export default function (pi: ExtensionAPI) {
     // abort streak the previous task left behind — without this, two
     // content-free aborts on one task would leave the breaker holding over
     // into an unrelated task that follows it.
-    lastTurnEndedInExtensionAbort = false;
     consecutiveNoContentAborts = 0;
     breakerNotified = false;
   });
@@ -649,7 +644,6 @@ export default function (pi: ExtensionAPI) {
       consecutiveNoContentAborts = 0;
       breakerNotified = false;
     }
-    lastTurnEndedInExtensionAbort = false;
     resetTurnStreamState();
 
     thinkingChars = 0;
