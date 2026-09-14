@@ -523,6 +523,7 @@ def test_the_log_being_read_is_not_suggested_back_to_the_user(tmp_path):
         tmp_path / "server.log.2026-09-12",
         _local("2026-09-12", "23:30:00"),
         _local("2026-09-13", "00:30:00"),
+        today=datetime.strptime("2026-09-13", "%Y-%m-%d").date(),
     )
     assert siblings == [tmp_path / "server.log"]
     assert missing_days == []
@@ -540,7 +541,9 @@ def test_a_sibling_retention_has_already_deleted_is_skipped(tmp_path, capsys):
 
     R.report(trial_dir, server_log)
 
-    siblings, missing_days = R.rotated_siblings(server_log, *R.read_window(trial_dir))
+    siblings, missing_days = R.rotated_siblings(
+        server_log, *R.read_window(trial_dir), today=datetime.strptime("2026-09-13", "%Y-%m-%d").date()
+    )
     assert siblings == [kept]
     assert missing_days == [datetime.strptime("2026-09-12", "%Y-%m-%d").date()]
     assert [r["prompt_tokens"] for r in _rows(trial_dir)] == ["1000", "3000"]
