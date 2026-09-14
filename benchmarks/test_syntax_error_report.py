@@ -223,6 +223,26 @@ def test_a_footerless_result_produces_no_match_of_its_own():
     assert S.result_text(text) == ""
 
 
+def test_output_containing_a_marker_shaped_line_is_not_mistaken_for_a_boundary():
+    """Real tool output is preserved verbatim, unescaped -- a diff's own
+    ">> "/"<< " style markers, or a cat'd file containing example shell
+    syntax, can legitimately produce an output LINE that looks exactly like
+    a call/result marker. That must not truncate the match and drop the
+    rest of the real result (including its own error and its footer)."""
+    text = (
+        ">> ShellSession({'command': 'diff a.txt b.txt'})\n"
+        "<< --- a.txt\n"
+        "+++ b.txt\n"
+        "<< this line looks like a result marker but is just diff output\n"
+        ">> this line looks like a call marker but is just diff output\n"
+        "syntax error at f.pl line 9, near \"x\"\n"
+        "[exit=1 cwd=/app timed_out=false backend=harbor-env]\n"
+    )
+    errors, calls_with_errors = S.count_errors(text)
+    assert errors["perl_errors"] == 1
+    assert calls_with_errors == 1
+
+
 # --- shell-call counting -------------------------------------------------
 
 

@@ -38,23 +38,36 @@ from pathlib import Path
 
 CSV_FILENAME = "syntax_errors.csv"
 
-# Real tool output starts with "<< " on its own line and, for shell tools,
-# ends at a "[exit=N cwd=... timed_out=... backend=...]" footer line -- DOTALL
-# so "." spans the (often many) output lines in between, MULTILINE so "^"/"$"
-# anchor to each line rather than the whole file. Not every tool produces
-# that footer: across the real corpus, non-shell tools ("write", "webfetch",
+# Two-phase extraction, not one regex over the whole file. A single call's
+# own tool output can legitimately contain a line starting with ">> " or
+# "<< " (diff markers, a cat'd file with example shell syntax in it, etc --
+# real tool output is preserved verbatim, unescaped), so splitting on every
+# marker-SHAPED line is wrong; splitting only on genuine call markers
+# (">> ToolName(", which only ever appears at the actual start of an
+# invocation) is not. Phase 1 finds those; phase 2 looks for a "<< ...
+# [exit=...]" result within each resulting per-call chunk, where any
+# embedded marker-looking line is just ordinary output, not a boundary.
+#
+# Not every tool produces the "[exit=N cwd=... timed_out=... backend=...]"
+# footer: across the real corpus, non-shell tools ("write", "webfetch",
 # "websearch") routinely appear with no footer at all -- in every real trial
-# checked, `>> ` calls consistently outnumber `[exit=` footers. A naive
-# non-greedy `(.*?)` would keep expanding right past one of those footerless
-# results looking for the NEXT footer anywhere later in the file, swallowing
-# an intervening ShellSession call's own command text (and any further
-# results before it) as if all of it were the first result's output -- the
-# exact command-text-scanning bug this file exists to avoid, reintroduced by
-# a different mechanism. The `(?!^>> |^<< )` guard on every consumed
-# character stops the match dead at the next call/result marker, so a
-# footerless result (no footer before the next marker) simply produces no
-# match at all instead of over-consuming.
-_RESULT_RE = re.compile(r"^<< ((?:(?!^>> |^<< ).)*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
+# checked, `>> ` calls consistently outnumber `[exit=` footers. Because each
+# chunk is already bounded by the NEXT real call marker, a footerless
+# result's chunk simply has no "[exit=...]" to find and correctly yields no
+# match, rather than the search spilling into a later chunk's content.
+_CALL_MARKER_RE = re.compile(r"^>> \w+\(", re.MULTILINE)
+_RESULT_IN_CHUNK_RE = re.compile(r"^<< (.*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
+
+
+def iter_results(text: str):
+    """Yield each tool call's own result body, in order, command text and
+    inter-call narration excluded."""
+    marks = [m.start() for m in _CALL_MARKER_RE.finditer(text)]
+    marks.append(len(text))
+    for start, end in zip(marks, marks[1:]):
+        match = _RESULT_IN_CHUNK_RE.search(text[start:end])
+        if match:
+            yield match.group(1)
 
 # Harbor/TB2.1 trials call the shell tool "ShellSession"; GAIA trials (see
 # benchmarks/gaia.py's ALLOWED_TOOLS) call it "bash"/"Bash" instead -- match
@@ -133,7 +146,7 @@ def find_trial_dirs(path: Path) -> tuple[list[Path], list[Path]]:
 
 def result_text(text: str) -> str:
     """Every tool result's own output, command text and narration excluded."""
-    return "\n".join(_RESULT_RE.findall(text))
+    return "\n".join(iter_results(text))
 
 
 def count_errors(text: str) -> tuple[dict[str, int], int]:
@@ -146,7 +159,7 @@ def count_errors(text: str) -> tuple[dict[str, int], int]:
     robust before/after signal when the language mix (and so per-error
     verbosity) can differ between two runs.
     """
-    results = _RESULT_RE.findall(text)
+    results = list(iter_results(text))
     counts = {name: 0 for name in PATTERNS}
     calls_with_errors = 0
     for result in results:
