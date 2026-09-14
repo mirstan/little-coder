@@ -38,13 +38,23 @@ from pathlib import Path
 
 CSV_FILENAME = "syntax_errors.csv"
 
-# Real tool output always starts with "<< " on its own line and ends at a
-# "[exit=N cwd=... timed_out=... backend=...]" footer line -- DOTALL so "."
-# spans the (often many) output lines in between, MULTILINE so "^"/"$" anchor
-# to each line rather than the whole file. A malformed/unterminated final
-# block (trial killed mid-command) simply isn't matched, which undercounts
-# rather than risks matching into the next command's text.
-_RESULT_RE = re.compile(r"^<< (.*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
+# Real tool output starts with "<< " on its own line and, for shell tools,
+# ends at a "[exit=N cwd=... timed_out=... backend=...]" footer line -- DOTALL
+# so "." spans the (often many) output lines in between, MULTILINE so "^"/"$"
+# anchor to each line rather than the whole file. Not every tool produces
+# that footer: across the real corpus, non-shell tools ("write", "webfetch",
+# "websearch") routinely appear with no footer at all -- in every real trial
+# checked, `>> ` calls consistently outnumber `[exit=` footers. A naive
+# non-greedy `(.*?)` would keep expanding right past one of those footerless
+# results looking for the NEXT footer anywhere later in the file, swallowing
+# an intervening ShellSession call's own command text (and any further
+# results before it) as if all of it were the first result's output -- the
+# exact command-text-scanning bug this file exists to avoid, reintroduced by
+# a different mechanism. The `(?!^>> |^<< )` guard on every consumed
+# character stops the match dead at the next call/result marker, so a
+# footerless result (no footer before the next marker) simply produces no
+# match at all instead of over-consuming.
+_RESULT_RE = re.compile(r"^<< ((?:(?!^>> |^<< ).)*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
 
 # Harbor/TB2.1 trials call the shell tool "ShellSession"; GAIA trials (see
 # benchmarks/gaia.py's ALLOWED_TOOLS) call it "bash"/"Bash" instead -- match
@@ -105,6 +115,16 @@ def find_trial_dirs(path: Path) -> tuple[list[Path], list[Path]]:
     """
     if is_trial_dir(path):
         return [path], []
+    if has_agent_dir_but_no_log(path):
+        # `path` itself is a trial dir, just not ready yet -- e.g. passed
+        # directly (not via its run-dir parent) before the trial has written
+        # its first line, or after it crashed during setup. Without this
+        # check it would fall through to iterdir() and get scanned as if it
+        # were a RUN directory containing sibling trials, none of which
+        # `path`'s own children (agent/, result.json, ...) actually are --
+        # silently returning ([], []) and dropping this trial from both
+        # lists instead of reporting it as skipped.
+        return [], [path]
     candidates = sorted(p for p in path.iterdir() if p.is_dir())
     trials = [p for p in candidates if is_trial_dir(p)]
     skipped = [p for p in candidates if has_agent_dir_but_no_log(p)]
@@ -116,7 +136,7 @@ def result_text(text: str) -> str:
     return "\n".join(_RESULT_RE.findall(text))
 
 
-def count_errors(text: str) -> dict[str, int]:
+def count_errors(text: str) -> tuple[dict[str, int], int]:
     """Per-pattern occurrence counts and the count of *results* touched by >=1.
 
     `total_errors` is occurrence-weighted (Perl's "Global symbol" fires once

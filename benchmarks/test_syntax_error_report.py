@@ -71,6 +71,19 @@ def test_a_trial_dir_shaped_directory_with_no_log_yet_is_reported_as_skipped(tmp
     assert [p.name for p in skipped] == ["crashed__2"]
 
 
+def test_a_not_yet_ready_trial_dir_passed_directly_is_still_reported_as_skipped(tmp_path):
+    """Without checking has_agent_dir_but_no_log first, a trial dir passed
+    directly (not via its run-dir parent) falls through to treating its OWN
+    children (agent/, result.json, ...) as if they were sibling trials --
+    none of which satisfy is_trial_dir either, so it would silently vanish
+    from both lists instead of landing in skipped."""
+    crashed = tmp_path / "crashed__2"
+    (crashed / "agent").mkdir(parents=True)
+    trials, skipped = S.find_trial_dirs(crashed)
+    assert trials == []
+    assert skipped == [crashed]
+
+
 # --- extraction: only real tool OUTPUT is scanned -----------------------
 
 
@@ -185,6 +198,31 @@ def test_an_unterminated_final_block_with_no_exit_footer_is_not_matched():
     assert calls_with_errors == 0
 
 
+def test_a_footerless_result_does_not_swallow_a_later_calls_command_text():
+    """Real bug: non-shell tools ("write", "webfetch", "websearch") produce
+    no [exit=...] footer at all -- in every real trial checked, `>> ` calls
+    outnumber `[exit=` footers. A naive non-greedy match would keep looking
+    past a footerless result for the NEXT footer anywhere later in the file,
+    swallowing an intervening ShellSession call's own command text (which
+    can legitimately contain the word "SyntaxError", e.g. writing a script
+    with an except-SyntaxError guard) as if it were the first result's
+    output -- the exact confound this file exists to avoid."""
+    text = (
+        ">> write({'path': '/tmp/f.py'})\n"
+        "<< wrote 40 lines\n"
+        "\n\n"
+        + _call("python3 -c \"raise SyntaxError('boom')\"", "SyntaxError: boom", exit_code=1)
+    )
+    errors, calls_with_errors = S.count_errors(text)
+    assert errors["python_errors"] == 1  # only the real interpreter error
+    assert calls_with_errors == 1
+
+
+def test_a_footerless_result_produces_no_match_of_its_own():
+    text = ">> write({'path': '/tmp/f.py'})\n<< wrote 40 lines\n\n\n"
+    assert S.result_text(text) == ""
+
+
 # --- shell-call counting -------------------------------------------------
 
 
@@ -217,7 +255,7 @@ def test_trial_row_computes_the_calls_with_errors_rate(tmp_path):
     assert row["run_label"] == "my-run"
 
 
-def test_error_rate_pct_cannot_exceed_100_percent_even_with_many_diagnostics_in_one_call():
+def test_error_rate_pct_cannot_exceed_100_percent_even_with_many_diagnostics_in_one_call(tmp_path):
     """A single call's output can contain several diagnostics (e.g. one gcc
     invocation printing 4 errors) -- the rate must stay a real percentage,
     counting affected CALLS, not raw diagnostic lines."""
@@ -226,22 +264,12 @@ def test_error_rate_pct_cannot_exceed_100_percent_even_with_many_diagnostics_in_
         "\n".join(f"a.c:{n}:1: error: bad" for n in range(1, 6)),
         exit_code=1,
     )
-    row = S.trial_row(_trial_dir_from_text(text), "run")
+    trial = _trial_dir(tmp_path, "task__abc", text)
+    row = S.trial_row(trial, "run")
     assert row["shell_calls"] == 1
     assert row["gcc_errors"] == 5
     assert row["calls_with_errors"] == 1
     assert row["error_rate_pct"] == 100.0
-
-
-def _trial_dir_from_text(text):
-    import tempfile
-    from pathlib import Path
-
-    base = Path(tempfile.mkdtemp())
-    trial = base / "task__abc"
-    (trial / "agent").mkdir(parents=True)
-    (trial / "agent" / "little_coder.live.log").write_text(text)
-    return trial
 
 
 def test_trial_row_with_zero_shell_calls_does_not_divide_by_zero(tmp_path):
