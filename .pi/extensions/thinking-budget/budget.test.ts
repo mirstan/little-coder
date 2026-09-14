@@ -1413,4 +1413,36 @@ describe("thinking-budget circuit breaker", () => {
     );
     expect(breakerNotices).toHaveLength(0);
   });
+
+  // A turn can end on its own — no message_update at all, so no abort and
+  // no content either — without ever exercising the abort mechanism the
+  // breaker is tracking. Checking content alone (the fix for the previous
+  // bug) is not sufficient on its own: it would treat this silent turn the
+  // same as a content-free ABORT and preserve the streak across it, letting
+  // an unrelated pair of aborts either side of it wrongly look consecutive.
+  it("resets the streak across a turn that ends silently, without an abort", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await contentFreeGuardTrip(h);
+    await retryTurn(h);
+    expect(aborts(h)).toBe(1);
+
+    // Turn 2: nothing happens at all, then it just ends.
+    await fire(h.pi, "turn_start", {}, h.ctx);
+
+    // Turn 3 is content-free again. If the silent turn hadn't broken the
+    // streak, this and the next content-free abort would look like turns
+    // 1 and 3 of one unbroken pair; it must instead start a fresh streak.
+    await contentFreeGuardTrip(h);
+    expect(aborts(h)).toBe(2);
+    await retryTurn(h);
+
+    await contentFreeGuardTrip(h);
+    expect(aborts(h)).toBe(3);
+    const breakerNotices = h.notifies.filter((n) =>
+      /standing down.*until a turn makes real progress/i.test(n),
+    );
+    expect(breakerNotices).toHaveLength(0);
+  });
 });

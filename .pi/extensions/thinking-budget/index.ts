@@ -247,11 +247,11 @@ let turnNonThinkingChars = 0;
 // measures this model on this machine, which a new prompt doesn't change.
 let ewmaCharsPerSec = 0;
 
-// Circuit-breaker state. The counter is read/reset by content alone
-// (turnNonThinkingChars), not by whether the turn was aborted — the `aborted`
-// flag itself couldn't have served that purpose anyway: agent_start fires
-// immediately before turn_start on the recovery path (agent-loop.js) and
-// clears `aborted` there, so turn_start would read false on every retry.
+// Circuit-breaker state. `lastTurnEndedInExtensionAbort` can't be read via
+// the existing `aborted` flag: agent_start fires immediately before
+// turn_start on the recovery path (agent-loop.js) and clears `aborted`
+// there, so turn_start would read false on every retry.
+let lastTurnEndedInExtensionAbort = false;
 let consecutiveNoContentAborts = 0;
 let breakerNotified = false;
 // One-shot per run, like the two suppression flags above.
@@ -442,7 +442,8 @@ function runBreachRecovery(
   triggeredByWallClockGuard: boolean,
 ): void {
   // Breaker bookkeeping first: ctx.abort() below replaces the session, and
-  // turn_start reads turnNonThinkingChars before resetting it.
+  // turn_start reads both of these before resetting the per-turn counters.
+  lastTurnEndedInExtensionAbort = true;
   if (turnNonThinkingChars === 0) consecutiveNoContentAborts++;
 
   if (!forcedOff) {
@@ -496,6 +497,7 @@ export default function (pi: ExtensionAPI) {
     capturedDeadlineForTotal = undefined;
     resetTurnStreamState();
     ewmaCharsPerSec = 0;
+    lastTurnEndedInExtensionAbort = false;
     consecutiveNoContentAborts = 0;
     breakerNotified = false;
     futilityNotified = false;
@@ -570,6 +572,7 @@ export default function (pi: ExtensionAPI) {
     // abort streak the previous task left behind — without this, two
     // content-free aborts on one task would leave the breaker holding over
     // into an unrelated task that follows it.
+    lastTurnEndedInExtensionAbort = false;
     consecutiveNoContentAborts = 0;
     breakerNotified = false;
   });
@@ -634,16 +637,21 @@ export default function (pi: ExtensionAPI) {
     // Both of these read the turn that just ENDED, so they have to run before
     // the per-turn counters below are cleared.
     foldThroughputSample();
-    // The breaker only stands down runs of aborts that produced nothing. Any
-    // real content is the signal that the loop is making progress again and
-    // clears the count — including a turn the guard eventually aborted after
-    // it had already streamed real output; `runBreachRecovery` only ever
-    // increments the counter for a turn with zero content in the first
-    // place, so this reset is not gated on whether the turn was aborted too.
-    if (turnNonThinkingChars > 0) {
+    // The breaker only holds a streak of turns THIS extension aborted for
+    // producing nothing. Any other outcome breaks that streak: real content
+    // (even from a turn the guard also ended up aborting for taking too
+    // long overall — runBreachRecovery only increments for a turn with zero
+    // content in the first place, so a content-producing abort should still
+    // clear here) is direct evidence of progress; and a turn that ended on
+    // its OWN terms without needing our intervention at all — whether or
+    // not it happened to produce content — means the abort mechanism itself
+    // wasn't even exercised that turn, so it can't be "the second of a
+    // pair" with the abort before it.
+    if (turnNonThinkingChars > 0 || !lastTurnEndedInExtensionAbort) {
       consecutiveNoContentAborts = 0;
       breakerNotified = false;
     }
+    lastTurnEndedInExtensionAbort = false;
     resetTurnStreamState();
 
     thinkingChars = 0;
