@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import uuid
 import base64
 from pathlib import Path
@@ -21,11 +22,22 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 
 # benchmarks/ isn't a package; make imports work when TB points at this file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rpc_client import PiRpc  # noqa: E402
+from rpc_client import (  # noqa: E402
+    PiRpc,
+    preview_tool_result,
+    prompt_with_error_retry,
+)
 
 
 DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
+#: Wall-clock budget for the single prompt this adapter issues. TB 1.0 gives
+#: the agent no per-task budget to read (unlike Harbor, which the sibling
+#: adapter resolves a real per-task timeout from), so this stays the flat
+#: value it has always been -- but it is now named and shared, because the
+#: deadline pi is told about, the prompt timeout, and the error-retry budget
+#: all have to be the same number or the three disagree about when time is up.
+DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 
 
 # ── tmux command execution (matches shell_session.py::_exec_tmux) ──────────
@@ -250,6 +262,58 @@ class LittleCoderAgent(BaseAgent):
             "When the task is complete, stop calling tools and say 'done'."
         )
 
+        def on_event(ev: dict) -> None:
+            """Provider-error breadcrumbs only.
+
+            Deliberately not a full live trajectory log (that's the Harbor
+            adapter's job): the one thing this log could never explain before
+            was why a session stopped early, so error/auto-retry events are
+            written as they happen, ahead of the summary block below.
+            """
+            if log_fh is None:
+                return
+            t = ev.get("type")
+            if t == "turn_end":
+                msg = ev.get("message")
+                if isinstance(msg, dict) and (
+                    msg.get("errorMessage") or msg.get("stopReason") == "error"
+                ):
+                    log_fh.write(
+                        f"=== turn error (stopReason={msg.get('stopReason')}): "
+                        f"{msg.get('errorMessage') or '(no errorMessage)'} ===\n"
+                    )
+                    log_fh.flush()
+            elif t == "auto_retry_start":
+                log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')}/"
+                    f"{ev.get('maxAttempts')} in {ev.get('delayMs')}ms: "
+                    f"{ev.get('errorMessage', '')} ===\n"
+                )
+                log_fh.flush()
+            elif t == "auto_retry_end":
+                log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')} finished "
+                    f"success={ev.get('success')} {ev.get('finalError', '')} ===\n"
+                )
+                log_fh.flush()
+
+        def log_line(text: str) -> None:
+            """Retry-loop progress, flushed so a `tail -f` shows a stalled
+            trial waiting out a backoff rather than appearing hung."""
+            if log_fh is None:
+                return
+            log_fh.write(f"=== {text} ===\n")
+            log_fh.flush()
+
+        # Given to pi as an absolute wall-clock deadline (the extensions
+        # built on `_shared/deadline.ts` -- finalize-warn and
+        # tb-finalize-guard -- read this env var through it and silently
+        # no-op without it), and tracked in parallel on the
+        # monotonic clock for the error-retry budget. Both from the same
+        # constant, taken at the same instant.
+        deadline_epoch_ms = int((time.time() + DEFAULT_PROMPT_TIMEOUT_SEC) * 1000)
+        prompt_deadline = time.monotonic() + DEFAULT_PROMPT_TIMEOUT_SEC
+
         try:
             with PiRpc(
                 model=self._model,
@@ -260,16 +324,40 @@ class LittleCoderAgent(BaseAgent):
                 tb_mode=True,
                 max_turns=self._max_turns,
                 tb_shell_handler=tb_shell_handler,
+                env={"LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms)},
             ) as rpc:
-                result = rpc.prompt_and_collect(prompt, timeout=3600)
+                # Retried in place on a provider-error completion -- one
+                # errored completion otherwise ends the whole trial with most
+                # of the budget unspent. See prompt_with_error_retry.
+                retry_outcome = prompt_with_error_retry(
+                    rpc,
+                    prompt,
+                    DEFAULT_PROMPT_TIMEOUT_SEC,
+                    on_event,
+                    deadline=prompt_deadline,
+                    log=log_line,
+                )
+                result = retry_outcome.result
                 text_out = result.assistant_text
                 turns = result.turn_count
                 if log_fh:
+                    # Distinguishes a crashed pi from a model that simply ran
+                    # long; both used to look identical in this log.
+                    log_fh.write(
+                        f"=== stop_reason: {getattr(result, 'stop_reason', 'unknown')} ===\n")
+                    log_fh.write(
+                        f"=== error retries: {retry_outcome.n_error_retries} "
+                        f"(last error: {retry_outcome.error_message}) ===\n")
+                    if retry_outcome.retry_exception:
+                        log_fh.write(
+                            f"=== retry raised (not propagated): "
+                            f"{retry_outcome.retry_exception} ===\n")
                     log_fh.write(f"=== assistant text ===\n{text_out}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
-                        preview = (tc.get("result_text", "") or "")[:400]
-                        log_fh.write(f"<< {preview}\n")
+                        log_fh.write(
+                            f"<< {preview_tool_result(tc.get('result_text', '') or '')}\n"
+                        )
                     # Extension notifications: per-turn evidence of
                     # skill-inject / knowledge-inject / thinking-budget /
                     # quality-monitor / turn-cap firing. Structured as one

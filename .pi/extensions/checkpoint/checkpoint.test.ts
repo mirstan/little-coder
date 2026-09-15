@@ -1,8 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  chmodSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import setupCheckpoint, { checkpointPath, tracked } from "./index.ts";
+import setupCheckpoint, { checkpointPath, tracked, MAX_BACKUP_BYTES } from "./index.ts";
 
 describe("checkpointPath", () => {
   it("reads the `path` key (current pi write/edit)", () => {
@@ -75,5 +84,507 @@ describe("checkpoint pre-edit backup net", () => {
     await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-0.json" } });
     await h.tool_call({ toolName: "write", input: { content: "no path here" } });
     expect(existsSync(join(home, ".little-coder", "checkpoints", "sess-0.json"))).toBe(false);
+  });
+});
+
+describe("checkpoint pre-edit backup net — shell writes", () => {
+  let home: string;
+  let origHome: string | undefined;
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    home = mkdtempSync(join(tmpdir(), "ckpt-shell-"));
+    process.env.HOME = home;
+    tracked.clear();
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function ckptDir(sessionFile: string): string {
+    return join(home, ".little-coder", "checkpoints", sessionFile.split("/").pop()!);
+  }
+
+  it("backs up a file redirected to via `>` in a bash call", async () => {
+    const h = setup();
+    const target = join(home, "task.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh1.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `echo garbage > ${target}` } });
+
+    const dir = ckptDir("sess-sh1.json");
+    expect(existsSync(dir)).toBe(true);
+    expect(readdirSync(dir).length).toBe(1);
+  });
+
+  it("backs up a file redirected to via `>>` in a ShellSession call", async () => {
+    const h = setup();
+    const target = join(home, "task2.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh2.json" } });
+    await h.tool_call({ toolName: "ShellSession", input: { command: `echo more >> ${target}` } });
+
+    expect(existsSync(ckptDir("sess-sh2.json"))).toBe(true);
+  });
+
+  it("backs up every file targeted by `tee`", async () => {
+    const h = setup();
+    const target = join(home, "task3.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh3.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `echo hi | tee ${target}` } });
+
+    expect(existsSync(ckptDir("sess-sh3.json"))).toBe(true);
+  });
+
+  it("backs up the `of=` target of `dd`", async () => {
+    const h = setup();
+    const target = join(home, "task4.txt");
+    writeFileSync(target, "original content");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh4.json" } });
+    await h.tool_call({
+      toolName: "bash",
+      input: { command: `dd if=/dev/zero of=${target} bs=1 count=1` },
+    });
+
+    expect(existsSync(ckptDir("sess-sh4.json"))).toBe(true);
+  });
+
+  it("is a no-op for a read-only shell command", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh5.json" } });
+    await h.tool_call({ toolName: "bash", input: { command: `cat somefile.txt | grep foo` } });
+
+    expect(existsSync(ckptDir("sess-sh5.json"))).toBe(false);
+  });
+
+  it("first-write-wins across a Write call followed by a shell redirect to the same path", async () => {
+    const h = setup();
+    const target = join(home, "shared.txt");
+    writeFileSync(target, "PRE-EXISTING");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh6.json" } });
+
+    await h.tool_call({ toolName: "Write", input: { path: target, content: "intermediate" } });
+    // Simulate the Write actually landing, then a later shell redirect to the
+    // same path in the same session.
+    writeFileSync(target, "intermediate");
+    await h.tool_call({ toolName: "bash", input: { command: `echo clobber > ${target}` } });
+
+    const dir = ckptDir("sess-sh6.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    const backedUp = readFileSync(join(dir, files[0]), "utf8");
+    expect(backedUp).toBe("PRE-EXISTING");
+  });
+
+  it("attempts a best-effort resolution for a relative path without crashing", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-sh7.json" } });
+
+    await expect(
+      h.tool_call({ toolName: "bash", input: { command: `echo hi > relative-out.txt` } }),
+    ).resolves.not.toThrow();
+
+    // Best-effort: resolves against ctx.cwd (defaulting to process.cwd() when
+    // no ctx is supplied), and the `.absent` sentinel covers the common case
+    // where the path doesn't exist there.
+    const dir = ckptDir("sess-sh7.json");
+    expect(existsSync(dir)).toBe(true);
+  });
+});
+
+describe("checkpoint hardening — keying, oversize/unreadable/dir safety, ShellSend, dir resilience", () => {
+  let home: string;
+  let origHome: string | undefined;
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    home = mkdtempSync(join(tmpdir(), "ckpt-hard-"));
+    process.env.HOME = home;
+    tracked.clear();
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function ckptDir(sessionFile: string): string {
+    return join(home, ".little-coder", "checkpoints", sessionFile.split("/").pop()!);
+  }
+
+  it("unifies the key across a relative Write and an absolute shell redirect to the same physical file", async () => {
+    const h = setup();
+    const abs = join(home, "same.txt");
+    writeFileSync(abs, "ORIGINAL-BYTES");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u1.json" } });
+
+    await h.tool_call({ toolName: "write", input: { path: "same.txt" } }, { cwd: home });
+    await h.tool_call({ toolName: "bash", input: { command: `echo x > ${abs}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u1.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("unifies a `~/` shell target with its absolute equivalent", async () => {
+    const h = setup();
+    const abs = join(home, "notes.md");
+    writeFileSync(abs, "TILDE-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u2.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo a > ~/notes.md` } }, { cwd: home });
+    await h.tool_call({ toolName: "bash", input: { command: `echo b > ${abs}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u2.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("TILDE-ORIGINAL");
+  });
+
+  it("keys a bare-absolute shell-redirect target on the literal path, not cwd-joined (unlike write-guard's rule)", async () => {
+    const h = setup();
+    const literal = "/nonexistent-lc-test-should-not-exist-abc123.md";
+    const cwd = join(home, "some", "subdir");
+    mkdirSync(cwd, { recursive: true });
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u3.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo x > ${literal}` } }, { cwd });
+
+    const dir = ckptDir("sess-u3.json");
+    const files = readdirSync(dir);
+    // The literal absolute path doesn't exist, so it's tracked via the
+    // `.absent` sentinel — its name encodes the actual key used. If the
+    // shell branch wrongly cwd-joined a bare-absolute path (write-guard's
+    // rule), the sentinel would instead encode `<cwd>/nonexistent-...md`.
+    const expectedSentinel = literal.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".absent";
+    expect(files).toEqual([expectedSentinel]);
+  });
+
+  it("normalizes an absolute path so ./ and // spellings key on the same physical file", async () => {
+    const h = setup();
+    const abs = join(home, "norm.txt");
+    writeFileSync(abs, "NORM-ORIGINAL");
+    const dotted = join(home, ".", "norm.txt");
+    const doubled = home + "//norm.txt";
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u5.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo a > ${dotted}` } }, { cwd: home });
+    writeFileSync(abs, "CLOBBERED-BY-FIRST-WRITE");
+    await h.tool_call({ toolName: "bash", input: { command: `echo b > ${doubled}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u5.json");
+    const files = readdirSync(dir);
+    // Unnormalized, these three spellings would be three distinct tracking
+    // keys -- the second "backup" would actually capture the already-
+    // clobbered bytes under a different filename, silently lying about what
+    // the original content was.
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("NORM-ORIGINAL");
+  });
+
+  it("backs up a bracket-named file that exists on disk (Next.js/Remix-style routes)", async () => {
+    const h = setup();
+    const routesDir = join(home, "routes");
+    mkdirSync(routesDir, { recursive: true });
+    const target = join(routesDir, "[id].tsx");
+    writeFileSync(target, "ORIGINAL-ROUTE-CONTENT");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u6.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > routes/[id].tsx` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u6.json");
+    const files = readdirSync(dir);
+    // Before the fix, the bare presence of `[`/`]` unconditionally excluded
+    // this target as "unexpanded glob syntax" -- silently backing up nothing
+    // for a real, existing file.
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIGINAL-ROUTE-CONTENT");
+  });
+
+  it("still skips a genuinely nonexistent bracket-shaped path (can't tell glob from literal)", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u7.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > routes/[slug].tsx` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u7.json");
+    expect(existsSync(dir) ? readdirSync(dir).length : 0).toBe(0);
+  });
+
+  it("still skips a target containing real shell substitution", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u8.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `echo x > "$OUT"` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-u8.json");
+    expect(existsSync(dir) ? readdirSync(dir).length : 0).toBe(0);
+  });
+
+  it("backs up a `cp` destination's pre-existing bytes, not the source's", async () => {
+    const h = setup();
+    const src = join(home, "src4.txt");
+    const dst = join(home, "dst4.txt");
+    writeFileSync(src, "SRC-CONTENT");
+    writeFileSync(dst, "DST-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u4.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `cp ${src} ${dst}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u4.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("DST-ORIGINAL");
+  });
+
+  it("backs up a GNU `sed -i` target's pre-state", async () => {
+    const h = setup();
+    const file = join(home, "sed5.txt");
+    writeFileSync(file, "aaa");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u5.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `sed -i 's/a/b/' ${file}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u5.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("aaa");
+  });
+
+  it("backs up an `mv` destination's pre-state, not the source's", async () => {
+    const h = setup();
+    const src = join(home, "movesrc.txt");
+    const dst = join(home, "movedst.txt");
+    writeFileSync(src, "MOVE-SRC");
+    writeFileSync(dst, "MOVE-DST-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u6.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `mv ${src} ${dst}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u6.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("MOVE-DST-ORIGINAL");
+  });
+
+  it("backs up the clobbered file inside a directory destination for `cp dir/`", async () => {
+    const h = setup();
+    const src = join(home, "report.md");
+    const destDir = join(home, "docs");
+    mkdirSync(destDir);
+    const clobbered = join(destDir, "report.md");
+    writeFileSync(src, "NEW-REPORT");
+    writeFileSync(clobbered, "DOCS-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d1.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `cp ${src} ${destDir}/` } }, { cwd: home });
+
+    // The destination *directory* is not a file and must not be snapshotted;
+    // the file it actually overwrites, docs/report.md, must be.
+    const dir = ckptDir("sess-d1.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("DOCS-ORIGINAL");
+  });
+
+  it("backs up every clobbered file for a multi-source `mv` into a directory", async () => {
+    const h = setup();
+    const destDir = join(home, "dest");
+    mkdirSync(destDir);
+    for (const n of ["a.md", "b.md"]) {
+      writeFileSync(join(home, n), `SRC-${n}`);
+      writeFileSync(join(destDir, n), `DEST-ORIGINAL-${n}`);
+    }
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d2.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `mv ${join(home, "a.md")} ${join(home, "b.md")} ${destDir}/` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-d2.json");
+    const contents = readdirSync(dir)
+      .map((f) => readFileSync(join(dir, f), "utf8"))
+      .sort();
+    expect(contents).toEqual(["DEST-ORIGINAL-a.md", "DEST-ORIGINAL-b.md"]);
+  });
+
+  it("handles `cp -t DIR` (every operand is a source)", async () => {
+    const h = setup();
+    const destDir = join(home, "tdest");
+    mkdirSync(destDir);
+    writeFileSync(join(home, "c.md"), "SRC-C");
+    writeFileSync(join(destDir, "c.md"), "TDEST-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d3.json" } });
+
+    await h.tool_call(
+      { toolName: "bash", input: { command: `cp -t ${destDir} ${join(home, "c.md")}` } },
+      { cwd: home },
+    );
+
+    const dir = ckptDir("sess-d3.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("TDEST-ORIGINAL");
+  });
+
+  it("still keys on the destination itself when it is a plain file, not a directory", async () => {
+    const h = setup();
+    const src = join(home, "s7.md");
+    const dst = join(home, "d7.md");
+    writeFileSync(src, "SRC7");
+    writeFileSync(dst, "DST7-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d4.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `cp ${src} ${dst}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-d4.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("DST7-ORIGINAL");
+  });
+
+  it("matches the write/edit tool name case-insensitively, like write-guard does", async () => {
+    const h = setup();
+    const file = join(home, "cased.md");
+    writeFileSync(file, "CASED-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-d5.json" } });
+
+    await h.tool_call({ toolName: "EDIT", input: { path: file } }, { cwd: home });
+
+    const dir = ckptDir("sess-d5.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("CASED-ORIGINAL");
+  });
+
+  it("skips a target that still contains unexpanded shell syntax", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u7.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo hi > $OUT` } }, { cwd: home });
+    await h.tool_call({ toolName: "bash", input: { command: `cp file.txt "$DEST/b.txt"` } }, { cwd: home });
+
+    expect(existsSync(ckptDir("sess-u7.json"))).toBe(false);
+  });
+
+  it("writes a `.toolarge` sentinel (no full copy) for an oversize file, and never retries it even after it shrinks", async () => {
+    const h = setup();
+    const file = join(home, "big.bin");
+    writeFileSync(file, Buffer.alloc(MAX_BACKUP_BYTES + 1, 1));
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u8.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo x > ${file}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u8.json");
+    const expectedSentinel = file.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".toolarge";
+    let files = readdirSync(dir);
+    expect(files).toEqual([expectedSentinel]);
+    expect(readFileSync(join(dir, expectedSentinel), "utf8")).toBe(String(MAX_BACKUP_BYTES + 1));
+
+    // Shrink the file and trigger the same target again — first-write-wins
+    // tracks it forever, so this must stay a no-op.
+    writeFileSync(file, "now tiny");
+    await h.tool_call({ toolName: "bash", input: { command: `echo y > ${file}` } }, { cwd: home });
+    files = readdirSync(dir);
+    expect(files).toEqual([expectedSentinel]);
+  });
+
+  it("skips (and does not track) a directory hit; a later real file at the same path backs up correctly", async () => {
+    const h = setup();
+    const target = join(home, "was-a-dir");
+    mkdirSync(target);
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u9.json" } });
+
+    await h.tool_call({ toolName: "bash", input: { command: `echo x > ${target}` } }, { cwd: home });
+    const dir = ckptDir("sess-u9.json");
+    expect(existsSync(dir)).toBe(false);
+
+    rmSync(target, { recursive: true, force: true });
+    writeFileSync(target, "REAL FILE CONTENT");
+    await h.tool_call({ toolName: "bash", input: { command: `echo y > ${target}` } }, { cwd: home });
+
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("REAL FILE CONTENT");
+  });
+
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  (isRoot ? it.skip : it)(
+    "skips (and does not track) an unreadable file; it backs up correctly once made readable again",
+    async () => {
+      const h = setup();
+      const file = join(home, "unreadable.txt");
+      writeFileSync(file, "SECRET-ORIGINAL");
+      chmodSync(file, 0o000);
+      try {
+        await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u10.json" } });
+        await h.tool_call({ toolName: "bash", input: { command: `echo x > ${file}` } }, { cwd: home });
+
+        const dir = ckptDir("sess-u10.json");
+        const expectedName = file.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200);
+        expect(existsSync(join(dir, expectedName))).toBe(false);
+
+        chmodSync(file, 0o644);
+        await h.tool_call({ toolName: "bash", input: { command: `echo y > ${file}` } }, { cwd: home });
+        expect(readFileSync(join(dir, expectedName), "utf8")).toBe("SECRET-ORIGINAL");
+      } finally {
+        chmodSync(file, 0o644);
+      }
+    },
+  );
+
+  it("backs up a ShellSend text payload that redirects to a file", async () => {
+    const h = setup();
+    const file = join(home, "send1.txt");
+    writeFileSync(file, "ORIG-SEND");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u11.json" } });
+
+    await h.tool_call({ toolName: "ShellSend", input: { text: `echo hi > ${file}` } }, { cwd: home });
+
+    const dir = ckptDir("sess-u11.json");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIG-SEND");
+  });
+
+  it("is a no-op for a ShellSend payload with no write in it", async () => {
+    const h = setup();
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u12.json" } });
+
+    await h.tool_call({ toolName: "ShellSend", input: { text: "just some repl input\n" } }, { cwd: home });
+
+    expect(existsSync(ckptDir("sess-u12.json"))).toBe(false);
+  });
+
+  it("recreates the checkpoint dir if it was deleted mid-session, so a later backup still succeeds", async () => {
+    const h = setup();
+    const file1 = join(home, "first.txt");
+    const file2 = join(home, "second.txt");
+    writeFileSync(file1, "FIRST-ORIGINAL");
+    writeFileSync(file2, "SECOND-ORIGINAL");
+    await h.session_start({}, { sessionManager: { getSessionFile: () => "/x/sess-u13.json" } });
+
+    await h.tool_call({ toolName: "write", input: { path: file1 } }, { cwd: home });
+    const dir = ckptDir("sess-u13.json");
+    expect(existsSync(dir)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+
+    await h.tool_call({ toolName: "write", input: { path: file2 } }, { cwd: home });
+    expect(existsSync(dir)).toBe(true);
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("SECOND-ORIGINAL");
   });
 });

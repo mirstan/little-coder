@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rpc_client import PiRpc  # noqa: E402
+from rpc_client import PiRpc, capture_environment_snapshot  # noqa: E402
 from gaia_scorer import score, extract_final_answer  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -180,6 +180,7 @@ def _run_task(
         turn_count = 0
         compactions = 0
         agent_ended = False
+        stop_reason = ""
         stderr = ""
         agent_error = ""
 
@@ -198,6 +199,11 @@ def _run_task(
                 turn_count = result.turn_count
                 compactions = result.compaction_events
                 agent_ended = result.agent_ended
+                # Why the run ended. Without it a crashed pi scores whatever
+                # extract_final_answer() finds in a truncated transcript --
+                # persisted, in seconds, indistinguishable from a genuine
+                # wrong answer. getattr for older rpc_client.
+                stop_reason = getattr(result, "stop_reason", "")
                 notifications = rpc.notifications()
                 stderr = rpc.stderr()
         except Exception as e:
@@ -231,6 +237,7 @@ def _run_task(
             "n_notifications": len(notifications),
             "compactions": compactions,
             "agent_ended": agent_ended,
+            "stop_reason": stop_reason,
             "agent_error": agent_error,
             "model_answer": model_answer,
         }
@@ -303,6 +310,9 @@ def main():
         "started_at": datetime.datetime.now().isoformat(),
         "task_ids": [r["task_id"] for r in records],
         "allowed_tools": ALLOWED_TOOLS,
+        # gaia.py has no --thinking flag today, so this only resolves the
+        # machine-local default; see capture_environment_snapshot's docstring.
+        "environment_snapshot": capture_environment_snapshot(args.model),
     }
     # Don't overwrite a manifest from an earlier resume run — append a
     # restart entry instead so we have full provenance.
@@ -313,7 +323,15 @@ def main():
         except Exception:
             existing = {}
         restarts = existing.get("restarts", [])
-        restarts.append({"at": manifest["started_at"], "n_tasks": manifest["n_tasks"]})
+        # Include the freshly-captured snapshot here too -- otherwise a
+        # resumed run under changed config (thinking level, sampling params,
+        # vendor patch) recorded nothing, which is exactly the silent drift
+        # this feature exists to catch.
+        restarts.append({
+            "at": manifest["started_at"],
+            "n_tasks": manifest["n_tasks"],
+            "environment_snapshot": manifest["environment_snapshot"],
+        })
         existing["restarts"] = restarts
         manifest_path.write_text(json.dumps(existing, indent=2))
     else:
