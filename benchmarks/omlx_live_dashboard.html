@@ -1,0 +1,386 @@
+<!--
+  Live, real-time graph of the local omlx server's own /api/status endpoint
+  (prefill/generation throughput, cache efficiency, model memory, active/
+  waiting requests). Self-contained, no build step, no external dependency --
+  open it directly (double-click, or `python3 -m http.server` from this
+  directory and visit the served URL) while omlx is running at
+  http://127.0.0.1:8000. Polls every 1.5s and keeps a 10-minute rolling
+  window in the tab's own memory; nothing is written to disk.
+
+  Does not include host swap/memory pressure (/api/status doesn't report
+  it) -- that's only in omlx_metrics_poller.py's JSONL output, sampled
+  every 30s during a benchmark run.
+-->
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>omlx live metrics</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0e0f12;
+    --panel: #17191d;
+    --border: #2a2d33;
+    --text: #e6e8eb;
+    --muted: #8a8f98;
+    --accent1: #4dd0e1;
+    --accent2: #ffb74d;
+    --accent3: #81c784;
+    --accent4: #ba68c8;
+    --bad: #ef5350;
+    --good: #66bb6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 20px;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 4px 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 0 rgba(102,187,106,0.6);
+  }
+  .dot.live {
+    background: var(--good);
+    animation: pulse 2s infinite;
+  }
+  .dot.dead { background: var(--bad); }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(102,187,106,0.5); }
+    70% { box-shadow: 0 0 0 8px rgba(102,187,106,0); }
+    100% { box-shadow: 0 0 0 0 rgba(102,187,106,0); }
+  }
+  .sub {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 18px;
+  }
+  .top-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .stat .label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .stat .value {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .value.small { font-size: 15px; font-weight: 500; }
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: 14px;
+  }
+  .chart-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px 8px;
+  }
+  .chart-card .title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .chart-card .title .name { font-size: 13px; color: var(--muted); }
+  .chart-card .title .current { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  canvas { display: block; width: 100%; height: 130px; }
+  .err {
+    display: none;
+    background: rgba(239,83,80,0.12);
+    border: 1px solid var(--bad);
+    color: var(--bad);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+  .err.show { display: block; }
+  footer {
+    margin-top: 20px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<h1><span class="dot" id="statusDot"></span> omlx live metrics</h1>
+<div class="sub" id="subline">connecting to http://127.0.0.1:8000 &hellip;</div>
+
+<div class="err" id="errBox"></div>
+
+<div class="top-row">
+  <div class="stat"><div class="label">Loaded model</div><div class="value small" id="statModel">&mdash;</div></div>
+  <div class="stat"><div class="label">Uptime</div><div class="value small" id="statUptime">&mdash;</div></div>
+  <div class="stat"><div class="label">Active / Waiting</div><div class="value" id="statActive">&mdash;</div></div>
+  <div class="stat"><div class="label">Total requests</div><div class="value" id="statTotalReq">&mdash;</div></div>
+  <div class="stat"><div class="label">Total tokens (out)</div><div class="value" id="statTotalTok">&mdash;</div></div>
+</div>
+
+<div class="charts">
+  <div class="chart-card">
+    <div class="title"><span class="name">Prefill throughput</span><span class="current" id="curPrefill">&mdash;</span></div>
+    <canvas id="chartPrefill"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="title"><span class="name">Generation throughput</span><span class="current" id="curGen">&mdash;</span></div>
+    <canvas id="chartGen"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="title"><span class="name">Cache efficiency</span><span class="current" id="curCache">&mdash;</span></div>
+    <canvas id="chartCache"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="title"><span class="name">Model memory used</span><span class="current" id="curMem">&mdash;</span></div>
+    <canvas id="chartMem"></canvas>
+  </div>
+</div>
+
+<footer id="footer">polling every 1.5s &middot; last 10 minutes retained</footer>
+
+<script>
+(function () {
+  const ENDPOINT = "http://127.0.0.1:8000/api/status";
+  const POLL_MS = 1500;
+
+  const series = {
+    prefill: [], gen: [], cache: [], mem: []
+  };
+
+  const dpr = window.devicePixelRatio || 1;
+
+  function fmtNum(n, digits) {
+    if (n === null || n === undefined || Number.isNaN(n)) return "—";
+    return n.toLocaleString(undefined, { maximumFractionDigits: digits ?? 1, minimumFractionDigits: 0 });
+  }
+
+  function fmtDuration(seconds) {
+    if (seconds === null || seconds === undefined) return "—";
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
+  }
+
+  function setupCanvas(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return ctx;
+  }
+
+  function drawChart(canvas, data, color, opts) {
+    opts = opts || {};
+    const rect = canvas.getBoundingClientRect();
+    if (canvas.width !== Math.round(rect.width * dpr) || canvas.height !== Math.round(rect.height * dpr)) {
+      setupCanvas(canvas);
+    }
+    const ctx = canvas.getContext("2d");
+    const w = rect.width, h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const padL = 34, padR = 6, padT = 6, padB = 6;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+
+    let vals = data.map(function (d) { return d.v; }).filter(function (v) { return v !== null && v !== undefined; });
+    let minV = opts.min !== undefined ? opts.min : 0;
+    let maxV = opts.max !== undefined ? opts.max : (vals.length ? Math.max.apply(null, vals) : 1);
+    if (opts.max === undefined) {
+      maxV = Math.max(maxV * 1.15, maxV + 1);
+    }
+    if (maxV <= minV) maxV = minV + 1;
+
+    // gridlines + labels
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.fillStyle = "#8a8f98";
+    ctx.font = "10px -apple-system, sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const steps = 3;
+    for (let i = 0; i <= steps; i++) {
+      const v = minV + (maxV - minV) * (i / steps);
+      const y = padT + plotH - (plotH * (i / steps));
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(w - padR, y);
+      ctx.stroke();
+      ctx.fillText(fmtNum(v, opts.digits ?? 0), padL - 6, y);
+    }
+
+    if (data.length < 2) return;
+
+    const n = data.length;
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.75;
+    ctx.lineJoin = "round";
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      const d = data[i];
+      const x = padL + plotW * (i / (n - 1));
+      if (d.v === null || d.v === undefined) { started = false; continue; }
+      const y = padT + plotH - plotH * ((d.v - minV) / (maxV - minV));
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+
+    // filled area under curve
+    ctx.lineTo(padL + plotW, padT + plotH);
+    ctx.lineTo(padL, padT + plotH);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    grad.addColorStop(0, color + "33");
+    grad.addColorStop(1, color + "00");
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+
+  const WINDOW_MS = 10 * 60 * 1000;
+
+  function pushPoint(arr, v) {
+    const now = Date.now();
+    arr.push({ v: v, t: now });
+    // Trim by elapsed time, not sample count: a hidden/background tab gets
+    // its setInterval throttled by the browser (often to ~1/min), so a
+    // fixed MAX_POINTS count would hold far more than 10 minutes of stale
+    // points in that case instead of the "last 10 minutes" the footer says.
+    while (arr.length > 1 && now - arr[0].t > WINDOW_MS) arr.shift();
+  }
+
+  const els = {
+    dot: document.getElementById("statusDot"),
+    subline: document.getElementById("subline"),
+    err: document.getElementById("errBox"),
+    model: document.getElementById("statModel"),
+    uptime: document.getElementById("statUptime"),
+    active: document.getElementById("statActive"),
+    totalReq: document.getElementById("statTotalReq"),
+    totalTok: document.getElementById("statTotalTok"),
+    curPrefill: document.getElementById("curPrefill"),
+    curGen: document.getElementById("curGen"),
+    curCache: document.getElementById("curCache"),
+    curMem: document.getElementById("curMem"),
+    chartPrefill: document.getElementById("chartPrefill"),
+    chartGen: document.getElementById("chartGen"),
+    chartCache: document.getElementById("chartCache"),
+    chartMem: document.getElementById("chartMem")
+  };
+
+  let consecutiveFailures = 0;
+  let pollInFlight = false;
+  // Set in poll() and reused by the resize handler so a resize can't
+  // rescale the memory chart's axis to an auto-scaled max — see drawChart's
+  // memMaxGB comment below.
+  let lastMemMaxGB;
+
+  async function poll() {
+    if (pollInFlight) return; // 1.5s tick can outrun a slow /api/status
+    pollInFlight = true;
+    try {
+      // A fetch that never settles (server wedged, connection stuck) would
+      // otherwise leave pollInFlight true forever, since the guard above
+      // can only be released by this try's finally -- silently freezing
+      // the dashboard on stale "live" data. Bound it so a hang recovers
+      // into the ordinary catch/finally path instead.
+      const res = await fetch(ENDPOINT, { cache: "no-store", signal: AbortSignal.timeout(POLL_MS * 3) });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const d = await res.json();
+      consecutiveFailures = 0;
+      els.dot.className = "dot live";
+      els.err.className = "err";
+      els.subline.textContent = "connected · omlx v" + (d.version || "?") + " · " + ENDPOINT;
+
+      const model = (d.loaded_models && d.loaded_models[0]) || d.default_model || "—";
+      els.model.textContent = model;
+      els.uptime.textContent = fmtDuration(d.uptime_seconds);
+      els.active.textContent = (d.active_requests ?? 0) + " / " + (d.waiting_requests ?? 0);
+      els.totalReq.textContent = fmtNum(d.total_requests, 0);
+      els.totalTok.textContent = fmtNum(d.total_completion_tokens, 0);
+
+      const prefill = d.avg_prefill_tps ?? null;
+      const gen = d.avg_generation_tps ?? null;
+      const cache = d.cache_efficiency ?? null;
+      const memUsed = d.model_memory_used ?? null;
+      const memMax = d.model_memory_max ?? null;
+      const memGB = memUsed !== null ? memUsed / (1024 ** 3) : null;
+      const memMaxGB = memMax !== null ? memMax / (1024 ** 3) : null;
+      if (memMaxGB) lastMemMaxGB = memMaxGB;
+
+      pushPoint(series.prefill, prefill);
+      pushPoint(series.gen, gen);
+      pushPoint(series.cache, cache);
+      pushPoint(series.mem, memGB);
+
+      els.curPrefill.textContent = prefill !== null ? fmtNum(prefill, 1) + " tok/s" : "—";
+      els.curGen.textContent = gen !== null ? fmtNum(gen, 1) + " tok/s" : "—";
+      els.curCache.textContent = cache !== null ? fmtNum(cache, 1) + "%" : "—";
+      els.curMem.textContent = memGB !== null ? fmtNum(memGB, 1) + " / " + fmtNum(memMaxGB, 0) + " GB" : "—";
+
+      drawChart(els.chartPrefill, series.prefill, "#4dd0e1", { digits: 0 });
+      drawChart(els.chartGen, series.gen, "#ffb74d", { digits: 0 });
+      drawChart(els.chartCache, series.cache, "#81c784", { min: 0, max: 100, digits: 0 });
+      drawChart(els.chartMem, series.mem, "#ba68c8", { min: 0, max: lastMemMaxGB || undefined, digits: 0 });
+    } catch (e) {
+      consecutiveFailures++;
+      els.dot.className = "dot dead";
+      els.subline.textContent = "not connected · " + ENDPOINT;
+      if (consecutiveFailures >= 2) {
+        els.err.className = "err show";
+        els.err.textContent = "Can't reach omlx at " + ENDPOINT + ". Is the server running? (" + e.message + ")";
+      }
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  window.addEventListener("resize", function () {
+    // Reuse the same lastMemMaxGB the last poll() drew with, not an
+    // auto-scaled max — otherwise a resize alone jumps the memory chart's
+    // axis (poll() pins it to the real ceiling, e.g. 48GB; auto-scale would
+    // instead fit just the current data, e.g. ~20GB).
+    drawChart(els.chartPrefill, series.prefill, "#4dd0e1", { digits: 0 });
+    drawChart(els.chartGen, series.gen, "#ffb74d", { digits: 0 });
+    drawChart(els.chartCache, series.cache, "#81c784", { min: 0, max: 100, digits: 0 });
+    drawChart(els.chartMem, series.mem, "#ba68c8", { min: 0, max: lastMemMaxGB || undefined, digits: 0 });
+  });
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+
+</body>
+</html>
