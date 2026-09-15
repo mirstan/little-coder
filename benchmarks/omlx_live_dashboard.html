@@ -169,7 +169,6 @@
 (function () {
   const ENDPOINT = "http://127.0.0.1:8000/api/status";
   const POLL_MS = 1500;
-  const MAX_POINTS = Math.round((10 * 60 * 1000) / POLL_MS); // ~10 min window
 
   const series = {
     prefill: [], gen: [], cache: [], mem: []
@@ -269,9 +268,16 @@
     ctx.fill();
   }
 
+  const WINDOW_MS = 10 * 60 * 1000;
+
   function pushPoint(arr, v) {
-    arr.push({ v: v, t: Date.now() });
-    while (arr.length > MAX_POINTS) arr.shift();
+    const now = Date.now();
+    arr.push({ v: v, t: now });
+    // Trim by elapsed time, not sample count: a hidden/background tab gets
+    // its setInterval throttled by the browser (often to ~1/min), so a
+    // fixed MAX_POINTS count would hold far more than 10 minutes of stale
+    // points in that case instead of the "last 10 minutes" the footer says.
+    while (arr.length > 1 && now - arr[0].t > WINDOW_MS) arr.shift();
   }
 
   const els = {
@@ -294,8 +300,15 @@
   };
 
   let consecutiveFailures = 0;
+  let pollInFlight = false;
+  // Set in poll() and reused by the resize handler so a resize can't
+  // rescale the memory chart's axis to an auto-scaled max — see drawChart's
+  // memMaxGB comment below.
+  let lastMemMaxGB;
 
   async function poll() {
+    if (pollInFlight) return; // 1.5s tick can outrun a slow /api/status
+    pollInFlight = true;
     try {
       const res = await fetch(ENDPOINT, { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -319,6 +332,7 @@
       const memMax = d.model_memory_max ?? null;
       const memGB = memUsed !== null ? memUsed / (1024 ** 3) : null;
       const memMaxGB = memMax !== null ? memMax / (1024 ** 3) : null;
+      if (memMaxGB) lastMemMaxGB = memMaxGB;
 
       pushPoint(series.prefill, prefill);
       pushPoint(series.gen, gen);
@@ -333,7 +347,7 @@
       drawChart(els.chartPrefill, series.prefill, "#4dd0e1", { digits: 0 });
       drawChart(els.chartGen, series.gen, "#ffb74d", { digits: 0 });
       drawChart(els.chartCache, series.cache, "#81c784", { min: 0, max: 100, digits: 0 });
-      drawChart(els.chartMem, series.mem, "#ba68c8", { min: 0, max: memMaxGB || undefined, digits: 0 });
+      drawChart(els.chartMem, series.mem, "#ba68c8", { min: 0, max: lastMemMaxGB || undefined, digits: 0 });
     } catch (e) {
       consecutiveFailures++;
       els.dot.className = "dot dead";
@@ -342,14 +356,20 @@
         els.err.className = "err show";
         els.err.textContent = "Can't reach omlx at " + ENDPOINT + ". Is the server running? (" + e.message + ")";
       }
+    } finally {
+      pollInFlight = false;
     }
   }
 
   window.addEventListener("resize", function () {
+    // Reuse the same lastMemMaxGB the last poll() drew with, not an
+    // auto-scaled max — otherwise a resize alone jumps the memory chart's
+    // axis (poll() pins it to the real ceiling, e.g. 48GB; auto-scale would
+    // instead fit just the current data, e.g. ~20GB).
     drawChart(els.chartPrefill, series.prefill, "#4dd0e1", { digits: 0 });
     drawChart(els.chartGen, series.gen, "#ffb74d", { digits: 0 });
     drawChart(els.chartCache, series.cache, "#81c784", { min: 0, max: 100, digits: 0 });
-    drawChart(els.chartMem, series.mem, "#ba68c8", { digits: 0 });
+    drawChart(els.chartMem, series.mem, "#ba68c8", { min: 0, max: lastMemMaxGB || undefined, digits: 0 });
   });
 
   poll();
