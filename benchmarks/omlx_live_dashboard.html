@@ -310,7 +310,12 @@
     if (pollInFlight) return; // 1.5s tick can outrun a slow /api/status
     pollInFlight = true;
     try {
-      const res = await fetch(ENDPOINT, { cache: "no-store" });
+      // A fetch that never settles (server wedged, connection stuck) would
+      // otherwise leave pollInFlight true forever, since the guard above
+      // can only be released by this try's finally -- silently freezing
+      // the dashboard on stale "live" data. Bound it so a hang recovers
+      // into the ordinary catch/finally path instead.
+      const res = await fetch(ENDPOINT, { cache: "no-store", signal: AbortSignal.timeout(POLL_MS * 3) });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const d = await res.json();
       consecutiveFailures = 0;
