@@ -1,0 +1,44 @@
+[project]
+name = "little-coder-self-improve"
+version = "0.1.0"
+description = "GEPA-based self-improvement loop for little-coder's master prompt, principles, and skills"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # dspy-ai is no longer used by the live-eval loop itself (run_gepa.py
+    # calls gepa.optimize() directly against a hand-built GEPAAdapter) --
+    # it remains only because tests/conftest.py's _restore_dspy_settings
+    # fixture still imports it. Droppable once that fixture and its own test,
+    # test_conftest_dspy_settings_restore.py, go.
+    "dspy-ai>=3.3,<4.0",
+    "gepa>=0.1",
+    "pydantic>=2",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Every import in this codebase uses the fully-qualified
+# `benchmarks.self_improve.*` name, but this pyproject.toml lives INSIDE
+# that same directory, two path segments short of the name its own code
+# expects. package-dir maps the dotted name back onto ".", so setuptools
+# finds the code where it actually sits; without both keys the install
+# builds an empty distribution. Verified by installing into a fresh venv
+# and importing benchmarks.self_improve(.ingest) from an unrelated cwd.
+package-dir = {"benchmarks.self_improve" = "."}
+packages = ["benchmarks.self_improve", "benchmarks.self_improve.ingest"]
+
+[tool.setuptools.package-data]
+# A NON-editable install (`pip install .`, vs. the `-e` install README.md
+# documents) ships the .py modules above but not config/*.yaml, which
+# run_gepa.py's --components-config default points at -- without this every
+# caller would have to supply an external config path.
+"benchmarks.self_improve" = ["config/*.yaml"]
