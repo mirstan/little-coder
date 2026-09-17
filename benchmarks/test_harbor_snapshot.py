@@ -362,10 +362,10 @@ class _OverflowEnv:
     """Fake harbor BaseEnvironment for the overflow-capture tests.
 
     exec() returns `stdout` only for model-issued commands (the ones carrying
-    an _exec_async sentinel), so the `mkdir -p` bootstrap doesn't accidentally
-    get handed a 200KB payload. mkdir_return_code is configurable because
-    BaseEnvironment.exec never raises on a failed command -- it reports
-    failure as a nonzero return_code, which this code deliberately ignores.
+    an _exec_async sentinel) -- there is no longer any other exec the code
+    issues (the mkdir bootstrap was removed; harbor's own tar-fallback mkdir
+    -p's the target as root when the fast `cp` path needs it, so this fake
+    never needs to simulate that side).
 
     upload_file() reads the host file's content and mode *during* the call:
     _capture_overflow_inner unlinks the tmp file in a finally before control
@@ -373,11 +373,10 @@ class _OverflowEnv:
     read by assertion time.
     """
 
-    def __init__(self, stdout: str = "", stderr: str = "", mkdir_return_code: int = 0,
+    def __init__(self, stdout: str = "", stderr: str = "",
                  upload_error: Exception | None = None, upload_delay_sec: float = 0.0):
         self.stdout = stdout
         self.stderr = stderr
-        self.mkdir_return_code = mkdir_return_code
         self.upload_error = upload_error
         self.upload_delay_sec = upload_delay_sec
         self.commands: list[str] = []
@@ -386,9 +385,7 @@ class _OverflowEnv:
 
     async def exec(self, command: str, timeout_sec: int | None = None, **kwargs) -> SimpleNamespace:
         self.commands.append(command)
-        if "__LC_END_" in command:
-            return SimpleNamespace(stdout=self.stdout, stderr=self.stderr, return_code=0)
-        return SimpleNamespace(stdout="", stderr="", return_code=self.mkdir_return_code)
+        return SimpleNamespace(stdout=self.stdout, stderr=self.stderr, return_code=0)
 
     async def upload_file(self, source_path, target_path: str) -> None:
         content, mode = None, None
@@ -414,35 +411,33 @@ def _run_exec(env, command: str = "echo hi", timeout: int = 5) -> str:
     return asyncio.run(scenario())
 
 
-def _mkdir_count(env) -> int:
-    return sum(1 for c in env.commands if c == f"mkdir -p {lca._CONTAINER_OVERFLOW_DIR}")
-
-
 def _host_tmp_paths(env) -> list[str]:
     return [src for src, _target, _content, _mode in env.uploads]
 
 
 def test_byte_capped_output_uploads_the_full_content_and_points_at_it():
     """The headline case. Asserts all of: upload happens exactly once, the
-    target is under the container overflow dir, the uploaded bytes are the
-    full untruncated cleaned output (not the capped body), the host file was
-    widened to 0644 (mkstemp's 0600 would be unreadable to a non-root task's
-    shell after docker cp lands it as root), and the note is spliced between
-    the body and the footer rather than after it."""
+    target is under this proxy's randomized container overflow dir, the
+    uploaded bytes are the full untruncated cleaned output (not the capped
+    body), the host file was widened to 0644 (mkstemp's 0600 would be
+    unreadable to a non-root task's shell after docker cp lands it as root),
+    and the note is spliced between the body and the footer rather than
+    after it."""
     env = _OverflowEnv(stdout=_OVERFLOW_STDOUT)
     out = _run_exec(env)
 
     assert len(env.uploads) == 1
     _src, target, content, mode = env.uploads[0]
-    assert target.startswith(lca._CONTAINER_OVERFLOW_DIR + "/")
+    assert target.startswith(lca._CONTAINER_OVERFLOW_DIR_PREFIX)
     assert target.endswith(".out")
-    assert content == lca._strip_ansi(lca._compose_raw(_OVERFLOW_STDOUT, "")).replace("\r", "")
+    assert content == lca._cleaned_output(_OVERFLOW_STDOUT, "")
     assert len(content) == len(_OVERFLOW_STDOUT)  # the full output, not the capped body
     assert mode == 0o644, f"host tmp file was mode {oct(mode or 0)}, not 0644"
 
     lines = out.split("\n")
     assert lines[-1].startswith("[exit=0 ")
     assert "output_truncated=true" in lines[-1]
+    assert "byte_capped=true" in lines[-1]
     assert lines[-2] == f"Full output: {target}"
 
 
@@ -453,58 +448,69 @@ def test_normal_output_never_uploads_anything():
     out = _run_exec(env)
 
     assert env.uploads == []
-    assert _mkdir_count(env) == 0
     assert "Full output:" not in out
     assert "output_truncated=true" not in out
 
 
 def test_body_containing_the_truncation_flag_does_not_trigger_capture():
     """The gate reads the footer line only. A command's own output can
-    legitimately contain the literal `output_truncated=true` -- e.g. the model
+    legitimately contain the literal `byte_capped=true` -- e.g. the model
     catting back an earlier transcript, or one of this feature's own overflow
     files -- and a whole-string scan would upload needlessly and splice a
     lying "Full output:" note onto an untruncated result."""
-    env = _OverflowEnv(stdout="[exit=0 cwd=/app timed_out=false output_truncated=true]\nreal output")
+    env = _OverflowEnv(stdout="[exit=0 cwd=/app timed_out=false byte_capped=true]\nreal output")
     out = _run_exec(env)
 
     assert env.uploads == []
     assert "Full output:" not in out
-    assert "output_truncated=true" not in out.rsplit("\n", 1)[-1]
+    assert "byte_capped=true" not in out.rsplit("\n", 1)[-1]
 
 
-def test_overflow_dir_is_bootstrapped_once_per_proxy():
-    """_overflow_dir_ready must actually gate the mkdir: two capped commands
-    on one proxy cost one bootstrap exec, not two."""
+def test_line_only_truncation_does_not_trigger_capture():
+    """Routine output that trips only the 200-line cap (pip install, pytest
+    -v, git log) sets output_truncated=true but not byte_capped=true, and
+    must not cost a docker-cp round trip -- that would make the common case
+    pay for a feature built for the rare, pathological one."""
+    many_short_lines = "\n".join(f"line {i}" for i in range(400))  # far under any byte cap
+    env = _OverflowEnv(stdout=many_short_lines)
+    out = _run_exec(env)
+
+    assert env.uploads == []
+    footer = out.rsplit("\n", 1)[-1]
+    assert "output_truncated=true" in footer
+    assert "byte_capped=true" not in footer
+    assert "Full output:" not in out
+
+
+def test_no_mkdir_bootstrap_and_dir_stays_stable_across_calls():
+    """The mkdir bootstrap was removed entirely (harbor's own tar-fallback
+    mkdir -p's the target as root when the fast `cp` path needs it), so no
+    exec beyond the model's own wrapped command is ever issued, and every
+    capture on one proxy instance targets the same per-proxy directory."""
     env = _OverflowEnv(stdout=_OVERFLOW_STDOUT)
 
     async def scenario():
         loop = asyncio.get_running_loop()
         proxy = lca._HarborShellProxy(env, loop, _logger())
-        await proxy._exec_async("echo one", 5)
-        await proxy._exec_async("echo two", 5)
+        first = await proxy._exec_async("echo one", 5)
+        second = await proxy._exec_async("echo two", 5)
+        return proxy, first, second
 
-    asyncio.run(scenario())
-    assert _mkdir_count(env) == 1
+    proxy, _first, _second = asyncio.run(scenario())
+    assert not any(c.strip().startswith("mkdir") for c in env.commands), (
+        f"unexpected mkdir exec: {env.commands}"
+    )
     assert len(env.uploads) == 2
-
-
-def test_failed_mkdir_does_not_block_the_upload():
-    """exec() reports a failed command as a nonzero return_code, never as an
-    exception, and the code deliberately doesn't check it: docker cp's tar
-    fallback mkdir -p's the target as root on its own. A regression that
-    treated a failed bootstrap as fatal would skip the upload entirely."""
-    env = _OverflowEnv(stdout=_OVERFLOW_STDOUT, mkdir_return_code=1)
-    out = _run_exec(env)
-
-    assert _mkdir_count(env) == 1
-    assert len(env.uploads) == 1
-    assert "Full output: " in out
+    dirs = {target.rsplit("/", 1)[0] for _src, target, _content, _mode in env.uploads}
+    assert dirs == {proxy._overflow_dir}
 
 
 def test_budget_exhaustion_stops_uploading_and_says_so(monkeypatch):
     """The per-trial ceiling exists to stop a pathological loop from filling
     the container's /tmp. Once it's hit the model is told the file wasn't
-    saved rather than being pointed at a path that doesn't exist."""
+    saved rather than being pointed at a path that doesn't exist -- and the
+    message must not itself look like a "Full output: <path>" line, or a
+    naive prefix-split would hand a model this sentence as a path."""
     monkeypatch.setattr(lca, "_OVERFLOW_BUDGET_BYTES", 300_000)
     env = _OverflowEnv(stdout=_OVERFLOW_STDOUT)  # 200_000 bytes cleaned
 
@@ -517,9 +523,10 @@ def test_budget_exhaustion_stops_uploading_and_says_so(monkeypatch):
 
     first, second = asyncio.run(scenario())
 
-    assert "Full output: /tmp/.lc_shell/" in first
+    assert f"Full output: {lca._CONTAINER_OVERFLOW_DIR_PREFIX}" in first
     assert len(env.uploads) == 1, "second capture uploaded despite an exhausted budget"
-    assert "Full output: not saved (per-session overflow-file budget exhausted)" in second
+    assert "Full output:" not in second
+    assert "not saved" in second and "budget exhausted" in second
     assert "output_truncated=true" in second.rsplit("\n", 1)[-1]
 
 
