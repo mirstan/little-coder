@@ -21,25 +21,36 @@ function inTbMode(): boolean {
   return process.env[TB_MODE_ENV] === "1";
 }
 
-async function execSubprocess(command: string, timeoutSec: number): Promise<string> {
+// Quoted as "~10MB" by helpers.ts's Partial-output note and by the tool
+// description below; change all three together.
+const EXEC_MAX_BUFFER = 10 * 1024 * 1024;
+
+export async function execSubprocess(command: string, timeoutSec: number): Promise<string> {
   try {
     const buf = execSync(command, {
       shell: "/bin/bash",
       timeout: timeoutSec * 1000,
       encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: EXEC_MAX_BUFFER,
     });
     return formatOutput(String(buf), 0, process.cwd(), false, "backend=subprocess", {
       overflowFile: true,
     });
   } catch (err: any) {
     const out = (err.stdout?.toString?.() ?? "") + (err.stderr?.toString?.() ?? "");
-    const timedOut = err.code === "ETIMEDOUT" || err.signal === "SIGTERM";
+    // Node SIGTERMs the child on maxBuffer overflow too, so the signal test
+    // alone reports a too-loud command as a too-slow one and sends the model
+    // back with a longer timeout that cannot help. err.stdout/err.stderr then
+    // hold only the first maxBuffer bytes, which is why the overflow file is
+    // labelled partial.
+    const capturedTruncated = err.code === "ENOBUFS";
+    const timedOut = !capturedTruncated && (err.code === "ETIMEDOUT" || err.signal === "SIGTERM");
     const code = typeof err.status === "number" ? err.status : -1;
     // Only this backend passes overflowFile: the command ran on this machine,
     // so a host tmp path is one the model can actually read back.
     return formatOutput(out, code, process.cwd(), timedOut, "backend=subprocess", {
       overflowFile: true,
+      captureTruncated: capturedTruncated,
     });
   }
 }
@@ -81,17 +92,19 @@ export default function (pi: ExtensionAPI) {
     description: inTbMode()
       ? "Run a command in a persistent bash session. cd, env vars, and shell state " +
         "persist across calls. One command per turn. Default timeout 30s (increase to " +
-        "120-300 for installs/builds). Output is capped at 200 lines / 48KB (whichever " +
-        "is hit first) with head/tail truncation and a trailing " +
-        "[exit=N cwd=… timed_out=…] footer."
+        "120-300 for installs/builds). Output is capped at 200 lines or ~48KB of " +
+        "retained content (whichever is hit first) with head/tail truncation, plus a " +
+        "short trailing [exit=N cwd=… timed_out=…] footer."
       : "Run a shell command. NOTE: each call runs in its own process — cd, env vars, " +
         "and shell state do NOT persist between calls, so use absolute paths and set " +
         "variables inline. Blocks until the command exits: for anything long-running " +
         "(training, builds, servers) use ShellStart instead. Default timeout 30s " +
-        "(increase to 120-300 for installs/builds). Output is capped at 200 lines / 48KB " +
-        "(whichever is hit first) with head/tail truncation and a trailing " +
-        "[exit=N cwd=… timed_out=…] footer; when the byte cap is hit, the full output is " +
-        "saved to a temp file named in a 'Full output:' line.",
+        "(increase to 120-300 for installs/builds). Output is capped at 200 lines or " +
+        "~48KB of retained content (whichever is hit first) with head/tail truncation, " +
+        "plus a short trailing [exit=N cwd=… timed_out=…] footer; when the byte cap is " +
+        "hit, the captured output is saved to a temp file named in a 'Full output:' " +
+        "line. Capture itself stops at ~10MB, past which the file is a prefix and says " +
+        "'Partial output' instead — redirect to a file for anything bigger.",
     parameters: Type.Object({
       command: Type.String({ description: "Shell command to run" }),
       timeout: Type.Optional(Type.Integer({ description: "Seconds (default 30, max 600)" })),

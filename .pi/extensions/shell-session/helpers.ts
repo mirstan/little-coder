@@ -2,7 +2,8 @@
 // local/tools/shell_session.py's _strip_ansi / _dedup_lines / _truncate_lines
 // so output reaches the model in the same format across backends.
 
-import { writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -112,27 +113,57 @@ export function truncateLines(lines: string[], cap = MAX_LINES): { lines: string
   };
 }
 
+// Overflow content is arbitrary command output — env dumps, credential files,
+// private source — so it must not land loose in a shared world-readable /tmp.
+// mkdtempSync gives a 0700 directory with an unguessable name (matching
+// deep-research/index.ts), which also denies an attacker the pre-created
+// symlink that a predictable path in /tmp invites. One per process, made on
+// first use so a session that never overflows leaves nothing behind.
+let overflowDir: string | null = null;
+let overflowDirUnavailable = false;
+
+function ensureOverflowDir(): string | null {
+  if (overflowDir || overflowDirUnavailable) return overflowDir;
+  try {
+    overflowDir = mkdtempSync(join(tmpdir(), "lc-shell-"));
+  } catch {
+    overflowDirUnavailable = true; // tmp isn't writable; stop retrying
+  }
+  return overflowDir;
+}
+
 /**
- * Save the full output so the model can still read what was cut. Only the
+ * Save the captured output so the model can still read what was cut. Only the
  * local subprocess backend may call this: under the tmux/harbor proxies the
  * command runs in a container that cannot see this host path.
  *
+ * `captureTruncated` means the caller's own buffer already lost the tail, so
+ * the file is a prefix and must not be advertised as the whole output.
+ *
  * Returns the model-facing line, or null when nothing was written.
  */
-function writeOverflowFile(cleaned: string): string | null {
+function writeOverflowFile(cleaned: string, captureTruncated: boolean): string | null {
+  const label = captureTruncated
+    ? "Partial output (first ~10MB only; command exceeded the capture buffer)"
+    : "Full output";
   const bytes = byteLen(cleaned);
   if (overflowBytesWritten + bytes > OVERFLOW_BUDGET_BYTES) {
-    return "Full output: not saved (per-session overflow-file budget exhausted)";
+    return `${label}: not saved (per-session overflow-file budget exhausted)`;
   }
+  const dir = ensureOverflowDir();
+  if (!dir) return null;
+  const path = join(dir, `${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}.log`);
   try {
-    const rand = Math.floor(Math.random() * 0x10000).toString(16).padStart(4, "0");
-    const path = join(tmpdir(), `lc-shell-${process.pid}-${Date.now()}-${rand}.log`);
-    writeFileSync(path, cleaned, "utf-8");
-    overflowBytesWritten += bytes;
-    return `Full output: ${path}`;
+    writeFileSync(path, cleaned, { encoding: "utf-8", mode: 0o600, flag: "wx" });
   } catch {
+    // "wx" refuses an existing path rather than overwriting it, so a name
+    // collision surfaces here as EEXIST. Dropping the note is deliberate:
+    // there is no logger in this module, and the caller already renders a
+    // missing note as "no overflow file" rather than as an error.
     return null;
   }
+  overflowBytesWritten += bytes;
+  return `${label}: ${path}`;
 }
 
 export function formatOutput(
@@ -141,7 +172,7 @@ export function formatOutput(
   cwd: string,
   timedOut: boolean,
   backendNote: string,
-  opts: { overflowFile?: boolean } = {},
+  opts: { overflowFile?: boolean; captureTruncated?: boolean } = {},
 ): string {
   const cleaned = stripAnsi(raw).replace(/\r/g, "");
   const rawBytes = byteLen(cleaned);
@@ -153,7 +184,7 @@ export function formatOutput(
   const byteCapped = pre.dropped > 0 || post.dropped > 0;
 
   if (byteCapped && opts.overflowFile) {
-    const note = writeOverflowFile(cleaned);
+    const note = writeOverflowFile(cleaned, opts.captureTruncated === true);
     if (note) body = body ? `${body}\n${note}` : note;
   }
 
@@ -164,6 +195,9 @@ export function formatOutput(
     // and the existing footer shape stays byte-identical for normal results.
     footerBits.push(`raw_bytes=${rawBytes}`);
   }
+  // rawBytes counts what the caller managed to capture, which for an ENOBUFS
+  // result is a ~10MB prefix of what the command actually produced.
+  if (opts.captureTruncated) footerBits.push("raw_bytes_exact=false");
   if (backendNote) footerBits.push(backendNote);
   const footer = `[${footerBits.join(" ")}]`;
   return body ? `${body}\n${footer}` : footer;

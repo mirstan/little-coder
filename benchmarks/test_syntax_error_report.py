@@ -223,6 +223,23 @@ def test_a_footerless_result_produces_no_match_of_its_own():
     assert S.result_text(text) == ""
 
 
+def test_output_containing_a_footer_shaped_line_does_not_end_the_result_early():
+    """Real bug: the body was bound to the FIRST "[exit=...]" line in the
+    chunk, so a result whose own output contains one -- cat'ing an older
+    trial log, or a byte cap cutting mid-line into a footer shape -- ended
+    there, and every error after it was silently dropped."""
+    text = (
+        ">> ShellSession({'command': 'cat old_trial.log'})\n"
+        "<< replaying a captured trial log:\n"
+        "[exit=0 cwd=/app timed_out=false backend=harbor-env]\n"
+        "SyntaxError: invalid syntax\n"
+        "[exit=1 cwd=/app timed_out=false backend=harbor-env]\n"
+    )
+    errors, calls_with_errors = S.count_errors(text)
+    assert errors["python_errors"] == 1
+    assert calls_with_errors == 1
+
+
 def test_output_containing_a_marker_shaped_line_is_not_mistaken_for_a_boundary():
     """Real tool output is preserved verbatim, unescaped -- a diff's own
     ">> "/"<< " style markers, or a cat'd file containing example shell

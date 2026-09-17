@@ -220,12 +220,18 @@ def test_byte_capped_output_never_claims_an_overflow_file(ad):
 
 
 def test_extract_exit_code_still_parses_a_capped_footer(ad):
+    # _extract_exit_code is harbor's alone; running it on tb-shaped output
+    # would only re-test harbor's parser and imply tb has one too.
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: tb has no _extract_exit_code")
     out = ad.fmt("x" * GIANT_LEN, code=7)
     assert _HARBOR._extract_exit_code(out) == 7
 
 
 def test_extract_exit_code_binds_to_the_real_trailing_footer(ad):
     """A mid-line byte cut can create a line that merely looks like a footer."""
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: tb has no _extract_exit_code")
     out = ad.fmt("[exit=99 cwd=/fake timed_out=false]\nreal output", code=0)
     assert _HARBOR._extract_exit_code(out) == 0
 

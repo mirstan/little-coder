@@ -1,5 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { readFileSync, unlinkSync } from "node:fs";
+import { describe, it, expect, afterAll } from "vitest";
+import { readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname } from "node:path";
 import {
   stripAnsi,
   dedupLines,
@@ -106,6 +108,22 @@ describe("capBytesHeadTail", () => {
 describe("formatOutput byte cap", () => {
   const GIANT_LEN = 1042304; // the real vocab.json grep result that crashed a trial
 
+  // Cleanup runs even when an assertion above it throws, which an unlinkSync
+  // at the end of a test body does not -- leaked overflow files accumulate
+  // across CI retries.
+  const overflowDirs = new Set<string>();
+  const overflowPath = (out: string, prefix: string): string => {
+    const lines = out.split("\n");
+    const noteLine = lines[lines.length - 2];
+    expect(noteLine.startsWith(prefix)).toBe(true);
+    const path = noteLine.slice(prefix.length);
+    overflowDirs.add(dirname(path));
+    return path;
+  };
+  afterAll(() => {
+    for (const dir of overflowDirs) rmSync(dir, { recursive: true, force: true });
+  });
+
   it("caps a single giant line with no newlines anywhere", () => {
     const line = "x".repeat(GIANT_LEN);
     const out = formatOutput(line, 0, "/tmp", false, "backend=subprocess");
@@ -155,15 +173,29 @@ describe("formatOutput byte cap", () => {
     const line = "y".repeat(GIANT_LEN);
     const out = formatOutput(line, 0, "/tmp", false, "backend=subprocess", { overflowFile: true });
 
-    const lines = out.split("\n");
-    const noteLine = lines[lines.length - 2];
-    expect(noteLine.startsWith("Full output: ")).toBe(true);
-    const path = noteLine.slice("Full output: ".length);
+    const path = overflowPath(out, "Full output: ");
     expect(readFileSync(path, "utf-8")).toBe(line);
-    unlinkSync(path);
   });
 
-  it("omits the overflow-file line for proxy backends", () => {
+  it("keeps overflow files private to this process", () => {
+    // The content is arbitrary command output, so on a shared /tmp neither the
+    // file nor the listing that reveals its name may be world-readable.
+    const out = formatOutput("y".repeat(GIANT_LEN), 0, "/tmp", false, "backend=subprocess", {
+      overflowFile: true,
+    });
+    const path = overflowPath(out, "Full output: ");
+    const dir = dirname(path);
+
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(dir).not.toBe(tmpdir());
+    expect(dirname(dir)).toBe(tmpdir());
+  });
+
+  it("never writes a file when overflowFile is unset", () => {
+    // Narrower than it looks: this is formatOutput's own default, not proof of
+    // anything backend-specific. That the tmux/harbor proxies never pass
+    // overflowFile is the caller's invariant, pinned in index.test.ts.
     const out = formatOutput("z".repeat(GIANT_LEN), 0, "/app", false, "backend=tmux-proxy");
     expect(out).not.toContain("Full output:");
   });

@@ -55,8 +55,14 @@ CSV_FILENAME = "syntax_errors.csv"
 # chunk is already bounded by the NEXT real call marker, a footerless
 # result's chunk simply has no "[exit=...]" to find and correctly yields no
 # match, rather than the search spilling into a later chunk's content.
+#
+# Within a chunk the body runs to the LAST footer-shaped line, not the first:
+# output can contain one verbatim (a cat'd trial log), and a byte-capped
+# result's mid-line cut can manufacture one. Binding to the first would end
+# the body there and silently drop every error after it. Same reasoning, and
+# same fix, as harbor_adapter's _extract_exit_code.
 _CALL_MARKER_RE = re.compile(r"^>> \w+\(", re.MULTILINE)
-_RESULT_IN_CHUNK_RE = re.compile(r"^<< (.*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
+_RESULT_IN_CHUNK_RE = re.compile(r"^<< (.*)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
 
 
 def iter_results(text: str):
