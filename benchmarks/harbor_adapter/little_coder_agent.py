@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import uuid
@@ -610,8 +611,15 @@ def _cap_bytes_head_tail(s: str, head_bytes: int, tail_bytes: int) -> tuple[str,
     return f"{head}\n  [... {_format_size(dropped)} truncated ...]\n{tail}", dropped
 
 
+def _compose_raw(stdout: str, stderr: str) -> str:
+    """The exact pre-format text _format_output cleans. Exposed so
+    _HarborShellProxy can reconstruct identical content for overflow capture
+    without re-deriving _format_output's own composition."""
+    return (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+
+
 def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: bool) -> str:
-    raw = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+    raw = _compose_raw(stdout, stderr)
     cleaned = _strip_ansi(raw).replace("\r", "")
     raw_bytes = len(cleaned.encode("utf-8"))
     pre_capped, pre_dropped = _cap_bytes_head_tail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES)
@@ -639,9 +647,11 @@ def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: boo
         "\n".join(deduped), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES
     )
     byte_capped = pre_dropped > 0 or post_dropped > 0
-    # No "Full output:" line here, unlike the local subprocess backend: the
-    # command ran inside the container, so any host path we wrote would be one
-    # the model cannot read.
+    # No "Full output:" line here, unlike the local subprocess backend: this
+    # function is pure and synchronous (and shared with tb_adapter), while
+    # producing a container-readable path needs an async upload. The harbor
+    # proxy splices that line in afterwards -- see
+    # _HarborShellProxy._capture_overflow.
     bits = [f"exit={code}", f"cwd={cwd}", f"timed_out={'true' if timed_out else 'false'}"]
     if truncated or byte_capped:
         bits.append("output_truncated=true")
@@ -676,6 +686,20 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     return f"cd {cwd} 2>/dev/null; {body} ; pwd"
 
 
+# Overflow capture: what _format_output's byte cap discards is pushed into the
+# container as a file the model can cat back. env.upload_file() is an
+# @abstractmethod on BaseEnvironment, so every harbor backend implements it --
+# unlike exec(), whose base signature has no stdin parameter, this is a
+# portable host->container transfer that needs no _wrap_command changes.
+_OVERFLOW_BUDGET_BYTES = 512 * 1024 * 1024  # mirrors the TS local-backend constant;
+                                            # same rationale -- stop a pathological
+                                            # loop from filling the container's /tmp
+_CONTAINER_OVERFLOW_DIR = "/tmp/.lc_shell"
+# Must fit inside run()'s fixed timeout+30 slack: a slow docker-cp has to
+# degrade to Phase 1's disclosure, not eat the caller's whole margin.
+_OVERFLOW_CAPTURE_TIMEOUT_SEC = 15
+
+
 class _HarborShellProxy:
     """Stateful shell proxy over harbor's BaseEnvironment.exec().
 
@@ -698,7 +722,73 @@ class _HarborShellProxy:
         # Before this lock existed, only the reader thread ever called run(),
         # so there was nothing to serialize against; run_harness is the first
         # caller that can execute concurrently with it.
+        #
+        # The lock does NOT cover overflow capture's own env.exec/upload_file
+        # calls -- see _capture_overflow.
         self._exec_lock = asyncio.Lock()
+        # Per-proxy-instance, i.e. per trial: a fresh proxy (fresh container)
+        # starts with a fresh budget and an unbootstrapped overflow dir.
+        self._overflow_bytes_written = 0
+        self._overflow_dir_ready = False
+
+    async def _capture_overflow(self, cleaned: str) -> str | None:
+        """Upload the full untruncated output into the container so a later
+        ShellSession call can cat it back, mirroring the TS local backend's
+        temp-file behavior.
+
+        Never raises and never blocks past _OVERFLOW_CAPTURE_TIMEOUT_SEC: on
+        any failure or timeout it degrades to returning None, leaving
+        output_truncated=true/raw_bytes= as the only disclosure -- exactly
+        Phase 1's behavior. Capture is a bonus; it must never make a result
+        worse than it was before this existed.
+
+        Runs outside _exec_lock deliberately (see run_harness's docstring):
+        neither the mkdir nor the upload reads or writes self.cwd, so there
+        is nothing here for the lock to protect, and holding it would stall
+        unrelated execs behind a docker-cp.
+        """
+        nbytes = len(cleaned.encode("utf-8"))
+        if self._overflow_bytes_written + nbytes > _OVERFLOW_BUDGET_BYTES:
+            return "Full output: not saved (per-session overflow-file budget exhausted)"
+        try:
+            return await asyncio.wait_for(
+                self._capture_overflow_inner(cleaned, nbytes),
+                timeout=_OVERFLOW_CAPTURE_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            # Catches the wait_for timeout too (asyncio.TimeoutError is an
+            # Exception subclass): a slow docker-cp must degrade the same way
+            # a failed one does.
+            self.logger.warning(f"LittleCoderAgent: overflow capture failed: {e}")
+            return None
+
+    async def _capture_overflow_inner(self, cleaned: str, nbytes: int) -> str:
+        if not self._overflow_dir_ready:
+            # Best-effort speed-up, not correctness-critical: docker cp's tar
+            # fallback mkdir -p's the target as root on its own if this never
+            # runs or fails. exec() does not raise on a nonzero exit, so a
+            # failed mkdir here just costs one extra fallback round-trip on
+            # the upload below -- which is why its return code goes unchecked.
+            await self.env.exec(command=f"mkdir -p {_CONTAINER_OVERFLOW_DIR}", timeout_sec=10)
+            self._overflow_dir_ready = True
+        token = uuid.uuid4().hex[:12]
+        container_path = f"{_CONTAINER_OVERFLOW_DIR}/{token}.out"
+        fd, host_tmp = tempfile.mkstemp(suffix=".log")
+        try:
+            # mkstemp defaults to 0600, and both the docker-cp fast path and
+            # the tar fallback (which force-extracts as uid=0/gid=0) land the
+            # file under an owner the agent's own container process may not
+            # be -- without this widening, a non-root task's shell gets
+            # Permission denied on the very file this feature exists to make
+            # readable.
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(cleaned)
+            await self.env.upload_file(host_tmp, container_path)
+        finally:
+            os.unlink(host_tmp)
+        self._overflow_bytes_written += nbytes
+        return f"Full output: {container_path}"
 
     async def _exec_async(self, command: str, timeout: int, track_cwd: bool = True) -> str:
         """track_cwd=False (used by run_harness -- see its docstring) skips
@@ -744,7 +834,20 @@ class _HarborShellProxy:
             return _format_output("", "command timed out", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"env.exec error: {e}", -1, self.cwd, False)
-        return _format_output(out, err, code, self.cwd, False)
+        result_str = _format_output(out, err, code, self.cwd, False)
+        # Footer line only, never the whole string: a command's own output can
+        # legitimately contain the literal text output_truncated=true (the
+        # model catting back a file it wrote, or one of this feature's own
+        # overflow files), and a body-wide scan would upload needlessly and
+        # splice a lying "Full output:" note into an untruncated result. Same
+        # hazard _extract_exit_code's last-match rule already guards against.
+        if "output_truncated=true" in result_str.rsplit("\n", 1)[-1]:
+            cleaned = _strip_ansi(_compose_raw(out, err)).replace("\r", "")
+            note = await self._capture_overflow(cleaned)
+            if note:
+                body, _, footer = result_str.rpartition("\n")
+                result_str = f"{body}\n{note}\n{footer}" if body else f"{note}\n{footer}"
+        return result_str
 
     def run(self, command: str, timeout: int) -> str:
         """Sync entry point called by PiRpc's reader thread."""
@@ -769,8 +872,13 @@ class _HarborShellProxy:
         method) must use ONLY run_harness, never run().
 
         _exec_async's own _exec_lock still serializes this against
-        model-issued commands (via run()), so a harness command and a
-        model command can never execute concurrently inside the container.
+        model-issued commands (via run()), so a harness command and a model
+        command never execute concurrently inside the container -- with one
+        deliberate, disclosed exception: overflow capture's mkdir and
+        upload_file (see _capture_overflow) run outside the lock and so can
+        overlap either. That is safe because neither touches self.cwd -- the
+        only state the lock exists to protect -- the mkdir path is absolute,
+        and docker permits concurrent execs against one container.
 
         Passes track_cwd=False: self.cwd is genuinely never read or written
         by a harness call (by construction, not by accident -- contrast the

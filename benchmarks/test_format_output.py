@@ -211,9 +211,54 @@ def test_harbor_stderr_giant_line_is_capped(ad):
 
 
 def test_byte_capped_output_never_claims_an_overflow_file(ad):
-    """Phase 1: the container-side file doesn't exist, so the marker must not
-    promise one."""
+    """_format_output itself never promises a file: it is pure and
+    synchronous, and the harbor proxy splices the "Full output:" line in
+    afterwards only once the upload has actually succeeded."""
     assert "Full output:" not in ad.fmt("x" * GIANT_LEN)
+
+
+# ── _compose_raw, the seam overflow capture reconstructs content through ──
+
+
+def test_compose_raw_matches_the_composition_it_was_extracted_from(ad):
+    """Pins the behavior-preserving extraction: _compose_raw must reproduce
+    the stdout/stderr concatenation _format_output used to inline, including
+    the falsy-stderr and None cases."""
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: tb_adapter's _format_output takes already-composed raw")
+    cr = _HARBOR._compose_raw
+    assert cr("out", "err") == "out\n[stderr]\nerr"
+    assert cr("out", "") == "out"
+    assert cr("", "err") == "\n[stderr]\nerr"
+    assert cr(None, None) == ""
+    assert cr("out", None) == "out"
+
+
+def test_compose_raw_cleaned_parity_with_format_outputs_own_pipeline(ad, monkeypatch):
+    """The overflow-capture path recomputes `cleaned` in _exec_async instead
+    of reaching into _format_output. Pin that the two computations agree
+    byte-for-byte on the multi-byte vector, so they cannot silently drift.
+
+    _format_output's internal `cleaned` is observed where it is handed to
+    _cap_bytes_head_tail -- the first thing downstream of the composition.
+    """
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: _compose_raw is the harbor proxy's seam")
+    stdout, stderr = "é" * 600000, "\x1b[31mé\r\né" * 10
+    seen: list[str] = []
+    real_cap = _HARBOR._cap_bytes_head_tail
+
+    def spy(s, head_bytes, tail_bytes):
+        seen.append(s)
+        return real_cap(s, head_bytes, tail_bytes)
+
+    monkeypatch.setattr(_HARBOR, "_cap_bytes_head_tail", spy)
+    _HARBOR._format_output(stdout, stderr, 0, "/app", False)
+    monkeypatch.undo()
+
+    proxy_cleaned = _HARBOR._strip_ansi(_HARBOR._compose_raw(stdout, stderr)).replace("\r", "")
+    assert seen, "_format_output no longer routes cleaned through _cap_bytes_head_tail"
+    assert seen[0] == proxy_cleaned
 
 
 # ── downstream footer consumers ───────────────────────────────────────────
