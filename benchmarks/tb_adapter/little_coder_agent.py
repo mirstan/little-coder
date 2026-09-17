@@ -44,14 +44,77 @@ DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_LINES = 200
 
+# Byte caps, which the line cap alone cannot enforce: one 1MB line is one
+# "line", so output with no newline in it used to reach the model whole and
+# blow the context window. Pane capture wraps at terminal width, which likely
+# defuses that here, but the cap is kept identical across adapters -- the
+# format contract between them is the point. Head/tail split mirrors the 2:1
+# line ratio below.
+MAX_BODY_HEAD_BYTES = 32 * 1024
+MAX_BODY_TAIL_BYTES = 16 * 1024
+# Pre-dedup gate: bounds the cost of split/dedup, which otherwise walk the
+# whole output before any truncation runs.
+MAX_RAW_HEAD_BYTES = 256 * 1024
+MAX_RAW_TAIL_BYTES = 128 * 1024
+
 
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
 
+def _format_size(n: int) -> str:
+    """Human-readable byte count, matching pi's own truncation markers."""
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
+def _cap_bytes_head_tail(s: str, head_bytes: int, tail_bytes: int) -> tuple[str, int]:
+    """Keep the first `head_bytes` and last `tail_bytes` of `s`, joined by a
+    marker. Returns (text, dropped_bytes).
+
+    Cuts prefer a line boundary but must never require one -- the case this
+    exists for is output with no newline in it at all. Byte-identical to the
+    TypeScript capBytesHeadTail in .pi/extensions/shell-session/helpers.ts;
+    test_format_output.py pins a shared multi-byte vector across the two.
+    """
+    buf = s.encode("utf-8")
+    if len(buf) <= head_bytes + tail_bytes:
+        return s, 0
+
+    # Last newline in the head window, so the kept head is as long as the
+    # budget allows; the first newline would legally cut at byte 10 of 32K.
+    head_end = buf.rfind(b"\n", 0, head_bytes)
+    if head_end < 0:
+        head_end = head_bytes
+        # Back off continuation bytes, keeping the shorter valid prefix.
+        while head_end > 0 and buf[head_end] & 0xC0 == 0x80:
+            head_end -= 1
+
+    tail_start = buf.find(b"\n", len(buf) - tail_bytes)
+    if tail_start >= 0:
+        tail_start += 1
+    else:
+        tail_start = len(buf) - tail_bytes
+        # Mirror image of the head side: skip *forward* off a continuation
+        # byte. decode(errors="ignore") is not equivalent here -- it drops a
+        # phantom partial character instead of skipping to the next real one.
+        while tail_start < len(buf) and buf[tail_start] & 0xC0 == 0x80:
+            tail_start += 1
+
+    dropped = tail_start - head_end
+    head = buf[:head_end].decode("utf-8")
+    tail = buf[tail_start:].decode("utf-8")
+    return f"{head}\n  [... {_format_size(dropped)} truncated ...]\n{tail}", dropped
+
+
 def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note: str) -> str:
     cleaned = _strip_ansi(raw).replace("\r", "")
-    lines = cleaned.split("\n")
+    raw_bytes = len(cleaned.encode("utf-8"))
+    pre_capped, pre_dropped = _cap_bytes_head_tail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES)
+    lines = pre_capped.split("\n")
     # dedup
     deduped = []
     last, dup = None, 0
@@ -74,10 +137,20 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
         skipped = len(deduped) - head - tail
         deduped = deduped[:head] + [f"  [... {skipped} lines truncated ...]"] + deduped[-tail:]
         truncated = True
-    body = "\n".join(deduped)
+    body, post_dropped = _cap_bytes_head_tail(
+        "\n".join(deduped), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES
+    )
+    byte_capped = pre_dropped > 0 or post_dropped > 0
+    # No "Full output:" line here, unlike the local subprocess backend: the
+    # command ran inside the container, so any host path we wrote would be one
+    # the model cannot read.
     bits = [f"exit={code}", f"cwd={cwd}", f"timed_out={'true' if timed_out else 'false'}"]
-    if truncated:
+    if truncated or byte_capped:
         bits.append("output_truncated=true")
+        # Only alongside output_truncated: untruncated output is its own raw
+        # size, and the existing footer shape stays byte-identical for normal
+        # results.
+        bits.append(f"raw_bytes={raw_bytes}")
     if backend_note:
         bits.append(backend_note)
     footer = "[" + " ".join(bits) + "]"

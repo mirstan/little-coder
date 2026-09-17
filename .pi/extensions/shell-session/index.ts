@@ -29,12 +29,18 @@ async function execSubprocess(command: string, timeoutSec: number): Promise<stri
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
     });
-    return formatOutput(String(buf), 0, process.cwd(), false, "backend=subprocess");
+    return formatOutput(String(buf), 0, process.cwd(), false, "backend=subprocess", {
+      overflowFile: true,
+    });
   } catch (err: any) {
     const out = (err.stdout?.toString?.() ?? "") + (err.stderr?.toString?.() ?? "");
     const timedOut = err.code === "ETIMEDOUT" || err.signal === "SIGTERM";
     const code = typeof err.status === "number" ? err.status : -1;
-    return formatOutput(out, code, process.cwd(), timedOut, "backend=subprocess");
+    // Only this backend passes overflowFile: the command ran on this machine,
+    // so a host tmp path is one the model can actually read back.
+    return formatOutput(out, code, process.cwd(), timedOut, "backend=subprocess", {
+      overflowFile: true,
+    });
   }
 }
 
@@ -75,14 +81,17 @@ export default function (pi: ExtensionAPI) {
     description: inTbMode()
       ? "Run a command in a persistent bash session. cd, env vars, and shell state " +
         "persist across calls. One command per turn. Default timeout 30s (increase to " +
-        "120-300 for installs/builds). Output is line-capped with head/tail truncation " +
-        "and a trailing [exit=N cwd=… timed_out=…] footer."
+        "120-300 for installs/builds). Output is capped at 200 lines / 48KB (whichever " +
+        "is hit first) with head/tail truncation and a trailing " +
+        "[exit=N cwd=… timed_out=…] footer."
       : "Run a shell command. NOTE: each call runs in its own process — cd, env vars, " +
         "and shell state do NOT persist between calls, so use absolute paths and set " +
         "variables inline. Blocks until the command exits: for anything long-running " +
         "(training, builds, servers) use ShellStart instead. Default timeout 30s " +
-        "(increase to 120-300 for installs/builds). Output is line-capped with " +
-        "head/tail truncation and a trailing [exit=N cwd=… timed_out=…] footer.",
+        "(increase to 120-300 for installs/builds). Output is capped at 200 lines / 48KB " +
+        "(whichever is hit first) with head/tail truncation and a trailing " +
+        "[exit=N cwd=… timed_out=…] footer; when the byte cap is hit, the full output is " +
+        "saved to a temp file named in a 'Full output:' line.",
     parameters: Type.Object({
       command: Type.String({ description: "Shell command to run" }),
       timeout: Type.Optional(Type.Integer({ description: "Seconds (default 30, max 600)" })),
