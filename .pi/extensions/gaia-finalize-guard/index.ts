@@ -11,7 +11,7 @@ import { resolveTurnCap } from "../_shared/turn-cap.ts";
 // — so a model that trails off mid-plan ("Let me fetch it to get the zip
 // codes.") gets scored on that fragment as its "answer."
 //
-// This mirrors finalize-warn's mechanism (inject a follow-up reminding the
+// This mirrors finalize-warn's mechanism (inject a steer reminding the
 // model to emit the Answer: line) but triggers on the actual signal that
 // matters — a turn that ended with no tool call AND no Answer: line —
 // rather than proximity to a turn cap. For GAIA on omlx/rapidmlx,

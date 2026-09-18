@@ -8,6 +8,7 @@ interface Handler {
 function makeHarness() {
   const notifies: string[] = [];
   const sent: { text: string; options: any }[] = [];
+  const state = { sendThrows: false };
   const handlers: Record<string, Handler[]> = {};
   const pi = {
     handlers,
@@ -15,6 +16,7 @@ function makeHarness() {
       (handlers[name] ??= []).push(h);
     },
     sendUserMessage(text: string, options: any) {
+      if (state.sendThrows) throw new Error("SDK does not support sendUserMessage");
       sent.push({ text, options });
     },
   };
@@ -25,7 +27,7 @@ function makeHarness() {
       },
     },
   };
-  return { pi, ctx, notifies, sent };
+  return { pi, ctx, notifies, sent, state };
 }
 
 async function fire(pi: any, name: string, event: any, ctx: any) {
@@ -70,10 +72,60 @@ describe("finalize-warn", () => {
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].text).toMatch(/Answer: <value>/);
     expect(h.sent[0].text).not.toMatch(/`/); // plain text, no backtick formatting
-    expect(h.sent[0].options).toEqual({ deliverAs: "followUp" });
+    expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
 
     await runTurns(h, 10); // keeps running past the cap point; still just 1 warn
     expect(h.sent).toHaveLength(1);
+  });
+
+  it("does not burn the one-shot latch or notify when sendUserMessage throws (wall-clock trigger)", async () => {
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(Date.now() + 60_000); // 60s out
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+
+    h.state.sendThrows = true;
+    await fire(h.pi, "turn_start", {}, h.ctx); // would warn, but send throws
+    expect(h.sent).toEqual([]);
+    expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(false);
+
+    h.state.sendThrows = false;
+    await fire(h.pi, "turn_start", {}, h.ctx); // latch wasn't burned, retries
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("still retries after a throw on the turn-count trigger, whose own condition is true for only one exact turn, and reports the actual remaining turns on retry", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 35); // one turn before the arm point (turn 36)
+
+    h.state.sendThrows = true;
+    await fire(h.pi, "turn_start", {}, h.ctx); // turn 36 — the one turn finalizeWarnWouldFire is true; send throws
+    expect(h.sent).toEqual([]);
+
+    h.state.sendThrows = false;
+    await fire(h.pi, "turn_start", {}, h.ctx); // turn 37 — finalizeWarnWouldFire is false again here
+    expect(h.sent).toHaveLength(1); // still retries, via the sticky "due" state, not the trigger re-firing
+    // 40 - 37 + 1 = 4, not the stale WARN_REMAINING (5) from the original turn 36 fire.
+    expect(h.notifies.some((n) => /4 turns left/i.test(n))).toBe(true);
+  });
+
+  it("stops retrying once the cap no longer leaves room for the model to see a queued nudge", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 35); // one turn before the arm point (turn 36)
+
+    h.state.sendThrows = true;
+    await runTurns(h, 5); // turns 36-40 — due, but every attempt throws
+    expect(h.sent).toEqual([]);
+
+    h.state.sendThrows = false;
+    await fire(h.pi, "turn_start", {}, h.ctx); // turn 41 — past the cap; a queued nudge would never be seen
+    expect(h.sent).toEqual([]);
   });
 
   it("uses the generic fallback message when no benchmark is set", async () => {

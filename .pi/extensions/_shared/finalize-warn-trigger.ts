@@ -12,6 +12,8 @@
 // This dir has no `index.ts` on purpose — the launcher's extension discovery
 // requires one, so `_shared` is skipped and stays a plain library.
 
+// 5, not fewer: the nudge needs several turns of real headroom for the
+// model to act on it, not just one before the cap aborts the run.
 export const WARN_REMAINING = 5; // turns
 export const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
 
