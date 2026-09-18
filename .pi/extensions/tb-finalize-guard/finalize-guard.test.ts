@@ -182,7 +182,7 @@ describe("tb-finalize-guard", () => {
       // Asks for more than existence: a present, well-formed file can still
       // have wrong content, or correct content plus extra scaffolding a
       // strict grader flags.
-      expect(h.sent[0].text).toMatch(/spot-check/i);
+      expect(h.sent[0].text).toMatch(/spot-check.*by an independent method/i);
       expect(h.sent[0].text).toMatch(/left behind anything/i);
       expect(h.sent[0].text).toMatch(/most literal reading/i);
       // The nudge fires on a toolless text turn; it must not be answerable
