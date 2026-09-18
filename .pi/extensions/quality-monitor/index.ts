@@ -89,19 +89,16 @@ export default function (pi: ExtensionAPI) {
     const call: ToolCall = { name: event.toolName, input: event.input };
     turnValidatedCalls.push(call);
 
-    // Deliberately unconditional, with no same-turn "something state-changing
-    // already ran" exemption mirroring assessResponse's own (issue #81):
-    // tried once, and reverted. turnValidatedCalls records every call this
-    // hook SEES, not every call that actually ran -- a state-changing call
-    // another guard (permission-gate, write-guard) itself rejected would
-    // still count as "environment changed" under that check, and worse, any
-    // trivial state-changing call at all (even a no-op) would satisfy it,
+    // Deliberately no same-turn state-changed exemption (unlike
+    // assessResponse's own, issue #81): turnValidatedCalls records every
+    // call this hook SEES, not every call that actually ran, so a call
+    // another guard rejected would still count as "environment changed" --
+    // and worse, ANY trivial state-changing call (even a no-op) would,
     // letting a looping model permanently defeat the block by prefixing
-    // every retry with one -- exactly the unconditional guarantee this
-    // mechanism exists to provide. The cost of staying unconditional is
-    // bounded: a genuine same-turn fix-then-retry (Edit, then the blocked
-    // command) gets this one retry rejected too, but blockedCall clears on
-    // that turn's own ok verdict, so the very next turn succeeds.
+    // every retry with one. Cost of staying unconditional: a genuine
+    // same-turn fix-then-retry (Edit, then the blocked command) gets this
+    // one retry rejected too, but blockedCall clears on that turn's own ok
+    // verdict, so the very next turn succeeds.
     if (blockedCall && sameCall(call, blockedCall)) {
       return { block: true, reason: BLOCKED_CALL_REASON };
     }

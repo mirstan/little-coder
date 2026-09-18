@@ -463,15 +463,11 @@ describe("quality-monitor tier-2 escalation", () => {
   });
 
   it("blocks unconditionally -- no same-turn state-changing call exempts it", async () => {
-    // A same-turn Edit (or anything else) before the retry must NOT exempt
-    // it. An earlier draft of this mechanism tried exactly that exemption,
-    // mirroring assessResponse's own envChanged, and it was reverted: it
-    // let a looping model permanently defeat the block by prefixing every
-    // retry with any trivial state-changing call (even a no-op), since this
-    // hook can only see that SOME call was attempted, not that it changed
-    // anything relevant -- or even that it succeeded, since a call another
-    // guard itself rejected still counts under that check. Pinning the
-    // reverted behavior directly guards against reintroducing it.
+    // A same-turn Edit (or any other call) before the retry must NOT exempt
+    // it: any exemption based only on "some state-changing call happened
+    // this turn" can't verify that call was relevant or even that it
+    // succeeded, and would let a looping model permanently defeat the block
+    // by prefixing every retry with a trivial one (even a no-op).
     await repeatLoop(3); // tier 2 fires and blocks bash
     const edit = { name: "Edit", input: { file_path: "/src/main.c" } };
     expect(await fireToolCall(h, edit.name, edit.input)).toBeUndefined();
