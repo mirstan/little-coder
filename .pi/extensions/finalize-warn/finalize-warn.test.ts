@@ -94,7 +94,7 @@ describe("finalize-warn", () => {
     expect(h.sent).toHaveLength(1);
   });
 
-  it("still retries after a throw on the turn-count trigger, whose own condition is true for only one exact turn", async () => {
+  it("still retries after a throw on the turn-count trigger, whose own condition is true for only one exact turn, and reports the actual remaining turns on retry", async () => {
     process.env.LITTLE_CODER_MAX_TURNS = "40";
     const h = makeHarness();
     setupExtension(h.pi as any);
@@ -108,6 +108,24 @@ describe("finalize-warn", () => {
     h.state.sendThrows = false;
     await fire(h.pi, "turn_start", {}, h.ctx); // turn 37 — finalizeWarnWouldFire is false again here
     expect(h.sent).toHaveLength(1); // still retries, via the sticky "due" state, not the trigger re-firing
+    // 40 - 37 + 1 = 4, not the stale WARN_REMAINING (5) from the original turn 36 fire.
+    expect(h.notifies.some((n) => /4 turns left/i.test(n))).toBe(true);
+  });
+
+  it("stops retrying once the cap no longer leaves room for the model to see a queued nudge", async () => {
+    process.env.LITTLE_CODER_MAX_TURNS = "40";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await fire(h.pi, "before_agent_start", {}, h.ctx);
+    await runTurns(h, 35); // one turn before the arm point (turn 36)
+
+    h.state.sendThrows = true;
+    await runTurns(h, 5); // turns 36-40 — due, but every attempt throws
+    expect(h.sent).toEqual([]);
+
+    h.state.sendThrows = false;
+    await fire(h.pi, "turn_start", {}, h.ctx); // turn 41 — past the cap; a queued nudge would never be seen
+    expect(h.sent).toEqual([]);
   });
 
   it("uses the generic fallback message when no benchmark is set", async () => {

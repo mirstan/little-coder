@@ -9,8 +9,8 @@ import {
   finalizeWarnWouldFire,
 } from "../_shared/finalize-warn-trigger.ts";
 
-// Pre-cap finalize-warn: when the agent is running low, inject a follow-up
-// user message telling it to wrap up. Two independent triggers share the
+// Pre-cap finalize-warn: when the agent is running low, steer in a user
+// message telling it to wrap up. Two independent triggers share the
 // same single-shot warning:
 //
 //   - turn-count: WARN_REMAINING turns left (this turn included) before
@@ -86,6 +86,12 @@ export default function (pi: ExtensionAPI) {
       dueThisRun = true;
     }
 
+    // Turn-cap headroom: on a retry (the original fire is always earlier
+    // than this by construction), a nudge queued now becomes the prompt for
+    // turnsThisRun + 1; past the cap, turn-cap aborts before the model ever
+    // sees it (mirrors tb-finalize-guard's Trigger A/B equivalent guard).
+    if (capForRun > 0 && turnsThisRun >= capForRun) return;
+
     // Re-derive which of the two triggers fired, purely for message wording
     // (finalizeWarnWouldFire only reports whether — not which).
     const turnTrigger =
@@ -93,6 +99,10 @@ export default function (pi: ExtensionAPI) {
       turnsThisRun === capForRun - WARN_REMAINING + 1;
     const remainingMs = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
     const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
+    // Actual remaining turns, not the constant -- on a retry (see
+    // dueThisRun above), turnsThisRun has moved past the original trigger
+    // turn, so WARN_REMAINING itself would understate how close the cap is.
+    const turnsLeft = capForRun > 0 ? capForRun - turnsThisRun + 1 : WARN_REMAINING;
 
     const msg = resolveFinalizeMessage(process.env.LITTLE_CODER_BENCHMARK);
     try {
@@ -107,7 +117,7 @@ export default function (pi: ExtensionAPI) {
       ctx,
       timeTrigger && !turnTrigger
         ? `~${Math.max(0, Math.round(remainingMs / 1000))}s left on the wall-clock budget — telling the model to finalize its answer now.`
-        : `${WARN_REMAINING} turns left — telling the model to finalize its answer now.`,
+        : `${turnsLeft} turns left — telling the model to finalize its answer now.`,
     );
   });
 }
