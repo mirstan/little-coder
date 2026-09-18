@@ -1477,12 +1477,12 @@ class LittleCoderAgent(BaseAgent):
                 f"base={timeout_info['base_timeout_sec']:.0f}s "
                 f"x{timeout_info['multiplier']} -> {effective_timeout_sec:.0f}s"
             )
-        deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
-        # The same instant as deadline_epoch_ms, on the monotonic clock the
-        # error-retry loop measures against. Derived from one shared
-        # effective_timeout_sec rather than re-read later, so a retry can
-        # never outlive the deadline pi itself was handed above.
-        prompt_deadline = time.monotonic() + effective_timeout_sec
+        # deadline_epoch_ms/prompt_deadline are anchored below, after the
+        # start-of-trial snapshot rather than here -- see that anchoring for
+        # why. Nothing between here and there needs either value:
+        # _build_environment_snapshot takes the resolved timeout_info dict,
+        # not these, and _compute_snapshot_delay_sec below only needs the
+        # plain effective_timeout_sec duration.
 
         # No turn cap: 40 was too tight (train-fasttext hit 41/40, one call
         # from its correct final fix), so it was raised to 80 -- which
@@ -1547,15 +1547,21 @@ class LittleCoderAgent(BaseAgent):
         # a long one, with less time left to notice, so nesting this inside
         # the `if` would exempt exactly the trials least able to recover.
         #
-        # Accepted cost, not fixed here: prompt_deadline/deadline_epoch_ms are
-        # already anchored above from a fixed reference time, but the
-        # deadline snapshot's own delay is a sleep starting only after this
-        # await returns -- so up to _INITIAL_SNAPSHOT_TIMEOUT_SEC (60s) of a
-        # slow container-side copy here erodes that much of SNAPSHOT_LEAD_SEC
-        # (600s)'s margin. Negligible against a 10x margin; would need
-        # threading the deadline snapshot's own scheduling off the real
-        # deadline instant rather than a post-await sleep to close entirely.
+        # Also why the model's own deadline is anchored below, after this
+        # await, rather than back where effective_timeout_sec was resolved:
+        # anchoring it there would let a slow container-side copy here
+        # silently eat into the model's nominal budget before its first
+        # prompt is even sent. Anchoring after means the model always gets
+        # the full effective_timeout_sec, regardless of how long staging
+        # and downloading this snapshot took.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
+
+        deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
+        # The same instant as deadline_epoch_ms, on the monotonic clock the
+        # error-retry loop measures against. Derived from one shared
+        # effective_timeout_sec rather than re-read later, so a retry can
+        # never outlive the deadline pi itself was handed above.
+        prompt_deadline = time.monotonic() + effective_timeout_sec
 
         # Schedule the best-effort deadline snapshot. Skipped entirely below
         # SNAPSHOT_MIN_BUDGET_SEC (see that constant's comment); the
