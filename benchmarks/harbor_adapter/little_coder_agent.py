@@ -943,6 +943,20 @@ class _HarborShellProxy:
         self.cwd = "/app"
         return f"shell reset (cwd → /app)"
 
+    def cleanup_overflow_staging(self) -> None:
+        """Remove the private host-side staging directory (see
+        _capture_overflow_inner), if this proxy ever created one.
+
+        Split out so LittleCoderAgent.run()'s finally block is a single call
+        whose own correctness needs no test of its own -- what's worth
+        testing (None-safe, ignore_errors, actually removes a populated
+        directory) lives here and is exercised directly, the same way
+        _build_environment_snapshot is split out from run() for the same
+        reason. Best-effort: cleanup must never fail the trial.
+        """
+        if self._host_stage_dir is not None:
+            shutil.rmtree(self._host_stage_dir, ignore_errors=True)
+
 
 def _resolve_token_usage(result_usage: dict, turn_count: int, stats: dict | None) -> dict:
     """Pick a token-usage source and compute the Harbor AgentContext mapping.
@@ -1441,12 +1455,10 @@ class LittleCoderAgent(BaseAgent):
                 except Exception:
                     pass
             # Per-capture files are unlinked as they're uploaded, but the
-            # private staging directory itself (see _capture_overflow_inner)
-            # otherwise outlives the trial -- one empty 0700 dir leaked per
-            # trial that ever byte-capped, forever, on the shared harness
-            # host. ignore_errors: cleanup best-effort, never fails the trial.
-            if proxy._host_stage_dir is not None:
-                shutil.rmtree(proxy._host_stage_dir, ignore_errors=True)
+            # private staging directory itself otherwise outlives the trial
+            # -- one empty 0700 dir leaked per trial that ever byte-capped,
+            # forever, on the shared harness host.
+            proxy.cleanup_overflow_staging()
             if log_fh:
                 log_fh.flush()
                 log_fh.close()

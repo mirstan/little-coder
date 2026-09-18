@@ -505,16 +505,22 @@ def test_no_mkdir_bootstrap_and_dir_stays_stable_across_calls():
     assert dirs == {proxy._overflow_dir}
 
 
-def test_host_stage_dir_is_removable_after_the_trial():
+def test_cleanup_overflow_staging_removes_the_dir_run_relies_on_it_for():
     """Per-file cleanup (see test_host_tmp_file_is_always_unlinked below)
     unlinks each staged file as it's uploaded, but the private 0700
-    directory those files lived in (LittleCoderAgent.run()'s job to remove,
-    via shutil.rmtree(proxy._host_stage_dir, ignore_errors=True) in its
-    outer finally) otherwise outlives the trial -- one leaked empty
-    directory per trial that ever byte-capped, forever, on the shared
-    harness host. This pins the mechanism run() relies on: after a capture,
-    the directory exists, is empty (no leaked files), and is safely
-    removable by exactly the call run() makes."""
+    directory those files lived in otherwise outlives the trial -- one
+    leaked empty directory per trial that ever byte-capped, forever, on the
+    shared harness host.
+
+    This exercises LittleCoderAgent.run()'s actual cleanup call, not a
+    re-implementation of it: run()'s finally block is (deliberately) just
+    `proxy.cleanup_overflow_staging()`, so calling that same method here --
+    rather than reaching in and calling shutil.rmtree directly on
+    proxy._host_stage_dir -- is what would actually catch a regression if
+    run()'s wiring or this method's own body ever drifted apart. Full
+    end-to-end coverage of run() itself would need a real PiRpc/fake_pi
+    harness, which is a heavier lift than this method's own logic warrants.
+    """
     env = _OverflowEnv(stdout=_OVERFLOW_STDOUT)
 
     async def scenario():
@@ -528,8 +534,24 @@ def test_host_stage_dir_is_removable_after_the_trial():
     assert os.path.isdir(proxy._host_stage_dir)
     assert os.listdir(proxy._host_stage_dir) == [], "a staged file leaked past its upload"
 
-    shutil.rmtree(proxy._host_stage_dir, ignore_errors=True)
+    proxy.cleanup_overflow_staging()
     assert not os.path.exists(proxy._host_stage_dir)
+
+
+def test_cleanup_overflow_staging_is_a_safe_no_op_when_nothing_ever_overflowed():
+    """A trial with no byte-capped output never creates a staging dir at
+    all; run()'s unconditional finally call must not raise on that proxy."""
+    env = _OverflowEnv(stdout="hello\nworld\n")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        proxy = lca._HarborShellProxy(env, loop, _logger())
+        await proxy._exec_async("echo hi", 5)
+        return proxy
+
+    proxy = asyncio.run(scenario())
+    assert proxy._host_stage_dir is None
+    proxy.cleanup_overflow_staging()  # must not raise
 
 
 def test_budget_exhaustion_stops_uploading_and_says_so(monkeypatch):
