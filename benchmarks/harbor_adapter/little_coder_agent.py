@@ -38,6 +38,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 # Repo root, derived the same way _read_version_from_package_json() finds
 # package.json -- benchmarks/harbor_adapter/little_coder_agent.py is two
@@ -142,11 +143,34 @@ SNAPSHOT_LEAD_SEC = 600.0
 SNAPSHOT_MIN_BUDGET_SEC = 300.0
 SNAPSHOT_START_MARKER = "/tmp/.lc-start"
 SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-snapshot"
-SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
+# Stage dirs are "<prefix>.$$" and the cleanup glob is "<prefix>.*", both
+# derived from one prefix so a command can never create a stage dir under a
+# name its own cleanup line doesn't reap.
+SNAPSHOT_STAGE_PREFIX = "/tmp/.lc-snapshot.stage"
+SNAPSHOT_STAGE_GLOB = f"{SNAPSHOT_STAGE_PREFIX}.*"
+# Feeds `head -z -n` below, and is the threshold that tells a complete
+# snapshot from one truncated at the cap.
+SNAPSHOT_MAX_FILES = 500
 
-# Bounded, atomically-staged snapshot of files modified under /app since
-# SNAPSHOT_START_MARKER was touched. Every cap here answers a specific
-# failure mode:
+# Start-of-trial snapshot of the task's PRE-EXISTING /app files. Catches the
+# class no write-detector can see -- a program the model spawned overwriting
+# a task-provided input from inside its own process (the motivating trial:
+# overfull-hbox, whose generated Perl script opened /app/input.tex for write).
+# Its own publish path and stage prefix, never the deadline snapshot's: the
+# two are published at different times under different scopes, and a shared
+# name would have one command's cleanup reap the other's directory.
+INITIAL_SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-initial"
+INITIAL_SNAPSHOT_STAGE_PREFIX = "/tmp/.lc-initial.stage"
+# Host-side destination, under the per-trial logs dir: per-trial by
+# construction, sitting next to environment_snapshot.json where a human doing
+# post-mortem recovery already looks, and download_dir lands it as a real
+# directory tree with the container's own paths preserved.
+INITIAL_SNAPSHOT_DIR_NAME = "initial_state"
+
+# Bounded, atomically-staged copy of files under /app, shared by both
+# snapshots (see _build_snapshot_command): the deadline one, scoped to files
+# modified since SNAPSHOT_START_MARKER was touched, and the start-of-trial
+# one, scoped to everything. Every cap here answers a specific failure mode:
 #   - per-file size cap (-size -10M) and an aggregate file-count cap
 #     (head -z -n 500) and an aggregate byte cap (209715200 = 200MB, via the
 #     `du --files0-from` sum) together bound total copy volume regardless of
@@ -155,11 +179,11 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 #   - a free-space reserve check (FREE >= TOTAL + 524288000, i.e. 500MB)
 #     protects storage_mb-tight task containers (10240MB typical in TB2.1
 #     task.tomls) from being pushed over their quota by the snapshot itself.
-#   - staging into $STAGE and only `mv`-ing it to SNAPSHOT_PUBLISH_PATH once
+#   - staging into $STAGE and only `mv`-ing it to the publish path once
 #     fully populated means a half-copied snapshot is never visible at the
 #     published path (atomic publish).
 #   - the whole body runs under an internal `timeout 20`, and the trailing
-#     `rm -rf SNAPSHOT_STAGE_GLOB` (outside that timeout) reaps a stage dir
+#     `rm -rf <stage prefix>.*` (outside that timeout) reaps a stage dir
 #     orphaned if the 20s kill lands mid-copy ("cleanup-on-timeout" duty).
 #     Documented here rather than as a trailing inline comment on the command
 #     string's own last line: _exec_async appends a wrapper epilogue
@@ -189,25 +213,94 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 #     no confirmed inventory of every TB task container's base image/findutils
 #     provenance, so rather than bet on GNU everywhere, `-s` alone is the
 #     whole fix here -- it's portable and sufficient on its own.
-_SNAPSHOT_COMMAND = (
-    "timeout 20 sh -c '\n"
-    "  set -e\n"
-    "  STAGE=/tmp/.lc-snapshot.stage.$$\n"
-    "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
-    "  # candidate list: files under /app changed since trial start, per-file <10M\n"
-    "  find /app -xdev -maxdepth 3 -type f -size -10M -newer /tmp/.lc-start -print0 2>/dev/null \\\n"
-    "    | head -z -n 500 > \"$STAGE/.list\"           # aggregate file-count cap\n"
-    "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
-    "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
-    "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
-    "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
-    "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
-    "    rm -f \"$STAGE/.list\"\n"
-    "    rm -rf /tmp/.lc-snapshot && mv \"$STAGE\" /tmp/.lc-snapshot   # atomic publish\n"
-    "  else\n"
-    "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
-    "  fi\n"
-    "' ; rm -rf /tmp/.lc-snapshot.stage.* 2>/dev/null"
+
+
+def _build_snapshot_command(
+    *,
+    scope_comment: str,
+    find_predicate: str,
+    publish_path: str,
+    stage_prefix: str,
+) -> str:
+    """Instantiate the bounded-copy command documented above.
+
+    Parameterized on exactly what differs between the two snapshots -- the
+    extra `find` predicate that sets the scope (and the comment naming it),
+    the publish path, and the stage-dir prefix -- so the second snapshot
+    inherits the first's hardening instead of growing a second copy
+    discipline of its own.
+
+    stage_prefix drives both `STAGE=<prefix>.$$` and the trailing
+    `rm -rf <prefix>.*`: passing them separately is how an instantiation ends
+    up leaking a stage dir per timeout kill under a name nothing reaps.
+
+    find_predicate is inserted after the shared caps and before -print0; ""
+    means no extra predicate. _SNAPSHOT_COMMAND's instantiation below is
+    byte-identical to the literal this constant held before the template
+    existed, pinned by test_harbor_snapshot.py -- that assertion is the whole
+    safety argument for refactoring a command that already runs in real
+    trials.
+    """
+    predicate = f" {find_predicate}" if find_predicate else ""
+    return (
+        "timeout 20 sh -c '\n"
+        "  set -e\n"
+        f"  STAGE={stage_prefix}.$$\n"
+        "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
+        f"  # {scope_comment}\n"
+        f"  find /app -xdev -maxdepth 3 -type f -size -10M{predicate} -print0 2>/dev/null \\\n"
+        f"    | head -z -n {SNAPSHOT_MAX_FILES} > \"$STAGE/.list\"           # aggregate file-count cap\n"
+        "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
+        "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
+        "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
+        "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
+        "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
+        "    rm -f \"$STAGE/.list\"\n"
+        f"    rm -rf {publish_path} && mv \"$STAGE\" {publish_path}   # atomic publish\n"
+        "  else\n"
+        "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
+        "  fi\n"
+        f"' ; rm -rf {stage_prefix}.* 2>/dev/null"
+    )
+
+
+_SNAPSHOT_COMMAND = _build_snapshot_command(
+    scope_comment="candidate list: files under /app changed since trial start, per-file <10M",
+    find_predicate=f"-newer {SNAPSHOT_START_MARKER}",
+    publish_path=SNAPSHOT_PUBLISH_PATH,
+    stage_prefix=SNAPSHOT_STAGE_PREFIX,
+)
+
+# How many files the start-of-trial snapshot actually published, appended to
+# that command only -- outside the shared template, so the deadline
+# instantiation stays byte-identical. The rc cannot carry this: the template
+# ends in a best-effort cleanup `rm`, so rc reports that rm, and the refuse
+# branch exits 0 exactly like the publish branch does.
+_INITIAL_SNAPSHOT_COUNT_PREFIX = "lc-initial-files="
+_INITIAL_SNAPSHOT_COUNT_PROBE = (
+    f" ; printf '{_INITIAL_SNAPSHOT_COUNT_PREFIX}%s\\n' "
+    f'"$(find {INITIAL_SNAPSHOT_PUBLISH_PATH} -type f 2>/dev/null | wc -l)"'
+)
+
+# The same bounded copy with the freshness filter dropped: at trial start
+# "every file under /app" is exactly "every pre-existing file", which is the
+# scope this snapshot exists to preserve.
+#
+# Every cap carries over unchanged but means something different against that
+# wider scope -- flagged here, not resolved: -maxdepth 3, the file-count cap
+# and -size -10M were sized for a modified-file delta, so against a whole tree
+# they can truncate silently (rc is 0 either way), and a >200MB aggregate makes
+# the command refuse outright rather than copy part of the tree. Hence the
+# three-way outcome logging in _classify_initial_snapshot; a bare "succeeded"
+# would be a lie on two of those paths.
+_INITIAL_SNAPSHOT_COMMAND = (
+    _build_snapshot_command(
+        scope_comment="candidate list: every file under /app at trial start, per-file <10M",
+        find_predicate="",
+        publish_path=INITIAL_SNAPSHOT_PUBLISH_PATH,
+        stage_prefix=INITIAL_SNAPSHOT_STAGE_PREFIX,
+    )
+    + _INITIAL_SNAPSHOT_COUNT_PROBE
 )
 
 
@@ -281,6 +374,150 @@ async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, lo
         raise
     except Exception as e:
         logger.info(f"LittleCoderAgent: deadline snapshot failed (non-fatal): {e}")
+
+
+_INITIAL_SNAPSHOT_COUNT_RE = re.compile(
+    rf"^{_INITIAL_SNAPSHOT_COUNT_PREFIX}\s*(\d+)", re.MULTILINE
+)
+# Bounds the whole stage+download round trip. Generous next to run_harness's
+# own 25s container-side timeout, because the download that follows is a
+# docker-cp of up to 200MB.
+_INITIAL_SNAPSHOT_TIMEOUT_SEC = 60.0
+
+
+def _parse_initial_snapshot_file_count(formatted_output: str) -> int | None:
+    """Pull _INITIAL_SNAPSHOT_COUNT_PROBE's count back out of run_harness's
+    returned string. Pure/module-level so it's directly testable without a
+    fake proxy.
+
+    None means the probe line never arrived -- a killed command, a `find`/`wc`
+    the image doesn't have, output truncated ahead of it -- which callers
+    treat the same as "did not succeed", never as zero files.
+    """
+    # Last match, for the same reason _extract_exit_code takes the last
+    # footer: a command's own output can contain a line shaped like this one.
+    last = None
+    for last in _INITIAL_SNAPSHOT_COUNT_RE.finditer(formatted_output):
+        pass
+    return int(last.group(1)) if last else None
+
+
+class _InitialSnapshotOutcome(NamedTuple):
+    outcome: str
+    download: bool
+    message: str
+
+
+def _classify_initial_snapshot(rc: int | None, file_count: int | None) -> _InitialSnapshotOutcome:
+    """Pure helper (split out for testability, like _compute_snapshot_delay_sec)
+    turning the start-of-trial snapshot's two observable results into the
+    outcome to log and whether there is anything worth downloading.
+
+    Four outcomes rather than "attempted"/"succeeded", because two real cases
+    are neither: a copy truncated at the file-count cap, and a refusal that
+    published nothing at all. Both exit 0, so rc alone cannot tell them from a
+    complete snapshot -- hence the file-count probe.
+
+    "partial" here means the file-count cap specifically. -maxdepth 3 and the
+    per-file -size -10M drop files with no observable trace, so even a
+    "succeeded" snapshot can be missing a large or deeply-nested original;
+    anything pointing the model at this copy has to say so.
+    """
+    if rc != 0:
+        return _InitialSnapshotOutcome(
+            "failed", False, f"failed -- stage command rc={rc}; skipping download"
+        )
+    if file_count is None:
+        return _InitialSnapshotOutcome(
+            "failed",
+            False,
+            "failed -- stage command reported no file count; skipping download",
+        )
+    if file_count == 0:
+        return _InitialSnapshotOutcome(
+            "refused",
+            False,
+            f"refused -- nothing published at {INITIAL_SNAPSHOT_PUBLISH_PATH} "
+            "(aggregate over the 200MB cap, free-space reserve unmet, or no "
+            "candidate files); skipping download",
+        )
+    if file_count >= SNAPSHOT_MAX_FILES:
+        return _InitialSnapshotOutcome(
+            "partial",
+            True,
+            f"partial -- {file_count} files, at the {SNAPSHOT_MAX_FILES}-file cap; "
+            "files past the cap have no start-of-trial copy",
+        )
+    return _InitialSnapshotOutcome(
+        "succeeded", True, f"succeeded -- {file_count} files staged"
+    )
+
+
+async def _snapshot_initial_state(
+    proxy: "_HarborShellProxy",
+    environment: BaseEnvironment,
+    logs_dir: Path | None,
+    logger: logging.Logger,
+) -> None:
+    """Stage a bounded copy of the task's pre-existing /app files inside the
+    container at trial start, then pull it onto the host under
+    logs_dir/INITIAL_SNAPSHOT_DIR_NAME.
+
+    Insurance only: must never raise into the trial, so every failure -- a
+    container without GNU coreutils, a download the environment backend
+    can't do, a slow docker-cp -- degrades to "no snapshot" and one log line.
+    That same swallowing is why the outcome is logged from the real rc and
+    real file count: a silent nothing here looks identical to success.
+
+    The container-side copy is left in place afterwards rather than deleted.
+    It gives the model an in-container restore source from turn 1 (`cp
+    /tmp/.lc-initial/app/input.tex /app/input.tex` would have recovered the
+    motivating trial outright). Accepted cost, flagged not fixed: it holds up
+    to 200MB of the same /tmp the deadline snapshot measures its own 500MB
+    free-space reserve against, so on a disk-tight container it can be what
+    makes that later snapshot refuse.
+    """
+    if logs_dir is None:
+        logger.info(
+            "LittleCoderAgent: skipping initial snapshot -- no per-trial logs dir"
+        )
+        return
+    try:
+        await asyncio.wait_for(
+            _snapshot_initial_state_inner(proxy, environment, logs_dir, logger),
+            timeout=_INITIAL_SNAPSHOT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: initial snapshot failed (non-fatal): {e}")
+
+
+async def _snapshot_initial_state_inner(
+    proxy: "_HarborShellProxy",
+    environment: BaseEnvironment,
+    logs_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    """The two-step body _snapshot_initial_state wraps in its timeout and
+    catch-all: stage in the container, then download what got published."""
+    out = await proxy.run_harness(_INITIAL_SNAPSHOT_COMMAND, timeout=25)
+    result = _classify_initial_snapshot(
+        _extract_exit_code(out), _parse_initial_snapshot_file_count(out)
+    )
+    logger.info(f"LittleCoderAgent: initial snapshot {result.message}")
+    if not result.download:
+        return
+    target = logs_dir / INITIAL_SNAPSHOT_DIR_NAME
+    # Required, not defensive: docker's download_dir runs `docker compose cp
+    # service:SRC/. DEST`, and `docker cp SRC/. DEST` needs DEST to already
+    # exist -- only download_dir_with_exclusions' base implementation mkdirs
+    # its own target. Without this the download fails on every trial, and the
+    # caller's catch-all would swallow it.
+    target.mkdir(parents=True, exist_ok=True)
+    await environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target)
+    logger.info(
+        f"LittleCoderAgent: initial snapshot downloaded to {target} "
+        f"(container-side copy kept at {INITIAL_SNAPSHOT_PUBLISH_PATH})"
+    )
 
 
 def _fallback_timeout_info() -> dict:
@@ -688,8 +925,8 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     cwd=None omits the leading `cd` and the trailing `pwd` entirely (used
     when track_cwd=False): sound only for a command that never itself needs
     a starting cwd and never `cd`s in a way the caller needs reported back --
-    true of _SNAPSHOT_COMMAND, the only cwd=None caller today, which uses
-    absolute paths (/app, /tmp) throughout.
+    true of every cwd=None caller today (both snapshot commands and the
+    start-marker touch), which use absolute paths (/app, /tmp) throughout.
     """
     body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
     if cwd is None:
@@ -919,8 +1156,9 @@ class _HarborShellProxy:
         complete it. run_harness instead awaits _exec_async directly -- same
         loop, no thread bridge, no fut.result().
 
-        This is also why the deadline-snapshot task (the only caller of this
-        method) must use ONLY run_harness, never run().
+        This is also why every harness-issued path -- the deadline-snapshot
+        task, the start-of-trial snapshot, the start-marker touch -- must use
+        ONLY run_harness, never run().
 
         _exec_async's own _exec_lock still serializes this against
         model-issued commands (via run()), so a harness command and a model
@@ -934,8 +1172,9 @@ class _HarborShellProxy:
         by a harness call (by construction, not by accident -- contrast the
         old docstring here, which claimed the same result but only held
         because every harness command happened to never `cd`). Sound because
-        _SNAPSHOT_COMMAND, the only harness command today, uses absolute
-        paths (/app, /tmp) throughout and needs no starting cwd.
+        every harness command today (both snapshot instantiations and the
+        start-marker touch) uses absolute paths (/app, /tmp) throughout and
+        needs no starting cwd.
         """
         return await self._exec_async(command, timeout, track_cwd=False)
 
@@ -1283,6 +1522,16 @@ class LittleCoderAgent(BaseAgent):
                 )
             except Exception as e:
                 self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
+
+        # Start-of-trial snapshot of the task's pre-existing /app files.
+        # Unconditional, and deliberately ahead of the deadline-snapshot gate
+        # below rather than inside it: that gate's rationale is "this trial is
+        # too short for a mid-run snapshot of the model's own work to be worth
+        # scheduling", which does not transfer to a snapshot of originals. A
+        # short trial destroys a task-provided input just as irrecoverably as
+        # a long one, with less time left to notice, so nesting this inside
+        # the `if` would exempt exactly the trials least able to recover.
+        await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
 
         # Schedule the best-effort deadline snapshot. Skipped entirely below
         # SNAPSHOT_MIN_BUDGET_SEC (see that constant's comment); the
