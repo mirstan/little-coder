@@ -1546,6 +1546,15 @@ class LittleCoderAgent(BaseAgent):
         # short trial destroys a task-provided input just as irrecoverably as
         # a long one, with less time left to notice, so nesting this inside
         # the `if` would exempt exactly the trials least able to recover.
+        #
+        # Accepted cost, not fixed here: prompt_deadline/deadline_epoch_ms are
+        # already anchored above from a fixed reference time, but the
+        # deadline snapshot's own delay is a sleep starting only after this
+        # await returns -- so up to _INITIAL_SNAPSHOT_TIMEOUT_SEC (60s) of a
+        # slow container-side copy here erodes that much of SNAPSHOT_LEAD_SEC
+        # (600s)'s margin. Negligible against a 10x margin; would need
+        # threading the deadline snapshot's own scheduling off the real
+        # deadline instant rather than a post-await sleep to close entirely.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
 
         # Schedule the best-effort deadline snapshot. Skipped entirely below
