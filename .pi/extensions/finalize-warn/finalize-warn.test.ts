@@ -70,7 +70,7 @@ describe("finalize-warn", () => {
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].text).toMatch(/Answer: <value>/);
     expect(h.sent[0].text).not.toMatch(/`/); // plain text, no backtick formatting
-    expect(h.sent[0].options).toEqual({ deliverAs: "followUp" });
+    expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
 
     await runTurns(h, 10); // keeps running past the cap point; still just 1 warn
     expect(h.sent).toHaveLength(1);

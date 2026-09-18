@@ -40,10 +40,15 @@ import {
 // abort policy and the warn policy stay independent and can be tuned /
 // disabled separately.
 //
-// pi.sendUserMessage(...,{deliverAs:"followUp"}) queues the message for the
-// NEXT user turn — so a warning fired at turn 39 only reaches the model at
-// turn 40, leaving 1 useful turn of headroom (then turn 41 = abort). Raised
-// to 5 so the message lands ~4 turns before cap, giving the model real room.
+// pi.sendUserMessage(...,{deliverAs:"steer"}) queues the message for the next
+// turn regardless of whether the model keeps calling tools -- unlike
+// deliverAs:"followUp", which only delivers once the model produces a turn
+// with no tool calls, and so can starve forever against a model that never
+// goes idle. A steer queued at turn 39 reaches the model at turn 40, absent a
+// competing steer queued the same turn (the default one-at-a-time drain
+// delivers one message per turn boundary, so a competitor can push it to
+// 41) -- either way, well inside the WARN_REMAINING headroom before the cap
+// aborts the run.
 
 // WARN_REMAINING / WARN_REMAINING_MS and the trigger condition itself now
 // live in _shared/finalize-warn-trigger.ts — see that module's header for
@@ -87,7 +92,7 @@ export default function (pi: ExtensionAPI) {
         : `${WARN_REMAINING} turns left — telling the model to finalize its answer now.`,
     );
     try {
-      pi.sendUserMessage(msg, { deliverAs: "followUp" });
+      pi.sendUserMessage(msg, { deliverAs: "steer" });
     } catch {
       // SDK without sendUserMessage — silently no-op rather than break the run
     }
