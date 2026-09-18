@@ -22,7 +22,7 @@ export function sameCall(a: ToolCall, b: ToolCall): boolean {
 // legitimate progress, not a loop — e.g. Edit a source file, then re-run the
 // same build command (issue #81). Bash/ShellSession count because a shell
 // command can change anything; matching is by lowercased tool name.
-const STATE_CHANGING_TOOLS = new Set([
+export const STATE_CHANGING_TOOLS = new Set([
   "edit",
   "write",
   "multiedit",
@@ -64,11 +64,9 @@ export function assessResponse(
             (r) => !sameCall(r, tc) && STATE_CHANGING_TOOLS.has(r.name.toLowerCase()),
           );
           if (envChanged) continue;
-          // Surfaced so a caller that needs to act on the specific offending
-          // call (quality-monitor's tier-2 block) doesn't have to re-run this
-          // same envChanged-aware match independently and risk diverging from
-          // it -- an earlier draft did exactly that and could arm a block on
-          // a *different*, exempted call in a multi-tool-call turn.
+          // Surfaced so a caller acting on the specific offending call
+          // (quality-monitor's tier-2 block) never has to re-run this same
+          // envChanged-aware match independently and risk diverging from it.
           return { ok: false, reason: "repeated_tool_call", offendingCall: tc };
         }
       }

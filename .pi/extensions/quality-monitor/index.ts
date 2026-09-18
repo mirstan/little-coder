@@ -6,6 +6,7 @@ import {
   BLOCKED_CALL_REASON,
   phraseForUser,
   sameCall,
+  STATE_CHANGING_TOOLS,
   type ToolCall,
 } from "./quality.ts";
 import { harnessIntervention } from "../_shared/intervention.ts";
@@ -26,15 +27,14 @@ let consecutiveFailures = 0;
 // handler below — since a fresh task shouldn't inherit a block or a failure
 // streak from whatever the previous one left behind.
 let blockedCall: ToolCall | null = null;
-let tier2Notified = false;
+let tier2NotifiedKey: string | null = null;
 // This turn's tool_call events, in pi's validated (schema-coerced) space —
 // see the tool_call handler's comment on why blockedCall is armed from this,
 // not from turn_end's raw content-block extraction. Cleared once turn_end
 // consumes it for the turn that just ended.
 let turnValidatedCalls: ToolCall[] = [];
 // Past this many consecutive failures, tier 1's plain correction has visibly
-// failed and turn_end escalates instead (it used to go silent for the rest of
-// the trial — a real run then looped for 334 more turns unopposed).
+// failed and turn_end escalates instead of going silent for the rest of the trial.
 const MAX_CONSECUTIVE_CORRECTIONS = 2;
 
 export default function (pi: ExtensionAPI) {
@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
     previousToolCalls = [];
     consecutiveFailures = 0;
     blockedCall = null;
-    tier2Notified = false;
+    tier2NotifiedKey = null;
     turnValidatedCalls = [];
   });
 
@@ -71,7 +71,7 @@ export default function (pi: ExtensionAPI) {
     previousToolCalls = [];
     consecutiveFailures = 0;
     blockedCall = null;
-    tier2Notified = false;
+    tier2NotifiedKey = null;
     turnValidatedCalls = [];
   });
 
@@ -88,16 +88,43 @@ export default function (pi: ExtensionAPI) {
     // string coerces here but not there, and comparing across the two spaces
     // would silently never match.
     const call: ToolCall = { name: event.toolName, input: event.input };
-    turnValidatedCalls.push(call);
 
     if (blockedCall && sameCall(call, blockedCall)) {
-      return { block: true, reason: BLOCKED_CALL_REASON };
+      // Same exemption assessResponse's own envChanged applies at turn_end
+      // (issue #81): if something state-changing already ran EARLIER in
+      // THIS turn -- before this call -- the environment plausibly changed
+      // since the loop was detected, so retrying is progress, not the same
+      // loop (e.g. Edit the bug, then retry the build command, in one
+      // turn). Without this, blockedCall could only clear at this turn's
+      // OWN turn_end, which runs after this tool_call has already fired --
+      // one turn too late to let the very turn that fixed the problem
+      // retry it. Checked against calls already recorded this turn, not
+      // including the current one (turnValidatedCalls.push is below this).
+      const envChangedThisTurn = turnValidatedCalls.some(
+        (c) => !sameCall(c, blockedCall!) && STATE_CHANGING_TOOLS.has(c.name.toLowerCase()),
+      );
+      turnValidatedCalls.push(call);
+      if (!envChangedThisTurn) {
+        return { block: true, reason: BLOCKED_CALL_REASON };
+      }
+      return;
     }
+
+    turnValidatedCalls.push(call);
   });
 
   pi.on("turn_end", async (event, ctx) => {
     const message = (event as any).message;
     if (!message) return;
+
+    // Consumed unconditionally, before any early return below: any tool_call
+    // events recorded while THIS turn was in flight belong to this turn no
+    // matter how it concludes. Leaving this cleared only on the normal path
+    // let an aborted/errored turn's calls leak into the NEXT turn's
+    // offending-call lookup, misarming the block on a stale entry from a
+    // turn that was never even assessed.
+    const thisTurnValidatedCalls = turnValidatedCalls;
+    turnValidatedCalls = [];
 
     // Skip turns that were interrupted/aborted — by the user pressing ESC OR by
     // a harness abort (thinking-budget, turn-cap). pi marks these with
@@ -129,7 +156,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Extract assistant text + tool calls from pi's content-block format
     const content = Array.isArray(message.content) ? message.content : [];
     const text = content
       .filter((c: any) => c?.type === "text")
@@ -141,18 +167,13 @@ export default function (pi: ExtensionAPI) {
 
     const verdict = assessResponse(text, currentCalls, previousToolCalls, knownTools);
 
-    // Update rolling state for next turn regardless of verdict. This turn's
-    // tool_call events were recorded (in validated space) as they happened;
-    // consume that array for this turn's escalation, then clear it so it
-    // can't leak into the next turn's.
+    // Update rolling state for next turn regardless of verdict.
     previousToolCalls = currentCalls;
-    const thisTurnValidatedCalls = turnValidatedCalls;
-    turnValidatedCalls = [];
 
     if (verdict.ok) {
       consecutiveFailures = 0;
       blockedCall = null;
-      tier2Notified = false;
+      tier2NotifiedKey = null;
       return;
     }
 
@@ -173,19 +194,33 @@ export default function (pi: ExtensionAPI) {
       if (offending) {
         // Arm from the validated-space recording of this same call, not the
         // raw offending object itself, so the tool_call handler's comparison
-        // (also validated-space) can actually match it next time. Falls back
-        // to the raw value if this turn's tool_call events weren't recorded
-        // for some reason (defensive; should always be found in practice).
-        const validated = thisTurnValidatedCalls.find((c) => c.name === offending.name);
+        // (also validated-space) can actually match it next time. Matched by
+        // POSITION, not by name or by sameCall: a name-only match picks the
+        // wrong call when a turn has two calls sharing a tool name, and
+        // sameCall's input-inclusive comparison would defeat the exact case
+        // this recording exists for -- raw "5000" vs. validated 5000 would
+        // never satisfy it. tool_call fires once per call in the same order
+        // the assistant's own content blocks list them, so `offending`'s
+        // index within `currentCalls` is a reliable correspondence into
+        // thisTurnValidatedCalls. Falls back to the raw value if not found
+        // (defensive; should always be found in practice).
+        const index = currentCalls.indexOf(offending);
+        const validated = index >= 0 ? thisTurnValidatedCalls[index] : undefined;
         blockedCall = validated ?? offending;
       }
 
-      // Escalate (the message) once per streak; re-sending the same text
-      // every turn is the "keep sending what already didn't work" failure
-      // this replaced. The block above, unlike the message, is not gated on
-      // this — see the comment above.
-      if (tier2Notified) return;
-      tier2Notified = true;
+      // Notify once per distinct situation, not once per streak: a
+      // DIFFERENT failure reason arising after an earlier tier-2
+      // notification must still get its own message, or the model gets
+      // zero feedback for it -- silence through a different door than the
+      // one this PR closed. "blocked" is one key for the whole
+      // repeated_tool_call case regardless of WHICH call is currently
+      // armed, since that message's text never varies by call, and
+      // re-arming (above) is not gated on this at all -- see its own
+      // comment.
+      const notifyKey = offending ? "blocked" : verdict.reason;
+      if (tier2NotifiedKey === notifyKey) return;
+      tier2NotifiedKey = notifyKey;
       if (offending) {
         harnessIntervention(
           ctx,

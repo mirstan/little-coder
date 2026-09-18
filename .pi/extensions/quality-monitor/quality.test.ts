@@ -406,6 +406,77 @@ describe("quality-monitor tier-2 escalation", () => {
     expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
   });
 
+  it("arms the block on the real repeat, not another call sharing its tool name", async () => {
+    // The previous turn's only call was bash ("gcc encode.c"). The turn that
+    // crosses the cap issues [Bash("ls -la"), Bash("gcc encode.c")] -- same
+    // tool name, only the second is the genuine verbatim repeat. A name-only
+    // lookup for the validated counterpart would find "ls -la" (first in
+    // array order) instead of the real offender.
+    await fireTurn(h, [bash]); // seed
+    await fireTurn(h, [bash]); // fail 1 (tier 1)
+    await fireTurn(h, [bash]); // fail 2 (tier 1)
+    const decoy = { name: "Bash", input: { command: "ls -la" } };
+    await fireTurn(h, [decoy, bash]); // fail 3: decoy is new, bash is the real repeat
+
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+    expect(await fireToolCall(h, decoy.name, decoy.input)).toBeUndefined();
+  });
+
+  it("does not let an aborted or errored turn's calls leak into the next turn's offending-call lookup", async () => {
+    await fireTurn(h, [bash]); // seed
+    await fireTurn(h, [bash]); // fail 1 (tier 1)
+    // A turn that fires tool_call for an unrelated command, then aborts --
+    // its recording must not survive into the next turn's lookup.
+    const decoy = { name: "Bash", input: { command: "ls -la" } };
+    await fireToolCall(h, decoy.name, decoy.input);
+    await fire(h, "turn_end", { message: { stopReason: "aborted", content: [] } });
+
+    await fireTurn(h, [bash]); // fail 2 (tier 1) -- still just bash's own streak
+    await fireTurn(h, [bash]); // fail 3: crosses the cap
+
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+    expect(await fireToolCall(h, decoy.name, decoy.input)).toBeUndefined();
+  });
+
+  it("still notifies once for a different failure reason arising after an earlier tier-2 notification", async () => {
+    await repeatLoop(3); // tier 2 fires on bash; one escalation message sent
+    const followUpsAfterTier2 = h.followUps.length;
+
+    // Model can't retry bash; instead it emits an empty response 3 times in
+    // a row -- a different failure reason within the same never-ok streak.
+    const empty = { message: { stopReason: "stop", content: [] } };
+    await fire(h, "turn_end", empty);
+    await fire(h, "turn_end", empty);
+    await fire(h, "turn_end", empty); // crosses the cap again, for a NEW reason
+
+    expect(h.followUps).toHaveLength(followUpsAfterTier2 + 1); // one fresh notification
+    expect(h.followUps[h.followUps.length - 1].msg).toBe(buildCorrectionMessage("empty_response"));
+
+    // A repeat of the SAME (now-notified) reason still doesn't re-notify.
+    await fire(h, "turn_end", empty);
+    expect(h.followUps).toHaveLength(followUpsAfterTier2 + 1);
+  });
+
+  it("exempts a same-turn fix-then-retry from the hard block, mirroring issue #81", async () => {
+    await repeatLoop(3); // tier 2 fires and blocks bash
+    // The very next turn: fix the bug, then retry the blocked command, in
+    // ONE turn -- exactly the pattern assessResponse's own envChanged
+    // exemption exists to allow. The Edit must be recorded (via its own
+    // tool_call event) before bash's retry is evaluated.
+    const edit = { name: "Edit", input: { file_path: "/src/main.c" } };
+    expect(await fireToolCall(h, edit.name, edit.input)).toBeUndefined();
+    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined(); // NOT blocked
+  });
+
+  it("still blocks a same-turn retry with no state-changing call in between", async () => {
+    await repeatLoop(3);
+    // A same-turn retry with nothing else happening first (no Edit) must
+    // stay blocked -- the exemption is specifically for a state change,
+    // not merely "not the very first attempt."
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+  });
+
   it("does not push toward a guardrail-bypass route in the escalation message", async () => {
     // The escalation message must not read as an unqualified "find another
     // way" -- that is exactly the interpreter-bypass hunt permission-gate's
