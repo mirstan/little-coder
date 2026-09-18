@@ -55,8 +55,28 @@ CSV_FILENAME = "syntax_errors.csv"
 # chunk is already bounded by the NEXT real call marker, a footerless
 # result's chunk simply has no "[exit=...]" to find and correctly yields no
 # match, rather than the search spilling into a later chunk's content.
+#
+# Within a chunk the body runs to the LAST footer-shaped line, not the first:
+# output can contain one verbatim (a cat'd trial log -- confirmed a real
+# pattern in this repo's own trial corpus, not just a hypothetical), and a
+# byte-capped result's mid-line cut can manufacture one. Binding to the first
+# would end the body there and silently drop every error after it. Same
+# reasoning, and same fix, as harbor_adapter's _extract_exit_code.
+#
+# This does trade one theoretical failure for its mirror image: a chunk's own
+# post-result narration -- confirmed to sit between the footer and the next
+# call marker in real live logs, e.g. "Let me examine the file structures"
+# -- could in principle itself contain a footer-shaped line, which the
+# greedy match would then treat as the real boundary and pull the narration
+# into the counted body. Accepted rather than "fixed" with a first-match/
+# last-match heuristic that would just re-flip which direction is exposed:
+# a real cat'd-log decoy preceding the actual result is a demonstrated
+# pattern in this corpus, while a model's own prose happening to match
+# `[exit=N cwd=... timed_out=...]`'s exact shape is not. Same epistemic
+# stance as the truncation/dedup caveat above: a lower bound, not an exact
+# count.
 _CALL_MARKER_RE = re.compile(r"^>> \w+\(", re.MULTILINE)
-_RESULT_IN_CHUNK_RE = re.compile(r"^<< (.*?)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
+_RESULT_IN_CHUNK_RE = re.compile(r"^<< (.*)^\[exit=.*?\]$", re.MULTILINE | re.DOTALL)
 
 
 def iter_results(text: str):

@@ -239,8 +239,13 @@ def _extract_exit_code(formatted_output: str) -> int | None:
     happen in practice -- _format_output always emits it); callers should
     treat that the same as "did not succeed".
     """
-    m = _HARNESS_EXIT_CODE_RE.search(formatted_output)
-    return int(m.group(1)) if m else None
+    # Last match, not the first: a command's own output can contain a line
+    # shaped like the footer, and a mid-line byte cut can even create one.
+    # The real footer is always last.
+    last = None
+    for last in _HARNESS_EXIT_CODE_RE.finditer(formatted_output):
+        pass
+    return int(last.group(1)) if last else None
 
 
 async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, logger: logging.Logger) -> None:
@@ -541,15 +546,76 @@ def _build_environment_snapshot(
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_LINES = 200
 
+# Byte caps, which the line cap alone cannot enforce: one 1MB line is one
+# "line", so a `grep` hit on a single-line JSON file used to reach the model
+# whole and blow the context window (this is the path that actually crashed a
+# gpt2-codegolf trial). Head/tail split mirrors the 2:1 line ratio below.
+MAX_BODY_HEAD_BYTES = 32 * 1024
+MAX_BODY_TAIL_BYTES = 16 * 1024
+# Pre-dedup gate: bounds the cost of split/dedup, which otherwise walk the
+# whole output before any truncation runs.
+MAX_RAW_HEAD_BYTES = 256 * 1024
+MAX_RAW_TAIL_BYTES = 128 * 1024
+
 
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s or "")
 
 
+def _format_size(n: int) -> str:
+    """Human-readable byte count, matching pi's own truncation markers."""
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
+def _cap_bytes_head_tail(s: str, head_bytes: int, tail_bytes: int) -> tuple[str, int]:
+    """Keep the first `head_bytes` and last `tail_bytes` of `s`, joined by a
+    marker. Returns (text, dropped_bytes).
+
+    Cuts prefer a line boundary but must never require one -- the case this
+    exists for is output with no newline in it at all. Byte-identical to the
+    TypeScript capBytesHeadTail in .pi/extensions/shell-session/helpers.ts;
+    test_format_output.py pins a shared multi-byte vector across the two.
+    """
+    buf = s.encode("utf-8")
+    if len(buf) <= head_bytes + tail_bytes:
+        return s, 0
+
+    # Last newline in the head window, so the kept head is as long as the
+    # budget allows; the first newline would legally cut at byte 10 of 32K.
+    head_end = buf.rfind(b"\n", 0, head_bytes)
+    if head_end < 0:
+        head_end = head_bytes
+        # Back off continuation bytes, keeping the shorter valid prefix.
+        while head_end > 0 and buf[head_end] & 0xC0 == 0x80:
+            head_end -= 1
+
+    tail_start = buf.find(b"\n", len(buf) - tail_bytes)
+    if tail_start >= 0:
+        tail_start += 1
+    else:
+        tail_start = len(buf) - tail_bytes
+        # Mirror image of the head side: skip *forward* off a continuation
+        # byte. decode(errors="ignore") is not equivalent here -- it drops a
+        # phantom partial character instead of skipping to the next real one.
+        while tail_start < len(buf) and buf[tail_start] & 0xC0 == 0x80:
+            tail_start += 1
+
+    dropped = tail_start - head_end
+    head = buf[:head_end].decode("utf-8")
+    tail = buf[tail_start:].decode("utf-8")
+    return f"{head}\n  [... {_format_size(dropped)} truncated ...]\n{tail}", dropped
+
+
 def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: bool) -> str:
     raw = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
     cleaned = _strip_ansi(raw).replace("\r", "")
-    lines = cleaned.split("\n")
+    raw_bytes = len(cleaned.encode("utf-8"))
+    pre_capped, pre_dropped = _cap_bytes_head_tail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES)
+    lines = pre_capped.split("\n")
     # dedup
     deduped, last, dup = [], None, 0
     for ln in lines:
@@ -569,9 +635,20 @@ def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: boo
         skipped = len(deduped) - head - tail
         deduped = deduped[:head] + [f"  [... {skipped} lines truncated ...]"] + deduped[-tail:]
         truncated = True
-    body = "\n".join(deduped)
+    body, post_dropped = _cap_bytes_head_tail(
+        "\n".join(deduped), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES
+    )
+    byte_capped = pre_dropped > 0 or post_dropped > 0
+    # No "Full output:" line here, unlike the local subprocess backend: the
+    # command ran inside the container, so any host path we wrote would be one
+    # the model cannot read.
     bits = [f"exit={code}", f"cwd={cwd}", f"timed_out={'true' if timed_out else 'false'}"]
-    if truncated: bits.append("output_truncated=true")
+    if truncated or byte_capped:
+        bits.append("output_truncated=true")
+        # Only alongside output_truncated: untruncated output is its own raw
+        # size, and the existing footer shape stays byte-identical for normal
+        # results.
+        bits.append(f"raw_bytes={raw_bytes}")
     bits.append("backend=harbor-env")
     footer = "[" + " ".join(bits) + "]"
     return f"{body}\n{footer}" if body else footer
