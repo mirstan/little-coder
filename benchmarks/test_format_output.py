@@ -179,6 +179,28 @@ def test_caps_many_short_lines_by_line_count(ad):
     assert len(out.split("\n")) <= ad.mod.MAX_LINES
 
 
+def test_byte_capped_true_only_when_the_byte_cap_actually_fired(ad):
+    """byte_capped=true is distinct from output_truncated=true, which also
+    fires for the plain 200-line cap -- the harbor overflow-capture path
+    gates on the narrower flag specifically so a long-but-small pip/pytest
+    log (common) doesn't cost a docker-cp round trip that a genuinely
+    byte-capped giant line (rare) should."""
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: byte_capped=true only exists in the harbor formatter")
+
+    giant = ad.fmt("x" * GIANT_LEN)
+    assert "output_truncated=true" in giant
+    assert "byte_capped=true" in giant
+
+    # 300 short lines (a few KB total) trips only the 200-line cap -- nowhere
+    # near either byte-cap stage (384KB raw pre-cap, 48KB body cap), unlike
+    # test_caps_many_short_lines_by_line_count's 300,000-line/~12MB input,
+    # which is large enough in aggregate to trip the raw pre-cap too.
+    small_many_lines = ad.fmt("\n".join(f"line {i}" for i in range(300)))
+    assert "output_truncated=true" in small_many_lines
+    assert "byte_capped=true" not in small_many_lines
+
+
 def test_dedup_still_rescues_identical_lines(ad):
     out = ad.fmt("same\n" * 100000)
     assert "duplicate line(s) collapsed" in out
@@ -211,9 +233,56 @@ def test_harbor_stderr_giant_line_is_capped(ad):
 
 
 def test_byte_capped_output_never_claims_an_overflow_file(ad):
-    """Phase 1: the container-side file doesn't exist, so the marker must not
-    promise one."""
+    """_format_output itself never promises a file: it is pure and
+    synchronous, and the harbor proxy splices the "Full output:" line in
+    afterwards only once the upload has actually succeeded."""
     assert "Full output:" not in ad.fmt("x" * GIANT_LEN)
+
+
+# ── _compose_raw, the seam overflow capture reconstructs content through ──
+
+
+def test_compose_raw_matches_the_composition_it_was_extracted_from(ad):
+    """Pins the behavior-preserving extraction: _compose_raw must reproduce
+    the stdout/stderr concatenation _format_output used to inline, including
+    the falsy-stderr and None cases."""
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: tb_adapter's _format_output takes already-composed raw")
+    cr = _HARBOR._compose_raw
+    assert cr("out", "err") == "out\n[stderr]\nerr"
+    assert cr("out", "") == "out"
+    assert cr("", "err") == "\n[stderr]\nerr"
+    assert cr(None, None) == ""
+    assert cr("out", None) == "out"
+
+
+def test_cleaned_output_matches_format_outputs_own_pipeline(ad, monkeypatch):
+    """_format_output and the overflow-capture path both call the same
+    _cleaned_output(stdout, stderr) helper now, specifically so the two
+    computations cannot silently drift apart the way two independent
+    recomputations of "_strip_ansi(_compose_raw(...)).replace(...)" could --
+    this pins that _format_output actually routes through the shared helper
+    rather than re-inlining the expression.
+
+    _format_output's internal `cleaned` is observed where it is handed to
+    _cap_bytes_head_tail -- the first thing downstream of the composition.
+    """
+    if ad.name != "harbor":
+        pytest.skip("harbor-only: _cleaned_output is the harbor proxy's seam")
+    stdout, stderr = "é" * 600000, "\x1b[31mé\r\né" * 10
+    seen: list[str] = []
+    real_cap = _HARBOR._cap_bytes_head_tail
+
+    def spy(s, head_bytes, tail_bytes):
+        seen.append(s)
+        return real_cap(s, head_bytes, tail_bytes)
+
+    monkeypatch.setattr(_HARBOR, "_cap_bytes_head_tail", spy)
+    _HARBOR._format_output(stdout, stderr, 0, "/app", False)
+    monkeypatch.undo()
+
+    assert seen, "_format_output no longer routes cleaned through _cap_bytes_head_tail"
+    assert seen[0] == _HARBOR._cleaned_output(stdout, stderr)
 
 
 # ── downstream footer consumers ───────────────────────────────────────────
