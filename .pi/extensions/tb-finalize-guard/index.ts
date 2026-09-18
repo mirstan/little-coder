@@ -326,11 +326,13 @@ function maybeFireTriggerA(
     "remain and this task is graded by inspecting the container's files/state " +
     "afterward — not this chat. Re-read the task instructions above and use " +
     "ShellSession to re-check your work — not just that the required files exist: " +
-    "(1) spot-check that the actual content/result is correct, by an independent " +
-    "method where possible, not by re-reading what you already produced; " +
-    "(2) check that you haven't left behind anything the task didn't ask for " +
-    "(extra files, leftover scaffolding, intermediate outputs) — a strict grader " +
-    "can fail on extras; (3) if you were ever unsure what's expected, resolve it " +
+    "(1) spot-check that the actual content/result is correct — run it, test it, " +
+    "or recompute it independently where possible; inspecting the file is fine, " +
+    "assuming it's right just because you wrote it is not; " +
+    "(2) if you created files the task didn't ask for (leftover scaffolding, " +
+    "intermediate outputs), remove only ones you created yourself and that " +
+    "nothing else needs — never anything that was already there; " +
+    "(3) if you were ever unsure what's expected, resolve it " +
     "by the most literal reading of the task text. If this recheck passes, say so " +
     "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
     "do not give up early.";

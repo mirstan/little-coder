@@ -182,8 +182,12 @@ describe("tb-finalize-guard", () => {
       // Asks for more than existence: a present, well-formed file can still
       // have wrong content, or correct content plus extra scaffolding a
       // strict grader flags.
-      expect(h.sent[0].text).toMatch(/spot-check.*by an independent method/i);
-      expect(h.sent[0].text).toMatch(/left behind anything/i);
+      expect(h.sent[0].text).toMatch(/spot-check.*recompute it independently/i);
+      // Cleanup is scoped to self-created files, never pre-existing content --
+      // an unscoped "remove what's extra" could convert a passing trial into
+      // a failing one.
+      expect(h.sent[0].text).toMatch(/remove only ones you created yourself/i);
+      expect(h.sent[0].text).toMatch(/never anything that was already there/i);
       expect(h.sent[0].text).toMatch(/most literal reading/i);
       // The nudge fires on a toolless text turn; it must not be answerable
       // with another one, or the second (and last) fire burns on the same
