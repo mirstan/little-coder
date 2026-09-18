@@ -7,7 +7,15 @@ export interface ToolCall {
 
 export type QualityResult =
   | { ok: true }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; offendingCall?: ToolCall };
+
+// The one place two ToolCalls are compared for "is this the same call" --
+// exported so a caller (quality-monitor's tier-2 block) that needs the same
+// notion of identity doesn't reimplement it inline and risk diverging from
+// this module's own match (step 3 below).
+export function sameCall(a: ToolCall, b: ToolCall): boolean {
+  return a.name === b.name && JSON.stringify(a.input) === JSON.stringify(b.input);
+}
 
 // Tools that mutate state the environment then depends on. If the previous turn
 // ran one of these *alongside* a repeated call, re-issuing that call is
@@ -50,16 +58,16 @@ export function assessResponse(
   //    loop (issue #81).
   if (toolCalls.length > 0 && recentToolCalls.length > 0) {
     for (const tc of toolCalls) {
-      const tcInput = JSON.stringify(tc.input);
       for (const prev of recentToolCalls) {
-        if (tc.name === prev.name && JSON.stringify(prev.input) === tcInput) {
-          const envChanged = recentToolCalls.some((r) => {
-            const isRepeatedCall =
-              r.name === tc.name && JSON.stringify(r.input) === tcInput;
-            return !isRepeatedCall && STATE_CHANGING_TOOLS.has(r.name.toLowerCase());
-          });
+        if (sameCall(tc, prev)) {
+          const envChanged = recentToolCalls.some(
+            (r) => !sameCall(r, tc) && STATE_CHANGING_TOOLS.has(r.name.toLowerCase()),
+          );
           if (envChanged) continue;
-          return { ok: false, reason: "repeated_tool_call" };
+          // Surfaced so a caller acting on the specific offending call
+          // (quality-monitor's tier-2 block) never has to re-run this same
+          // envChanged-aware match independently and risk diverging from it.
+          return { ok: false, reason: "repeated_tool_call", offendingCall: tc };
         }
       }
     }
@@ -107,6 +115,43 @@ export function buildCorrectionMessage(reason: string): string {
 
   return corrections[reason] ?? `Issue detected: ${reason}. Please try again.`;
 }
+
+// Tier 2's model-facing text: sent once per failure streak, after tier 1's
+// buildCorrectionMessage has already been steered MAX_CONSECUTIVE_CORRECTIONS
+// times and visibly failed. Kept alongside buildCorrectionMessage/phraseForUser
+// (this module's other model/harness-facing text) rather than inline in
+// quality-monitor/index.ts, per the same convention.
+
+// The exact tool call is now hard-blocked (see quality-monitor's tool_call
+// handler) -- this explains that and, deliberately, does NOT say "try
+// something else" unconditionally: the most likely real repeat loop is a
+// model retrying a call permission-gate already refused (assessResponse's
+// envChanged exemption doesn't cover a lone refused call re-issued with
+// nothing else in between), and a bare "different action" push would read as
+// license to hunt for another route to the same effect -- exactly what
+// permission-gate's own refusal text exists to stop (issue #94: refused
+// ./build.sh -> bash ./build.sh -> sh ./build.sh -> a successful python3 -c
+// subprocess.run(...), since interpreters are themselves whitelisted). This
+// carve-out mirrors that refusal's own wording so the two messages agree.
+export function buildBlockedCallEscalationMessage(): string {
+  return (
+    "You are stuck in a loop: a tool call has repeated verbatim with nothing " +
+    "else changing in between. That exact call is now blocked -- it will be " +
+    "rejected if you try it again. If it was refused by a guardrail (a " +
+    "permission or whitelist message), that refusal is the answer -- do not " +
+    "re-run the same operation through python3 -c, node -e, env, sh, or an " +
+    "-exec flag to reach the same effect another way; tell the user it was " +
+    "refused and continue with the rest of the task. Otherwise, explain what " +
+    "isn't working, then take a materially different action."
+  );
+}
+
+// The model-facing reason on the block itself (see the point above: sent
+// every time the blocked call is retried, not just once).
+export const BLOCKED_CALL_REASON =
+  "This exact tool call is blocked -- it's a verbatim repeat of a call " +
+  "already flagged as looping, with nothing else changing in between. " +
+  "Take a materially different action.";
 
 // Short, user-facing phrasing for the harness-intervention line (distinct from
 // buildCorrectionMessage, which is the verbose text sent to the model).
