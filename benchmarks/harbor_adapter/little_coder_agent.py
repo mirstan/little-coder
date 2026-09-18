@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1439,6 +1440,13 @@ class LittleCoderAgent(BaseAgent):
                     pass
                 except Exception:
                     pass
+            # Per-capture files are unlinked as they're uploaded, but the
+            # private staging directory itself (see _capture_overflow_inner)
+            # otherwise outlives the trial -- one empty 0700 dir leaked per
+            # trial that ever byte-capped, forever, on the shared harness
+            # host. ignore_errors: cleanup best-effort, never fails the trial.
+            if proxy._host_stage_dir is not None:
+                shutil.rmtree(proxy._host_stage_dir, ignore_errors=True)
             if log_fh:
                 log_fh.flush()
                 log_fh.close()
