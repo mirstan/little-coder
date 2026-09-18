@@ -423,16 +423,21 @@ describe("quality-monitor tier-2 escalation", () => {
   });
 
   it("does not let an aborted or errored turn's calls leak into the next turn's offending-call lookup", async () => {
+    // The arming turn must follow the abort IMMEDIATELY, with no ordinary
+    // turn_end in between: an ordinary turn already consumes-and-clears
+    // turnValidatedCalls on its own (both before and after this fix), so an
+    // intervening one would flush the leak before it could matter and this
+    // test would pass even against the pre-fix code.
     await fireTurn(h, [bash]); // seed
     await fireTurn(h, [bash]); // fail 1 (tier 1)
+    await fireTurn(h, [bash]); // fail 2 (tier 1)
     // A turn that fires tool_call for an unrelated command, then aborts --
     // its recording must not survive into the next turn's lookup.
     const decoy = { name: "Bash", input: { command: "ls -la" } };
     await fireToolCall(h, decoy.name, decoy.input);
     await fire(h, "turn_end", { message: { stopReason: "aborted", content: [] } });
 
-    await fireTurn(h, [bash]); // fail 2 (tier 1) -- still just bash's own streak
-    await fireTurn(h, [bash]); // fail 3: crosses the cap
+    await fireTurn(h, [bash]); // fail 3: crosses the cap, right after the abort
 
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
     expect(await fireToolCall(h, decoy.name, decoy.input)).toBeUndefined();
@@ -457,23 +462,24 @@ describe("quality-monitor tier-2 escalation", () => {
     expect(h.followUps).toHaveLength(followUpsAfterTier2 + 1);
   });
 
-  it("exempts a same-turn fix-then-retry from the hard block, mirroring issue #81", async () => {
+  it("blocks unconditionally -- no same-turn state-changing call exempts it", async () => {
+    // A same-turn Edit (or anything else) before the retry must NOT exempt
+    // it. An earlier draft of this mechanism tried exactly that exemption,
+    // mirroring assessResponse's own envChanged, and it was reverted: it
+    // let a looping model permanently defeat the block by prefixing every
+    // retry with any trivial state-changing call (even a no-op), since this
+    // hook can only see that SOME call was attempted, not that it changed
+    // anything relevant -- or even that it succeeded, since a call another
+    // guard itself rejected still counts under that check. Pinning the
+    // reverted behavior directly guards against reintroducing it.
     await repeatLoop(3); // tier 2 fires and blocks bash
-    // The very next turn: fix the bug, then retry the blocked command, in
-    // ONE turn -- exactly the pattern assessResponse's own envChanged
-    // exemption exists to allow. The Edit must be recorded (via its own
-    // tool_call event) before bash's retry is evaluated.
     const edit = { name: "Edit", input: { file_path: "/src/main.c" } };
     expect(await fireToolCall(h, edit.name, edit.input)).toBeUndefined();
-    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined(); // NOT blocked
-  });
-
-  it("still blocks a same-turn retry with no state-changing call in between", async () => {
-    await repeatLoop(3);
-    // A same-turn retry with nothing else happening first (no Edit) must
-    // stay blocked -- the exemption is specifically for a state change,
-    // not merely "not the very first attempt."
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+    // And the block survives indefinitely -- prefixing every subsequent
+    // attempt with its own fresh state-changing call doesn't wear it down.
+    const noop = { name: "Bash", input: { command: "echo hi" } };
+    expect(await fireToolCall(h, noop.name, noop.input)).toBeUndefined();
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
   });
 

@@ -22,7 +22,7 @@ export function sameCall(a: ToolCall, b: ToolCall): boolean {
 // legitimate progress, not a loop — e.g. Edit a source file, then re-run the
 // same build command (issue #81). Bash/ShellSession count because a shell
 // command can change anything; matching is by lowercased tool name.
-export const STATE_CHANGING_TOOLS = new Set([
+const STATE_CHANGING_TOOLS = new Set([
   "edit",
   "write",
   "multiedit",

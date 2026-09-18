@@ -6,7 +6,6 @@ import {
   BLOCKED_CALL_REASON,
   phraseForUser,
   sameCall,
-  STATE_CHANGING_TOOLS,
   type ToolCall,
 } from "./quality.ts";
 import { harnessIntervention } from "../_shared/intervention.ts";
@@ -88,29 +87,24 @@ export default function (pi: ExtensionAPI) {
     // string coerces here but not there, and comparing across the two spaces
     // would silently never match.
     const call: ToolCall = { name: event.toolName, input: event.input };
-
-    if (blockedCall && sameCall(call, blockedCall)) {
-      // Same exemption assessResponse's own envChanged applies at turn_end
-      // (issue #81): if something state-changing already ran EARLIER in
-      // THIS turn -- before this call -- the environment plausibly changed
-      // since the loop was detected, so retrying is progress, not the same
-      // loop (e.g. Edit the bug, then retry the build command, in one
-      // turn). Without this, blockedCall could only clear at this turn's
-      // OWN turn_end, which runs after this tool_call has already fired --
-      // one turn too late to let the very turn that fixed the problem
-      // retry it. Checked against calls already recorded this turn, not
-      // including the current one (turnValidatedCalls.push is below this).
-      const envChangedThisTurn = turnValidatedCalls.some(
-        (c) => !sameCall(c, blockedCall!) && STATE_CHANGING_TOOLS.has(c.name.toLowerCase()),
-      );
-      turnValidatedCalls.push(call);
-      if (!envChangedThisTurn) {
-        return { block: true, reason: BLOCKED_CALL_REASON };
-      }
-      return;
-    }
-
     turnValidatedCalls.push(call);
+
+    // Deliberately unconditional, with no same-turn "something state-changing
+    // already ran" exemption mirroring assessResponse's own (issue #81):
+    // tried once, and reverted. turnValidatedCalls records every call this
+    // hook SEES, not every call that actually ran -- a state-changing call
+    // another guard (permission-gate, write-guard) itself rejected would
+    // still count as "environment changed" under that check, and worse, any
+    // trivial state-changing call at all (even a no-op) would satisfy it,
+    // letting a looping model permanently defeat the block by prefixing
+    // every retry with one -- exactly the unconditional guarantee this
+    // mechanism exists to provide. The cost of staying unconditional is
+    // bounded: a genuine same-turn fix-then-retry (Edit, then the blocked
+    // command) gets this one retry rejected too, but blockedCall clears on
+    // that turn's own ok verdict, so the very next turn succeeds.
+    if (blockedCall && sameCall(call, blockedCall)) {
+      return { block: true, reason: BLOCKED_CALL_REASON };
+    }
   });
 
   pi.on("turn_end", async (event, ctx) => {
