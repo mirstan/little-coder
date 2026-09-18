@@ -1,12 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Dirent } from "node:fs";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, opendirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectDeliverableWrites } from "../_shared/shell-write.ts";
 import { normalizeWritePath } from "../write-guard/index.ts";
 import { envNumber } from "../_shared/env-number.ts";
-import { harnessIntervention } from "../_shared/intervention.ts";
+import { harnessIntervention, type InterventionCtx } from "../_shared/intervention.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
 // or Edit tool modifies it. First-write-wins per session (don't re-backup
@@ -229,7 +229,11 @@ function isRealDir(dirent: Dirent, fullPath: string): boolean {
  * Exported (rather than kept module-local) so tests can drive it directly
  * as well as through the `session_start` handler.
  */
-export function snapshotWorkingDirectory(sessionId: string, cwd: string | undefined, ctx: any): void {
+export function snapshotWorkingDirectory(
+  sessionId: string,
+  cwd: string | undefined,
+  ctx: InterventionCtx | undefined,
+): void {
   if (!sessionId || !cwd) return; // best-effort: ctx.cwd is non-optional per pi's types, but never trust that here
   try {
     const maxEntries = envNumber(SNAPSHOT_MAX_ENTRIES_ENV, SNAPSHOT_MAX_ENTRIES);
@@ -246,31 +250,43 @@ export function snapshotWorkingDirectory(sessionId: string, cwd: string | undefi
 
     walk: while (queue.length > 0) {
       const { dir, depth } = queue.shift()!;
-      let dirents: Dirent[];
+      // opendirSync + readSync, not readdirSync: readdirSync materializes
+      // every dirent in the directory into one array before the loop below
+      // ever gets a chance to check the entries budget, so a single
+      // pathological directory (an unpacked archive, say) would still pay
+      // for a full allocation + listing regardless of maxEntries. Streaming
+      // one entry at a time makes the budget bound the actual read, not
+      // just the processing after the read already happened.
+      let handle;
       try {
-        dirents = readdirSync(dir, { withFileTypes: true });
+        handle = opendirSync(dir);
       } catch {
         continue; // unreadable dir: best-effort, move on
       }
-      for (const dirent of dirents) {
-        if (entries >= maxEntries) { truncated = "entries"; break walk; }
-        entries++;
-        const full = join(dir, dirent.name);
-        if (full === excludeDir) continue; // never snapshot our own backup store
+      try {
+        let dirent: Dirent | null;
+        while ((dirent = handle.readSync()) !== null) {
+          if (entries >= maxEntries) { truncated = "entries"; break walk; }
+          entries++;
+          const full = join(dir, dirent.name);
+          if (full === excludeDir) continue; // never snapshot our own backup store
 
-        if (isRealDir(dirent, full)) {
-          if (SNAPSHOT_SKIP_DIRS.has(dirent.name)) continue;
-          if (depth < maxDepth) queue.push({ dir: full, depth: depth + 1 });
-          continue;
+          if (isRealDir(dirent, full)) {
+            if (SNAPSHOT_SKIP_DIRS.has(dirent.name)) continue;
+            if (depth < maxDepth) queue.push({ dir: full, depth: depth + 1 });
+            continue;
+          }
+
+          // File, file symlink, or dir symlink: backupIfNeeded's own statSync
+          // follows a symlink and only copies a real file (`isFile()`), so a
+          // dir symlink is skipped untracked and a broken link throws into
+          // its own catch -- no separate type logic needed here.
+          if (bytes >= maxBytes) { truncated = "bytes"; break walk; }
+          const written = backupIfNeeded(sessionId, full);
+          if (written) bytes += written;
         }
-
-        // File, file symlink, or dir symlink: backupIfNeeded's own statSync
-        // follows a symlink and only copies a real file (`isFile()`), so a
-        // dir symlink is skipped untracked and a broken link throws into
-        // its own catch -- no separate type logic needed here.
-        if (bytes >= maxBytes) { truncated = "bytes"; break walk; }
-        const written = backupIfNeeded(sessionId, full);
-        if (written) bytes += written;
+      } finally {
+        handle.closeSync();
       }
     }
 
