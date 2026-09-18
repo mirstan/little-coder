@@ -11,7 +11,15 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 // a fresh extension instance is loaded per session via the session lifecycle.
 let previousToolCalls: ToolCall[] = [];
 let consecutiveFailures = 0;
-const MAX_CONSECUTIVE_CORRECTIONS = 2; // stop nudging after 2 failed corrections
+// Tier-2 escalation state. Like previousToolCalls/consecutiveFailures these
+// survive a mid-task compaction on purpose: compaction fires `session_compact`
+// in place, not `session_start`, and the loop being broken outlives it.
+let blockedCall: ToolCall | null = null;
+let tier2Notified = false;
+// Past this many consecutive failures, tier 1's plain correction has visibly
+// failed and turn_end escalates instead (it used to go silent for the rest of
+// the trial — a real run then looped for 334 more turns unopposed).
+const MAX_CONSECUTIVE_CORRECTIONS = 2;
 
 export default function (pi: ExtensionAPI) {
   // Populate the known-tools set lazily by observing tool_execution events.
@@ -25,6 +33,33 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     previousToolCalls = [];
     consecutiveFailures = 0;
+    blockedCall = null;
+    tier2Notified = false;
+  });
+
+  // Tier 2 for a repeat loop: reject the looping call outright. pi delivers a
+  // `{block, reason}` result to the model as a tool error in the same turn, so
+  // breaking the loop doesn't depend on the model heeding steered text. No
+  // unblock path is needed — any difference in the input stops matching.
+  //
+  // Known gap: `event.input` is schema-validated (coerced), while blockedCall
+  // came from the raw content-block arguments turn_end reads. Coercion is the
+  // identity for string fields, so shell-command repeats — the loop shape this
+  // targets — match; a repeat on a tool with a coercible numeric arg would not.
+  pi.on("tool_call", async (event) => {
+    if (!blockedCall) return;
+    const name = (event as any).toolName;
+    // ToolCallEvent carries only `input`; there is no `args`/`arguments` form.
+    const input = (event as any).input;
+    if (name === blockedCall.name && JSON.stringify(input) === JSON.stringify(blockedCall.input)) {
+      return {
+        block: true,
+        reason:
+          "This exact tool call is blocked -- it's a verbatim repeat of a call " +
+          "already flagged as looping, with nothing else changing in between. " +
+          "Take a materially different action.",
+      };
+    }
   });
 
   pi.on("turn_end", async (event, ctx) => {
@@ -73,21 +108,52 @@ export default function (pi: ExtensionAPI) {
 
     const verdict = assessResponse(text, currentCalls, previousToolCalls, knownTools);
 
-    // Update rolling state for next turn regardless of verdict
+    // Update rolling state for next turn regardless of verdict.
     previousToolCalls = currentCalls;
 
     if (verdict.ok) {
       consecutiveFailures = 0;
+      blockedCall = null;
+      tier2Notified = false;
       return;
     }
 
-    // Cap corrections so we don't burn turns in a correction loop
     consecutiveFailures++;
     if (consecutiveFailures > MAX_CONSECUTIVE_CORRECTIONS) {
-      harnessIntervention(
-        ctx,
-        `${phraseForUser(verdict.reason)} — backing off after ${consecutiveFailures} in a row.`,
-      );
+      // Escalate once per streak; re-sending the same escalation every turn is
+      // the "keep sending what already didn't work" failure this replaced.
+      if (tier2Notified) return;
+      // assessResponse names the exact offending call itself (its own
+      // envChanged-aware match, not re-run independently here) — a multi-call
+      // turn can have an earlier call that matches the previous turn but was
+      // exempted (issue #81), so re-deriving this separately, without that
+      // exemption, could name the wrong one.
+      const offending = verdict.reason === "repeated_tool_call" ? verdict.offendingCall : undefined;
+      tier2Notified = true;
+      if (offending) {
+        blockedCall = offending;
+        harnessIntervention(
+          ctx,
+          `${phraseForUser(verdict.reason)} — blocking the exact call and escalating.`,
+        );
+        // No repeat count in this text: consecutiveFailures counts failures of
+        // any reason, so "repeated N times" could be false on a mixed streak.
+        pi.sendUserMessage(
+          "You are stuck in a loop: a tool call has repeated verbatim with nothing " +
+            "else changing in between. That exact call is now blocked -- it will be " +
+            "rejected if you try it again. Explain what isn't working, then take a " +
+            "materially different action.",
+          { deliverAs: "steer" },
+        );
+      } else {
+        // Nothing to block (empty response, unknown tool, malformed args). Keep
+        // correcting rather than going silent.
+        harnessIntervention(
+          ctx,
+          `${phraseForUser(verdict.reason)} — still correcting after ${consecutiveFailures} in a row.`,
+        );
+        pi.sendUserMessage(buildCorrectionMessage(verdict.reason), { deliverAs: "steer" });
+      }
       return;
     }
 

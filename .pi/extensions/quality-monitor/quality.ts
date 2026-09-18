@@ -7,7 +7,7 @@ export interface ToolCall {
 
 export type QualityResult =
   | { ok: true }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; offendingCall?: ToolCall };
 
 // Tools that mutate state the environment then depends on. If the previous turn
 // ran one of these *alongside* a repeated call, re-issuing that call is
@@ -59,7 +59,12 @@ export function assessResponse(
             return !isRepeatedCall && STATE_CHANGING_TOOLS.has(r.name.toLowerCase());
           });
           if (envChanged) continue;
-          return { ok: false, reason: "repeated_tool_call" };
+          // Surfaced so a caller that needs to act on the specific offending
+          // call (quality-monitor's tier-2 block) doesn't have to re-run this
+          // same envChanged-aware match independently and risk diverging from
+          // it -- an earlier draft did exactly that and could arm a block on
+          // a *different*, exempted call in a multi-tool-call turn.
+          return { ok: false, reason: "repeated_tool_call", offendingCall: tc };
         }
       }
     }

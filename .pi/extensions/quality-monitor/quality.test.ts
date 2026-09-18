@@ -35,7 +35,7 @@ describe("assessResponse", () => {
     const now = [{ name: "Read", input: { file_path: "/a" } }];
     const prev = [{ name: "Read", input: { file_path: "/a" } }];
     expect(assessResponse("", now, prev, known)).toEqual({
-      ok: false, reason: "repeated_tool_call",
+      ok: false, reason: "repeated_tool_call", offendingCall: now[0],
     });
   });
   it("does not flag as repeat when inputs differ", () => {
@@ -54,7 +54,7 @@ describe("assessResponse", () => {
   it("still flags a verbatim repeat when nothing else changed", () => {
     const build = { name: "Bash", input: { command: "npm run build" } };
     expect(assessResponse("", [build], [build], known)).toEqual({
-      ok: false, reason: "repeated_tool_call",
+      ok: false, reason: "repeated_tool_call", offendingCall: build,
     });
   });
   it("still flags a repeat when the only other calls are read-only (#81)", () => {
@@ -62,8 +62,26 @@ describe("assessResponse", () => {
     const now = [build];
     const prev = [{ name: "Read", input: { file_path: "/log" } }, build];
     expect(assessResponse("", now, prev, known)).toEqual({
-      ok: false, reason: "repeated_tool_call",
+      ok: false, reason: "repeated_tool_call", offendingCall: build,
     });
+  });
+  it("names the correct offender, not just the first array match, when an earlier same-turn call is exempted (#81 interaction)", () => {
+    // prev turn ran Bash(X) then Read(Y). Current turn repeats both, in the
+    // OPPOSITE order (Read(Y) checked first). Read(Y)'s repeat is exempted --
+    // Bash(X) is present in prev, is state-changing, and isn't Read(Y) itself,
+    // so the environment plausibly changed since Read(Y) last ran. Bash(X)'s
+    // own repeat is NOT exempted: Read(Y) isn't state-changing, and Bash(X) is
+    // excluded from exempting itself. So assessResponse's real control flow
+    // (checks Read(Y) first, finds it exempted, continues to Bash(X), flags
+    // that) must return Bash(X) as the offender -- a naive re-derivation that
+    // just finds the first tc with ANY exact match in prev, ignoring the
+    // exemption, would wrongly name Read(Y) instead (it's first in `now`).
+    const bashX = { name: "Bash", input: { command: "run-x" } };
+    const readY = { name: "Read", input: { file_path: "/y" } };
+    const prev = [bashX, readY];
+    const now = [readY, bashX]; // readY checked first; bashX is the real offender
+    const result = assessResponse("", now, prev, known);
+    expect(result).toEqual({ ok: false, reason: "repeated_tool_call", offendingCall: bashX });
   });
   it("detects malformed args sentinel", () => {
     const calls = [{ name: "Read", input: { _raw: "garbage" } }];
@@ -129,6 +147,28 @@ function harness() {
 async function fire(h: any, name: string, event: any) {
   for (const fn of h.pi.handlers[name] ?? []) await fn(event, h.ctx);
 }
+// Mirrors pi's emitToolCall dispatch: every handler runs, the first truthy
+// `block` short-circuits.
+async function fireToolCall(h: any, toolName: string, input: unknown) {
+  for (const fn of h.pi.handlers["tool_call"] ?? []) {
+    const r = await fn({ type: "tool_call", toolCallId: "t1", toolName, input }, h.ctx);
+    if (r?.block) return r;
+  }
+  return undefined;
+}
+// turn_end event for a completed turn making the given tool calls. pi's
+// content blocks carry raw `arguments`, which is what the extension reads.
+function turn(calls: { name: string; input: unknown }[], text = "") {
+  return {
+    message: {
+      stopReason: "stop",
+      content: [
+        ...(text ? [{ type: "text", text }] : []),
+        ...calls.map((c) => ({ type: "toolCall", name: c.name, arguments: c.input })),
+      ],
+    },
+  };
+}
 
 describe("quality-monitor turn_end", () => {
   let h: ReturnType<typeof harness>;
@@ -193,5 +233,133 @@ describe("quality-monitor turn_end", () => {
     });
     expect(h.followUps).toHaveLength(0);
     expect(h.notifies).toHaveLength(0);
+  });
+});
+
+// ── tier-2 escalation: block the looping call instead of going silent ───────
+describe("quality-monitor tier-2 escalation", () => {
+  let h: ReturnType<typeof harness>;
+  const bash = { name: "Bash", input: { command: "gcc encode.c" } };
+
+  beforeEach(async () => {
+    h = harness();
+    await fire(h, "session_start", {});
+  });
+
+  // Drive `n` consecutive verbatim repeats of `bash` (the first turn seeds the
+  // previous-turn state and is itself ok).
+  async function repeatLoop(n: number) {
+    await fire(h, "turn_end", turn([bash]));
+    for (let i = 0; i < n; i++) await fire(h, "turn_end", turn([bash]));
+  }
+
+  it("keeps tier 1 unchanged for the first two failures", async () => {
+    await repeatLoop(2);
+    expect(h.followUps).toHaveLength(2);
+    expect(h.followUps[0].msg).toBe(buildCorrectionMessage("repeated_tool_call"));
+    expect(h.followUps[1].msg).toBe(buildCorrectionMessage("repeated_tool_call"));
+    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
+  });
+
+  it("arms the block on the repeated call, not another call in the same turn", async () => {
+    // Two tier-1 failures, then a turn making the repeat AND an unrelated call.
+    await fire(h, "turn_end", turn([bash]));
+    await fire(h, "turn_end", turn([bash]));
+    await fire(h, "turn_end", turn([bash]));
+    const other = { name: "Read", input: { file_path: "/new" } };
+    await fire(h, "turn_end", turn([bash, other]));
+
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+    expect(await fireToolCall(h, other.name, other.input)).toBeUndefined();
+  });
+
+  it("blocks the exact repeated call with a reason once tier 2 fires", async () => {
+    await repeatLoop(3);
+    const result = await fireToolCall(h, bash.name, bash.input);
+    expect(result?.block).toBe(true);
+    expect(typeof result?.reason).toBe("string");
+    expect(result?.reason).toMatch(/repeat/i);
+    expect(h.notifies.join("\n")).toMatch(/blocking the exact call/i);
+    expect(h.followUps[2].msg).toMatch(/blocked/i);
+    expect(h.followUps[2].opts).toEqual({ deliverAs: "steer" });
+  });
+
+  it("does not block a call with the same tool name but different input", async () => {
+    await repeatLoop(3);
+    expect(await fireToolCall(h, "Bash", { command: "ls" })).toBeUndefined();
+  });
+
+  it("escalates exactly once, however long the loop continues", async () => {
+    await repeatLoop(3);
+    const followUps = h.followUps.length;
+    const notifies = h.notifies.length;
+    await fire(h, "turn_end", turn([bash]));
+    await fire(h, "turn_end", turn([bash]));
+    expect(h.followUps).toHaveLength(followUps);
+    expect(h.notifies).toHaveLength(notifies);
+    // The block itself keeps firing per call.
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+  });
+
+  it("clears the block and the escalation on a recovered turn", async () => {
+    await repeatLoop(3);
+    await fire(h, "turn_end", turn([], "I'll try something else."));
+    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
+
+    // consecutiveFailures reset too: the next repeat gets tier 1 again.
+    const before = h.followUps.length;
+    await fire(h, "turn_end", turn([bash]));
+    await fire(h, "turn_end", turn([bash]));
+    expect(h.followUps.slice(before).map((f) => f.msg)).toEqual([
+      buildCorrectionMessage("repeated_tool_call"),
+    ]);
+  });
+
+  it("re-arms for a different loop later in the same session", async () => {
+    await repeatLoop(3);
+    await fire(h, "turn_end", turn([], "changing approach."));
+
+    const other = { name: "Bash", input: { command: "make test" } };
+    await fire(h, "turn_end", turn([other]));
+    await fire(h, "turn_end", turn([other]));
+    await fire(h, "turn_end", turn([other]));
+    await fire(h, "turn_end", turn([other]));
+
+    expect(await fireToolCall(h, other.name, other.input)).toMatchObject({ block: true });
+    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
+  });
+
+  it("keeps correcting past the cap for reasons with no call to block", async () => {
+    const empty = { message: { stopReason: "stop", content: [] } };
+    await fire(h, "turn_end", empty);
+    await fire(h, "turn_end", empty);
+    await fire(h, "turn_end", empty); // 3rd failure: used to go silent here
+    expect(h.followUps).toHaveLength(3);
+    expect(h.followUps[2].msg).toBe(buildCorrectionMessage("empty_response"));
+    expect(h.followUps[2].opts).toEqual({ deliverAs: "steer" });
+    expect(h.notifies[2]).toMatch(/still correcting/i);
+    expect(await fireToolCall(h, "Bash", {})).toBeUndefined();
+
+    // Still only one escalation.
+    await fire(h, "turn_end", empty);
+    expect(h.followUps).toHaveLength(3);
+  });
+
+  it("claims no repeat count when the streak mixed other failure reasons", async () => {
+    // knownTools is populated by observed executions; without it the
+    // unknown-tool check is skipped.
+    await fire(h, "tool_execution_start", { toolName: "Bash" });
+    const ghost = { name: "Ghost", input: {} };
+    await fire(h, "turn_end", turn([bash]));
+    await fire(h, "turn_end", turn([ghost, bash])); // unknown_tool
+    await fire(h, "turn_end", turn([ghost, bash])); // unknown_tool
+    await fire(h, "turn_end", turn([bash])); // first actual repeat -> tier 2
+
+    const escalation = h.followUps[h.followUps.length - 1].msg;
+    expect(escalation).toMatch(/blocked/i);
+    // consecutiveFailures is 3 here but the call repeated once: no count claim.
+    expect(escalation).not.toMatch(/\d/);
+    expect(escalation).not.toMatch(/times|in a row/i);
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
   });
 });
