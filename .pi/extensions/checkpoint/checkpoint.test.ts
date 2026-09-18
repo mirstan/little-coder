@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   mkdtempSync,
   mkdirSync,
@@ -8,10 +8,16 @@ import {
   readdirSync,
   readFileSync,
   chmodSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import setupCheckpoint, { checkpointPath, tracked, MAX_BACKUP_BYTES } from "./index.ts";
+import setupCheckpoint, {
+  checkpointPath,
+  tracked,
+  MAX_BACKUP_BYTES,
+  snapshotWorkingDirectory,
+} from "./index.ts";
 
 describe("checkpointPath", () => {
   it("reads the `path` key (current pi write/edit)", () => {
@@ -50,6 +56,10 @@ describe("checkpoint pre-edit backup net", () => {
     home = mkdtempSync(join(tmpdir(), "ckpt-"));
     process.env.HOME = home;
     tracked.clear();
+    // An ambient benchmark/session-id var on a benchmark box must not flake
+    // these tests, which assume interactive (no-env-var) behavior.
+    delete process.env.LITTLE_CODER_BENCHMARK;
+    delete process.env.LITTLE_CODER_SESSION_ID;
   });
   afterEach(() => {
     if (origHome === undefined) delete process.env.HOME;
@@ -95,6 +105,8 @@ describe("checkpoint pre-edit backup net — shell writes", () => {
     home = mkdtempSync(join(tmpdir(), "ckpt-shell-"));
     process.env.HOME = home;
     tracked.clear();
+    delete process.env.LITTLE_CODER_BENCHMARK;
+    delete process.env.LITTLE_CODER_SESSION_ID;
   });
   afterEach(() => {
     if (origHome === undefined) delete process.env.HOME;
@@ -202,6 +214,8 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     home = mkdtempSync(join(tmpdir(), "ckpt-hard-"));
     process.env.HOME = home;
     tracked.clear();
+    delete process.env.LITTLE_CODER_BENCHMARK;
+    delete process.env.LITTLE_CODER_SESSION_ID;
   });
   afterEach(() => {
     if (origHome === undefined) delete process.env.HOME;
@@ -587,4 +601,418 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     expect(files.length).toBe(1);
     expect(readFileSync(join(dir, files[0]), "utf8")).toBe("SECOND-ORIGINAL");
   });
+});
+
+// GAIA-only session-start walk. `taskDir` stands in for gaia.py's fresh
+// host-side TemporaryDirectory (gaia.py:138-172) -- a directory distinct
+// from `home`, mirroring the real shape where the task's work dir and
+// ~/.little-coder are never the same tree.
+describe("checkpoint session-start snapshot", () => {
+  let home: string;
+  let taskDir: string;
+  let origHome: string | undefined;
+  let origBenchmark: string | undefined;
+  let origSessionId: string | undefined;
+
+  function ckptDir(sessionId: string): string {
+    return join(home, ".little-coder", "checkpoints", sessionId);
+  }
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origBenchmark = process.env.LITTLE_CODER_BENCHMARK;
+    origSessionId = process.env.LITTLE_CODER_SESSION_ID;
+    home = mkdtempSync(join(tmpdir(), "ckpt-snap-home-"));
+    taskDir = mkdtempSync(join(tmpdir(), "ckpt-snap-task-"));
+    process.env.HOME = home;
+    process.env.LITTLE_CODER_BENCHMARK = "gaia";
+    delete process.env.LITTLE_CODER_SESSION_ID;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_BYTES;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_DEPTH;
+    tracked.clear();
+  });
+
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    if (origBenchmark === undefined) delete process.env.LITTLE_CODER_BENCHMARK;
+    else process.env.LITTLE_CODER_BENCHMARK = origBenchmark;
+    if (origSessionId === undefined) delete process.env.LITTLE_CODER_SESSION_ID;
+    else process.env.LITTLE_CODER_SESSION_ID = origSessionId;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_BYTES;
+    delete process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_DEPTH;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(taskDir, { recursive: true, force: true });
+  });
+
+  // 1. Regression shape, end to end: a subprocess-style overwrite with no
+  // tool_call at all must still be recoverable, because the session-start
+  // walk captured the original before the model ever acted.
+  it("backs up a pre-existing task file at session start, surviving a subprocess-style overwrite with no tool_call", async () => {
+    const h = setup();
+    const target = join(taskDir, "input.tex");
+    writeFileSync(target, "ORIGINAL");
+    await h.session_start(
+      {},
+      { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+    );
+
+    // No tool_call at all here -- e.g. a spawned script's own internal
+    // `open(path).write(...)`, which no shell-syntax detector can see.
+    writeFileSync(target, "CLOBBERED-BY-SUBPROCESS");
+
+    const dir = ckptDir("default");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIGINAL");
+  });
+
+  // 2. First-write-wins integration: the walk and the per-write net share
+  // `tracked`, so a later write tool_call to an already-walked file must
+  // not overwrite the session-start original with a second backup.
+  it("first-write-wins: a post-walk write tool_call to a walked file adds no second backup", async () => {
+    const h = setup();
+    const target = join(taskDir, "notes.txt");
+    writeFileSync(target, "ORIGINAL");
+    await h.session_start(
+      {},
+      { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+    );
+
+    await h.tool_call({ toolName: "write", input: { path: target, content: "model output" } }, { cwd: taskDir });
+
+    const dir = ckptDir("default");
+    const files = readdirSync(dir);
+    expect(files.length).toBe(1);
+    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("ORIGINAL");
+  });
+
+  // 3. Gating: an allowlist, not a truthy gate.
+  describe("gating", () => {
+    it("does not walk when LITTLE_CODER_BENCHMARK is unset", async () => {
+      delete process.env.LITTLE_CODER_BENCHMARK;
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "x");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(existsSync(ckptDir("default"))).toBe(false);
+    });
+
+    it('does not walk for "terminal_bench" -- the corrected premise: an allowlist, not truthiness', async () => {
+      process.env.LITTLE_CODER_BENCHMARK = "terminal_bench";
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "x");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(existsSync(ckptDir("default"))).toBe(false);
+    });
+
+    it("does not walk when cwd is missing, even under the gaia gate", async () => {
+      const h = setup();
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, ui: { notify: vi.fn() } }, // no cwd
+      );
+      expect(existsSync(ckptDir("default"))).toBe(false);
+    });
+
+    it("disables the walk entirely when SNAPSHOT_MAX_ENTRIES is <= 0", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES = "0";
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "x");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(existsSync(ckptDir("default"))).toBe(false);
+    });
+  });
+
+  // 4. Session id: LITTLE_CODER_SESSION_ID wins over the derived session
+  // file (even when both are present); unset falls back to the file, then
+  // "default"; an empty string is treated as unset (the `||` vs `??` fix).
+  describe("session id", () => {
+    it("prefers LITTLE_CODER_SESSION_ID over the session file when both are present", async () => {
+      process.env.LITTLE_CODER_SESSION_ID = "gaia-abc";
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "ORIG");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => "/x/sess-999.json" }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      expect(existsSync(ckptDir("gaia-abc"))).toBe(true);
+      expect(existsSync(ckptDir("sess-999.json"))).toBe(false);
+    });
+
+    it("falls back to the derived session-file id when LITTLE_CODER_SESSION_ID is unset, exactly as today", async () => {
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "ORIG");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => "/x/sess-777.json" }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(existsSync(ckptDir("sess-777.json"))).toBe(true);
+    });
+
+    it('falls back to "default" when both LITTLE_CODER_SESSION_ID and the session file are absent', async () => {
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "ORIG");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(existsSync(ckptDir("default"))).toBe(true);
+    });
+
+    it("treats an empty-string LITTLE_CODER_SESSION_ID as unset (`||`, not `??`)", async () => {
+      process.env.LITTLE_CODER_SESSION_ID = "";
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "ORIG");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => "/x/sess-555.json" }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      // An ambient empty-string var must fall through to the session file,
+      // not become "" and (via backupIfNeeded's own `!sessionId` guard)
+      // silently disable every backup for the session.
+      expect(existsSync(ckptDir("sess-555.json"))).toBe(true);
+    });
+  });
+
+  // 5. ui guard (Fix 2): a ctx lacking `ui` must never throw; when `ui` is
+  // present, the partial-snapshot notice fires exactly once.
+  describe("ui guard", () => {
+    it("does not throw when the entry budget is hit and ctx has no ui", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES = "1";
+      const h = setup();
+      writeFileSync(join(taskDir, "a.txt"), "A");
+      writeFileSync(join(taskDir, "b.txt"), "B");
+
+      await expect(
+        h.session_start({}, { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir }), // no ui at all
+      ).resolves.not.toThrow();
+    });
+
+    it("notifies exactly once, matching /harness intervention: .*partial/, when the entry budget is hit", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES = "1";
+      const h = setup();
+      writeFileSync(join(taskDir, "a.txt"), "A");
+      writeFileSync(join(taskDir, "b.txt"), "B");
+      const notify = vi.fn();
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify } },
+      );
+
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify.mock.calls[0][0]).toMatch(/harness intervention: .*partial/);
+    });
+
+    it("stays silent when the walk completes under budget", async () => {
+      const h = setup();
+      writeFileSync(join(taskDir, "a.txt"), "A");
+      const notify = vi.fn();
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify } },
+      );
+
+      expect(notify).not.toHaveBeenCalled();
+    });
+  });
+
+  // 6. Symlink hazard: the confirmed cycle terminates promptly (never
+  // `recursive: true`); a file symlink is backed up with the target's real
+  // content; a symlinked directory is neither descended nor tracked.
+  describe("symlinks", () => {
+    it("terminates promptly on a symlinked directory cycle and still backs up real files inside it", async () => {
+      const realDir = join(taskDir, "real");
+      mkdirSync(realDir);
+      writeFileSync(join(realDir, "keep.txt"), "KEEP-ME");
+      // mkdir real; ln -s ../real real/loop -- a one-level cycle that
+      // `readdirSync(dir, { recursive: true })` is confirmed to follow
+      // 30+ levels deep before being killed.
+      symlinkSync(join("..", "real"), join(realDir, "loop"), "dir");
+
+      const h = setup();
+      const start = Date.now();
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      expect(Date.now() - start).toBeLessThan(5000);
+
+      const dir = ckptDir("default");
+      const contents = readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8"));
+      expect(contents).toContain("KEEP-ME");
+    });
+
+    it("backs up a file symlink with the target's real content", async () => {
+      const outsideTarget = join(home, "outside-target.txt");
+      writeFileSync(outsideTarget, "TARGET-CONTENT");
+      symlinkSync(outsideTarget, join(taskDir, "link.txt"));
+
+      const h = setup();
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const files = readdirSync(dir);
+      expect(files.length).toBe(1);
+      expect(readFileSync(join(dir, files[0]), "utf8")).toBe("TARGET-CONTENT");
+    });
+
+    it("never descends into, nor tracks, a symlinked directory", async () => {
+      // The real directory lives OUTSIDE taskDir -- reachable only through
+      // the symlink below -- so this actually exercises "never descended
+      // into a symlinked dir," not just "a real subdirectory got walked."
+      const realDir = join(home, "elsewhere");
+      mkdirSync(realDir);
+      writeFileSync(join(realDir, "secret.txt"), "SECRET");
+      symlinkSync(realDir, join(taskDir, "dirlink"), "dir");
+
+      const h = setup();
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const contents = existsSync(dir)
+        ? readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8"))
+        : [];
+      expect(contents).not.toContain("SECRET");
+    });
+  });
+
+  // 7. Budgets: entries, bytes, and depth caps each bound the walk; shallow
+  // ordering means a top-level-only entry budget still captures every
+  // top-level file before any nested one.
+  describe("budgets", () => {
+    it("a tiny entries cap stops the walk: only entries up to the cap get processed", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES = "2";
+      const h = setup();
+      for (const n of ["a.txt", "b.txt", "c.txt", "d.txt"]) writeFileSync(join(taskDir, n), n);
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      expect(readdirSync(dir).length).toBe(2);
+    });
+
+    it("a tiny byte cap stops copying after the file that crosses it", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_BYTES = "5";
+      const h = setup();
+      writeFileSync(join(taskDir, "a.txt"), "AAAAAAAAAA"); // 10 bytes: alone over the 5-byte cap
+      writeFileSync(join(taskDir, "b.txt"), "BBBBBBBBBB");
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      // The first file's own bytes may overshoot the cap by up to one file
+      // (accepted, per design, over a second stat) -- but the walk must
+      // stop before a second file is copied.
+      const dir = ckptDir("default");
+      expect(readdirSync(dir).length).toBe(1);
+    });
+
+    it("a depth cap skips files below it", async () => {
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_DEPTH = "1";
+      const h = setup();
+      const nested = join(taskDir, "sub");
+      mkdirSync(nested);
+      writeFileSync(join(taskDir, "top.txt"), "TOP");
+      writeFileSync(join(nested, "deep.txt"), "DEEP");
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const contents = readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8"));
+      expect(contents).toContain("TOP");
+      expect(contents).not.toContain("DEEP");
+    });
+
+    it("shallow-first: a top-level-only entry budget still backs up every top-level file, never a nested one", async () => {
+      const nested = join(taskDir, "sub");
+      mkdirSync(nested);
+      writeFileSync(join(taskDir, "top1.txt"), "TOP1");
+      writeFileSync(join(taskDir, "top2.txt"), "TOP2");
+      writeFileSync(join(nested, "deep.txt"), "DEEP");
+      // Top level has exactly 3 dirents: top1.txt, top2.txt, sub/.
+      process.env.LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES = "3";
+
+      const h = setup();
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const contents = readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8"));
+      expect(contents.sort()).toEqual(["TOP1", "TOP2"]);
+    });
+  });
+
+  // 8. Skip-list and oversize passthrough.
+  describe("skip-list and oversize passthrough", () => {
+    it("never descends into a skip-listed directory (.git, node_modules, __pycache__, .venv, venv)", async () => {
+      const h = setup();
+      for (const skipped of [".git", "node_modules", "__pycache__", ".venv", "venv"]) {
+        const d = join(taskDir, skipped);
+        mkdirSync(d);
+        writeFileSync(join(d, "f.txt"), `INSIDE-${skipped}`);
+      }
+      writeFileSync(join(taskDir, "real.txt"), "REAL");
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const contents = readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8"));
+      expect(contents).toEqual(["REAL"]);
+    });
+
+    it("writes a .toolarge sentinel (no full copy) for an oversize file found by the walk", async () => {
+      const h = setup();
+      const big = join(taskDir, "big.bin");
+      writeFileSync(big, Buffer.alloc(MAX_BACKUP_BYTES + 1, 1));
+
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+
+      const dir = ckptDir("default");
+      const expectedSentinel = big.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".toolarge";
+      expect(readdirSync(dir)).toEqual([expectedSentinel]);
+    });
+  });
+
+  // 9. Full existing suite as regression: covered by the describe blocks
+  // above this one in the file, whose beforeEach now deletes
+  // LITTLE_CODER_BENCHMARK / LITTLE_CODER_SESSION_ID so an ambient var on a
+  // benchmark box can't flake them, and whose exact entry-count assertions
+  // (e.g. `readdirSync(dir).length` toBe(1)) are exactly why the
+  // `!== "gaia"` gate must keep the walk inert for every one of them.
 });

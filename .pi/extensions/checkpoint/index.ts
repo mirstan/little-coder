@@ -1,9 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import type { Dirent } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectDeliverableWrites } from "../_shared/shell-write.ts";
 import { normalizeWritePath } from "../write-guard/index.ts";
+import { envNumber } from "../_shared/env-number.ts";
+import { harnessIntervention } from "../_shared/intervention.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
 // or Edit tool modifies it. First-write-wins per session (don't re-backup
@@ -122,11 +125,16 @@ export function shellWriteTargets(
     .map((src) => join(dest, basename(src)));
 }
 
-function backupIfNeeded(sessionId: string, filePath: string): void {
-  if (!sessionId || !filePath) return;
+// Return value (added for the session-start walk's byte budget, below):
+// content bytes actually written on a real copy, `undefined` for a
+// sentinel/skip/already-tracked/failure. Additive -- the two existing
+// call sites (tool_call's write/edit and shell-write branches) still
+// call this as a bare statement and ignore it.
+function backupIfNeeded(sessionId: string, filePath: string): number | undefined {
+  if (!sessionId || !filePath) return undefined;
   let session = tracked.get(sessionId);
   if (!session) { session = new Set(); tracked.set(sessionId, session); }
-  if (session.has(filePath)) return;
+  if (session.has(filePath)) return undefined;
   try {
     let st;
     try {
@@ -136,18 +144,155 @@ function backupIfNeeded(sessionId: string, filePath: string): void {
         writeFileSync(join(checkpointDir(sessionId), safeName(filePath) + ".absent"), "");
         session.add(filePath);
       }
-      return; // any other stat failure: leave untracked so a later write can retry
+      return undefined; // any other stat failure: leave untracked so a later write can retry
     }
-    if (!st.isFile()) return; // directory/fifo/socket: skip, do NOT track
+    if (!st.isFile()) return undefined; // directory/fifo/socket: skip, do NOT track
     if (st.size > MAX_BACKUP_BYTES) {
       writeFileSync(join(checkpointDir(sessionId), safeName(filePath) + ".toolarge"), String(st.size));
       session.add(filePath); // tracked forever: never retry (a later smaller version is a mid-session intermediate, not the original)
-      return;
+      return undefined;
     }
-    writeFileSync(join(checkpointDir(sessionId), safeName(filePath)), readFileSync(filePath));
+    const content = readFileSync(filePath);
+    writeFileSync(join(checkpointDir(sessionId), safeName(filePath)), content);
     session.add(filePath); // only after the backup actually succeeded
+    return content.length;
   } catch {
     // best-effort; deliberately NOT tracked so a failed copy doesn't suppress a retry
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GAIA session-start snapshot
+//
+// gaia.py stages at most one attachment into a fresh host-side temp dir and
+// launches pi with `cwd` pointing there (gaia.py:138-172) -- the one
+// benchmark shape where this extension's own `fs` calls can see the task's
+// files before the model ever acts. Harbor/TB's task files live inside a
+// Docker container this host-side process has no path to; that case is
+// handled adapter-side instead (see the comment on the session_start
+// handler below).
+//
+// Budgets, re-derived for GAIA's actual task shape (0-1 files, flat at
+// session start): these are guardrails expected to never bind on a real
+// GAIA task -- they exist to bound the blast radius of a future adapter
+// change (a new allowlist entry, a staging change that unpacks archives, a
+// misconfigured cwd), not to ration a known-large tree.
+const SNAPSHOT_MAX_ENTRIES_ENV = "LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_ENTRIES";
+const SNAPSHOT_MAX_BYTES_ENV = "LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_BYTES";
+const SNAPSHOT_MAX_DEPTH_ENV = "LITTLE_CODER_CHECKPOINT_SNAPSHOT_MAX_DEPTH";
+
+const SNAPSHOT_MAX_ENTRIES = 500; // dirents processed (dirs included); <= 0 disables the walk
+const SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024; // cumulative content bytes copied
+const SNAPSHOT_MAX_DEPTH = 4; // levels below cwd (cwd's own entries = depth 1)
+
+// Everything on this list is regenerable, never an irreplaceable task
+// original -- same reasoning as the shell-write net's targets, just applied
+// to a whole-tree walk instead of a single detected write. Hardcoded, not
+// an env knob: unlike the numeric budgets above, there's no legitimate
+// reason an operator would want to re-include one of these.
+const SNAPSHOT_SKIP_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", "venv"]);
+
+// readdir dirents don't follow symlinks for their `d_type`-derived checks,
+// so `dirent.isDirectory()` alone already excludes symlinked directories
+// (they report `isSymbolicLink()` instead). The only real ambiguity is
+// DT_UNKNOWN (some filesystems/platforms never populate `d_type`), where
+// every `is*()` check comes back false -- one `lstatSync` settles it.
+// `lstat`, not `stat`, so a symlinked directory found this way is also
+// correctly seen as NOT a real directory to descend into; it falls through
+// to `backupIfNeeded` below instead, same as the `isSymbolicLink()` case.
+function isRealDir(dirent: Dirent, fullPath: string): boolean {
+  if (dirent.isSymbolicLink()) return false;
+  if (dirent.isDirectory()) return true;
+  if (dirent.isFile()) return false;
+  try {
+    return lstatSync(fullPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Session-start walk of `cwd`, backing up every pre-existing file via the
+ * same `backupIfNeeded` the per-write net uses -- same storage, same
+ * `tracked` first-write-wins map, so a later write/edit/shell redirect to a
+ * walked file is already tracked and the session-start original is what
+ * survives.
+ *
+ * Manual iterative BFS -- one `readdirSync(dir, { withFileTypes: true })`
+ * per directory -- never `readdirSync(dir, { recursive: true })`, which
+ * follows symlinked directory loops (confirmed empirically: a one-level
+ * cycle recursed 30+ levels before being killed). The queue is FIFO, so the
+ * walk is shallow-first: if a budget runs out mid-walk, top-of-tree files
+ * -- where task inputs live -- were captured first.
+ *
+ * Exported (rather than kept module-local) so tests can drive it directly
+ * as well as through the `session_start` handler.
+ */
+export function snapshotWorkingDirectory(sessionId: string, cwd: string | undefined, ctx: any): void {
+  if (!sessionId || !cwd) return; // best-effort: ctx.cwd is non-optional per pi's types, but never trust that here
+  try {
+    const maxEntries = envNumber(SNAPSHOT_MAX_ENTRIES_ENV, SNAPSHOT_MAX_ENTRIES);
+    if (maxEntries <= 0) return; // literal-0 (or negative) kill switch
+    const maxBytes = envNumber(SNAPSHOT_MAX_BYTES_ENV, SNAPSHOT_MAX_BYTES);
+    const maxDepth = envNumber(SNAPSHOT_MAX_DEPTH_ENV, SNAPSHOT_MAX_DEPTH);
+    // Never descend into our own backup store, however cwd happens to be set.
+    const excludeDir = resolve(join(homedir(), ".little-coder"));
+
+    let entries = 0;
+    let bytes = 0;
+    let truncated: "entries" | "bytes" | undefined;
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: resolve(cwd), depth: 1 }];
+
+    walk: while (queue.length > 0) {
+      const { dir, depth } = queue.shift()!;
+      let dirents: Dirent[];
+      try {
+        dirents = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue; // unreadable dir: best-effort, move on
+      }
+      for (const dirent of dirents) {
+        if (entries >= maxEntries) { truncated = "entries"; break walk; }
+        entries++;
+        const full = join(dir, dirent.name);
+        if (full === excludeDir) continue; // never snapshot our own backup store
+
+        if (isRealDir(dirent, full)) {
+          if (SNAPSHOT_SKIP_DIRS.has(dirent.name)) continue;
+          if (depth < maxDepth) queue.push({ dir: full, depth: depth + 1 });
+          continue;
+        }
+
+        // File, file symlink, or dir symlink: backupIfNeeded's own statSync
+        // follows a symlink and only copies a real file (`isFile()`), so a
+        // dir symlink is skipped untracked and a broken link throws into
+        // its own catch -- no separate type logic needed here.
+        if (bytes >= maxBytes) { truncated = "bytes"; break walk; }
+        const written = backupIfNeeded(sessionId, full);
+        if (written) bytes += written;
+      }
+    }
+
+    // Budget exhaustion is visible, not silent; a complete walk stays quiet.
+    // Guarded on `ctx?.ui` (Fix 2): pi's ExtensionContext declares `ui`
+    // non-optional and gaia.py does forward notifications in practice, but
+    // an uncaught throw here would be a session-killing failure mode for a
+    // best-effort feature, and this runs under RPC mode -- the least-
+    // typical ctx shape. The outer try/catch is the last line of defense
+    // regardless.
+    if (truncated && ctx?.ui) {
+      const reason =
+        truncated === "entries"
+          ? `entry budget reached at ${maxEntries}`
+          : `byte budget reached at ${maxBytes}`;
+      harnessIntervention(
+        ctx,
+        `session-start snapshot of the task directory is partial (${reason}) -- files not yet walked have no pre-run backup.`,
+      );
+    }
+  } catch {
+    // best-effort, like every other checkpoint path -- never throw out of session_start
   }
 }
 
@@ -155,7 +300,33 @@ export default function (pi: ExtensionAPI) {
   let currentSessionId = "default";
 
   pi.on("session_start", async (_event, ctx) => {
-    currentSessionId = ctx.sessionManager.getSessionFile()?.split("/").pop() ?? "default";
+    // `||`, not `??`: an ambient *empty-string* LITTLE_CODER_SESSION_ID (a
+    // wrapper script that exports the var without a value) must fall
+    // through here, not become "" and silently disable every backup for
+    // the session via backupIfNeeded's own `if (!sessionId || ...) return;`
+    // guard. `||` matches the existing convention (evidence/index.ts,
+    // browser/index.ts, shell-session/index.ts all key on
+    // `LITTLE_CODER_SESSION_ID || "default"`) -- this conforms checkpoint
+    // to a pattern three sibling extensions already follow, rather than
+    // inventing a new one. rpc_client.py exports this var for every
+    // benchmark caller that passes session_id (GAIA and Harbor both do),
+    // so this also un-collides every benchmark's checkpoint namespace, not
+    // just GAIA's -- interactive pi (no env var) keeps today's
+    // derived-from-file behavior.
+    currentSessionId =
+      process.env.LITTLE_CODER_SESSION_ID
+      || ctx.sessionManager.getSessionFile()?.split("/").pop()
+      || "default";
+
+    // GAIA-only allowlist, not a truthy gate -- mirrors
+    // gaia-finalize-guard's identical `!== "gaia"` early return.
+    // benchmark="terminal_bench" runs with a *host-side* cwd (wherever the
+    // harness was launched from, typically the little-coder repo root), so
+    // a truthy gate here would walk and snapshot the repo itself. An
+    // interactive session never sets this var, so a developer's real repo
+    // is never walked.
+    if (process.env.LITTLE_CODER_BENCHMARK !== "gaia") return;
+    snapshotWorkingDirectory(currentSessionId, ctx?.cwd, ctx);
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -201,7 +372,14 @@ export default function (pi: ExtensionAPI) {
     //   program's own internal file writes (e.g. a Python/C script's
     //   `open(path).write(...)`). This closes the shell-command-shaped gap,
     //   not a general backstop against every way a subprocess can modify a
-    //   file.
+    //   file. On GAIA, `snapshotWorkingDirectory`'s session-start walk
+    //   (below) closes this specific gap by capturing the task's
+    //   pre-existing files before the model ever acts, independent of
+    //   shell-syntax detection entirely. On Harbor/Terminal-Bench this
+    //   extension can't see the gap at all -- the task runs inside a
+    //   Docker container this host-side process has no filesystem path to
+    //   -- so that case is handled adapter-side instead, in
+    //   benchmarks/harbor_adapter/little_coder_agent.py.
     // - Commands that destroy a file without *writing* one are out of scope:
     //   `rm`, `truncate`, `patch`, `tar -x`, `git checkout --`, `sort -o`.
     //   detectDeliverableWrites answers "did this produce a deliverable",
