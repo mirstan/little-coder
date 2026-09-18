@@ -313,13 +313,27 @@ function maybeFireTriggerA(
   if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   const minutesLeft = Math.max(0, Math.round(remainingMs / 60000));
+  // Deliberately asks for more than "does the required file exist": a
+  // present, well-formed file can still have wrong content, and correct
+  // content can still fail grading if something extra was left behind that
+  // wasn't asked for. (1)/(2)/(3) below map to those two failure modes plus
+  // resolving self-noticed ambiguity literally rather than by guessing at
+  // grader intent. "use ShellSession" stays explicit: this fires on a
+  // toolless text turn, so a nudge answerable with another toolless text
+  // turn would just burn the second fire on the same pattern.
   const msg =
     `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
     "remain and this task is graded by inspecting the container's files/state " +
     "afterward — not this chat. Re-read the task instructions above and use " +
-    "ShellSession to verify every required file/state exists exactly as specified. " +
-    "If everything is verified in place, say so explicitly and stop. Otherwise, keep " +
-    "working — you have plenty of time; do not give up early.";
+    "ShellSession to re-check your work — not just that the required files exist: " +
+    "(1) spot-check that the actual content/result is correct, by an independent " +
+    "method where possible, not by re-reading what you already produced; " +
+    "(2) check that you haven't left behind anything the task didn't ask for " +
+    "(extra files, leftover scaffolding, intermediate outputs) — a strict grader " +
+    "can fail on extras; (3) if you were ever unsure what's expected, resolve it " +
+    "by the most literal reading of the task text. If this recheck passes, say so " +
+    "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
+    "do not give up early.";
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });
@@ -331,7 +345,7 @@ function maybeFireTriggerA(
   triggerAFireCount++;
   harnessIntervention(
     ctx,
-    `turn ended without a tool call (or errored with empty content) with ~${minutesLeft}m ` +
+    `turn ended without a tool call with ~${minutesLeft}m ` +
       "left on the wall-clock budget — telling the model not to give up early.",
   );
   return true;
