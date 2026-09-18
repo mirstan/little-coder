@@ -44,11 +44,12 @@ import {
 // turn regardless of whether the model keeps calling tools -- unlike
 // deliverAs:"followUp", which only delivers once the model produces a turn
 // with no tool calls, and so can starve forever against a model that never
-// goes idle. A steer queued at turn 39 reaches the model at turn 40, absent a
-// competing steer queued the same turn (the default one-at-a-time drain
-// delivers one message per turn boundary, so a competitor can push it to
-// 41) -- either way, well inside the WARN_REMAINING headroom before the cap
-// aborts the run.
+// goes idle. A steer queued at turn 39 normally reaches the model at turn
+// 40, but the steering queue is shared and drains one message per turn
+// boundary (its default "one-at-a-time" mode), so any other extension's
+// steer already queued at turn 39 delays this one by a further turn per
+// competitor. See tb-finalize-guard's Trigger B comment for the resulting,
+// accepted risk to its compliance window.
 
 // WARN_REMAINING / WARN_REMAINING_MS and the trigger condition itself now
 // live in _shared/finalize-warn-trigger.ts — see that module's header for
@@ -60,11 +61,13 @@ let turnsThisRun = 0;
 let capForRun = 0;
 let deadlineForRun = 0;
 let warnedThisRun = false;
+let dueThisRun = false;
 
 export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     turnsThisRun = 0;
     warnedThisRun = false;
+    dueThisRun = false;
     capForRun = resolveTurnCap(event);
     deadlineForRun = resolveDeadlineEpochMs(event);
   });
@@ -73,7 +76,15 @@ export default function (pi: ExtensionAPI) {
     turnsThisRun++;
     if (warnedThisRun) return;
 
-    if (!finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) return;
+    // Once due, keep retrying every turn until delivery succeeds -- the
+    // turn-count trigger below is only true on one exact turn, so without
+    // this a single throw would lose the warning for the rest of the run
+    // (the same starvation shape this file exists to fix, just from a send
+    // failure instead of followUp's queueing semantics).
+    if (!dueThisRun) {
+      if (!finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) return;
+      dueThisRun = true;
+    }
 
     // Re-derive which of the two triggers fired, purely for message wording
     // (finalizeWarnWouldFire only reports whether — not which).
@@ -83,18 +94,20 @@ export default function (pi: ExtensionAPI) {
     const remainingMs = deadlineForRun > 0 ? deadlineForRun - Date.now() : Infinity;
     const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
 
-    warnedThisRun = true;
     const msg = resolveFinalizeMessage(process.env.LITTLE_CODER_BENCHMARK);
+    try {
+      pi.sendUserMessage(msg, { deliverAs: "steer" });
+    } catch {
+      // SDK without sendUserMessage -- dueThisRun stays true, so the next
+      // turn_start retries instead of silently dropping the warning.
+      return;
+    }
+    warnedThisRun = true;
     harnessIntervention(
       ctx,
       timeTrigger && !turnTrigger
         ? `~${Math.max(0, Math.round(remainingMs / 1000))}s left on the wall-clock budget — telling the model to finalize its answer now.`
         : `${WARN_REMAINING} turns left — telling the model to finalize its answer now.`,
     );
-    try {
-      pi.sendUserMessage(msg, { deliverAs: "steer" });
-    } catch {
-      // SDK without sendUserMessage — silently no-op rather than break the run
-    }
   });
 }

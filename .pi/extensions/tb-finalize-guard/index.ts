@@ -51,14 +51,20 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 // state, via the shared `finalizeWarnWouldFire` in
 // _shared/finalize-warn-trigger.ts.
 //
-// finalize-warn's message is delivered as deliverAs:"steer", which lands on
-// the model's next turn (occasionally one turn later still, if another
-// extension's steer is queued the same turn — see finalize-warn/index.ts's
-// own comment), not the turn during which the trigger fired. So "armed" here
-// also tracks the turn number at which arming happened, and compliance is
-// judged starting from the turn AFTER that one — the model can't be faulted
-// for not complying with a message it hasn't seen yet. The 2-turn window
-// below already absorbs that occasional one-turn slip.
+// finalize-warn's message is delivered as deliverAs:"steer", which normally
+// lands on the model's next turn, not the turn during which the trigger
+// fired. So "armed" here also tracks the turn number at which arming
+// happened, and compliance is judged starting from the turn AFTER that one.
+//
+// Known, accepted gap: if another extension's steer is queued the same turn
+// as finalize-warn's, delivery slips a turn (see finalize-warn/index.ts's
+// own comment) and this window starts judging compliance one turn before
+// the model has actually seen the message -- Trigger B can then fire after
+// only one turn of real exposure instead of two. Left as-is rather than
+// widening the window: the consequence is an extra "write it now" nudge
+// firing a turn earlier than ideal in an already-rare case, not a missed
+// catch, and widening would loosen the tuned 2-turn window for every run
+// that doesn't hit the slip.
 //
 // Compliance is judged via _shared/shell-write.ts's `detectDeliverableWrites`
 // — a tb-finalize-guard-only superset of `detectWriteTargets` that also
