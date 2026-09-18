@@ -1,12 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Dirent } from "node:fs";
 import { lstatSync, mkdirSync, opendirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { SHELL_TOOLS, detectDeliverableWrites } from "../_shared/shell-write.ts";
 import { normalizeWritePath } from "../write-guard/index.ts";
 import { envNumber } from "../_shared/env-number.ts";
 import { harnessIntervention, type InterventionCtx } from "../_shared/intervention.ts";
+import { DEFAULT_HEAVY_DIRS } from "../extra-tools/glob.ts";
 
 // Port of checkpoint/hooks.py. Snapshots a file's contents before a Write
 // or Edit tool modifies it. First-write-wins per session (don't re-backup
@@ -37,8 +39,17 @@ function checkpointDir(sessionId: string): string {
   return dir;
 }
 
+// A short hash of the full path, not just the flattened+truncated tail,
+// disambiguates two different paths that happen to share their last 200
+// (post-flattening) characters -- e.g. two files at the same depth under
+// differently-named long parent directories. Without it the second such
+// backup silently overwrites the first's bytes on disk: a real, if narrow,
+// risk once a single walk can touch hundreds of files in one pass, rather
+// than the one-or-two files a normal write/edit session ever backs up.
 function safeName(filePath: string): string {
-  return filePath.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200);
+  const hash = createHash("sha1").update(filePath).digest("hex").slice(0, 8);
+  const flat = filePath.replace(/[^A-Za-z0-9._-]/g, "_").slice(-190);
+  return `${flat}.${hash}`;
 }
 
 // Local to checkpoint: the shell expands `~/` itself and writes bare-absolute
@@ -186,12 +197,15 @@ const SNAPSHOT_MAX_ENTRIES = 500; // dirents processed (dirs included); <= 0 dis
 const SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024; // cumulative content bytes copied
 const SNAPSHOT_MAX_DEPTH = 4; // levels below cwd (cwd's own entries = depth 1)
 
-// Everything on this list is regenerable, never an irreplaceable task
-// original -- same reasoning as the shell-write net's targets, just applied
-// to a whole-tree walk instead of a single detected write. Hardcoded, not
-// an env knob: unlike the numeric budgets above, there's no legitimate
-// reason an operator would want to re-include one of these.
-const SNAPSHOT_SKIP_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", "venv"]);
+// Reuses extra-tools/glob.ts's own heavy-dir list rather than growing a
+// second, narrower one that only some future edit remembers to keep in
+// sync -- the exact "two lists drift apart" risk this file's own
+// SHELL_TOOLS comment already warns about for a different set. Everything
+// on that list is regenerable or a macOS/system directory that would never
+// legitimately be a task's own reference input, so treating it the same
+// way here (never an irreplaceable original) is consistent with its
+// existing rationale, not a new one.
+const SNAPSHOT_SKIP_DIRS = DEFAULT_HEAVY_DIRS;
 
 // readdir dirents don't follow symlinks for their `d_type`-derived checks,
 // so `dirent.isDirectory()` alone already excludes symlinked directories
@@ -219,12 +233,12 @@ function isRealDir(dirent: Dirent, fullPath: string): boolean {
  * walked file is already tracked and the session-start original is what
  * survives.
  *
- * Manual iterative BFS -- one `readdirSync(dir, { withFileTypes: true })`
- * per directory -- never `readdirSync(dir, { recursive: true })`, which
- * follows symlinked directory loops (confirmed empirically: a one-level
- * cycle recursed 30+ levels before being killed). The queue is FIFO, so the
- * walk is shallow-first: if a budget runs out mid-walk, top-of-tree files
- * -- where task inputs live -- were captured first.
+ * Manual iterative BFS -- one `opendirSync`/`readSync` stream per directory
+ * -- never `readdirSync(dir, { recursive: true })`, which follows
+ * symlinked directory loops (confirmed empirically: a one-level cycle
+ * recursed 30+ levels before being killed). The queue is FIFO, so the walk
+ * is shallow-first: if a budget runs out mid-walk, top-of-tree files --
+ * where task inputs live -- were captured first.
  *
  * Exported (rather than kept module-local) so tests can drive it directly
  * as well as through the `session_start` handler.
@@ -267,6 +281,12 @@ export function snapshotWorkingDirectory(
         let dirent: Dirent | null;
         while ((dirent = handle.readSync()) !== null) {
           if (entries >= maxEntries) { truncated = "entries"; break walk; }
+          // Checked here, unconditionally, rather than only once a file
+          // dirent turns up: once the byte budget is spent nothing more
+          // will ever be copied, so there's no reason to keep dequeuing
+          // and reading further directories just to discover more files
+          // that would immediately be skipped anyway.
+          if (bytes >= maxBytes) { truncated = "bytes"; break walk; }
           entries++;
           const full = join(dir, dirent.name);
           if (full === excludeDir) continue; // never snapshot our own backup store
@@ -281,7 +301,6 @@ export function snapshotWorkingDirectory(
           // follows a symlink and only copies a real file (`isFile()`), so a
           // dir symlink is skipped untracked and a broken link throws into
           // its own catch -- no separate type logic needed here.
-          if (bytes >= maxBytes) { truncated = "bytes"; break walk; }
           const written = backupIfNeeded(sessionId, full);
           if (written) bytes += written;
         }
@@ -329,10 +348,20 @@ export default function (pi: ExtensionAPI) {
     // so this also un-collides every benchmark's checkpoint namespace, not
     // just GAIA's -- interactive pi (no env var) keeps today's
     // derived-from-file behavior.
-    currentSessionId =
+    // Scrubbed with the same char class safeName uses for backup filenames:
+    // a value containing `/` or `..` used raw here would let checkpointDir's
+    // join() resolve outside ~/.little-coder/checkpoints/ entirely. Not
+    // reachable by an attacker today (every setter of this env var is the
+    // harness itself), but a misconfigured wrapper or future caller
+    // shouldn't be able to silently redirect or disable the whole backup
+    // net -- replacing `/` leaves no real separator for a later join() to
+    // walk, turning any such value into one inert, harmless segment name
+    // instead of a path.
+    currentSessionId = (
       process.env.LITTLE_CODER_SESSION_ID
       || ctx.sessionManager.getSessionFile()?.split("/").pop()
-      || "default";
+      || "default"
+    ).replace(/[^A-Za-z0-9._-]/g, "_");
 
     // GAIA-only allowlist, not a truthy gate -- mirrors
     // gaia-finalize-guard's identical `!== "gaia"` early return.

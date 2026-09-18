@@ -11,6 +11,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import setupCheckpoint, {
   checkpointPath,
@@ -18,6 +19,15 @@ import setupCheckpoint, {
   MAX_BACKUP_BYTES,
   snapshotWorkingDirectory,
 } from "./index.ts";
+
+// Mirrors safeName's own algorithm exactly, so a test can predict the
+// backup filename a given absolute path produces without importing an
+// unexported function.
+function expectedSafeName(filePath: string): string {
+  const hash = createHash("sha1").update(filePath).digest("hex").slice(0, 8);
+  const flat = filePath.replace(/[^A-Za-z0-9._-]/g, "_").slice(-190);
+  return `${flat}.${hash}`;
+}
 
 describe("checkpointPath", () => {
   it("reads the `path` key (current pi write/edit)", () => {
@@ -272,7 +282,7 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     // `.absent` sentinel — its name encodes the actual key used. If the
     // shell branch wrongly cwd-joined a bare-absolute path (write-guard's
     // rule), the sentinel would instead encode `<cwd>/nonexistent-...md`.
-    const expectedSentinel = literal.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".absent";
+    const expectedSentinel = expectedSafeName(literal) + ".absent";
     expect(files).toEqual([expectedSentinel]);
   });
 
@@ -502,7 +512,7 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
     await h.tool_call({ toolName: "bash", input: { command: `echo x > ${file}` } }, { cwd: home });
 
     const dir = ckptDir("sess-u8.json");
-    const expectedSentinel = file.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".toolarge";
+    const expectedSentinel = expectedSafeName(file) + ".toolarge";
     let files = readdirSync(dir);
     expect(files).toEqual([expectedSentinel]);
     expect(readFileSync(join(dir, expectedSentinel), "utf8")).toBe(String(MAX_BACKUP_BYTES + 1));
@@ -547,7 +557,7 @@ describe("checkpoint hardening — keying, oversize/unreadable/dir safety, Shell
         await h.tool_call({ toolName: "bash", input: { command: `echo x > ${file}` } }, { cwd: home });
 
         const dir = ckptDir("sess-u10.json");
-        const expectedName = file.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200);
+        const expectedName = expectedSafeName(file);
         expect(existsSync(join(dir, expectedName))).toBe(false);
 
         chmodSync(file, 0o644);
@@ -784,6 +794,21 @@ describe("checkpoint session-start snapshot", () => {
       // silently disable every backup for the session.
       expect(existsSync(ckptDir("sess-555.json"))).toBe(true);
     });
+
+    it("scrubs a path-traversal-shaped LITTLE_CODER_SESSION_ID instead of using it raw as a directory segment", async () => {
+      process.env.LITTLE_CODER_SESSION_ID = "../../etc/evil";
+      const h = setup();
+      writeFileSync(join(taskDir, "f.txt"), "ORIG");
+      await h.session_start(
+        {},
+        { sessionManager: { getSessionFile: () => undefined }, cwd: taskDir, ui: { notify: vi.fn() } },
+      );
+      // The malicious value becomes one inert, flattened segment name
+      // inside checkpoints/, rather than the two ".." components walking
+      // back out to home/etc/evil the way a raw, unsanitized join() would.
+      expect(existsSync(join(home, ".little-coder", "checkpoints", ".._.._etc_evil"))).toBe(true);
+      expect(existsSync(join(home, "etc", "evil"))).toBe(false);
+    });
   });
 
   // 5. ui guard (Fix 2): a ctx lacking `ui` must never throw; when `ui` is
@@ -1004,7 +1029,7 @@ describe("checkpoint session-start snapshot", () => {
       );
 
       const dir = ckptDir("default");
-      const expectedSentinel = big.replace(/[^A-Za-z0-9._-]/g, "_").slice(-200) + ".toolarge";
+      const expectedSentinel = expectedSafeName(big) + ".toolarge";
       expect(readdirSync(dir)).toEqual([expectedSentinel]);
     });
   });
