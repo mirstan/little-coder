@@ -143,11 +143,11 @@ SNAPSHOT_LEAD_SEC = 600.0
 SNAPSHOT_MIN_BUDGET_SEC = 300.0
 SNAPSHOT_START_MARKER = "/tmp/.lc-start"
 SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-snapshot"
-# Stage dirs are "<prefix>.$$" and the cleanup glob is "<prefix>.*", both
-# derived from one prefix so a command can never create a stage dir under a
-# name its own cleanup line doesn't reap.
+# Stage dirs are "<prefix>.$$" and the cleanup glob is "<prefix>.*" --
+# _build_snapshot_command derives both from this one prefix, so a command
+# can never create a stage dir under a name its own cleanup line doesn't
+# reap.
 SNAPSHOT_STAGE_PREFIX = "/tmp/.lc-snapshot.stage"
-SNAPSHOT_STAGE_GLOB = f"{SNAPSHOT_STAGE_PREFIX}.*"
 # Feeds `head -z -n` below, and is the threshold that tells a complete
 # snapshot from one truncated at the cap.
 SNAPSHOT_MAX_FILES = 500
@@ -294,7 +294,16 @@ _INITIAL_SNAPSHOT_COUNT_PROBE = (
 # three-way outcome logging in _classify_initial_snapshot; a bare "succeeded"
 # would be a lie on two of those paths.
 _INITIAL_SNAPSHOT_COMMAND = (
-    _build_snapshot_command(
+    # Unconditional cleanup of the publish path itself before staging even
+    # starts -- outside the shared template (which only clears it on its
+    # own success path), so a refusal always finds nothing there and the
+    # probe below correctly reports 0 files, not whatever a previous
+    # invocation happened to leave behind. Not expected to ever matter in
+    # practice (a fresh container has nothing at this path the first time
+    # this command ever runs), but "nothing at this path" should not be
+    # allowed to depend on that assumption holding.
+    f"rm -rf {INITIAL_SNAPSHOT_PUBLISH_PATH} ; "
+    + _build_snapshot_command(
         scope_comment="candidate list: every file under /app at trial start, per-file <10M",
         find_predicate="",
         publish_path=INITIAL_SNAPSHOT_PUBLISH_PATH,
@@ -422,16 +431,22 @@ def _classify_initial_snapshot(rc: int | None, file_count: int | None) -> _Initi
     per-file -size -10M drop files with no observable trace, so even a
     "succeeded" snapshot can be missing a large or deeply-nested original;
     anything pointing the model at this copy has to say so.
+
+    rc is accepted and logged for visibility only, never branched on: the
+    wrapped command's own last statement is always its trailing cleanup
+    `rm`, which exits 0 whether staging succeeded, refused, or crashed
+    partway through, so the sentinel _wrap_command captures can never
+    actually distinguish those cases. The same is true of the pre-existing
+    deadline snapshot's rc, just never load-bearing there since it only
+    feeds a log message. A genuine crash before the probe's own printf
+    ever ran is instead caught below, correctly, by the probe line simply
+    never arriving.
     """
-    if rc != 0:
-        return _InitialSnapshotOutcome(
-            "failed", False, f"failed -- stage command rc={rc}; skipping download"
-        )
     if file_count is None:
         return _InitialSnapshotOutcome(
             "failed",
             False,
-            "failed -- stage command reported no file count; skipping download",
+            f"failed -- stage command reported no file count (rc={rc}); skipping download",
         )
     if file_count == 0:
         return _InitialSnapshotOutcome(

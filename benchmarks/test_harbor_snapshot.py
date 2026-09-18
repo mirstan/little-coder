@@ -257,6 +257,18 @@ def test_initial_instantiation_publishes_to_its_own_path():
     assert lca.SNAPSHOT_PUBLISH_PATH not in cmd
 
 
+def test_initial_instantiation_clears_its_publish_path_before_staging():
+    """A refused or crashed run must never let the probe count stale content
+    left at the publish path by an earlier invocation -- that would make a
+    refusal look identical to a real success. The clear has to be its own
+    statement outside the shared template, since that template only clears
+    the publish path on its own success branch."""
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    clear_idx = cmd.index(f"rm -rf {lca.INITIAL_SNAPSHOT_PUBLISH_PATH} ;")
+    stage_idx = cmd.index(f"STAGE={lca.INITIAL_SNAPSHOT_STAGE_PREFIX}")
+    assert clear_idx < stage_idx
+
+
 def test_initial_instantiation_stages_and_cleans_up_under_its_own_prefix():
     """Parameterizing the stage prefix without its cleanup glob leaks one
     stage dir per timeout kill under a name nothing reaps; reusing the
@@ -323,8 +335,15 @@ def test_composed_initial_snapshot_command_parses_under_sh_n(shell, cwd):
         (0, 0, "refused", False),
         # No probe line at all -- not the same as zero files.
         (0, None, "failed", False),
-        (2, 3, "failed", False),
         (None, None, "failed", False),
+        # rc is deliberately NOT branched on (see the function's own
+        # docstring): the wrapped command's last statement is always its
+        # trailing cleanup `rm`, which exits 0 regardless of what the
+        # staging step itself did, so a nonzero rc here carries no signal.
+        # A real file count -- meaning the probe's own printf did run --
+        # takes precedence over whatever rc claims.
+        (2, 3, "succeeded", True),
+        (1, 0, "refused", False),
     ],
 )
 def test_classify_initial_snapshot(rc, file_count, outcome, download):
@@ -460,10 +479,11 @@ def test_initial_snapshot_keeps_the_container_side_copy(tmp_path):
         line for line in env.commands[0].splitlines()
         if f"rm -rf {lca.INITIAL_SNAPSHOT_PUBLISH_PATH} " in line
     ]
-    # The one rm of the published path is the atomic publish's own pre-clean,
-    # on the same line as the mv that immediately replaces it.
-    assert len(publish_rms) == 1
-    assert f'mv "$STAGE" {lca.INITIAL_SNAPSHOT_PUBLISH_PATH}' in publish_rms[0]
+    # Two: the unconditional pre-stage clear (this run's own leftover-content
+    # guard), and the atomic publish's own pre-clean on the same line as the
+    # mv that immediately replaces it. Neither is a post-download cleanup.
+    assert len(publish_rms) == 2
+    assert any(f'mv "$STAGE" {lca.INITIAL_SNAPSHOT_PUBLISH_PATH}' in line for line in publish_rms)
 
 
 def test_initial_snapshot_refused_skips_the_download(tmp_path, caplog):
@@ -487,16 +507,30 @@ def test_initial_snapshot_partial_still_downloads_and_says_so(tmp_path, caplog):
     assert any("partial" in r.message for r in caplog.records)
 
 
-def test_initial_snapshot_nonzero_rc_skips_the_download(tmp_path, caplog):
-    """A stage command that didn't complete says nothing reliable about what
-    is at the publish path, so a file count reported alongside a bad rc must
-    not be trusted into a download."""
+def test_initial_snapshot_ignores_rc_when_a_real_file_count_is_present(tmp_path, caplog):
+    """rc is never trustworthy here (see _classify_initial_snapshot's own
+    docstring: the wrapped command's last statement is always its harmless
+    trailing cleanup, so rc is ~0 regardless of what staging actually did).
+    A real, parsed file count -- meaning the probe's own printf genuinely
+    ran -- must win over whatever rc claims, not be second-guessed by it."""
     env = _InitialSnapshotEnv(file_count=3, return_code=2)
     with caplog.at_level(logging.INFO):
         _run_initial_snapshot(env, tmp_path)
 
+    assert len(env.downloads) == 1
+    assert any("succeeded" in r.message for r in caplog.records)
+
+
+def test_initial_snapshot_no_probe_line_fails_regardless_of_rc(tmp_path, caplog):
+    """The one genuine failure signal: the probe's own printf never ran at
+    all, so there is no file count to trust -- rc is logged for visibility
+    only, never branched on."""
+    env = _InitialSnapshotEnv(file_count=None, return_code=0)
+    with caplog.at_level(logging.INFO):
+        _run_initial_snapshot(env, tmp_path)
+
     assert env.downloads == []
-    assert any("rc=2" in r.message for r in caplog.records)
+    assert any("failed" in r.message and "rc=0" in r.message for r in caplog.records)
 
 
 def test_initial_snapshot_download_failure_is_non_fatal(tmp_path):
