@@ -1,5 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { assessResponse, buildCorrectionMessage, phraseForUser, type ToolCall } from "./quality.ts";
+import {
+  assessResponse,
+  buildBlockedCallEscalationMessage,
+  buildCorrectionMessage,
+  BLOCKED_CALL_REASON,
+  phraseForUser,
+  sameCall,
+  type ToolCall,
+} from "./quality.ts";
 import { harnessIntervention } from "../_shared/intervention.ts";
 
 // Port of local/quality.py. Hooks turn_end, inspects the assistant message
@@ -13,9 +21,17 @@ let previousToolCalls: ToolCall[] = [];
 let consecutiveFailures = 0;
 // Tier-2 escalation state. Like previousToolCalls/consecutiveFailures these
 // survive a mid-task compaction on purpose: compaction fires `session_compact`
-// in place, not `session_start`, and the loop being broken outlives it.
+// in place, not `session_start`, and the loop being broken outlives it. They
+// do NOT survive a genuine new prompt in the same session — see the `input`
+// handler below — since a fresh task shouldn't inherit a block or a failure
+// streak from whatever the previous one left behind.
 let blockedCall: ToolCall | null = null;
 let tier2Notified = false;
+// This turn's tool_call events, in pi's validated (schema-coerced) space —
+// see the tool_call handler's comment on why blockedCall is armed from this,
+// not from turn_end's raw content-block extraction. Cleared once turn_end
+// consumes it for the turn that just ended.
+let turnValidatedCalls: ToolCall[] = [];
 // Past this many consecutive failures, tier 1's plain correction has visibly
 // failed and turn_end escalates instead (it used to go silent for the rest of
 // the trial — a real run then looped for 334 more turns unopposed).
@@ -35,30 +51,47 @@ export default function (pi: ExtensionAPI) {
     consecutiveFailures = 0;
     blockedCall = null;
     tier2Notified = false;
+    turnValidatedCalls = [];
+  });
+
+  // A genuinely new prompt in the same session is a fresh task, not a
+  // continuation of whatever failure streak the previous one left behind —
+  // without this, a block or streak from task A would carry into task B.
+  // Mirrors thinking-budget's own input handler and its filter: our OWN
+  // steer messages above ALSO route through prompt() and fire this event
+  // with source "extension" — without excluding that, the escalation steer
+  // we just sent would immediately wipe the state it exists to protect.
+  // `streamingBehavior` catches what `source` alone can't: it's set only
+  // when the user types while the agent is mid-turn (a steer of the CURRENT
+  // task), which also isn't a new task.
+  pi.on("input", async (event) => {
+    if ((event as any)?.source === "extension" || (event as any)?.streamingBehavior !== undefined) {
+      return;
+    }
+    previousToolCalls = [];
+    consecutiveFailures = 0;
+    blockedCall = null;
+    tier2Notified = false;
+    turnValidatedCalls = [];
   });
 
   // Tier 2 for a repeat loop: reject the looping call outright. pi delivers a
   // `{block, reason}` result to the model as a tool error in the same turn, so
   // breaking the loop doesn't depend on the model heeding steered text. No
   // unblock path is needed — any difference in the input stops matching.
-  //
-  // Known gap: `event.input` is schema-validated (coerced), while blockedCall
-  // came from the raw content-block arguments turn_end reads. Coercion is the
-  // identity for string fields, so shell-command repeats — the loop shape this
-  // targets — match; a repeat on a tool with a coercible numeric arg would not.
   pi.on("tool_call", async (event) => {
-    if (!blockedCall) return;
-    const name = (event as any).toolName;
-    // ToolCallEvent carries only `input`; there is no `args`/`arguments` form.
-    const input = (event as any).input;
-    if (name === blockedCall.name && JSON.stringify(input) === JSON.stringify(blockedCall.input)) {
-      return {
-        block: true,
-        reason:
-          "This exact tool call is blocked -- it's a verbatim repeat of a call " +
-          "already flagged as looping, with nothing else changing in between. " +
-          "Take a materially different action.",
-      };
+    // ToolCallEvent carries only `toolName`/`input`, both properly typed on
+    // every member of the union -- no `args`/`arguments` form, no cast
+    // needed. `input` IS pi's validated (schema-coerced) space, which is why
+    // turn_end records this same array to arm blockedCall from, rather than
+    // its own raw content-block extraction -- a numeric arg submitted as a
+    // string coerces here but not there, and comparing across the two spaces
+    // would silently never match.
+    const call: ToolCall = { name: event.toolName, input: event.input };
+    turnValidatedCalls.push(call);
+
+    if (blockedCall && sameCall(call, blockedCall)) {
+      return { block: true, reason: BLOCKED_CALL_REASON };
     }
   });
 
@@ -108,8 +141,13 @@ export default function (pi: ExtensionAPI) {
 
     const verdict = assessResponse(text, currentCalls, previousToolCalls, knownTools);
 
-    // Update rolling state for next turn regardless of verdict.
+    // Update rolling state for next turn regardless of verdict. This turn's
+    // tool_call events were recorded (in validated space) as they happened;
+    // consume that array for this turn's escalation, then clear it so it
+    // can't leak into the next turn's.
     previousToolCalls = currentCalls;
+    const thisTurnValidatedCalls = turnValidatedCalls;
+    turnValidatedCalls = [];
 
     if (verdict.ok) {
       consecutiveFailures = 0;
@@ -120,31 +158,44 @@ export default function (pi: ExtensionAPI) {
 
     consecutiveFailures++;
     if (consecutiveFailures > MAX_CONSECUTIVE_CORRECTIONS) {
-      // Escalate once per streak; re-sending the same escalation every turn is
-      // the "keep sending what already didn't work" failure this replaced.
-      if (tier2Notified) return;
       // assessResponse names the exact offending call itself (its own
       // envChanged-aware match, not re-run independently here) — a multi-call
       // turn can have an earlier call that matches the previous turn but was
       // exempted (issue #81), so re-deriving this separately, without that
-      // exemption, could name the wrong one.
+      // exemption, could name the wrong one. Re-armed on every repeated_tool_
+      // call verdict for as long as the streak continues, even after the
+      // one-time notification below has already fired: if the model can't
+      // retry the now-blocked call and starts looping on a DIFFERENT one
+      // instead, that's still one continuous failure streak, and the block
+      // needs to follow whichever call is looping right now, not freeze on
+      // the first one.
       const offending = verdict.reason === "repeated_tool_call" ? verdict.offendingCall : undefined;
+      if (offending) {
+        // Arm from the validated-space recording of this same call, not the
+        // raw offending object itself, so the tool_call handler's comparison
+        // (also validated-space) can actually match it next time. Falls back
+        // to the raw value if this turn's tool_call events weren't recorded
+        // for some reason (defensive; should always be found in practice).
+        const validated = thisTurnValidatedCalls.find((c) => c.name === offending.name);
+        blockedCall = validated ?? offending;
+      }
+
+      // Escalate (the message) once per streak; re-sending the same text
+      // every turn is the "keep sending what already didn't work" failure
+      // this replaced. The block above, unlike the message, is not gated on
+      // this — see the comment above.
+      if (tier2Notified) return;
       tier2Notified = true;
       if (offending) {
-        blockedCall = offending;
         harnessIntervention(
           ctx,
           `${phraseForUser(verdict.reason)} — blocking the exact call and escalating.`,
         );
         // No repeat count in this text: consecutiveFailures counts failures of
         // any reason, so "repeated N times" could be false on a mixed streak.
-        pi.sendUserMessage(
-          "You are stuck in a loop: a tool call has repeated verbatim with nothing " +
-            "else changing in between. That exact call is now blocked -- it will be " +
-            "rejected if you try it again. Explain what isn't working, then take a " +
-            "materially different action.",
-          { deliverAs: "steer" },
-        );
+        // See buildBlockedCallEscalationMessage's own comment for why this
+        // isn't a bare "try something different" push.
+        pi.sendUserMessage(buildBlockedCallEscalationMessage(), { deliverAs: "steer" });
       } else {
         // Nothing to block (empty response, unknown tool, malformed args). Keep
         // correcting rather than going silent.

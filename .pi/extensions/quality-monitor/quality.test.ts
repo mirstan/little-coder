@@ -156,6 +156,24 @@ async function fireToolCall(h: any, toolName: string, input: unknown) {
   }
   return undefined;
 }
+// Fires the tool_call events a real turn making `calls` would fire BEFORE
+// its turn_end -- needed for anything that exercises blockedCall, since it's
+// armed from the validated-space recording tool_call builds, not from
+// turn_end's own raw extraction. `overrideInputs[i]`, if given, is what the
+// tool_call event reports for calls[i] (its "validated/coerced" input),
+// letting a test simulate coercion diverging from the raw content-block
+// value turn(calls) below will separately carry.
+async function fireTurn(
+  h: any,
+  calls: { name: string; input: unknown }[],
+  text = "",
+  overrideInputs: unknown[] = [],
+) {
+  for (let i = 0; i < calls.length; i++) {
+    await fireToolCall(h, calls[i].name, overrideInputs[i] ?? calls[i].input);
+  }
+  return fire(h, "turn_end", turn(calls, text));
+}
 // turn_end event for a completed turn making the given tool calls. pi's
 // content blocks carry raw `arguments`, which is what the extension reads.
 function turn(calls: { name: string; input: unknown }[], text = "") {
@@ -247,10 +265,11 @@ describe("quality-monitor tier-2 escalation", () => {
   });
 
   // Drive `n` consecutive verbatim repeats of `bash` (the first turn seeds the
-  // previous-turn state and is itself ok).
+  // previous-turn state and is itself ok), firing realistic tool_call events
+  // ahead of each turn_end the way pi actually would.
   async function repeatLoop(n: number) {
-    await fire(h, "turn_end", turn([bash]));
-    for (let i = 0; i < n; i++) await fire(h, "turn_end", turn([bash]));
+    await fireTurn(h, [bash]);
+    for (let i = 0; i < n; i++) await fireTurn(h, [bash]);
   }
 
   it("keeps tier 1 unchanged for the first two failures", async () => {
@@ -262,12 +281,17 @@ describe("quality-monitor tier-2 escalation", () => {
   });
 
   it("arms the block on the repeated call, not another call in the same turn", async () => {
-    // Two tier-1 failures, then a turn making the repeat AND an unrelated call.
-    await fire(h, "turn_end", turn([bash]));
-    await fire(h, "turn_end", turn([bash]));
-    await fire(h, "turn_end", turn([bash]));
+    // Seed, then two tier-1 failures (not yet past the cap), then the turn
+    // that first crosses it makes the repeat AND an unrelated new call -- so
+    // this is the FIRST time the offending-call derivation runs, not a
+    // re-arm of a block a single-call turn already set (which wouldn't
+    // exercise the derivation at all: it would already be armed from before
+    // this turn ran).
+    await fireTurn(h, [bash]); // seed
+    await fireTurn(h, [bash]); // fail 1 (tier 1)
+    await fireTurn(h, [bash]); // fail 2 (tier 1)
     const other = { name: "Read", input: { file_path: "/new" } };
-    await fire(h, "turn_end", turn([bash, other]));
+    await fireTurn(h, [bash, other]); // fail 3: crosses the cap
 
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
     expect(await fireToolCall(h, other.name, other.input)).toBeUndefined();
@@ -289,16 +313,69 @@ describe("quality-monitor tier-2 escalation", () => {
     expect(await fireToolCall(h, "Bash", { command: "ls" })).toBeUndefined();
   });
 
+  it("matches in pi's validated-argument space, not turn_end's raw extraction", async () => {
+    // A numeric arg submitted as the string "5000" and schema-coerced to the
+    // number 5000 is what the tool_call event actually reports -- the space
+    // blockedCall must be armed from, and the space the tool_call handler's
+    // own comparison runs in. If arming used turn_end's raw ("5000") value
+    // instead, this match would silently never fire.
+    const coerced = { name: "Bash", input: { retries: 5000 } };
+    const raw = { name: "Bash", input: { retries: "5000" } };
+    await fireTurn(h, [raw], "", [coerced.input]); // seed
+    await fireTurn(h, [raw], "", [coerced.input]); // fail 1 (tier 1)
+    await fireTurn(h, [raw], "", [coerced.input]); // fail 2 (tier 1)
+    await fireTurn(h, [raw], "", [coerced.input]); // fail 3 (crosses the cap)
+    expect(await fireToolCall(h, coerced.name, coerced.input)).toMatchObject({ block: true });
+  });
+
   it("escalates exactly once, however long the loop continues", async () => {
     await repeatLoop(3);
     const followUps = h.followUps.length;
     const notifies = h.notifies.length;
-    await fire(h, "turn_end", turn([bash]));
-    await fire(h, "turn_end", turn([bash]));
+    await fireTurn(h, [bash]);
+    await fireTurn(h, [bash]);
     expect(h.followUps).toHaveLength(followUps);
     expect(h.notifies).toHaveLength(notifies);
     // The block itself keeps firing per call.
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+  });
+
+  it("keeps re-arming the block for whichever call is looping, even after the one-time message fired, within ONE continuous streak", async () => {
+    // Two distinct Grep calls (not state-changing, unlike Bash) so a shift in
+    // offender is reachable without an intervening `ok` verdict resetting
+    // tier2Notified -- with Bash, the previous offender's mere presence in
+    // the prior turn would itself exempt anything else from being flagged
+    // (STATE_CHANGING_TOOLS's envChanged check), making a same-streak shift
+    // impossible to construct realistically. This is why this case is
+    // distinct from "re-arms for a different loop later in the same
+    // session" below: no `ok` turn happens anywhere in this sequence, so
+    // tier2Notified must stay true throughout, and only the fix under test
+    // (re-arming blockedCall outside the tier2Notified gate) makes the block
+    // follow the new offender instead of freezing on the first one.
+    // NOTE: no assertion-only fireToolCall() calls between the fireTurn()s
+    // below -- fireToolCall's own tool_call firing pushes into
+    // turnValidatedCalls same as a real one would, and an extra probe call
+    // for the same tool NAME as the next turn's real call would leave a
+    // stale entry `.find` could match instead of the real one. Assert only
+    // once, after the full sequence.
+    const callA = { name: "Grep", input: { pattern: "foo" } };
+    const callB = { name: "Grep", input: { pattern: "bar" } };
+    await fireTurn(h, [callA]); // seed
+    await fireTurn(h, [callA]); // fail 1 (tier 1)
+    await fireTurn(h, [callA]); // fail 2 (tier 1)
+    await fireTurn(h, [callA, callB]); // fail 3: A repeats (crosses cap) AND B appears for the first time
+    const followUpsAfterTier2 = h.followUps.length;
+
+    // Now the model repeats ONLY B (drops A) -- B matches the B from the
+    // turn just above, and is not exempted (the only other entry in that
+    // prior turn, A, isn't state-changing) -- so this is STILL a failure
+    // (verdict.ok is never true across this whole sequence), and B becomes
+    // the new offendingCall.
+    await fireTurn(h, [callB]);
+
+    expect(h.followUps).toHaveLength(followUpsAfterTier2); // no new message
+    expect(await fireToolCall(h, callA.name, callA.input)).toBeUndefined(); // no longer armed
+    expect(await fireToolCall(h, callB.name, callB.input)).toMatchObject({ block: true }); // now armed
   });
 
   it("clears the block and the escalation on a recovered turn", async () => {
@@ -308,8 +385,8 @@ describe("quality-monitor tier-2 escalation", () => {
 
     // consecutiveFailures reset too: the next repeat gets tier 1 again.
     const before = h.followUps.length;
-    await fire(h, "turn_end", turn([bash]));
-    await fire(h, "turn_end", turn([bash]));
+    await fireTurn(h, [bash]);
+    await fireTurn(h, [bash]);
     expect(h.followUps.slice(before).map((f) => f.msg)).toEqual([
       buildCorrectionMessage("repeated_tool_call"),
     ]);
@@ -320,13 +397,55 @@ describe("quality-monitor tier-2 escalation", () => {
     await fire(h, "turn_end", turn([], "changing approach."));
 
     const other = { name: "Bash", input: { command: "make test" } };
-    await fire(h, "turn_end", turn([other]));
-    await fire(h, "turn_end", turn([other]));
-    await fire(h, "turn_end", turn([other]));
-    await fire(h, "turn_end", turn([other]));
+    await fireTurn(h, [other]);
+    await fireTurn(h, [other]);
+    await fireTurn(h, [other]);
+    await fireTurn(h, [other]);
 
     expect(await fireToolCall(h, other.name, other.input)).toMatchObject({ block: true });
     expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
+  });
+
+  it("does not push toward a guardrail-bypass route in the escalation message", async () => {
+    // The escalation message must not read as an unqualified "find another
+    // way" -- that is exactly the interpreter-bypass hunt permission-gate's
+    // own refusal text exists to stop (issue #94). This pins the presence of
+    // the carve-out, not just that SOME escalation text was sent.
+    await repeatLoop(3);
+    const escalation = h.followUps[h.followUps.length - 1].msg;
+    expect(escalation).toMatch(/refus/i);
+    expect(escalation).toMatch(/python3|node -e|env|-exec/i);
+  });
+
+  it("resets the block and streak on a genuinely new prompt", async () => {
+    await repeatLoop(3);
+    // A real new prompt: no `source`/`streamingBehavior` marking it as our
+    // own steer or a mid-turn interjection.
+    await fire(h, "input", { text: "let's do something else" });
+    expect(await fireToolCall(h, bash.name, bash.input)).toBeUndefined();
+
+    const before = h.followUps.length;
+    await fireTurn(h, [bash]);
+    await fireTurn(h, [bash]);
+    expect(h.followUps.slice(before).map((f) => f.msg)).toEqual([
+      buildCorrectionMessage("repeated_tool_call"),
+    ]);
+  });
+
+  it("does not reset on its own steer message's input event", async () => {
+    // pi.sendUserMessage() (ours, tier 2's own escalation) routes through the
+    // same prompt() pi's real "input" event fires from, tagged source
+    // "extension" -- without excluding that, the escalation we just sent
+    // would immediately undo the block it exists to set.
+    await repeatLoop(3);
+    await fire(h, "input", { source: "extension", text: "..." });
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+  });
+
+  it("does not reset on a mid-turn steer from the user", async () => {
+    await repeatLoop(3);
+    await fire(h, "input", { source: "interactive", streamingBehavior: "queue", text: "..." });
+    expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
   });
 
   it("keeps correcting past the cap for reasons with no call to block", async () => {
@@ -357,8 +476,9 @@ describe("quality-monitor tier-2 escalation", () => {
 
     const escalation = h.followUps[h.followUps.length - 1].msg;
     expect(escalation).toMatch(/blocked/i);
-    // consecutiveFailures is 3 here but the call repeated once: no count claim.
-    expect(escalation).not.toMatch(/\d/);
+    // consecutiveFailures is 3 here but the call repeated once: no count
+    // claim (not a bare digit check -- the message's own "python3" mention
+    // would false-positive on that).
     expect(escalation).not.toMatch(/times|in a row/i);
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
   });
