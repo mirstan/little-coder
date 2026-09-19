@@ -1,7 +1,17 @@
-"""Tests for the deadline-snapshot mechanism in _HarborShellProxy /
-LittleCoderAgent.run() in little_coder_agent.py:
+"""Tests for the two container-snapshot mechanisms in _HarborShellProxy /
+LittleCoderAgent.run() in little_coder_agent.py -- the deadline snapshot of
+what the model changed, and the start-of-trial snapshot of the task's
+pre-existing files:
 
   - the bounded, atomically-staged snapshot shell command itself
+  - _build_snapshot_command's two instantiations: the deadline one byte-for-byte
+    unchanged from the literal it replaced (the whole safety argument for
+    templating a command already running in real trials), the start-of-trial one
+    differing in exactly its find predicate, publish path and stage prefix
+  - the start-of-trial snapshot's stage-then-download wiring: the target
+    directory it must create itself (harbor's docker download_dir does not),
+    the container-side copy it must leave behind, and its three-way
+    succeeded/partial/refused outcome decision
   - _wrap_command() actually composing a parseable shell script -- both for
     a harness call's cwd=None form and a model call's cd/pwd-tracking form
     -- verified by actually feeding the composed string to `sh -n`/`bash -n`
@@ -31,12 +41,14 @@ time; none of this file's actual assertions touch Harbor itself. Same
 scaffolding convention as test_harbor_adapter_timeout.py.
 """
 import asyncio
+import inspect
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -188,6 +200,387 @@ def test_composed_harness_command_parses_under_sh_n(shell):
         f"(rc={result.returncode}): {result.stderr!r}"
     )
     assert result.stderr == ""
+
+
+# ── 1c. Command template: the deadline instance must not have moved, and
+#      the start-of-trial instance must differ only where intended ─────────
+
+# _SNAPSHOT_COMMAND's literal exactly as it shipped, before it became an
+# instantiation of _build_snapshot_command. Frozen here rather than re-derived
+# from the template, which is the only way this pins anything.
+_SNAPSHOT_COMMAND_AS_SHIPPED = (
+    "timeout 20 sh -c '\n"
+    "  set -e\n"
+    "  STAGE=/tmp/.lc-snapshot.stage.$$\n"
+    "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
+    "  # candidate list: files under /app changed since trial start, per-file <10M\n"
+    "  find /app -xdev -maxdepth 3 -type f -size -10M -newer /tmp/.lc-start -print0 2>/dev/null \\\n"
+    "    | head -z -n 500 > \"$STAGE/.list\"           # aggregate file-count cap\n"
+    "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
+    "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
+    "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
+    "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
+    "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
+    "    rm -f \"$STAGE/.list\"\n"
+    "    rm -rf /tmp/.lc-snapshot && mv \"$STAGE\" /tmp/.lc-snapshot   # atomic publish\n"
+    "  else\n"
+    "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
+    "  fi\n"
+    "' ; rm -rf /tmp/.lc-snapshot.stage.* 2>/dev/null"
+)
+
+
+def test_deadline_instantiation_is_byte_identical_to_the_shipped_command():
+    """The whole safety argument for templating a command that already runs in
+    real trials: the deadline snapshot's emitted string did not change."""
+    assert lca._SNAPSHOT_COMMAND == _SNAPSHOT_COMMAND_AS_SHIPPED
+
+
+def test_initial_instantiation_drops_the_freshness_filter():
+    """At trial start "every file under /app" is exactly "every pre-existing
+    file" -- the scope this snapshot exists to preserve. A -newer clause would
+    also match nothing here: this runs before run() touches the start
+    marker, so find would error on a path that doesn't exist yet."""
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    assert "-newer" not in cmd
+    assert lca.SNAPSHOT_START_MARKER not in cmd
+    assert "find /app -xdev -maxdepth 3 -type f -size -10M -print0" in cmd
+
+
+def test_initial_instantiation_publishes_to_its_own_path():
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    assert lca.INITIAL_SNAPSHOT_PUBLISH_PATH == "/tmp/.lc-initial"
+    assert f'mv "$STAGE" {lca.INITIAL_SNAPSHOT_PUBLISH_PATH}' in cmd
+    # Never the deadline snapshot's published copy: the two have different
+    # scopes and different lifetimes, and either overwriting the other loses
+    # the one the model or a post-mortem actually wanted.
+    assert lca.SNAPSHOT_PUBLISH_PATH not in cmd
+
+
+def test_initial_instantiation_clears_its_publish_path_before_staging():
+    """A refused or crashed run must never let the probe count stale content
+    left at the publish path by an earlier invocation -- that would make a
+    refusal look identical to a real success. The clear has to be its own
+    statement outside the shared template, since that template only clears
+    the publish path on its own success branch."""
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    clear_idx = cmd.index(f"rm -rf {lca.INITIAL_SNAPSHOT_PUBLISH_PATH} ;")
+    stage_idx = cmd.index(f"STAGE={lca.INITIAL_SNAPSHOT_STAGE_PREFIX}")
+    assert clear_idx < stage_idx
+
+
+def test_initial_instantiation_stages_and_cleans_up_under_its_own_prefix():
+    """Parameterizing the stage prefix without its cleanup glob leaks one
+    stage dir per timeout kill under a name nothing reaps; reusing the
+    deadline prefix instead has each command's cleanup line reaping the
+    other's in-progress stage dir."""
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    assert f"STAGE={lca.INITIAL_SNAPSHOT_STAGE_PREFIX}.$$" in cmd
+    assert f"rm -rf {lca.INITIAL_SNAPSHOT_STAGE_PREFIX}.* 2>/dev/null" in cmd
+    assert lca.SNAPSHOT_STAGE_PREFIX not in cmd
+
+
+def test_initial_instantiation_keeps_every_shared_cap():
+    """The caps are the reason the start snapshot reuses this command instead
+    of inventing a second copy discipline."""
+    cmd = lca._INITIAL_SNAPSHOT_COMMAND
+    for fragment in (
+        "timeout 20 sh -c",
+        "set -e",
+        "-size -10M",
+        f"head -z -n {lca.SNAPSHOT_MAX_FILES}",
+        "209715200",
+        "524288000",
+        '[ -s "$STAGE/.list" ]',
+    ):
+        assert fragment in cmd, fragment
+
+
+def test_initial_snapshot_command_last_line_has_no_trailing_inline_comment():
+    """Same 2.1 regression pin as the deadline command: the last line gets
+    _exec_async's epilogue appended directly onto it."""
+    last_line = lca._INITIAL_SNAPSHOT_COMMAND.rsplit("\n", 1)[-1]
+    assert "#" not in last_line, last_line
+
+
+@pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
+@pytest.mark.parametrize("cwd", [None, "/app"], ids=["harness-form", "model-form"])
+def test_composed_initial_snapshot_command_parses_under_sh_n(shell, cwd):
+    """The start-of-trial command composes a file-count probe onto the shared
+    template, so it needs its own parse check -- substring assertions are
+    exactly what let the 2.1 syntax error ship."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not found on PATH")
+    composed = lca._wrap_command(lca._INITIAL_SNAPSHOT_COMMAND, cwd, "__LC_END_test__")
+    result = subprocess.run([shell, "-n"], input=composed, text=True, capture_output=True)
+    assert result.returncode == 0, f"{shell} -n rejected it: {result.stderr!r}"
+    assert result.stderr == ""
+
+
+# ── 1d. Three-way outcome decision (pure helpers) ──────────────────────────
+
+@pytest.mark.parametrize(
+    "rc, file_count, outcome, download",
+    [
+        (0, 1, "succeeded", True),
+        (0, 12, "succeeded", True),
+        (0, 499, "succeeded", True),
+        # At/over the file-count cap: the copy really is truncated, and rc is
+        # 0 either way -- reporting this as "succeeded" is the specific lie
+        # this split exists to prevent.
+        (0, 500, "partial", True),
+        (0, 700, "partial", True),
+        # Published nothing: aggregate over 200MB, free-space reserve unmet,
+        # or no candidate files. Still rc=0, and nothing to download.
+        (0, 0, "refused", False),
+        # No probe line at all -- not the same as zero files.
+        (0, None, "failed", False),
+        (None, None, "failed", False),
+        # rc is deliberately NOT branched on (see the function's own
+        # docstring): the wrapped command's last statement is always its
+        # trailing cleanup `rm`, which exits 0 regardless of what the
+        # staging step itself did, so a nonzero rc here carries no signal.
+        # A real file count -- meaning the probe's own printf did run --
+        # takes precedence over whatever rc claims.
+        (2, 3, "succeeded", True),
+        (1, 0, "refused", False),
+    ],
+)
+def test_classify_initial_snapshot(rc, file_count, outcome, download):
+    result = lca._classify_initial_snapshot(rc, file_count)
+    assert result.outcome == outcome
+    assert result.download is download
+    assert result.message.startswith(outcome)
+
+
+def test_classify_initial_snapshot_never_reports_a_bare_attempt():
+    """An unconditional "attempted" is what let the 2.1 syntax error (rc=2,
+    every trial) run undetected; against a whole-tree scope a bare
+    "succeeded" is the same failure one level up."""
+    for rc, count in ((0, 3), (0, 500), (0, 0), (0, None), (2, 3)):
+        assert "attempted" not in lca._classify_initial_snapshot(rc, count).message
+
+
+def test_parse_file_count_tolerates_padded_wc_output():
+    """BSD `wc -l` pads its count with leading spaces; GNU's doesn't."""
+    assert lca._parse_initial_snapshot_file_count(
+        "lc-initial-files=       7\n[exit=0 cwd=/app backend=harbor-env]"
+    ) == 7
+
+
+def test_parse_file_count_missing_probe_line_is_none_not_zero():
+    """None ("the probe never ran") and 0 ("it ran and published nothing")
+    take different branches in _classify_initial_snapshot, so they must not
+    collapse here."""
+    assert lca._parse_initial_snapshot_file_count(
+        "[exit=0 cwd=/app backend=harbor-env]"
+    ) is None
+    assert lca._parse_initial_snapshot_file_count("lc-initial-files=0") == 0
+
+
+def test_parse_file_count_takes_the_last_match():
+    """A command's own output can contain a line shaped like the probe's --
+    the real one is always last."""
+    out = "lc-initial-files=99\nlc-initial-files=4\n[exit=0 cwd=/app]"
+    assert lca._parse_initial_snapshot_file_count(out) == 4
+
+
+# ── 1e. Stage + download wiring ────────────────────────────────────────────
+
+class _InitialSnapshotEnv:
+    """Fake environment for _snapshot_initial_state.
+
+    exec() answers the stage command with the file-count line the real
+    container's probe would print. download_dir mimics `docker compose cp
+    service:SRC/. DEST` by refusing when DEST does not already exist -- that
+    is the real Docker behaviour (harbor's docker download_dir never creates
+    the target; only download_dir_with_exclusions' base implementation does),
+    and it's what turns a missing mkdir into a test failure here instead of a
+    silently swallowed no-op on every real trial.
+    """
+
+    def __init__(self, file_count: int | None = 3, return_code: int = 0,
+                 download_error: Exception | None = None, download_delay_sec: float = 0.0):
+        self.file_count = file_count
+        self.return_code = return_code
+        self.download_error = download_error
+        self.download_delay_sec = download_delay_sec
+        self.commands: list[str] = []
+        self.downloads: list[tuple[str, str]] = []
+
+    async def exec(self, command: str, timeout_sec: int | None = None, **kwargs) -> SimpleNamespace:
+        self.commands.append(command)
+        stdout = ""
+        if lca._INITIAL_SNAPSHOT_COUNT_PREFIX in command and self.file_count is not None:
+            stdout = f"{lca._INITIAL_SNAPSHOT_COUNT_PREFIX}{self.file_count}\n"
+        return SimpleNamespace(stdout=stdout, stderr="", return_code=self.return_code)
+
+    async def download_dir(self, source_dir: str, target_dir) -> None:
+        self.downloads.append((source_dir, str(target_dir)))
+        if not os.path.isdir(target_dir):
+            raise FileNotFoundError(
+                f"docker cp: destination {target_dir} does not exist"
+            )
+        if self.download_delay_sec:
+            await asyncio.sleep(self.download_delay_sec)
+        if self.download_error is not None:
+            raise self.download_error
+        Path(target_dir, "app").mkdir(exist_ok=True)
+        Path(target_dir, "app", "input.tex").write_text("original bytes")
+
+
+def _run_initial_snapshot(env, logs_dir, logger=None):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        proxy = lca._HarborShellProxy(env, loop, _logger())
+        await lca._snapshot_initial_state(proxy, env, logs_dir, logger or _logger())
+
+    asyncio.run(scenario())
+
+
+def test_initial_snapshot_stages_then_downloads_into_the_trial_dir(tmp_path):
+    """The headline path: one stage command, then a download into
+    logs_dir/initial_state/ -- whose creation is this adapter's job, not
+    download_dir's."""
+    env = _InitialSnapshotEnv(file_count=3)
+    _run_initial_snapshot(env, tmp_path)
+
+    assert len(env.commands) == 1
+    assert "STAGE=/tmp/.lc-initial.stage.$$" in env.commands[0]
+    assert env.downloads == [
+        (lca.INITIAL_SNAPSHOT_PUBLISH_PATH, str(tmp_path / lca.INITIAL_SNAPSHOT_DIR_NAME))
+    ]
+    assert (tmp_path / "initial_state" / "app" / "input.tex").read_text() == "original bytes"
+
+
+def test_initial_snapshot_creates_the_target_dir_before_downloading(tmp_path):
+    """Pins the mkdir specifically: the fake download_dir raises exactly as
+    `docker cp SRC/. DEST` does when DEST is missing, and the caller swallows
+    every exception -- so without the mkdir this feature would produce
+    nothing on every trial while looking fine."""
+    env = _InitialSnapshotEnv(file_count=3)
+    logs_dir = tmp_path / "trial" / "nested"  # not created by anyone else
+    _run_initial_snapshot(env, logs_dir)
+
+    assert (logs_dir / "initial_state").is_dir()
+    assert env.downloads, "download never ran"
+
+
+def test_initial_snapshot_keeps_the_container_side_copy(tmp_path):
+    """Deliberate: the published copy is the model's in-container restore
+    source for the rest of the trial, so nothing may delete it once the
+    host-side download has succeeded."""
+    env = _InitialSnapshotEnv(file_count=3)
+    _run_initial_snapshot(env, tmp_path)
+
+    # A post-download cleanup would need a second exec.
+    assert len(env.commands) == 1
+    publish_rms = [
+        line for line in env.commands[0].splitlines()
+        if f"rm -rf {lca.INITIAL_SNAPSHOT_PUBLISH_PATH} " in line
+    ]
+    # Two: the unconditional pre-stage clear (this run's own leftover-content
+    # guard), and the atomic publish's own pre-clean on the same line as the
+    # mv that immediately replaces it. Neither is a post-download cleanup.
+    assert len(publish_rms) == 2
+    assert any(f'mv "$STAGE" {lca.INITIAL_SNAPSHOT_PUBLISH_PATH}' in line for line in publish_rms)
+
+
+def test_initial_snapshot_refused_skips_the_download(tmp_path, caplog):
+    """A refusal publishes nothing, so downloading would just raise. It is
+    logged as "refused", not as a failure and not as a success."""
+    env = _InitialSnapshotEnv(file_count=0)
+    with caplog.at_level(logging.INFO):
+        _run_initial_snapshot(env, tmp_path)
+
+    assert env.downloads == []
+    assert not (tmp_path / "initial_state").exists()
+    assert any("refused" in r.message for r in caplog.records)
+
+
+def test_initial_snapshot_partial_still_downloads_and_says_so(tmp_path, caplog):
+    env = _InitialSnapshotEnv(file_count=lca.SNAPSHOT_MAX_FILES)
+    with caplog.at_level(logging.INFO):
+        _run_initial_snapshot(env, tmp_path)
+
+    assert len(env.downloads) == 1
+    assert any("partial" in r.message for r in caplog.records)
+
+
+def test_initial_snapshot_ignores_rc_when_a_real_file_count_is_present(tmp_path, caplog):
+    """rc is never trustworthy here (see _classify_initial_snapshot's own
+    docstring: the wrapped command's last statement is always its harmless
+    trailing cleanup, so rc is ~0 regardless of what staging actually did).
+    A real, parsed file count -- meaning the probe's own printf genuinely
+    ran -- must win over whatever rc claims, not be second-guessed by it."""
+    env = _InitialSnapshotEnv(file_count=3, return_code=2)
+    with caplog.at_level(logging.INFO):
+        _run_initial_snapshot(env, tmp_path)
+
+    assert len(env.downloads) == 1
+    assert any("succeeded" in r.message for r in caplog.records)
+
+
+def test_initial_snapshot_no_probe_line_fails_regardless_of_rc(tmp_path, caplog):
+    """The one genuine failure signal: the probe's own printf never ran at
+    all, so there is no file count to trust -- rc is logged for visibility
+    only, never branched on."""
+    env = _InitialSnapshotEnv(file_count=None, return_code=0)
+    with caplog.at_level(logging.INFO):
+        _run_initial_snapshot(env, tmp_path)
+
+    assert env.downloads == []
+    assert any("failed" in r.message and "rc=0" in r.message for r in caplog.records)
+
+
+def test_initial_snapshot_download_failure_is_non_fatal(tmp_path):
+    """Insurance must never take the trial down with it."""
+    env = _InitialSnapshotEnv(file_count=3, download_error=RuntimeError("docker cp exploded"))
+    _run_initial_snapshot(env, tmp_path)  # must not raise
+
+
+def test_initial_snapshot_hang_degrades_within_its_timeout(tmp_path, monkeypatch):
+    """A wedged docker-cp must cost the trial its snapshot, not its wall
+    clock."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
+
+    started = time.monotonic()
+    _run_initial_snapshot(env, tmp_path)
+    assert time.monotonic() - started < 5
+
+
+def test_initial_snapshot_without_a_logs_dir_never_touches_the_container():
+    """No per-trial dir means nowhere to put the download; don't pay for the
+    stage either."""
+    env = _InitialSnapshotEnv(file_count=3)
+    _run_initial_snapshot(env, None)
+
+    assert env.commands == []
+    assert env.downloads == []
+
+
+def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
+    """Placement pin. The deadline snapshot is skipped below
+    SNAPSHOT_MIN_BUDGET_SEC because a short trial has little of the model's
+    own work worth recovering -- a rationale that does not transfer to the
+    task's pre-existing files. Nesting the initial snapshot inside that gate
+    would exempt exactly the trials with the least time to recover, and no
+    unit test of the helper itself would notice."""
+    src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
+    call_line = next(
+        line for line in src.splitlines() if "_snapshot_initial_state(" in line
+    )
+    gate_line = next(
+        line for line in src.splitlines() if "if snapshot_delay_sec is not None:" in line
+    )
+    assert src.index(call_line) < src.index(gate_line), (
+        "the initial snapshot must run before the deadline-snapshot gate"
+    )
+    # Same indentation as the gate itself: one level deeper would mean it sits
+    # inside some conditional.
+    assert len(call_line) - len(call_line.lstrip()) == len(gate_line) - len(gate_line.lstrip())
+    assert call_line.lstrip().startswith("await _snapshot_initial_state(")
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
