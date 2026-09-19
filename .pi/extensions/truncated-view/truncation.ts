@@ -11,11 +11,12 @@
 // state, no clock, no filesystem — so a given result always annotates the same
 // way and every rule is testable without a shell.
 //
-// Honesty rule, the property this module lives or dies by: the note asserts
-// only what is checked here — the command's final segment, and the size of
-// the output being annotated. It never claims anything about what the
-// truncator stage itself returned, because a multi-statement command composes
-// output from stages this module does not analyze.
+// Honesty rule, the property this module lives or dies by: the note only
+// quotes the command's own final segment, never a claim about what that
+// segment returned — a multi-statement command (`cat a; head -50 b`) composes
+// its result from stages this module can't attribute individual lines to, so
+// the combined output's size is used only to decide WHETHER to annotate, never
+// to describe what the truncator itself produced.
 
 import { basename } from "node:path";
 import { envNumber } from "../_shared/env-number.ts";
@@ -26,6 +27,8 @@ export interface TrailingTruncator {
   tool: "head" | "tail";
   unit: "lines" | "bytes";
   limit: number;
+  /** The final chain segment verbatim, for quoting the actual command in the note. */
+  raw: string;
 }
 
 export const MIN_LINES_ENV = "LITTLE_CODER_PARTIAL_VIEW_MIN_LINES";
@@ -102,8 +105,8 @@ export function detectTrailingTruncator(command: string): TrailingTruncator | nu
       wordUnit = "lines";
       raw = word.slice(1);
     } else {
-      // An unread flag may still be the one setting the count (`--lines 50`,
-      // `-qn50`, `-f`); falling back to 10 would put a false limit in the note.
+      // An unread flag may still be the one setting the count (`-qn50`, `-f`);
+      // falling back to 10 would put a false limit in the note.
       return null;
     }
 
@@ -114,11 +117,15 @@ export function detectTrailingTruncator(command: string): TrailingTruncator | nu
     limit = count; // last count flag wins, as in coreutils
   }
 
-  return { tool, unit, limit: limit ?? DEFAULT_LINES };
+  return { tool, unit, limit: limit ?? DEFAULT_LINES, raw: last };
 }
 
-// Markers and footer are emitted byte-identically by shell-session/helpers.ts
-// and its two Python twins, so they can be re-parsed here.
+// Markers and footer must stay byte-identical across four places: this
+// file's regexes, shell-session/helpers.ts
+// (formatOutput/dedupLines/truncateLines), and the two Python twins,
+// benchmarks/tb_adapter/little_coder_agent.py and
+// benchmarks/harbor_adapter/little_coder_agent.py. A wording change in any of
+// the other three silently stops these regexes matching, with no error.
 const FOOTER_RE = /^\[exit=-?\d+ cwd=.* timed_out=(?:true|false).*\]$/;
 const RAW_BYTES_RE = /\braw_bytes=(\d+)\b/;
 const DUPLICATE_MARKER_RE = /^\s*\[\.\.\. (\d+) duplicate line\(s\) collapsed \.\.\.\]$/;
@@ -177,29 +184,23 @@ export function splitFooter(text: string): { body: string; footer: string | null
   return { body: lines.slice(0, -1).join("\n"), footer: last };
 }
 
-export function partialViewNote(truncator: TrailingTruncator, unknownCut: boolean): string {
-  const { tool, unit, limit } = truncator;
-  const spelling = unit === "bytes" ? `${tool} -c ${limit}` : `${tool} -${limit}`;
-  const observed =
-    unit === "bytes"
-      ? `the output reaches ${limit} bytes`
-      : unknownCut
-        ? "the output was truncated before its line count could be established"
-        : `the output reaches ${limit} lines`;
-  const consequence =
-    tool === "head"
-      ? unit === "bytes"
-        ? "the source may continue past what is shown"
-        : "the source may continue past the last line shown"
-      : unit === "bytes"
-        ? "the source may have earlier content before what is shown"
-        : "the source may have earlier lines before the first line shown";
-  const advice =
-    unit === "lines"
-      ? " Don't conclude something is absent from this view — re-run with a larger " +
-        "limit or a targeted filter (grep/awk) if it matters."
-      : "";
-  return `[partial view: this command ends in '${spelling}' and ${observed}, so ${consequence}.${advice}]`;
+// Keyed by `${tool}:${unit}`. What "partial" means for that combination —
+// never what the truncator actually returned, per the honesty rule above.
+const CONSEQUENCE: Record<string, string> = {
+  "head:lines": "the source may continue past the last line shown",
+  "head:bytes": "the source may continue past what is shown",
+  "tail:lines": "the source may have earlier lines before the first line shown",
+  "tail:bytes": "the source may have earlier content before what is shown",
+};
+
+export function partialViewNote(truncator: TrailingTruncator): string {
+  const { tool, unit, raw } = truncator;
+  const consequence = CONSEQUENCE[`${tool}:${unit}`];
+  return (
+    `[partial view: this command ends in '${raw}', so ${consequence}. Don't ` +
+    "conclude something is absent from this view — re-run with a larger limit " +
+    "or a targeted filter (grep/awk) if it matters.]"
+  );
 }
 
 /**
@@ -220,7 +221,6 @@ export function annotate(command: string, text: string): string | null {
   const { body, footer } = splitFooter(text);
   const footerRawBytes = footer ? Number(RAW_BYTES_RE.exec(footer)?.[1] ?? NaN) : NaN;
 
-  let unknownCut = false;
   if (truncator.unit === "bytes") {
     const bytes = Number.isFinite(footerRawBytes)
       ? footerRawBytes
@@ -229,14 +229,16 @@ export function annotate(command: string, text: string): string | null {
   } else {
     const counted = reconstructLineCount(body);
     // The pre-dedup cap fires exactly when the raw output exceeds its budget,
-    // and its marker is the one a later line cut can drop.
-    unknownCut =
+    // and its marker is the one a later line cut can drop. When that happens
+    // the reconstructed count is an unreliable lower bound, so annotate
+    // anyway rather than trust a count that may be short.
+    const unknownCut =
       counted.unknownCut ||
       (Number.isFinite(footerRawBytes) &&
         footerRawBytes > MAX_RAW_HEAD_BYTES + MAX_RAW_TAIL_BYTES);
     if (counted.count < truncator.limit && !unknownCut) return null;
   }
 
-  const note = partialViewNote(truncator, unknownCut);
+  const note = partialViewNote(truncator);
   return footer ? `${body}\n${note}\n${footer}` : `${body.trimEnd()}\n${note}`;
 }

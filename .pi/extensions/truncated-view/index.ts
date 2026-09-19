@@ -15,6 +15,11 @@ import { annotate } from "./truncation.ts";
 
 // Not _shared/shell-write.ts's SHELL_TOOLS: that set gates writes and includes
 // ShellStart, whose result is a job-started acknowledgment, not command output.
+//
+// Known gap, not fixed here: bg-shell's ShellLog reads back a background
+// job's buffered output and can be truncated by the same self-authored
+// head/tail, with no note. Its tool_result carries no command (just
+// {id, lines, offset}), so detectTrailingTruncator has nothing to check.
 const ANNOTATED_TOOLS = new Set(["bash", "Bash", "ShellSession"]);
 
 type TextOrImage = { type: string; text?: string };

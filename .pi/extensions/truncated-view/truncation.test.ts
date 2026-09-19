@@ -9,7 +9,7 @@ import {
   MIN_BYTES_ENV,
   MIN_LINES_ENV,
 } from "./truncation.ts";
-import { MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES } from "../shell-session/helpers.ts";
+import { MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES, formatOutput } from "../shell-session/helpers.ts";
 
 // The command from the failing raman-fitting trial (harbor run
 // 2026-09-14__23-29-55, live log line 534), with a decoy `head -999` added to
@@ -51,6 +51,7 @@ describe("detectTrailingTruncator", () => {
       tool: "head",
       unit: "lines",
       limit: 50,
+      raw: "head -50",
     });
   });
 
@@ -59,27 +60,29 @@ describe("detectTrailingTruncator", () => {
       tool: "head",
       unit: "lines",
       limit: 50,
+      raw: "head -50 file.txt",
     });
     expect(detectTrailingTruncator("/usr/bin/head -50 f")).toEqual({
       tool: "head",
       unit: "lines",
       limit: 50,
+      raw: "/usr/bin/head -50 f",
     });
   });
 
   it.each([
-    ["head -n 50 f", { tool: "head", unit: "lines", limit: 50 }],
-    ["head -n50 f", { tool: "head", unit: "lines", limit: 50 }],
-    ["head --lines=50 f", { tool: "head", unit: "lines", limit: 50 }],
-    ["head --lines 50 f", { tool: "head", unit: "lines", limit: 50 }],
-    ["head -q -50 f g", { tool: "head", unit: "lines", limit: 50 }],
-    ["foo | head", { tool: "head", unit: "lines", limit: 10 }],
-    ["tail -20 log", { tool: "tail", unit: "lines", limit: 20 }],
-    ["head -c 4096 f", { tool: "head", unit: "bytes", limit: 4096 }],
-    ["head -c4096 f", { tool: "head", unit: "bytes", limit: 4096 }],
-    ["head --bytes=4096 f", { tool: "head", unit: "bytes", limit: 4096 }],
+    ["head -n 50 f", { tool: "head", unit: "lines", limit: 50, raw: "head -n 50 f" }],
+    ["head -n50 f", { tool: "head", unit: "lines", limit: 50, raw: "head -n50 f" }],
+    ["head --lines=50 f", { tool: "head", unit: "lines", limit: 50, raw: "head --lines=50 f" }],
+    ["head --lines 50 f", { tool: "head", unit: "lines", limit: 50, raw: "head --lines 50 f" }],
+    ["head -q -50 f g", { tool: "head", unit: "lines", limit: 50, raw: "head -q -50 f g" }],
+    ["foo | head", { tool: "head", unit: "lines", limit: 10, raw: "head" }],
+    ["tail -20 log", { tool: "tail", unit: "lines", limit: 20, raw: "tail -20 log" }],
+    ["head -c 4096 f", { tool: "head", unit: "bytes", limit: 4096, raw: "head -c 4096 f" }],
+    ["head -c4096 f", { tool: "head", unit: "bytes", limit: 4096, raw: "head -c4096 f" }],
+    ["head --bytes=4096 f", { tool: "head", unit: "bytes", limit: 4096, raw: "head --bytes=4096 f" }],
     // Last count flag wins, as in coreutils.
-    ["head -10 -n 50 f", { tool: "head", unit: "lines", limit: 50 }],
+    ["head -10 -n 50 f", { tool: "head", unit: "lines", limit: 50, raw: "head -10 -n 50 f" }],
   ])("parses %j", (command, expected) => {
     expect(detectTrailingTruncator(command)).toEqual(expected);
   });
@@ -89,6 +92,7 @@ describe("detectTrailingTruncator", () => {
       tool: "tail",
       unit: "lines",
       limit: 50,
+      raw: "tail -50",
     });
   });
 
@@ -158,10 +162,9 @@ describe("annotate", () => {
   });
 
   const HEAD_50_NOTE =
-    "[partial view: this command ends in 'head -50' and the output reaches 50 lines, " +
-    "so the source may continue past the last line shown. Don't conclude something is " +
-    "absent from this view — re-run with a larger limit or a targeted filter (grep/awk) " +
-    "if it matters.]";
+    "[partial view: this command ends in 'head -50', so the source may continue " +
+    "past the last line shown. Don't conclude something is absent from this " +
+    "view — re-run with a larger limit or a targeted filter (grep/awk) if it matters.]";
 
   it("annotates the real evidence result above the footer", () => {
     const text = `=== Peak at 3745 ===\n${rows(49)}${HARBOR_FOOTER}`;
@@ -177,8 +180,8 @@ describe("annotate", () => {
 
   // Finding A. This command's own output is three stages deep, so how many
   // lines the trailing `head -20` returned is unknowable from the text — the
-  // note must claim only the command's shape and the output's size. Matches
-  // the shape at live log line 605 of the evidence trial.
+  // note must claim only the command's own final segment, nothing numeric.
+  // Matches the shape at live log line 605 of the evidence trial.
   it("claims nothing about what the truncator stage itself returned", () => {
     const command = [
       "ls -la /app",
@@ -188,10 +191,29 @@ describe("annotate", () => {
     const out = annotate(command, `${rows(25)}${HARBOR_FOOTER}`);
     expect(out).not.toBeNull();
     const note = out!.split("\n").at(-2)!;
-    expect(note).toContain("this command ends in 'head -20'");
-    expect(note).toContain("the output reaches 20 lines");
-    expect(note).not.toMatch(/returned/);
-    expect(note).not.toMatch(/full 20/);
+    expect(note).toBe(
+      "[partial view: this command ends in 'head -20', so the source may continue " +
+        "past the last line shown. Don't conclude something is absent from this " +
+        "view — re-run with a larger limit or a targeted filter (grep/awk) if it matters.]",
+    );
+    expect(note).not.toMatch(/\d+ lines?\b/);
+  });
+
+  // The OCR-reported shape: a `;`-chained command where an earlier stage
+  // (cat, 60 lines) contributes most of a combined 63-line result, and the
+  // trailing `head -50` on its own 3-line source never came close to its
+  // limit. The old note said "the output reaches 50 lines" — head's own
+  // limit, mislabeled as what was observed — which was false. The gate can
+  // still fire on the combined size (that's a suppression heuristic, not a
+  // claim), but the note itself must not attribute any count to head.
+  it("does not credit an earlier chain segment's lines to the trailing truncator", () => {
+    const cat60 = rows(60);
+    const head3 = rows(3); // b.txt only has 3 lines; head -50 returned all of them
+    const out = annotate("cat a.txt; head -50 b.txt", `${cat60}${head3}${HARBOR_FOOTER}`);
+    expect(out).not.toBeNull(); // combined 63 lines clears the 50 floor — gate fires
+    const note = out!.split("\n").at(-2)!;
+    expect(note).toContain("this command ends in 'head -50 b.txt'");
+    expect(note).not.toMatch(/\d+ lines?\b/); // never claims 50, 63, or any other count
   });
 
   // The certain negative: `head -50` that gave back fewer than 50 lines did
@@ -239,18 +261,16 @@ describe("annotate", () => {
   });
 
   // Finding B: the pre-dedup cap fires iff the raw output exceeded its budget,
-  // and the marker it leaves can be dropped by the later line cut.
-  it("annotates an uncountable result and says the count is what is missing", () => {
+  // and the marker it leaves can be dropped by the later line cut. The gate
+  // must still fire (an unreliable lower bound must not read as "under the
+  // limit"), and the note stays the same generic text either way — it never
+  // claimed a count in the first place.
+  it("still annotates when the real count is unknowable, with the same generic note", () => {
     const raw = MAX_RAW_HEAD_BYTES + MAX_RAW_TAIL_BYTES + 1;
     const footer = `[exit=0 cwd=/app timed_out=false output_truncated=true raw_bytes=${raw}]`;
     const out = annotate("seq 1000000 | head -50", `${rows(10)}${footer}`);
     expect(out).not.toBeNull();
-    expect(out!.split("\n").at(-2)).toBe(
-      "[partial view: this command ends in 'head -50' and the output was truncated " +
-        "before its line count could be established, so the source may continue past " +
-        "the last line shown. Don't conclude something is absent from this view — " +
-        "re-run with a larger limit or a targeted filter (grep/awk) if it matters.]",
-    );
+    expect(out!.split("\n").at(-2)).toBe(HEAD_50_NOTE);
   });
 
   it("stays silent when raw_bytes is within the pre-dedup budget", () => {
@@ -270,11 +290,24 @@ describe("annotate", () => {
   it("tells tail's story in the other direction", () => {
     const out = annotate("tail -50 log", `${rows(50)}${HARBOR_FOOTER}`);
     expect(out!.split("\n").at(-2)).toBe(
-      "[partial view: this command ends in 'tail -50' and the output reaches 50 lines, " +
-        "so the source may have earlier lines before the first line shown. Don't conclude " +
-        "something is absent from this view — re-run with a larger limit or a targeted " +
-        "filter (grep/awk) if it matters.]",
+      "[partial view: this command ends in 'tail -50 log', so the source may " +
+        "have earlier lines before the first line shown. Don't conclude " +
+        "something is absent from this view — re-run with a larger limit or a " +
+        "targeted filter (grep/awk) if it matters.]",
     );
+  });
+
+  // Quoting fix: the note must quote what the model actually typed, not a
+  // normalized `tool -limit` spelling that may appear nowhere in the command.
+  it("quotes the command's own long-flag spelling verbatim", () => {
+    const out = annotate("head -n 50 f", `${rows(50)}${HARBOR_FOOTER}`);
+    expect(out!.split("\n").at(-2)).toContain("this command ends in 'head -n 50 f'");
+  });
+
+  it("quotes a bare head without inventing a '-10' that was never typed", () => {
+    const out = annotate("foo | head", `${rows(10)}${HARBOR_FOOTER}`);
+    expect(out!.split("\n").at(-2)).toContain("this command ends in 'head'");
+    expect(out!.split("\n").at(-2)).not.toContain("-10");
   });
 
   describe("byte limits", () => {
@@ -287,8 +320,10 @@ describe("annotate", () => {
     it("annotates a body that reaches the byte limit", () => {
       const out = annotate("head -c 2048 f", `${big}\n${HARBOR_FOOTER}`);
       expect(out!.split("\n").at(-2)).toBe(
-        "[partial view: this command ends in 'head -c 2048' and the output reaches 2048 " +
-          "bytes, so the source may continue past what is shown.]",
+        "[partial view: this command ends in 'head -c 2048 f', so the source " +
+          "may continue past what is shown. Don't conclude something is " +
+          "absent from this view — re-run with a larger limit or a targeted " +
+          "filter (grep/awk) if it matters.]",
       );
     });
 
@@ -304,14 +339,16 @@ describe("annotate", () => {
     it("prefers the footer's raw_bytes over the capped body's own size", () => {
       const footer = "[exit=0 cwd=/app timed_out=false output_truncated=true raw_bytes=9000]";
       const out = annotate("head -c 4096 f", `short\n${footer}`);
-      expect(out!.split("\n").at(-2)).toContain("the output reaches 4096 bytes");
+      expect(out).not.toBeNull(); // would stay null on the 6-byte body alone
     });
 
     it("tells tail's story in the other direction", () => {
       const out = annotate("tail -c 2048 f", `${big}\n${HARBOR_FOOTER}`);
       expect(out!.split("\n").at(-2)).toBe(
-        "[partial view: this command ends in 'tail -c 2048' and the output reaches 2048 " +
-          "bytes, so the source may have earlier content before what is shown.]",
+        "[partial view: this command ends in 'tail -c 2048 f', so the source " +
+          "may have earlier content before what is shown. Don't conclude " +
+          "something is absent from this view — re-run with a larger limit " +
+          "or a targeted filter (grep/awk) if it matters.]",
       );
     });
   });
@@ -323,22 +360,52 @@ describe("partialViewNote", () => {
   it("never contains an exit= substring", () => {
     for (const tool of ["head", "tail"] as const) {
       for (const unit of ["lines", "bytes"] as const) {
-        for (const unknownCut of [false, true]) {
-          expect(partialViewNote({ tool, unit, limit: 50 }, unknownCut)).not.toContain("exit=");
-        }
+        expect(
+          partialViewNote({ tool, unit, limit: 50, raw: `${tool} -50` }),
+        ).not.toContain("exit=");
       }
     }
   });
 
-  // A byte limit has no line count to be missing, whatever the caller passes.
+  // A byte limit has no line count to be missing.
   it("never describes a byte limit in terms of lines", () => {
     for (const tool of ["head", "tail"] as const) {
-      for (const unknownCut of [false, true]) {
-        expect(
-          partialViewNote({ tool, unit: "bytes", limit: 2048 }, unknownCut),
-        ).not.toContain("line");
-      }
+      expect(
+        partialViewNote({ tool, unit: "bytes", limit: 2048, raw: `${tool} -c 2048` }),
+      ).not.toContain("line");
     }
+  });
+});
+
+// ── marker/footer format coupling with the real producer ───────────────────
+//
+// truncation.ts's regexes re-derive shell-session/helpers.ts's marker/footer
+// formats as independent string literals. These tests run the REAL formatter
+// (not hand-typed fixtures) so a future wording drift in helpers.ts fails
+// here instead of silently disabling the partial-view feature. The two
+// Python twins (benchmarks/tb_adapter, benchmarks/harbor_adapter) can't be
+// exercised from a vitest suite; the comment at truncation.ts's marker
+// regexes names all three producers for a human to check instead.
+describe("marker/footer coupling with shell-session/helpers.ts's real formatOutput", () => {
+  it("reconstructs the true line count through a real line-cap marker", () => {
+    const raw = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
+    const formatted = formatOutput(raw, 0, "/app", false, "");
+    // The harness's own 200-line cap hides most of the 500 real lines, so a
+    // limit just above the visible cap must still be judged as reached...
+    expect(annotate("seq 500 | head -450", formatted)).not.toBeNull();
+    // ...and a limit above the true total must still read as not reached.
+    expect(annotate("seq 500 | head -600", formatted)).toBeNull();
+  });
+
+  it("still fires when a real pre-dedup byte cap likely swallowed its own marker", () => {
+    // One line far past the pre-dedup budget: capBytesHeadTail's marker sits
+    // in the middle of a ~384KB span the *second* (48KB) cap keeps only the
+    // edges of, so the marker line itself may not survive to be re-parsed —
+    // exactly the case the footer's own raw_bytes fallback exists for.
+    const raw = "x".repeat(MAX_RAW_HEAD_BYTES + MAX_RAW_TAIL_BYTES + 10_000);
+    const formatted = formatOutput(raw, 0, "/app", false, "");
+    expect(formatted).toContain("raw_bytes=");
+    expect(annotate("cat huge.txt | head -50", formatted)).not.toBeNull();
   });
 });
 
@@ -385,6 +452,8 @@ describe("truncated-view tool_result handler", () => {
     ["a non-shell tool", { toolName: "Read" }],
     // ShellStart returns a job-started acknowledgment, not command output.
     ["ShellStart", { toolName: "ShellStart" }],
+    // bg-shell's ShellLog is a known, documented gap — see index.ts.
+    ["ShellLog", { toolName: "ShellLog" }],
     ["an error result", { isError: true }],
     ["an image block", { content: [{ type: "image", data: "…" }] }],
     ["empty content", { content: [] }],
