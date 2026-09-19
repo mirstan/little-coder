@@ -117,10 +117,11 @@ describe("detectTrailingTruncator", () => {
   });
 
   it("does not treat a quoted # as a comment opener", () => {
-    // The whole thing is one echo argument; splitWords keeps the quotes, so
-    // "head" is never even the first word of a segment — declined already by
-    // the pre-existing quoted-echo case below, this just confirms the `#`
-    // inside it didn't get treated as a comment cutpoint either.
+    // The `|` here is unquoted, so splitCommandChain does split off a live
+    // `head -50` segment — detection must still fire on it. Only the `#`
+    // inside the quotes must be ignored by findCommentStart's quote
+    // tracking; if it weren't, stripComments would cut everything from
+    // there on, including the real ` | head -50` that follows.
     expect(detectTrailingTruncator('echo "a # b" | head -50')).toEqual({
       tool: "head",
       unit: "lines",
