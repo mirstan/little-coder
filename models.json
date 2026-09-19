@@ -1,5 +1,5 @@
 {
-  "default": "llamacpp/qwen3.6-35b-a3b",
+  "default": "omlx/tiel-coder-oq6e-fp16",
   "providers": {
     "llamacpp": {
       "api": "openai-completions",
@@ -40,6 +40,39 @@
           "input": ["text"],
           "contextWindow": 32768,
           "maxTokens": 4096,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    },
+    "omlx": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "apiKey": "IGNORED",
+      "models": [
+        {
+          "id": "tiel-coder-oq4e",
+          "name": "Tiel-Coder-35B-A3B-oQ4e (omlx)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 80000,
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": { "enable_thinking": true, "preserve_thinking": true }
+          },
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "tiel-coder-oq6e-fp16",
+          "name": "Tiel-Coder-35B-A3B-oQ6e-fp16 (omlx)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 80000,
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": { "enable_thinking": true, "preserve_thinking": true }
+          },
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         }
       ]
