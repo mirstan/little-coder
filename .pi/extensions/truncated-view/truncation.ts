@@ -20,8 +20,46 @@
 
 import { basename } from "node:path";
 import { envNumber } from "../_shared/env-number.ts";
-import { splitCommandChain, splitWords } from "../_shared/shell-write.ts";
+import { scan, splitCommandChain, splitWords } from "../_shared/shell-write.ts";
 import { MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES } from "../shell-session/helpers.ts";
+
+// Word-boundary characters after which a `#` can start a comment. Not a full
+// bash grammar (e.g. `)#x` right after a closing paren is missed, since
+// splitCommandChain has no paren-awareness either) — under-detecting a
+// comment is safe here (the segment is still judged, same as today), so this
+// stays deliberately narrow rather than chasing every shell-comment corner.
+const COMMENT_BOUNDARY = new Set([" ", "\t", ";", "|", "&", "\n"]);
+
+/** Index of a word-start, unquoted `#`, or -1. quote-aware via scan(). */
+function findCommentStart(line: string): number {
+  let idx = -1;
+  let atWordStart = true;
+  scan(line, (ch, i, quote) => {
+    if (idx !== -1 || quote) return;
+    if (ch === "#" && atWordStart) {
+      idx = i;
+      return;
+    }
+    atWordStart = COMMENT_BOUNDARY.has(ch);
+  });
+  return idx;
+}
+
+/**
+ * Drop `#`-comments before chain-splitting, so `echo hi # | head -50` can't
+ * be misread as a live `head` stage — splitCommandChain itself has no
+ * comment awareness, since its other consumers (write-guard's write
+ * detection, permission-gate) don't need one.
+ */
+function stripComments(cmd: string): string {
+  return cmd
+    .split("\n")
+    .map((line) => {
+      const idx = findCommentStart(line);
+      return idx === -1 ? line : line.slice(0, idx);
+    })
+    .join("\n");
+}
 
 export interface TrailingTruncator {
   tool: "head" | "tail";
@@ -66,7 +104,7 @@ function parseCount(token: string | undefined): number | null {
  * accepted false negatives.
  */
 export function detectTrailingTruncator(command: string): TrailingTruncator | null {
-  const segments = splitCommandChain(command);
+  const segments = splitCommandChain(stripComments(command));
   const last = segments[segments.length - 1];
   if (!last) return null;
   const words = splitWords(last);
@@ -78,7 +116,13 @@ export function detectTrailingTruncator(command: string): TrailingTruncator | nu
 
   for (let i = 1; i < words.length; i++) {
     const word = words[i];
-    if (word === "-" || !word.startsWith("-")) continue; // file operand
+    if (word === "-") continue; // stdin placeholder, not a flag
+    if (!word.startsWith("-")) {
+      // `tail +5`: start at line 5, not a count — declining rather than
+      // reading it as a bare file operand and defaulting limit to 10.
+      if (/^\+\d+$/.test(word)) return null;
+      continue; // file operand
+    }
     if (COUNTLESS_FLAGS.has(word)) continue;
 
     let wordUnit: "lines" | "bytes";
@@ -131,7 +175,11 @@ const RAW_BYTES_RE = /\braw_bytes=(\d+)\b/;
 const DUPLICATE_MARKER_RE = /^\s*\[\.\.\. (\d+) duplicate line\(s\) collapsed \.\.\.\]$/;
 const LINES_MARKER_RE = /^\s*\[\.\.\. (\d+) lines truncated \.\.\.\]$/;
 const BYTES_MARKER_RE = /^\s*\[\.\.\. [\d.]+(?:B|KB|MB) truncated \.\.\.\]$/;
-const OVERFLOW_NOTE_RE = /^(?:Full output|Partial output)\b/;
+// Exact shape from shell-session/helpers.ts's writeOverflowFile (and its
+// Python twin's `f"Full output: {container_path}"`) — anchored end-to-end so
+// command output that merely starts with these words isn't misread as the
+// harness's own note.
+const OVERFLOW_NOTE_RE = /^(?:Full output|Partial output \([^)]*\)): \S+$/;
 
 export interface ReconstructedCount {
   count: number;
@@ -193,13 +241,16 @@ const CONSEQUENCE: Record<string, string> = {
   "tail:bytes": "the source may have earlier content before what is shown",
 };
 
+// No quote delimiter around `raw`: the model's own final segment can itself
+// contain a single quote (`tail -20 '/tmp/my log'`), which would otherwise
+// make the note's own quoting look broken or ambiguous.
 export function partialViewNote(truncator: TrailingTruncator): string {
   const { tool, unit, raw } = truncator;
   const consequence = CONSEQUENCE[`${tool}:${unit}`];
   return (
-    `[partial view: this command ends in '${raw}', so ${consequence}. Don't ` +
-    "conclude something is absent from this view — re-run with a larger limit " +
-    "or a targeted filter (grep/awk) if it matters.]"
+    `[partial view: this command's last stage is: ${raw} — so ${consequence}. ` +
+    "Don't conclude something is absent from this view — re-run with a larger " +
+    "limit or a targeted filter (grep/awk) if it matters.]"
   );
 }
 
@@ -240,5 +291,9 @@ export function annotate(command: string, text: string): string | null {
   }
 
   const note = partialViewNote(truncator);
-  return footer ? `${body}\n${note}\n${footer}` : `${body.trimEnd()}\n${note}`;
+  if (footer) return `${body}\n${note}\n${footer}`;
+  // No footer to sit above (GAIA's bash) — append after body's own content
+  // exactly as-is; only add the separating newline the body doesn't already
+  // end with, so trailing whitespace that was part of the real output stays.
+  return body.endsWith("\n") ? `${body}${note}` : `${body}\n${note}`;
 }
