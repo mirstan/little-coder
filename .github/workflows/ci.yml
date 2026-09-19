@@ -11,6 +11,12 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: both jobs only read the repo. Without this the workflow
+# inherits whatever the repository's default GITHUB_TOKEN permissions are,
+# which on older repos is read/write for every scope.
+permissions:
+  contents: read
+
 jobs:
   npm-ci:
     name: npm ci
@@ -26,3 +32,23 @@ jobs:
 
       # --ignore-scripts: don't download playwright browsers on every CI run.
       - run: npm ci --ignore-scripts
+
+  pytest:
+    name: benchmarks pytest
+    runs-on: ubuntu-latest
+    # A hung fake-pi subprocess would otherwise burn the 6h default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pytest
+
+      # The PiRpc terminal-reason tests drive a fake pi subprocess
+      # (benchmarks/fake_pi.py), so they need neither the pi CLI nor a model
+      # server. The older tests in test_rpc_client.py self-skip without
+      # node_modules/.bin/pi.
+      - run: python -m pytest benchmarks/ -q
