@@ -9,7 +9,7 @@
 #   TBENCH_ROOT=/custom/path benchmarks/tb_pilot.sh my-task
 #
 # Env:
-#   TB_LITTLE_CODER_MODEL  — overrides the model (default: llamacpp/qwen3.6-35b-a3b)
+#   TB_LITTLE_CODER_MODEL  — overrides the model (default: omlx/tiel-coder-oq6e-fp16)
 #   TBENCH_ROOT            — terminal-bench checkout (default: ~/Documents/terminal-bench)
 #   TB_DATASET_SUBDIR      — tasks/ vs original-tasks/ (default: original-tasks)
 #
@@ -17,7 +17,7 @@
 # to `sg docker -c ...` automatically.
 set -euo pipefail
 
-MODEL="${TB_LITTLE_CODER_MODEL:-llamacpp/qwen3.6-35b-a3b}"
+MODEL="${TB_LITTLE_CODER_MODEL:-omlx/tiel-coder-oq6e-fp16}"
 ROOT="${TBENCH_ROOT:-$HOME/Documents/terminal-bench}"
 SUBDIR="${TB_DATASET_SUBDIR:-original-tasks}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

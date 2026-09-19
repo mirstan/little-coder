@@ -17,7 +17,7 @@
 # actually used the code you think it did.
 #
 # Env:
-#   TB_LITTLE_CODER_MODEL   — model override (default: llamacpp/qwen3.6-35b-a3b)
+#   TB_LITTLE_CODER_MODEL   — model override (default: omlx/tiel-coder-oq6e-fp16)
 #   TB_DATASET              — dataset override (default:
 #                             terminal-bench/terminal-bench-2-1, resolved via
 #                             harbor's newer org/name package registry, NOT
@@ -71,7 +71,7 @@
 #   benchmarks/harbor_runs/<timestamp>/...
 set -euo pipefail
 
-MODEL="${TB_LITTLE_CODER_MODEL:-llamacpp/qwen3.6-35b-a3b}"
+MODEL="${TB_LITTLE_CODER_MODEL:-omlx/tiel-coder-oq6e-fp16}"
 DATASET="${TB_DATASET:-terminal-bench/terminal-bench-2-1}"
 TIMEOUT_MULTIPLIER="${TB_TIMEOUT_MULTIPLIER:-15}"
 OVERRIDE_CPUS="${TB_OVERRIDE_CPUS:-4}"
