@@ -595,13 +595,26 @@ def _toolchain_probe_note(tools: list[str] | None) -> str | None:
     )
 
 
+class _ToolchainProbeResult(NamedTuple):
+    tools: list[str] | None
+    status: str
+
+
 async def _probe_toolchain(
     proxy: "_HarborShellProxy", logger: logging.Logger
-) -> list[str] | None:
+) -> _ToolchainProbeResult:
     """Run the probe once at trial start.
 
     Best-effort like the snapshots either side of it: any failure degrades to
-    no prompt line, never to a wrong one.
+    no prompt line, never to a wrong one. The returned `status` is what makes
+    that degradation legible after the fact: `tools` alone serializes to the
+    same JSON `null` whether the container call raised or the probe ran
+    cleanly and genuinely found none of the candidates -- `status` is the
+    raw record of which of those actually happened, for
+    environment_snapshot.json. (A run_harness timeout does not raise here --
+    _exec_async catches its own asyncio.TimeoutError and returns a normal
+    "command timed out" string -- so that case is disclosed inside the raw
+    output captured by the non-exception branch below, not by the except.)
     """
     try:
         out = await proxy.run_harness(
@@ -609,10 +622,16 @@ async def _probe_toolchain(
         )
     except Exception as e:
         logger.info(f"LittleCoderAgent: toolchain probe failed (non-fatal): {e}")
-        return None
+        return _ToolchainProbeResult(None, f"probe failed: {e}")
     tools = _parse_toolchain_probe(out)
     logger.info(f"LittleCoderAgent: toolchain probe -> {tools}")
-    return tools
+    # Sliced, not the full string: on a broken image this is _format_output's
+    # whole footer-and-all output, up to the ~48KB per-call cap -- more than
+    # a status field needs to disclose "what actually happened" and needless
+    # bulk in a JSON file meant for a quick post-mortem read.
+    return _ToolchainProbeResult(
+        tools, f"probe ran, raw output: {out[:2000]!r}"
+    )
 
 
 # Stated up front rather than left to the ShellSession tool description
@@ -890,6 +909,7 @@ def _build_environment_snapshot(
     ambient_max_turns_env: str | None,
     timeout_info: dict,
     toolchain: list[str] | None = None,
+    toolchain_probe_status: str | None = None,
 ) -> dict:
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
@@ -911,10 +931,13 @@ def _build_environment_snapshot(
     snapshot["adapter_file"] = str(Path(__file__).resolve())
     snapshot["adapter_mtime"] = _ADAPTER_MTIME
     snapshot["timeout_provenance"] = timeout_info
-    # Recorded even when None: the field alone can't tell "found nothing"
-    # from "never completed" -- that's the paired, differently-worded
-    # logger.info line above (_probe_toolchain) to read alongside it.
+    # toolchain_probe alone can't tell "found nothing" from "never
+    # completed" -- both serialize as null. toolchain_probe_status is the
+    # raw record (the exception message, or the probe's actual stdout) that
+    # makes that distinction from the JSON file alone, without having to go
+    # find the matching logger.info line in the trial log.
     snapshot["toolchain_probe"] = toolchain
+    snapshot["toolchain_probe_status"] = toolchain_probe_status
     return snapshot
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
@@ -1646,6 +1669,42 @@ class LittleCoderAgent(BaseAgent):
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
         )
 
+        # One cheap probe of what the image actually ships, before the
+        # deadline is anchored so its cost is not charged to the model. Run
+        # ahead of the start-of-trial snapshot below (rather than after, as
+        # this used to be ordered) for the same reason the env-snapshot
+        # write right below is ordered ahead of it too -- see that comment.
+        toolchain = await _probe_toolchain(proxy, self.logger)
+
+        # Per-trial environment_snapshot.json: best-effort, must never fail
+        # a trial. Sits after the toolchain probe so it can record what that
+        # found, but deliberately AHEAD of _snapshot_initial_state below --
+        # unlike the probe, nothing this snapshot writes depends on that
+        # snapshot's outcome, and _snapshot_initial_state is bounded at 60s
+        # (including a docker-cp of up to 200MB) versus the probe's 10s. The
+        # original guarantee this restores: environment_snapshot.json lands
+        # early enough to survive even a mid-start termination, rather than
+        # depending on the initial-state stage+download finishing first.
+        # Still ahead of the PiRpc-construction try/except further below so
+        # it (and the config-provenance log line) land even if PiRpc itself
+        # fails to construct (e.g. PI_BIN missing) -- exactly the
+        # diagnostics that failure needs most.
+        if self.logs_dir:
+            try:
+                snapshot = _build_environment_snapshot(
+                    model,
+                    max_turns=max_turns,
+                    ambient_max_turns_env=ambient_max_turns_env,
+                    timeout_info=timeout_info,
+                    toolchain=toolchain.tools,
+                    toolchain_probe_status=toolchain.status,
+                )
+                (self.logs_dir / "environment_snapshot.json").write_text(
+                    json.dumps(snapshot, indent=2, default=str)
+                )
+            except Exception as e:
+                self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
+
         # Start-of-trial snapshot of the task's pre-existing /app files.
         # Unconditional, and deliberately ahead of the deadline-snapshot gate
         # below rather than inside it: that gate's rationale is "this trial is
@@ -1662,36 +1721,24 @@ class LittleCoderAgent(BaseAgent):
         # prompt is even sent. Anchoring after means the model always gets
         # the full effective_timeout_sec, regardless of how long staging
         # and downloading this snapshot took.
+        #
+        # Both this and the toolchain probe above go through run_harness,
+        # which shares _exec_async's _exec_lock with every model-issued
+        # command -- so gathering the two concurrently would not actually
+        # run them in parallel inside the container, only add scheduling
+        # complexity for no wall-clock benefit. Staying sequential keeps
+        # this simple; only the write order above changed.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
 
-        # One cheap probe of what the image actually ships, before the
-        # deadline is anchored so its cost is not charged to the model.
-        toolchain = await _probe_toolchain(proxy, self.logger)
+        # Composed here, after the initial-state snapshot, rather than right
+        # after the probe above: _compose_prompt is pure and `prompt` isn't
+        # read until prompt_with_error_retry far below, so nothing requires
+        # it to exist this early, and leaving it here means a prompt note
+        # that a later change derives from _snapshot_initial_state's outcome
+        # has somewhere to plug in without re-threading this function.
         prompt = _compose_prompt(
-            prompt_prefix, prompt_task_block, [_toolchain_probe_note(toolchain)]
+            prompt_prefix, prompt_task_block, [_toolchain_probe_note(toolchain.tools)]
         )
-
-        # Per-trial environment_snapshot.json: best-effort, must never fail
-        # a trial. Sits after the probes above so it can record what they
-        # found, and still ahead of the PiRpc-construction try/except below
-        # so it (and the config-provenance log line) land even if PiRpc
-        # itself fails to construct (e.g. PI_BIN missing) -- exactly the
-        # diagnostics that failure needs most. Safe to delay this far: every
-        # probe above is individually time-bounded.
-        if self.logs_dir:
-            try:
-                snapshot = _build_environment_snapshot(
-                    model,
-                    max_turns=max_turns,
-                    ambient_max_turns_env=ambient_max_turns_env,
-                    timeout_info=timeout_info,
-                    toolchain=toolchain,
-                )
-                (self.logs_dir / "environment_snapshot.json").write_text(
-                    json.dumps(snapshot, indent=2, default=str)
-                )
-            except Exception as e:
-                self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
 
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
         # The same instant as deadline_epoch_ms, on the monotonic clock the

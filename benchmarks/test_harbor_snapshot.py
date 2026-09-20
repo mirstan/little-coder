@@ -585,6 +585,25 @@ def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
     assert call_line.lstrip().startswith("await _snapshot_initial_state(")
 
 
+def test_environment_snapshot_write_lands_before_the_initial_state_snapshot():
+    """Placement pin, restoring a guarantee an earlier refactor narrowed:
+    environment_snapshot.json must land before _snapshot_initial_state (bounded
+    at 60s, including a docker-cp of up to 200MB) rather than after it, so it
+    survives even a mid-start termination during that stage+download. Nothing
+    the env-snapshot write needs -- max_turns, timeout_info, the toolchain
+    probe result -- depends on _snapshot_initial_state's outcome."""
+    src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
+    write_line = next(
+        line for line in src.splitlines() if '"environment_snapshot.json"' in line
+    )
+    snapshot_call_line = next(
+        line for line in src.splitlines() if "await _snapshot_initial_state(" in line
+    )
+    assert src.index(write_line) < src.index(snapshot_call_line), (
+        "environment_snapshot.json must be written before _snapshot_initial_state runs"
+    )
+
+
 # ── 1f. Start-of-trial toolchain probe + prompt assembly ───────────────────
 
 @pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
@@ -662,12 +681,41 @@ def test_prompt_always_carries_the_hard_limits_paragraph():
         assert lca._HARD_LIMITS_PARAGRAPH in prompt
 
 
+def _shell_session_timeout_constants() -> tuple[int, int]:
+    """Read the ShellSession tool's own default/max timeout straight out of
+    .pi/extensions/shell-session -- the only place that actually enforces
+    them -- so the paragraph test below can't drift silently from the code
+    it claims to pin. Regex, not an import: this is TypeScript, and there is
+    no existing pattern in this repo for a Python test to load a TS module,
+    so parsing the two literals out of source is the cheap alternative to
+    either a shared JSON constants file or leaving the claim unverified.
+    """
+    ts_dir = lca._REPO_ROOT / ".pi" / "extensions" / "shell-session"
+    helpers_src = (ts_dir / "helpers.ts").read_text()
+    default_timeout = int(
+        re.search(r"DEFAULT_TIMEOUT\s*=\s*(\d+)", helpers_src).group(1)
+    )
+    index_src = (ts_dir / "index.ts").read_text()
+    max_timeout = int(
+        re.search(r"Math\.min\(rawTimeout,\s*(\d+)\)", index_src).group(1)
+    )
+    return default_timeout, max_timeout
+
+
 def test_hard_limits_paragraph_states_the_caps_the_harness_enforces():
     """Pins the numbers to the code that enforces them -- a stale prompt here
-    is worse than none, since the model would trust it."""
+    is worse than none, since the model would trust it.
+
+    All four numbers are now actually derived from the enforcing side: the
+    200-line/48KB caps from this module's own MAX_LINES/MAX_BODY_*_BYTES
+    (which _exec_async's formatting path applies), and the 30s/600s timeout
+    bounds from .pi/extensions/shell-session's own source (the ShellSession
+    tool description these numbers used to only echo, hand-typed, with no
+    check that they still matched)."""
     para = lca._HARD_LIMITS_PARAGRAPH
-    assert "default 30s" in para
-    assert "up to 600" in para
+    default_timeout, max_timeout = _shell_session_timeout_constants()
+    assert f"default {default_timeout}s" in para
+    assert f"up to {max_timeout}" in para
     assert f"{lca.MAX_LINES} lines" in para
     capped_kb = (lca.MAX_BODY_HEAD_BYTES + lca.MAX_BODY_TAIL_BYTES) // 1024
     assert f"{capped_kb}KB" in para
@@ -695,13 +743,19 @@ def test_prompt_omits_the_toolchain_line_when_the_probe_found_nothing():
 
 
 def test_probe_toolchain_returns_none_when_the_container_call_raises():
-    """Best-effort: a probe failure costs the prompt line, never the trial."""
+    """Best-effort: a probe failure costs the prompt line, never the trial --
+    but the raw exception must still be recoverable from `status`, since
+    `tools=None` alone is indistinguishable from a probe that ran clean and
+    found nothing."""
 
     class _ExplodingProxy:
         async def run_harness(self, command, timeout):
             raise RuntimeError("exec exploded")
 
-    assert asyncio.run(lca._probe_toolchain(_ExplodingProxy(), _logger())) is None
+    result = asyncio.run(lca._probe_toolchain(_ExplodingProxy(), _logger()))
+    assert result.tools is None
+    assert "probe failed" in result.status
+    assert "exec exploded" in result.status
 
 
 def test_probe_toolchain_reads_stdout_and_ignores_a_nonzero_rc():
@@ -718,20 +772,35 @@ def test_probe_toolchain_reads_stdout_and_ignores_a_nonzero_rc():
         proxy._exec_async = fake_exec
         return await lca._probe_toolchain(proxy, _logger())
 
-    assert asyncio.run(scenario()) == ["perl", "awk"]
+    result = asyncio.run(scenario())
+    assert result.tools == ["perl", "awk"]
+    assert "probe ran, raw output" in result.status
 
 
 def test_environment_snapshot_records_the_probe_result_even_when_empty():
     """Post-mortem needs "probe found nothing" to be distinguishable from an
-    adapter build that never probed at all."""
+    adapter build that never probed at all -- toolchain_probe alone can't do
+    that (both are JSON null), so toolchain_probe_status must carry the raw
+    record of what actually happened."""
     info = lca._fallback_timeout_info()
     for toolchain in (["python3"], None):
         snapshot = lca._build_environment_snapshot(
             "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
             timeout_info=info, toolchain=toolchain,
+            toolchain_probe_status="probe ran, raw output: 'python3 '",
         )
         assert "toolchain_probe" in snapshot
         assert snapshot["toolchain_probe"] == toolchain
+        assert snapshot["toolchain_probe_status"] == "probe ran, raw output: 'python3 '"
+
+    # And the None/None case (probe never even attempted a status) still
+    # serializes cleanly rather than raising.
+    snapshot = lca._build_environment_snapshot(
+        "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+        timeout_info=info, toolchain=None, toolchain_probe_status=None,
+    )
+    assert snapshot["toolchain_probe"] is None
+    assert snapshot["toolchain_probe_status"] is None
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────

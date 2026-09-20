@@ -58,6 +58,33 @@ MAX_RAW_HEAD_BYTES = 256 * 1024
 MAX_RAW_TAIL_BYTES = 128 * 1024
 
 
+# The output-caps and minimal-image sentences below are kept in sync by hand
+# with the harbor adapter's _HARD_LIMITS_PARAGRAPH (same enforcement on both
+# backends -- ANSI_RE/MAX_LINES/MAX_BODY_*_BYTES above are separately
+# duplicated constants with the same values as harbor's), the same way
+# _format_output is duplicated across the two adapters rather than shared.
+# test_format_output.py pins that shared substring across both paragraphs.
+#
+# The timeout sentence is NOT kept in sync, and never should be: harbor's
+# docker-exec timeout actually kills the process, but _TmuxShellProxy.run
+# only passes the timeout to tmux's send_keys(block=True) and moves on --
+# nothing here sends a C-c or kills anything, so a command that overruns
+# keeps running in the background. Telling the model it was "killed" would
+# be false on this backend.
+_HARD_LIMITS_PARAGRAPH = (
+    "Hard limits of this environment: each ShellSession call has a "
+    "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts); a command that runs past its "
+    "timeout keeps running in the background rather than being "
+    "killed — its output so far is shown, and it may keep writing "
+    "output that interleaves with, or shows up ahead of, a "
+    "subsequent command's own output. Output is capped at 200 "
+    "lines / ~48KB per call. The container image is minimal: check which "
+    "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+    "designing an approach around one."
+)
+
+
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
@@ -331,16 +358,7 @@ class LittleCoderAgent(BaseAgent):
             "You are running as root in the container; /app is writable.\n"
             "File tools like Read/Write/Edit are NOT available — use shell commands "
             "(cat, sed -i, heredoc 'cat > file <<EOF') through ShellSession instead.\n\n"
-            # Kept in sync by hand with the harbor adapter's
-            # _HARD_LIMITS_PARAGRAPH, the same way _format_output is
-            # duplicated across the two adapters rather than shared.
-            "Hard limits of this environment: each ShellSession call is killed at "
-            "its timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
-            "compiles/installs/long scripts; a killed command does not run its "
-            "cleanup and can leave files half-written). Output is capped at 200 "
-            "lines / ~48KB per call. The container image is minimal: check which "
-            "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
-            "designing an approach around one.\n\n"
+            + _HARD_LIMITS_PARAGRAPH + "\n\n"
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
@@ -407,7 +425,20 @@ class LittleCoderAgent(BaseAgent):
                 tb_mode=True,
                 max_turns=self._max_turns,
                 tb_shell_handler=tb_shell_handler,
-                env={"LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms)},
+                # Unattended, same as the harbor/gaia/aider_polyglot adapters
+                # (see harbor_adapter/little_coder_agent.py's own env= for
+                # the fuller rationale): there is no human present to grant
+                # a permission-gate prompt, and its "auto" default's
+                # SAFE_PREFIXES whitelist is necessarily incomplete (e.g. it
+                # covers `which`/`type`/`printenv` but not `command`, which
+                # this adapter's own hard-limits paragraph tells the model to
+                # run as its very first probe). Whitelisting one command at a
+                # time is whack-a-mole; every other TB agent already runs
+                # with unrestricted tool access here.
+                env={
+                    "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+                    "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+                },
             ) as rpc:
                 # Retried in place on a provider-error completion -- one
                 # errored completion otherwise ends the whole trial with most

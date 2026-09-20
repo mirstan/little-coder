@@ -12,6 +12,7 @@ formatter -- which touches neither package -- untested everywhere it runs.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -318,3 +319,62 @@ def test_syntax_error_report_still_finds_the_result_body(ad):
     bodies = list(iter_results(log))
     assert len(bodies) == 1
     assert "SyntaxError" in bodies[0]
+
+
+# ── _HARD_LIMITS_PARAGRAPH: shared caps, divergent kill semantics ─────────
+
+
+def test_hard_limits_paragraphs_share_caps_but_diverge_on_kill_semantics(ad):
+    """The output-caps / minimal-image sentence is hand-kept identical across
+    both adapters' hard-limits paragraphs (see each module's comment above
+    its _HARD_LIMITS_PARAGRAPH); the timeout-kill sentence must NOT match,
+    because it isn't true on both backends: harbor's docker-exec timeout
+    actually kills the overrun process, but TB 1.0's _TmuxShellProxy.run only
+    passes the timeout to tmux's send_keys(block=True) and sends no C-c or
+    kill -- an overrun command keeps running in the background there. Runs
+    once (guarded on ad.name) since it inspects both modules directly rather
+    than through the per-adapter `fmt` callable.
+    """
+    if ad.name != "harbor":
+        pytest.skip("runs once -- inspects both modules directly, not ad.fmt")
+
+    harbor_kb = (_HARBOR.MAX_BODY_HEAD_BYTES + _HARBOR.MAX_BODY_TAIL_BYTES) // 1024
+    tb_kb = (_TB.MAX_BODY_HEAD_BYTES + _TB.MAX_BODY_TAIL_BYTES) // 1024
+    assert _HARBOR.MAX_LINES == _TB.MAX_LINES
+    assert harbor_kb == tb_kb
+
+    shared = (
+        f"Output is capped at {_HARBOR.MAX_LINES} lines / ~{harbor_kb}KB per call. "
+        "The container image is minimal: check which interpreters and tools "
+        "exist (`command -v python3 perl gcc ...`) before designing an "
+        "approach around one."
+    )
+    assert shared in _HARBOR._HARD_LIMITS_PARAGRAPH
+    assert shared in _TB._HARD_LIMITS_PARAGRAPH
+
+    assert "call is killed at its timeout" in _HARBOR._HARD_LIMITS_PARAGRAPH
+    assert "does not run its cleanup" in _HARBOR._HARD_LIMITS_PARAGRAPH
+    # TB's paragraph may mention "killed" only to disclaim it (see the
+    # module comment above _HARD_LIMITS_PARAGRAPH) -- it must never assert
+    # that a call IS killed or that cleanup does not run, since neither is
+    # true on the tmux backend.
+    assert "call is killed at its timeout" not in _TB._HARD_LIMITS_PARAGRAPH
+    assert "does not run its cleanup" not in _TB._HARD_LIMITS_PARAGRAPH
+    assert "keeps running in the background" in _TB._HARD_LIMITS_PARAGRAPH
+
+
+def test_tb_adapter_sets_accept_all_permission_mode(ad):
+    """The permission-gate's "auto" default whitelists `which`/`type`/
+    `printenv` but not `command` -- the very probe _HARD_LIMITS_PARAGRAPH
+    tells the model to run first (`command -v python3 perl gcc ...`). This
+    adapter must set accept-all, same as harbor/gaia/aider_polyglot, or that
+    first probe (and any other command the whitelist doesn't happen to
+    cover) gets silently refused with no human present to grant it. Source
+    inspection, not a live PiRpc: exercising perform_task() end to end would
+    need a real TmuxSession/container, which nothing else in this file sets
+    up either.
+    """
+    if ad.name != "tb":
+        pytest.skip("tb-only: harbor's own accept-all is exercised in harbor's own tests")
+    src = inspect.getsource(_TB.LittleCoderAgent.perform_task)
+    assert '"LITTLE_CODER_PERMISSION_MODE": "accept-all"' in src
