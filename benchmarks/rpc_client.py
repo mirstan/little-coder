@@ -1312,7 +1312,8 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # Reserve room for the marker so the common case stays within `limit`.
     # A fixed reserve, not the marker's exact length, because that length
     # depends on the omitted count, which depends on where we cut.
-    marker_reserve = 40
+    # Sized for the self-describing marker below.
+    marker_reserve = 90
     body_budget = max(0, limit - marker_reserve - (len(footer) + 1 if footer else 0))
     if len(body) <= body_budget:
         return _with_footer(body)
@@ -1326,7 +1327,10 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # No boundary at all (one unbroken token wider than the budget) leaves
     # `cut` as the hard slice -- unavoidable, and still better than also
     # losing the footer.
-    marker = f"… [+{len(body) - len(cut)} chars truncated]"
+    marker = (
+        f"… [+{len(body) - len(cut)} chars omitted from this log preview; "
+        "the model received the full output]"
+    )
     out = f"{cut}\n{marker}" if cut else marker
     return _with_footer(out)
 

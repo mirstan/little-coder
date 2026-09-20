@@ -800,6 +800,9 @@ def _build_environment_snapshot(
 # output-format consistency is preserved across benchmarks.
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_LINES = 200
+# Tiny relative to the byte caps below, which still catch anything past this
+# that's actually large.
+SMALL_OUTPUT_FLOOR_BYTES = 4 * 1024
 
 # Byte caps, which the line cap alone cannot enforce: one 1MB line is one
 # "line", so a `grep` hit on a single-line JSON file used to reach the model
@@ -897,7 +900,7 @@ def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: boo
         deduped.append(f"  [... {dup} duplicate line(s) collapsed ...]")
     # truncate
     truncated = False
-    if len(deduped) > MAX_LINES:
+    if len(deduped) > MAX_LINES and len("\n".join(deduped).encode("utf-8")) > SMALL_OUTPUT_FLOOR_BYTES:
         head, tail = MAX_LINES // 2, MAX_LINES // 4
         skipped = len(deduped) - head - tail
         deduped = deduped[:head] + [f"  [... {skipped} lines truncated ...]"] + deduped[-tail:]
