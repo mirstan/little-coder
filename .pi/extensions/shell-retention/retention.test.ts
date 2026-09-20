@@ -440,6 +440,20 @@ describe("demoteMessages", () => {
     expect(commandOf(out.messages[1])).toContain(CMD_DEMOTED_INFIX + archiveId("victim"));
   });
 
+  // Real output that merely starts with the prefix text and separately
+  // mentions this pair's own id must still be demoted — the check requires
+  // the complete, exact marker line, not "starts with X and contains Y".
+  it("does not mistake real output that merely resembles the result marker for an already-demoted one", () => {
+    const id = archiveId("victim2");
+    const resultText =
+      `${RESULT_DEMOTED_PREFIX} mode] test output for debugging shell-retention.ts\n` +
+      `checking id format: ShellRecall id=${id} looks right\n` +
+      filler(5000, "out");
+    const msgs = [userMsg("t"), assistantShell("victim2", "debug-test"), shellResult("victim2", resultText, null), ...pairs(4, "n")];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect(textOf(out.messages[2])).not.toBe(resultText);
+  });
+
   // A thoughtSignature on a sibling text/thinking block (not the toolCall
   // block itself) must still block the command rewrite — pi's
   // google-shared.js states the signature "can appear on ANY part type".

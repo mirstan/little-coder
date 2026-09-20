@@ -295,11 +295,15 @@ function isSignedMessage(m: any): boolean {
 // (e.g. quoted as an example in a heredoc) — this repo is self-hosted, so
 // that shape can appear as plain command text with no demotion involved.
 const CMD_DEMOTED_MARKER_RE = /^\[\.\.\. \S+ of command text demoted — ShellRecall id=(sr-[0-9a-f]{16}) \.\.\.\]$/m;
-const RESULT_DEMOTED_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16}) /;
+// Anchored to the complete first line, not just "starts with the prefix and
+// mentions an id somewhere" — real output that happens to open with the
+// prefix text could otherwise coincidentally satisfy a looser check.
+const RESULT_DEMOTED_MARKER_RE =
+  /^\[shell result demoted — \S+ originally; ShellRecall id=(sr-[0-9a-f]{16}) pages back the full command\+output\]/;
 
 function alreadyDemoted(p: Pair): boolean {
   const ownId = archiveId(p.toolCallId);
-  const resultMatch = p.resultText.startsWith(RESULT_DEMOTED_PREFIX) && RESULT_DEMOTED_ID_RE.exec(p.resultText);
+  const resultMatch = RESULT_DEMOTED_MARKER_RE.exec(p.resultText);
   if (resultMatch && resultMatch[1] === ownId) return true;
   const cmdMatch = CMD_DEMOTED_MARKER_RE.exec(p.command);
   return cmdMatch !== null && cmdMatch[1] === ownId;
