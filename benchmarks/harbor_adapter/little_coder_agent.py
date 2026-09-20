@@ -1671,9 +1671,9 @@ class LittleCoderAgent(BaseAgent):
 
         # One cheap probe of what the image actually ships, before the
         # deadline is anchored so its cost is not charged to the model. Run
-        # ahead of the start-of-trial snapshot below (rather than after, as
-        # this used to be ordered) for the same reason the env-snapshot
-        # write right below is ordered ahead of it too -- see that comment.
+        # ahead of the start-of-trial snapshot below for the same reason the
+        # env-snapshot write right below is ordered ahead of it too -- see
+        # that comment.
         toolchain = await _probe_toolchain(proxy, self.logger)
 
         # Per-trial environment_snapshot.json: best-effort, must never fail
