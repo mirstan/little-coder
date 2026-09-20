@@ -1,7 +1,7 @@
 # Plan: second-round harness improvements (2026-09-19 trajectory analysis)
 
-Status: **priorities 1-5 merged (PRs #54-57, 2026-09-20); priorities 6-12 not yet
-started.** See `STATE.md` for how this fits into the overall project.
+Status: **ranked list drafted, not yet designed/critiqued/implemented.** See
+`STATE.md` for how this fits into the overall project.
 
 ## Source
 
@@ -30,20 +30,17 @@ trajectories to passing (the model would still fail the task).
 
 ## Carried-over item: pre-execution syntax diagnostics (LSP alternative)
 
-`syntax-check-lsp-alternative.md` — not checked into this repo; it lives in this
-session's scratchpad (`harness-improvement-plans/`, alongside the other per-item
-design docs referenced below), not alongside this file. Origin is **separate
-from this file's 2026-09-19 trajectory analysis** — it's a Fable Plan agent's
-earlier LSP-integration research from mid-session, recovered from the transcript
-after an explicit "locate the lsp integration plan that wasn't executed" request,
-and never folded into this ranked list until now. Checked 2026-09-20: every
-*other* scratchpad design doc from that same directory
-(`11-observation-pack-context-demotion.md`, `9-truncated-view-annotation.md`,
-`checkpoint-session-start-snapshot.md`, `finalize-warn-followup-to-steer.md`,
-`quality-monitor-escalating-loop-breaker.md`, `shell-output-byte-cap-fix.md`,
-`shell-output-overflow-capture-phase2.md`, `trigger-a-correctness-nudge.md`) maps
-to an already-merged PR — their own status headers say "not yet implemented" but
-that's stale, written before implementation.
+`syntax-check-lsp-alternative.md`, same directory. Origin is **separate from this
+file's 2026-09-19 trajectory analysis** — it's a Fable Plan agent's earlier
+LSP-integration research from mid-session, recovered from the transcript after an
+explicit "locate the lsp integration plan that wasn't executed" request, and never
+folded into this ranked list until now. Checked 2026-09-20: every *other* design
+doc in this directory (`11-observation-pack-context-demotion.md`,
+`9-truncated-view-annotation.md`, `checkpoint-session-start-snapshot.md`,
+`finalize-warn-followup-to-steer.md`, `quality-monitor-escalating-loop-breaker.md`,
+`shell-output-byte-cap-fix.md`, `shell-output-overflow-capture-phase2.md`,
+`trigger-a-correctness-nudge.md`) maps to an already-merged PR — their own status
+headers say "not yet implemented" but that's stale, written before implementation.
 Spot-verified two of the less obviously-titled ones directly against code
 (`checkpoint/index.ts`'s `session_start` handler, `quality-monitor/index.ts`'s
 escalation state) to be sure rather than trust filenames. This is the one
@@ -58,16 +55,28 @@ tool result only on failure, for whichever of 4 languages the model just wrote.
 **Why it ranks where it does**: strongest evidence base of anything on this list —
 not a single-trajectory anecdote but a *measured, reproducing* failure rate: 24.5%
 calls-with-syntax-error on the motivating trial, and confirmed on 2026-09-19 that
-the identical trial re-run on current `dev` (with everything else already merged)
-still accumulates syntax errors mid-run — none of the shipped fixes touch this
-failure class. Generalizes to Aider Polyglot's write/edit-tool path for free
-(verified against `aider_polyglot.py`'s actual `ALLOWED_TOOLS`). Mechanics are
-unusually thoroughly pre-verified for an unimplemented design (exact hook, exact
-proxy channel, footer-parsing regex, a real observed failure loop it targets
-directly — a Perl syntax error the model rewrote identically twice before finally
-reading the line) — but it has never been through an adversarial critique pass,
-unlike every other now-merged design from that scratchpad batch, which is real
-remaining risk the impact/effort call doesn't capture.
+the identical trial re-run on current `dev` (with everything else already merged
+at that time) still accumulates syntax errors mid-run. Generalizes to Aider
+Polyglot's write/edit-tool path for free (verified against `aider_polyglot.py`'s
+actual `ALLOWED_TOOLS`). Mechanics are unusually thoroughly pre-verified (exact
+hook, exact proxy channel, a real observed failure loop it targets directly — a
+Perl syntax error the model rewrote identically twice before finally reading the
+line).
+
+**Update 2026-09-20**: sent through a Fable adversarial critique against current
+`dev` (post PR #54-57) — verdict **ready with 5 amendments, all folded into
+`syntax-check-lsp-alternative.md`**. No amendment was fundamental; every reuse
+target (the `tool_result` hook pattern, the proxy channel, `detectDeliverableWrites`,
+`checkpointPath`) checked out against the post-merge codebase, though several line
+references had drifted and two real conflicts with extensions that landed *after*
+this design was first written got caught and fixed (reuse `truncated-view`'s
+`splitFooter` instead of hand-rolling footer parsing; insert the diagnostic above
+the footer, not appended after, to stay compatible with `truncated-view`'s own
+footer-last assumption). One amendment flags that the 2026-09-19 evidence number
+should be re-measured before implementation, since PR #54's timeout warnings
+plausibly already reduce one subset of the motivating failure — this is a
+measurement task, not a design blocker. **This item is now ready to implement,
+same as priorities 1-5 were after their own critique passes.**
 
 ## Priority order (impact × effort)
 
@@ -84,7 +93,7 @@ where the full rationale lives.
 | 3 | `#9` State hard tool-contract limits up front (30s cap, interpreters present) | Medium | **S** | Static injected hint, no new state machine; cost real turns in 2 of 4 trajectories — **merged, PR #56** |
 | 4 | `#10` Don't truncate small (<4KB) tool outputs | Low–Med | **S** | Threshold tweak to an existing formatter; narrow but free — **merged, PR #55** |
 | 5 | `#3` Advertise the pristine initial-state snapshot to the agent | **High** | M | Would have caught overfull-hbox's corruption instantly; extends checkpoint/snapshot machinery already built (PR #29/#50/#51) — **merged, PR #57** |
-| 6 | *(carried over)* Pre-execution syntax diagnostics (LSP alternative) | **High** | M | Strongest evidence of anything remaining — measured, reproducing failure rate (not a single trajectory), generalizes to Aider Polyglot for free, but the one item here with no adversarial critique pass yet |
+| 6 | *(carried over)* Pre-execution syntax diagnostics (LSP alternative) | **High** | M | Strongest evidence of anything remaining — measured, reproducing failure rate (not a single trajectory), generalizes to Aider Polyglot for free. **Design + adversarial critique both complete as of 2026-09-20 (verdict: ready with 5 amendments, all folded in) — ready to implement, no longer blocked on critique.** |
 | 7 | `#6` Baseline-grounded adversarial re-verification in "don't give up" nudges | Medium | S–M | Directive-text change to existing nudge extensions; pairs directly with #3/PR #57 (a real baseline now exists to verify against) |
 | 8 | `#5` Earlier/more frequent deadline-progress nudges (50%/75% checkpoints) | Med–High | M | Extends tb-finalize-guard triggers; needs a "does a runnable deliverable exist yet" heuristic |
 | 9 | `#4` Fuzzy/near-duplicate loop detection | Med–High | M | Extends quality-monitor's loop-breaker; similarity matching carries real false-positive risk, needs careful tuning |
@@ -191,11 +200,12 @@ evidence.
    critique → Sonnet/Opus implement, reviewed (security-review, OCR, `/code-review
    high`, Cubic, and 3 rounds of dedicated `/code-comments` across Opus and Fable
    passes), and merged as PRs #54-57 on 2026-09-20.
-2. Priority 6 (LSP-alternative syntax-check) already has a design — the gap is
-   specifically the adversarial critique pass every other now-merged item in this
-   directory went through and this one hasn't. Natural next step: send
-   `syntax-check-lsp-alternative.md` through a Fable adversarial critique before
-   implementing, same pipeline as everything else.
+2. ~~Priority 6 (LSP-alternative syntax-check)~~ — **design + critique done**
+   (2026-09-20, verdict ready with 5 amendments, folded in). Ready to hand to a
+   Sonnet/Opus implementer in an isolated worktree, same pipeline as priorities
+   1-5. One pre-implementation task noted in the critique: re-run
+   `benchmarks/syntax_error_report.py` on a fresh write-compressor trial to
+   confirm the 2026-09-19 evidence baseline still holds post-#54-57.
 3. Priority 7 is newly unblocked (PR #57 gives it a real baseline to verify
    against) and is small — could go straight to implementation without a full
    design pass, mirroring how PR #47-#52 were handled.
