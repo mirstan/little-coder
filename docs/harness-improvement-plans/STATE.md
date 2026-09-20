@@ -258,15 +258,48 @@ manual full-suite run surfaced it. Fixed in a separate isolated worktree
 (`little-coder-skill-inject-fix`, branch `fix/skill-inject-test-prompt-regex`),
 mutation-tested, opened as **PR #59**.
 
+## 4c. PRs #58, #59, #60 merged (2026-09-20)
+
+On explicit user instruction ("merge 59, then 60, then 58, if cubic is clear"),
+gated on each PR's Cubic scan being clear and zero unresolved review threads.
+
+- Before merging, ran a further round of work per user request: 3 parallel Fable
+  subagents (one per branch) applied the `/code-comments` methodology to each
+  branch's own diff against `origin/dev`. #58 got 2 real fixes (an overstated
+  "must never surface" claim contradicted by its own perl checker; an
+  absolute "never appears" claim about resolved paths that was really "need not
+  appear"). #59 got 1 real fix (a docstring overstating what it reconstructs,
+  plus refactor-provenance language that belonged in the commit message, not
+  the comment). #60 had no findings — its diff adds no comments, and the fix
+  it landed made a pre-existing comment true rather than leaving it false.
+- Those comment-fix pushes triggered fresh Cubic scans, which caught 2 more
+  real findings on #58 (a new test that didn't actually exercise the
+  basename-fallback branch it claimed to — confirmed via mutation test; a
+  fail-open comment that named only perl's exception when gcc/cc's
+  `-fsyntax-only` also resolves `#include` headers). Both fixed, mutation
+  where applicable, replied+resolved.
+- **Lesson learned, worth remembering**: a GitHub Actions "rerun" replays the
+  *original* commit SHAs — it does not re-test against an updated base branch.
+  PR #60's `vitest` job kept showing red after #59 merged even though `git
+  rerun` was used, because the rerun wasn't actually testing against merged
+  `dev`. Fixed by rebasing `ci/add-vitest` onto `origin/dev` and
+  force-pushing, which triggers a genuine new merge-ref test. Confirmed green
+  both locally (1158/1158 tests) and in the new CI run before merging.
+- Merge order: #59 (`343ea47`) → #60 → #58, all via `gh pr merge --merge`
+  (this repo's established convention, matching PRs #54-57's merge-commit
+  style). All three fully green and thread-clean at merge time.
+
 ## 5. Open loose ends
 
-- PRs #58 and #59 need an explicit "merge" instruction from the user (CI running
-  as of this update — npm ci/pytest green on both, Cubic pending).
-- The vitest-not-in-CI gap (see above) is a standing risk worth its own fix at
-  some point — a `.github/workflows/ci.yml` job running `npx vitest run` — not
-  attempted here since it's outside the scope of what was asked.
 - Priorities 7-12 in `PLAN.md` have not been started.
-- The design's own flagged follow-up (re-run `benchmarks/syntax_error_report.py`
-  on a fresh write-compressor trial to confirm the 24.5%/2026-09-19 evidence
-  baseline still holds post-#54-57) is still outstanding — needs a live harbor
-  trial, not done as part of implementation.
+- Re-run `benchmarks/syntax_error_report.py` on a fresh write-compressor trial
+  to confirm the 24.5%/2026-09-19 evidence baseline for priority 6 still holds
+  post-#54-58 — still outstanding, needs a live harbor trial, not a code change.
+- The separate 8-issue plan from an earlier trajectory analysis (saved at
+  `~/.claude/plans/calm-churning-wigderson.md`, not part of this `PLAN.md`'s
+  ranked list) still has an open Phase 4 implementation plan (branches
+  A-F: error-stop-reason-retry, tb-guard-trigger-c, adaptive-thinking-budget,
+  checkpoint-shell-writes, temporal-research-trigger, shell-contract-nudge).
+  Checked 2026-09-20: no branches or merged PRs matching those names exist —
+  this plan was never executed. Distinct from priorities 7-12 above; needs its
+  own decision on whether it's still wanted before picking it back up.

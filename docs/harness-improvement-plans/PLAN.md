@@ -1,7 +1,7 @@
 # Plan: second-round harness improvements (2026-09-19 trajectory analysis)
 
-Status: **ranked list drafted, not yet designed/critiqued/implemented.** See
-`STATE.md` for how this fits into the overall project.
+Status: **priorities 1-6 merged (PRs #54-58, 2026-09-20); priorities 7-12 not yet
+started.** See `STATE.md` for how this fits into the overall project.
 
 ## Source
 
@@ -93,7 +93,7 @@ where the full rationale lives.
 | 3 | `#9` State hard tool-contract limits up front (30s cap, interpreters present) | Medium | **S** | Static injected hint, no new state machine; cost real turns in 2 of 4 trajectories — **merged, PR #56** |
 | 4 | `#10` Don't truncate small (<4KB) tool outputs | Low–Med | **S** | Threshold tweak to an existing formatter; narrow but free — **merged, PR #55** |
 | 5 | `#3` Advertise the pristine initial-state snapshot to the agent | **High** | M | Would have caught overfull-hbox's corruption instantly; extends checkpoint/snapshot machinery already built (PR #29/#50/#51) — **merged, PR #57** |
-| 6 | *(carried over)* Pre-execution syntax diagnostics (LSP alternative) | **High** | M | Strongest evidence of anything remaining — measured, reproducing failure rate (not a single trajectory), generalizes to Aider Polyglot for free. **Design + adversarial critique both complete as of 2026-09-20 (verdict: ready with 5 amendments, all folded in) — ready to implement, no longer blocked on critique.** |
+| 6 | *(carried over)* Pre-execution syntax diagnostics (LSP alternative) | **High** | M | Strongest evidence of anything remaining — measured, reproducing failure rate (not a single trajectory), generalizes to Aider Polyglot for free. **Merged, PR #58** (2026-09-20), after a second implementation round fixed 8 more Cubic findings (2 declined with evidence, 6 real) and a `/code-comments` pass found 4 more real comment issues. |
 | 7 | `#6` Baseline-grounded adversarial re-verification in "don't give up" nudges | Medium | S–M | Directive-text change to existing nudge extensions; pairs directly with #3/PR #57 (a real baseline now exists to verify against) |
 | 8 | `#5` Earlier/more frequent deadline-progress nudges (50%/75% checkpoints) | Med–High | M | Extends tb-finalize-guard triggers; needs a "does a runnable deliverable exist yet" heuristic |
 | 9 | `#4` Fuzzy/near-duplicate loop detection | Med–High | M | Extends quality-monitor's loop-breaker; similarity matching carries real false-positive risk, needs careful tuning |
@@ -105,15 +105,20 @@ where the full rationale lives.
 resolved before this update — PR #53 is merged — and isn't part of this
 prioritization.
 
-**Reading the table**: priorities 1-5 are done (all merged 2026-09-20, PRs #54-57).
-6 is the carried-over item — high-impact, medium-effort, but uncritiqued, so it
-should get the full design→critique pipeline treatment before implementation
-despite how far along its design already is. 7 is the next tier — still
-high-leverage, lower effort, and now unblocked (needs the baseline #3/PR #57
-provides). 8-10 are real but generalized gaps, medium effort with more design
-judgment required. 11-12 are the highest-effort/highest-risk or lowest-impact
-items — 11 in particular should not be rushed given the direct tension in the
-evidence.
+**Reading the table**: priorities 1-6 are done (all merged 2026-09-20, PRs
+#54-58). 7 is the next tier — still high-leverage, lower effort, and unblocked
+(needs the baseline #3/PR #57 provides). 8-10 are real but generalized gaps,
+medium effort with more design judgment required. 11-12 are the
+highest-effort/highest-risk or lowest-impact items — 11 in particular should
+not be rushed given the direct tension in the evidence.
+
+**Also merged alongside priority 6, not part of this ranked list** (discovered
+as drive-by fixes during the priority-6 round, not scored items): PR #59 fixed
+a pre-existing `skill-inject` test-harness bug (a test's prompt-reconstruction
+regex broke silently when PR #56/#57 refactored the real prompt-assembly code);
+PR #60 added a `vitest` CI job — the ~1170-test suite under `.pi/extensions/`
+had zero CI enforcement before this, which is exactly how PR #59's bug went
+undetected. See `STATE.md` section 4b for both.
 
 ## Ranked list
 
@@ -200,12 +205,11 @@ evidence.
    critique → Sonnet/Opus implement, reviewed (security-review, OCR, `/code-review
    high`, Cubic, and 3 rounds of dedicated `/code-comments` across Opus and Fable
    passes), and merged as PRs #54-57 on 2026-09-20.
-2. ~~Priority 6 (LSP-alternative syntax-check)~~ — **design + critique done**
-   (2026-09-20, verdict ready with 5 amendments, folded in). Ready to hand to a
-   Sonnet/Opus implementer in an isolated worktree, same pipeline as priorities
-   1-5. One pre-implementation task noted in the critique: re-run
-   `benchmarks/syntax_error_report.py` on a fresh write-compressor trial to
-   confirm the 2026-09-19 evidence baseline still holds post-#54-57.
+2. ~~Priority 6 (LSP-alternative syntax-check)~~ — **done**, merged as PR #58
+   (2026-09-20). Still outstanding: re-run `benchmarks/syntax_error_report.py`
+   on a fresh write-compressor trial to confirm the 2026-09-19 24.5%
+   evidence baseline still holds post-#54-58 — not done, needs a live harbor
+   trial, not just a code change.
 3. Priority 7 is newly unblocked (PR #57 gives it a real baseline to verify
    against) and is small — could go straight to implementation without a full
    design pass, mirroring how PR #47-#52 were handled.
