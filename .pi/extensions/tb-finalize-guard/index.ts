@@ -331,13 +331,15 @@ function baselineCaveats(baseline: InitialSnapshotOutcome): string {
   return `It may not contain very large (>10MB) or deeply nested files. ${partial}`;
 }
 
-// Mirrors _initial_snapshot_advertisement's own restraint, for the same
-// reason it states there: the dangerous misreading of "a reference copy
-// exists" is a model near a stopping point restoring pristine originals over
-// the solution it just finished writing.
+// Verbatim from _initial_snapshot_advertisement's own restraint sentence
+// (minus its "never write into {path}" clause, which has no TS-side
+// equivalent to point at), so the two recovery prompts can't drift apart on
+// the exact wording: the dangerous misreading of "a reference copy exists"
+// is a model near a stopping point restoring pristine originals over the
+// solution it just finished writing.
 const RESTORE_RESTRAINT =
-  "Restore from it only a file you believe was corrupted — never over your own " +
-  "completed solution; treat it as read-only.";
+  "Restore from there only a file you believe you corrupted — never over " +
+  "your own completed solution. Treat it as read-only.";
 
 /**
  * Trigger A's nudge text.

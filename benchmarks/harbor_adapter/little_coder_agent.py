@@ -550,13 +550,22 @@ def _pi_env(
     model after a path that does not exist. Carrying the classified outcome
     rather than a bare flag also lets the reader pass on the same
     cap-truncation caveat the prompt paragraph carries.
+
+    Set to empty, not omitted, when no copy was staged: PiRpc builds the
+    child env as dict(os.environ) updated with this dict, so an omitted key
+    does not clear one already present in THIS process's own environment
+    (e.g. leaked from an earlier trial in the same worker/shell). Empty
+    still reads as "no copy" to every consumer -- initialSnapshotOutcome()'s
+    exact match on "succeeded"/"partial" and _initial_snapshot_is_present's
+    own outcome check both treat it the same as absent.
     """
     env = {
         "LITTLE_CODER_PERMISSION_MODE": "accept-all",
         "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
     }
-    if _initial_snapshot_is_present(initial_snapshot):
-        env["LITTLE_CODER_INITIAL_SNAPSHOT"] = initial_snapshot.outcome
+    env["LITTLE_CODER_INITIAL_SNAPSHOT"] = (
+        initial_snapshot.outcome if _initial_snapshot_is_present(initial_snapshot) else ""
+    )
     return env
 
 

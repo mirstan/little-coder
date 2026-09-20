@@ -970,13 +970,29 @@ def test_pi_env_publishes_the_outcome_when_a_copy_was_staged(outcome):
 
 @pytest.mark.parametrize("outcome", [None, "failed", "refused"])
 def test_pi_env_stays_silent_when_no_copy_was_staged(outcome):
-    """Unset, not a falsy value: an extension reading an empty string as
-    "there is a copy" would point the model at a path that does not exist --
-    the same cost _initial_snapshot_advertisement refuses to pay."""
+    """Empty, not omitted: PiRpc's child env starts as a copy of this
+    process's own os.environ, so an omitted key doesn't clear one already
+    present there (e.g. leaked from an earlier trial in the same
+    worker/shell) -- explicitly empty clobbers it either way. Every
+    consumer already treats empty the same as absent, the same cost
+    _initial_snapshot_advertisement refuses to pay by pointing at a path
+    that does not exist."""
     arg = None if outcome is None else _outcome(outcome)
-    assert "LITTLE_CODER_INITIAL_SNAPSHOT" not in lca._pi_env(
-        deadline_epoch_ms=1, initial_snapshot=arg
-    )
+    assert lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+
+
+def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process():
+    """rpc_client.PiRpc builds the child's env as a copy of this process's
+    own os.environ, updated with _pi_env's dict -- a key _pi_env omitted
+    would pass through untouched. If LITTLE_CODER_INITIAL_SNAPSHOT were
+    still set in this process from an earlier trial (same worker, same
+    shell), a run with no real copy staged would wrongly advertise one."""
+    os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"] = "succeeded"
+    try:
+        env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=None)
+        assert env["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+    finally:
+        del os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"]
 
 
 @pytest.mark.parametrize("outcome", [None, "failed", "refused", "succeeded", "partial"])
@@ -985,9 +1001,7 @@ def test_pi_env_gate_agrees_with_the_prompt_advertisement(outcome):
     in the prompt and not in the nudges, or the reverse."""
     arg = None if outcome is None else _outcome(outcome)
     advertised = lca._initial_snapshot_advertisement(arg) is not None
-    in_env = "LITTLE_CODER_INITIAL_SNAPSHOT" in lca._pi_env(
-        deadline_epoch_ms=1, initial_snapshot=arg
-    )
+    in_env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] != ""
     assert advertised == in_env
 
 
