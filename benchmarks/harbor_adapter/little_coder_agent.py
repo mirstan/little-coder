@@ -1086,7 +1086,8 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     when track_cwd=False): sound only for a command that never itself needs
     a starting cwd and never `cd`s in a way the caller needs reported back --
     true of every cwd=None caller today (both snapshot commands and the
-    start-marker touch), which use absolute paths (/app, /tmp) throughout.
+    start-marker touch, which use absolute paths (/app, /tmp) throughout;
+    the toolchain probe, which touches the filesystem not at all).
     """
     body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
     if cwd is None:
