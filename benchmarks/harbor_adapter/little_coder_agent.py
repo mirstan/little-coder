@@ -26,6 +26,7 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -990,6 +991,20 @@ def _stage_overflow_file(fd: int, cleaned: str) -> None:
         f.write(cleaned)
 
 
+# Pinned to harbor 0.22.0's exact RuntimeError text (docker.py:682/741) --
+# re-check this match on any harbor upgrade. timeout_sec is always int here,
+# so no decimal-seconds alternate is needed.
+_HARBOR_TIMEOUT_MSG_RE = re.compile(r"^Command timed out after \d+ seconds$")
+_TIMEOUT_KILL_WARNING = (
+    "WARNING: this command hit its {N}s timeout and its connection was killed. "
+    "Any file it was mid-way through writing may now be HALF-WRITTEN, and any "
+    "cleanup/restore logic at the end of a script did NOT run — re-verify (cat/wc/diff) "
+    "any file it touched before trusting it. A compute-bound process may even still be "
+    "running in the container (check with ps). If the command simply needs more time, "
+    "re-run it with a larger `timeout` parameter (up to 600 seconds)."
+)
+
+
 class _HarborShellProxy:
     """Stateful shell proxy over harbor's BaseEnvironment.exec().
 
@@ -1130,8 +1145,16 @@ class _HarborShellProxy:
                             self.cwd = cwd_line[0].strip()
                     out = out[:marker].rstrip()
         except asyncio.TimeoutError:
-            return _format_output("", "command timed out", -1, self.cwd, True)
+            # Dead for the docker backend today (harbor swallows this and
+            # raises RuntimeError instead -- see below), kept for other
+            # backends/future harbor versions where it may still fire.
+            warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+            return _format_output("", f"command timed out\n{warning}", -1, self.cwd, True)
         except Exception as e:
+            if _HARBOR_TIMEOUT_MSG_RE.fullmatch(str(e)):
+                # The real timeout path for docker -- see asyncio.TimeoutError branch above.
+                warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+                return _format_output("", f"env.exec error: {e}\n{warning}", -1, self.cwd, True)
             return _format_output("", f"env.exec error: {e}", -1, self.cwd, False)
         result_str = _format_output(out, err, code, self.cwd, False)
         # byte_capped=true, not output_truncated=true: the latter also fires
@@ -1157,6 +1180,12 @@ class _HarborShellProxy:
         fut = asyncio.run_coroutine_threadsafe(self._exec_async(command, timeout), self.loop)
         try:
             return fut.result(timeout=timeout + 30)
+        except concurrent.futures.TimeoutError as e:
+            # This layer's own timeout+30 margin expired -- _exec_async is
+            # still running (or stuck) on self.loop; same truth gap as the
+            # docker RuntimeError case above.
+            warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+            return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
 
