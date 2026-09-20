@@ -964,7 +964,9 @@ def test_pi_env_publishes_the_outcome_when_a_copy_was_staged(outcome):
     """The extensions' only evidence that /tmp/.lc-initial is really there.
     The outcome string itself, not a flag: a reader has to be able to repeat
     the cap-truncation caveat that "partial" carries."""
-    env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=_outcome(outcome))
+    env = lca._pi_env(
+        budget_start_epoch_ms=1, deadline_epoch_ms=1, initial_snapshot=_outcome(outcome)
+    )
     assert env["LITTLE_CODER_INITIAL_SNAPSHOT"] == outcome
 
 
@@ -978,7 +980,12 @@ def test_pi_env_stays_silent_when_no_copy_was_staged(outcome):
     _initial_snapshot_advertisement refuses to pay by pointing at a path
     that does not exist."""
     arg = None if outcome is None else _outcome(outcome)
-    assert lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+    assert (
+        lca._pi_env(budget_start_epoch_ms=1, deadline_epoch_ms=1, initial_snapshot=arg)[
+            "LITTLE_CODER_INITIAL_SNAPSHOT"
+        ]
+        == ""
+    )
 
 
 def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process(monkeypatch):
@@ -992,7 +999,9 @@ def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process(monkeypa
     an unconditional del."""
     monkeypatch.setenv("LITTLE_CODER_INITIAL_SNAPSHOT", "succeeded")
     full_env = dict(os.environ)
-    full_env.update(lca._pi_env(deadline_epoch_ms=1, initial_snapshot=None))
+    full_env.update(
+        lca._pi_env(budget_start_epoch_ms=1, deadline_epoch_ms=1, initial_snapshot=None)
+    )
     assert full_env["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
 
 
@@ -1002,12 +1011,22 @@ def test_pi_env_gate_agrees_with_the_prompt_advertisement(outcome):
     in the prompt and not in the nudges, or the reverse."""
     arg = None if outcome is None else _outcome(outcome)
     advertised = lca._initial_snapshot_advertisement(arg) is not None
-    in_env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] != ""
+    in_env = (
+        lca._pi_env(budget_start_epoch_ms=1, deadline_epoch_ms=1, initial_snapshot=arg)[
+            "LITTLE_CODER_INITIAL_SNAPSHOT"
+        ]
+        != ""
+    )
     assert advertised == in_env
 
 
-def test_pi_env_always_carries_the_deadline_and_permission_mode():
-    env = lca._pi_env(deadline_epoch_ms=1700000000000, initial_snapshot=None)
+def test_pi_env_always_carries_the_budget_window_and_permission_mode():
+    env = lca._pi_env(
+        budget_start_epoch_ms=1699999000000,
+        deadline_epoch_ms=1700000000000,
+        initial_snapshot=None,
+    )
+    assert env["LITTLE_CODER_BUDGET_START_EPOCH_MS"] == "1699999000000"
     assert env["LITTLE_CODER_DEADLINE_EPOCH_MS"] == "1700000000000"
     assert env["LITTLE_CODER_PERMISSION_MODE"] == "accept-all"
 
@@ -1018,6 +1037,7 @@ def test_run_hands_pi_env_to_the_rpc_client():
     src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
     assert "env=_pi_env(" in src
     assert "initial_snapshot=initial_snapshot," in src
+    assert "budget_start_epoch_ms=budget_start_epoch_ms," in src
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────

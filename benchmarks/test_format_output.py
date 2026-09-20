@@ -402,12 +402,13 @@ def test_tb_adapter_sets_accept_all_permission_mode(ad):
     tells the model to run first (`command -v python3 perl gcc ...`). This
     adapter must set accept-all, same as harbor/gaia/aider_polyglot, or that
     first probe (and any other command the whitelist doesn't happen to
-    cover) gets refused with no human present to grant it. Source
-    inspection, not a live PiRpc: exercising perform_task() end to end would
-    need a real TmuxSession/container, which nothing else in this file sets
-    up either.
+    cover) gets refused with no human present to grant it. The pure env
+    helper plus a source-inspection pin that perform_task() actually uses it,
+    not a live PiRpc: exercising perform_task() end to end would need a real
+    TmuxSession/container, which nothing else in this file sets up either.
     """
     if ad.name != "tb":
         pytest.skip("tb-only: harbor's own accept-all is exercised in harbor's own tests")
-    src = inspect.getsource(_TB.LittleCoderAgent.perform_task)
-    assert '"LITTLE_CODER_PERMISSION_MODE": "accept-all"' in src
+    env = _TB._pi_env(budget_start_epoch_ms=1, deadline_epoch_ms=2)
+    assert env["LITTLE_CODER_PERMISSION_MODE"] == "accept-all"
+    assert "env=_pi_env(" in inspect.getsource(_TB.LittleCoderAgent.perform_task)

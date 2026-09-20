@@ -203,6 +203,33 @@ _TMUX_TIMEOUT_WARNING = (
 )
 
 
+def _pi_env(*, budget_start_epoch_ms: int, deadline_epoch_ms: int) -> dict[str, str]:
+    """The env pi's extensions are handed for this trial. Pure/module-level so
+    its contents are assertable without standing up a whole run, mirroring the
+    harbor adapter's own _pi_env -- the two must publish the same timing vars
+    or an extension would behave differently on TB1.0 than on TB2.x for no
+    reason a reader could find.
+
+    Unattended permission mode, same as the harbor/gaia/aider_polyglot
+    adapters (see harbor_adapter/little_coder_agent.py's own _pi_env for the
+    fuller rationale): there is no human present to grant a permission-gate
+    prompt, and its "auto" default's SAFE_PREFIXES whitelist is necessarily
+    incomplete (e.g. it covers `which`/`type`/`printenv` but not `command`,
+    which this adapter's own hard-limits paragraph tells the model to run as
+    its very first probe). Whitelisting one command at a time is whack-a-mole;
+    every other TB agent already runs with unrestricted tool access here.
+
+    LITTLE_CODER_INITIAL_SNAPSHOT is deliberately absent: this adapter stages
+    no start-of-trial copy, so an extension reading it must stay silent about
+    one. See the harbor adapter's _pi_env, which does set it.
+    """
+    return {
+        "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+        "LITTLE_CODER_BUDGET_START_EPOCH_MS": str(budget_start_epoch_ms),
+        "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+    }
+
+
 class _TmuxShellProxy:
     """Routes ShellSession calls from pi back to a TB TmuxSession.
 
@@ -426,13 +453,14 @@ class LittleCoderAgent(BaseAgent):
             log_fh.write(f"=== {text} ===\n")
             log_fh.flush()
 
-        # Given to pi as an absolute wall-clock deadline (the extensions
-        # built on `_shared/deadline.ts` -- finalize-warn and
-        # tb-finalize-guard -- read this env var through it and silently
-        # no-op without it), and tracked in parallel on the
-        # monotonic clock for the error-retry budget. Both from the same
+        # Given to pi as an absolute wall-clock interval (finalize-warn
+        # reads its far end through `_shared/deadline.ts`; tb-finalize-guard
+        # reads both ends, through that and `_shared/budget-progress.ts`,
+        # and silently no-ops without them), and tracked in parallel on the
+        # monotonic clock for the error-retry budget. All from the same
         # constant, taken at the same instant.
-        deadline_epoch_ms = int((time.time() + DEFAULT_PROMPT_TIMEOUT_SEC) * 1000)
+        budget_start_epoch_ms = int(time.time() * 1000)
+        deadline_epoch_ms = budget_start_epoch_ms + int(DEFAULT_PROMPT_TIMEOUT_SEC * 1000)
         prompt_deadline = time.monotonic() + DEFAULT_PROMPT_TIMEOUT_SEC
 
         try:
@@ -445,20 +473,10 @@ class LittleCoderAgent(BaseAgent):
                 tb_mode=True,
                 max_turns=self._max_turns,
                 tb_shell_handler=tb_shell_handler,
-                # Unattended, same as the harbor/gaia/aider_polyglot adapters
-                # (see harbor_adapter/little_coder_agent.py's own env= for
-                # the fuller rationale): there is no human present to grant
-                # a permission-gate prompt, and its "auto" default's
-                # SAFE_PREFIXES whitelist is necessarily incomplete (e.g. it
-                # covers `which`/`type`/`printenv` but not `command`, which
-                # this adapter's own hard-limits paragraph tells the model to
-                # run as its very first probe). Whitelisting one command at a
-                # time is whack-a-mole; every other TB agent already runs
-                # with unrestricted tool access here.
-                env={
-                    "LITTLE_CODER_PERMISSION_MODE": "accept-all",
-                    "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
-                },
+                env=_pi_env(
+                    budget_start_epoch_ms=budget_start_epoch_ms,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                ),
             ) as rpc:
                 # Retried in place on a provider-error completion -- one
                 # errored completion otherwise ends the whole trial with most

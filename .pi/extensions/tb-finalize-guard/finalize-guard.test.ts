@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import setupExtension, { buildTriggerAMessage, buildTriggerCRecoveryMessage } from "./index.ts";
+import setupExtension, {
+  buildTriggerAMessage,
+  buildTriggerCRecoveryMessage,
+  buildTriggerDMessage,
+} from "./index.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
 
@@ -120,6 +124,21 @@ function setDeadlineMinutesFromNow(minutes: number) {
   process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(fakeNow + minutes * 60 * 1000);
 }
 
+// A trial budget of `totalMinutes` with `fractionUsed` of it already gone as
+// of fakeNow. Both ends are resolved at before_agent_start, so this has to
+// be called before the run starts; advancing fakeNow afterwards is what
+// moves the trial through its milestones.
+function setBudget(totalMinutes: number, fractionUsed: number) {
+  const totalMs = totalMinutes * 60 * 1000;
+  const start = fakeNow - Math.round(totalMs * fractionUsed);
+  process.env.LITTLE_CODER_BUDGET_START_EPOCH_MS = String(start);
+  process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(start + totalMs);
+}
+
+function advanceMinutes(minutes: number) {
+  fakeNow += minutes * 60 * 1000;
+}
+
 describe("tb-finalize-guard", () => {
   beforeEach(() => {
     process.env.LITTLE_CODER_BENCHMARK = "terminal_bench";
@@ -133,6 +152,7 @@ describe("tb-finalize-guard", () => {
     // Left unset by default everywhere else in this suite, so every other
     // test also covers the no-baseline path a TB1.0 trial actually runs.
     delete process.env.LITTLE_CODER_INITIAL_SNAPSHOT;
+    delete process.env.LITTLE_CODER_BUDGET_START_EPOCH_MS;
     Date.now = REAL_NOW;
   });
 
@@ -908,6 +928,294 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
       await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
       expect(h.sent).toHaveLength(5);
+    });
+  });
+
+  describe("Trigger D — budget-progress checkpoint", () => {
+    it("never fires without a published trial-start instant", async () => {
+      // A deadline alone cannot express a fraction, so every adapter that
+      // publishes only one (TB before this change, GAIA, aider, interactive
+      // pi) leaves this trigger off entirely.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      for (let i = 0; i < 4; i++) await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("fires at the half-way milestone when nothing has been written outside /tmp", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].options).toEqual({ deliverAs: "steer" });
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.5, 60, false));
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(true);
+    });
+
+    it("does not repeat a milestone it has already spent", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+      advanceMinutes(12); // 60% spent -- still short of the next milestone
+      await turn(h, shellTurn(["ls -la"]));
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("stays silent at half-time once a deliverable has been written", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.4);
+      await newSession(h);
+      await turn(h, shellTurn(["echo 42 > /app/answer.txt"]));
+      advanceMinutes(12); // 50%
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("does not nag a run that spent its first 40% reading before writing anything", async () => {
+      // The false positive this gate exists to avoid: a deliberate
+      // read-then-write trajectory looks identical to a stalled one until
+      // it writes, so the evidence -- not the reading -- is what decides.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.05);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la /app"]));
+      await turn(h, shellTurn(["cat /app/instructions.md"]));
+      advanceMinutes(24); // 25% spent, still only reading
+      await turn(h, shellTurn(["grep -rn TODO /app", "echo notes > /tmp/notes.md"]));
+      advanceMinutes(18); // 40% spent
+      await turn(h, shellTurn(["cat > /app/solution.py"])); // the plan, written
+      expect(h.sent).toHaveLength(0);
+      advanceMinutes(12); // 50% -- the milestone, with evidence on disk
+      await turn(h, shellTurn(["python3 /app/solution.py"]));
+      advanceMinutes(12); // 60%
+      await turn(h, shellTurn(["python3 /app/solution.py"]));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("fires the milder checkpoint at the later milestone when a deliverable exists", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.4);
+      await newSession(h);
+      await turn(h, shellTurn(["echo 42 > /app/answer.txt"]));
+      advanceMinutes(42); // 75%
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.75, 30, true));
+    });
+
+    it("fires the strong checkpoint at the later milestone when nothing has been written", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.75);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.75, 30, false));
+    });
+
+    it("sends one message, not a backlog, when several milestones come due at once", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.3);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(0);
+      advanceMinutes(60); // 80% -- both milestones crossed inside one turn
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.8, 24, false));
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("stands down inside finalize-warn's wall-clock window, which owns the endgame", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 11 / 12); // exactly WARN_REMAINING_MS left
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(0);
+    });
+
+    it("still fires one minute outside that window", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 109 / 120); // 11 minutes left
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("stands down at the turn cap without spending the milestone", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.3);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 3); // too small for finalize-warn's turn window to ever open
+      await turn(h, shellTurn(["ls -la"])); // turn 1
+      await turn(h, shellTurn(["ls -la"])); // turn 2
+      advanceMinutes(60); // 80%
+      await turn(h, shellTurn(["ls -la"])); // turn 3 == capForRun
+      expect(h.sent).toHaveLength(0);
+
+      // A later run in the same session has headroom again, and the
+      // milestone was never marked, so it is still owed.
+      await startRun(h, 10);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("latches nothing when the send throws, and retries on the next turn", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5);
+      await newSession(h);
+
+      h.state.sendThrows = true;
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toEqual([]);
+      expect(h.notifies.some((n) => /harness intervention:/i.test(n))).toBe(false);
+
+      h.state.sendThrows = false;
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it("keeps its milestones across a continuation and resets them for a new session", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+
+      await startRun(h); // a continuation: the trial clock did not restart
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(1);
+
+      await newSession(h); // a new task
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.sent).toHaveLength(2);
+    });
+
+    it("counts a write from long before Trigger B could arm", async () => {
+      // Regression pin for hoisting the per-turn write scan out of
+      // maybeAdvanceTriggerB: it used to run only while Trigger B was armed,
+      // which is always inside the endgame this trigger stands down for.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.3);
+      await fire(h.pi, "session_start", {}, h.ctx);
+      await startRun(h, 10); // Trigger B cannot arm before turn 6
+      await turn(h, shellTurn(["echo 42 > /app/answer.txt"])); // turn 1
+      advanceMinutes(30); // 55% -- half-way milestone, spent silently
+      await turn(h, shellTurn(["ls -la"])); // turn 2
+      expect(h.sent).toHaveLength(0);
+      advanceMinutes(30); // 80%
+      await turn(h, shellTurn(["ls -la"])); // turn 3
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.8, 24, true));
+    });
+
+    it("is silent outside terminal_bench", async () => {
+      process.env.LITTLE_CODER_BENCHMARK = "gaia";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.8);
+      await newSession(h);
+      await turn(h, shellTurn(["ls -la"]));
+      expect(h.calls).toEqual([]);
+    });
+
+    it("does not demand a non-executable deliverable be run", async () => {
+      // This trial's whole deliverable is a value in a text file, so
+      // "run it" would be an impossible demand.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.3);
+      await newSession(h);
+      await turn(h, shellTurn(["echo 42 > /app/answer.txt"]));
+      advanceMinutes(60); // 80%
+      await turn(h, shellTurn(["cat /app/answer.txt"]));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.8, 24, true));
+      expect(h.sent[0].text).toContain("otherwise compare the file or state you produced");
+      expect(h.sent[0].text).not.toContain("run it to confirm it executes");
+    });
+
+    it("stays silent in a turn-cap-bound endgame after Trigger B has already fired", async () => {
+      // `armed` cannot re-latch once triggerBFired is set, and
+      // finalizeWarnWouldFire's turn half is edge-triggered, so every turn
+      // of a turn-cap-bound warn window except the edge one looks calm to
+      // both. Only the level-triggered window check suppresses here.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(150, 0.4); // 90 minutes left: nowhere near the wall-clock window
+      await fire(h.pi, "session_start", {}, h.ctx);
+
+      // Run 1: drive Trigger B to fire, which permanently disarms `armed`.
+      await startRun(h, 10);
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
+      await turn(h, shellTurn(["echo 42 > /app/answer.txt"])); // turn 7 — compliant
+      await turn(h, shellTurn(["ls -la"])); // turn 8
+      await turn(h, shellTurn(["ls -la"])); // turn 9 — Trigger B fires
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toMatch(/still have not written your answer/i);
+
+      // Run 2: a continuation, still short of the later milestone.
+      await startRun(h, 10);
+      for (let i = 0; i < 5; i++) await turn(h, shellTurn(["ls -la"])); // turns 1-5
+      expect(h.sent).toHaveLength(1);
+
+      advanceMinutes(60); // 80% spent, 30 minutes left
+      await turn(h, shellTurn(["ls -la"])); // turn 6 — the warn edge; calm to nobody
+      await turn(h, shellTurn(["ls -la"])); // turn 7 — inside the window, past the edge
+      await turn(h, shellTurn(["ls -la"])); // turn 8
+      expect(h.sent).toHaveLength(1);
+    });
+  });
+
+  describe("buildTriggerDMessage", () => {
+    it("reports the share of the budget spent and the minutes left", () => {
+      const msg = buildTriggerDMessage(0.5, 60, false);
+      expect(msg).toContain("about 50% of this task's time budget");
+      expect(msg).toContain("~60 minutes remain");
+      expect(buildTriggerDMessage(0.77, 12, true)).toContain("about 77%");
+    });
+
+    it("names the missing deliverable only when there is no evidence of one", () => {
+      expect(buildTriggerDMessage(0.5, 60, false)).toContain(
+        "nothing has been written outside /tmp",
+      );
+      const mild = buildTriggerDMessage(0.75, 30, true);
+      expect(mild).not.toContain("nothing has been written outside /tmp");
+      expect(mild).toContain("Make sure your best current version is saved");
+    });
+
+    it("conditions its verification demand on the deliverable being executable", () => {
+      // Many TB deliverables are a repaired file, a git state, or a value
+      // at a path; an unconditional "run it" costs those trials the very
+      // turns this nudge exists to save.
+      for (const hasEvidence of [false, true]) {
+        const msg = buildTriggerDMessage(0.75, 30, hasEvidence);
+        expect(msg).toContain("if your deliverable is a program or script, run it");
+        expect(msg).toContain("otherwise compare the file or state you produced");
+        expect(msg).not.toContain("run it to confirm it executes");
+        expect(msg).not.toContain("runnable version");
+        expect(msg).not.toContain("runs end-to-end");
+      }
     });
   });
 
