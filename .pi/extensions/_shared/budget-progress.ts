@@ -10,10 +10,9 @@
 //
 // The start instant comes from the party that owns the budget (both TB
 // adapters, at the same instant they derive the deadline from) rather than
-// from when this extension process happened to start: the harbor adapter
-// snapshots and probes the container before pi exists, so the two instants
-// are not the same and the difference would silently mis-scale every
-// milestone.
+// from when this extension process happened to start: only the adapter
+// knows where the interval it enforces began — pi's own start trails that
+// instant by whatever adapter setup sits in between.
 //
 // This dir has no `index.ts` on purpose — see finalize-warn-trigger.ts.
 

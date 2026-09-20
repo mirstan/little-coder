@@ -933,9 +933,10 @@ describe("tb-finalize-guard", () => {
 
   describe("Trigger D — budget-progress checkpoint", () => {
     it("never fires without a published trial-start instant", async () => {
-      // A deadline alone cannot express a fraction, so every adapter that
-      // publishes only one (TB before this change, GAIA, aider, interactive
-      // pi) leaves this trigger off entirely.
+      // A deadline alone cannot express a fraction: an adapter that
+      // publishes only one end (TB before this change) leaves this trigger
+      // off entirely, same as the ones that publish neither (GAIA, aider,
+      // interactive pi).
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);

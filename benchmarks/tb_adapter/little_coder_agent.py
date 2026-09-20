@@ -461,10 +461,11 @@ class LittleCoderAgent(BaseAgent):
 
         # Given to pi as an absolute wall-clock interval (finalize-warn
         # reads its far end through `_shared/deadline.ts`; tb-finalize-guard
-        # reads both ends, through that and `_shared/budget-progress.ts`,
-        # and silently no-ops without them), and tracked in parallel on the
-        # monotonic clock for the error-retry budget. All from the same
-        # constant, taken at the same instant.
+        # reads both ends, through that and `_shared/budget-progress.ts`;
+        # both extensions' wall-clock triggers silently no-op without these
+        # vars), and tracked in parallel on the monotonic clock for the
+        # error-retry budget. All from the same constant, taken at the same
+        # instant.
         budget_start_epoch_ms = int(time.time() * 1000)
         deadline_epoch_ms = budget_start_epoch_ms + int(DEFAULT_PROMPT_TIMEOUT_SEC * 1000)
         prompt_deadline = time.monotonic() + DEFAULT_PROMPT_TIMEOUT_SEC
