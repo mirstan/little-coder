@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import setupSyntaxCheck, { resetMissingCheckers } from "./index.ts";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// The local backend's failure modes (a real timeout, a real missing binary)
+// are only reachable deterministically with execSync stubbed — the same
+// reason shell-session/index.test.ts stubs it.
+const { execSyncMock } = vi.hoisted(() => ({ execSyncMock: vi.fn() }));
+vi.mock("node:child_process", () => ({ execSync: execSyncMock }));
+
+const { default: setupSyntaxCheck, resetMissingCheckers } = await import("./index.ts");
 import { SKIP_SENTINEL, SYNTAX_CHECK_ENV } from "./helpers.ts";
 import { formatOutput } from "../shell-session/helpers.ts";
 import { TB_PROXY_PREFIX } from "../_shared/tb-proxy.ts";
@@ -52,6 +59,7 @@ const PERL_FAILURE = formatOutput(
 
 beforeEach(() => {
   process.env.LITTLE_CODER_TB_MODE = "1";
+  execSyncMock.mockReset();
   resetMissingCheckers();
 });
 afterEach(() => {
@@ -161,5 +169,66 @@ describe("write/edit handler", () => {
     const event = { toolName: "write", isError: false, input: { path: "README.md" }, content: [{ type: "text", text: "wrote" }] };
     expect(await write(event, ctx)).toBeUndefined();
     expect(ctx.proxied).toEqual([]);
+  });
+});
+
+// Outside TB mode the check runs host-side, so there is no footer to read the
+// verdict out of — execSync's own exit status is it.
+describe("local backend", () => {
+  const WRITE = "cat > /app/v3.pl <<'EOF'\n$x]\nEOF";
+
+  /** An execSync throw shaped like a real nonzero exit. */
+  function exitError(status: number, stderr: string): Error {
+    const err: any = new Error("Command failed");
+    err.status = status;
+    err.stdout = "";
+    err.stderr = stderr;
+    return err;
+  }
+
+  beforeEach(() => {
+    delete process.env.LITTLE_CODER_TB_MODE;
+  });
+
+  it("reports the checker's error with no footer to parse", async () => {
+    const [shell] = register();
+    execSyncMock.mockImplementation(() => {
+      throw exitError(255, 'syntax error at /app/v3.pl line 1, near "$x]"');
+    });
+    const out = await shell(shellResult(WRITE, "wrote it"), stubCtx(""));
+    expect(out.content[0].text).toContain("[syntax-check] perl -c /app/v3.pl FAILED (exit 255)");
+    expect(out.content[0].text).toContain('near "$x]"');
+  });
+
+  it("stays silent when the file parses", async () => {
+    const [shell] = register();
+    execSyncMock.mockReturnValue("/app/v3.pl syntax OK\n");
+    expect(await shell(shellResult(WRITE, "wrote it"), stubCtx(""))).toBeUndefined();
+  });
+
+  it("stays silent when the checker is missing", async () => {
+    const [shell] = register();
+    execSyncMock.mockReturnValue(`${SKIP_SENTINEL}\n`);
+    expect(await shell(shellResult(WRITE, "wrote it"), stubCtx(""))).toBeUndefined();
+  });
+
+  it("stays silent when the check itself times out", async () => {
+    const [shell] = register();
+    execSyncMock.mockImplementation(() => {
+      const err: any = new Error("Command failed");
+      err.code = "ETIMEDOUT";
+      err.signal = "SIGTERM";
+      err.status = null;
+      throw err;
+    });
+    expect(await shell(shellResult(WRITE, "wrote it"), stubCtx(""))).toBeUndefined();
+  });
+
+  it("stays silent when the shell never produced an exit status", async () => {
+    const [shell] = register();
+    execSyncMock.mockImplementation(() => {
+      throw Object.assign(new Error("spawn /bin/bash ENOENT"), { code: "ENOENT" });
+    });
+    expect(await shell(shellResult(WRITE, "wrote it"), stubCtx(""))).toBeUndefined();
   });
 });
