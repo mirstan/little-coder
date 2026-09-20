@@ -122,14 +122,21 @@ export function extractComparableText(call: ToolCall): string {
 }
 
 /**
- * A call's identity, for excluding verbatim repeats from the clustering.
+ * A call's identity, for excluding verbatim repeats from the clustering --
+ * must agree with `sameCall`'s notion of "the same call", or a repeat one
+ * counts as verbatim and the other doesn't evades both detectors: skipped
+ * here as "the loop-breaker's job", but not actually caught by the
+ * loop-breaker. So this hashes the same order-sensitive JSON `sameCall`
+ * compares, not `stableStringify` (key-order-insensitive, correct for
+ * `extractComparableText`'s fuzzy-similarity text, wrong for identity).
+ *
  * Hashed rather than kept whole: a window entry outlives its call by up to
  * `window` turns, and the serialized input of a multi-megabyte Write would
  * otherwise be retained per entry -- the same unbounded retention
  * sampleForCompare exists to prevent.
  */
 export function identityKey(call: ToolCall): string {
-  return createHash("sha1").update(`${call.name} ${stableStringify(call.input)}`).digest("hex");
+  return createHash("sha1").update(`${call.name} ${JSON.stringify(call.input)}`).digest("hex");
 }
 
 export interface FuzzyOptions {

@@ -12,6 +12,7 @@ import {
   tokenize,
 } from "./similarity.ts";
 import { pinEnv } from "../_shared/env-pin.ts";
+import { sameCall } from "./quality.ts";
 
 // Every `new FuzzyLoopTracker()` below asserts against the built-in
 // defaults, which fuzzyOptionsFromEnv reads out of the environment. A shell
@@ -197,10 +198,17 @@ describe("identityKey", () => {
     expect(identityKey(call("a"))).not.toBe(identityKey(call("b")));
     expect(identityKey({ name: "Write", input: 1 })).not.toBe(identityKey({ name: "Edit", input: 1 }));
   });
-  it("ignores object key order, as the comparison text does", () => {
-    expect(identityKey({ name: "Grep", input: { a: 1, b: 2 } })).toBe(
-      identityKey({ name: "Grep", input: { b: 2, a: 1 } }),
-    );
+  it("agrees with sameCall on key order, unlike the comparison text", () => {
+    // Regression: this used to assert the opposite -- identityKey ignored
+    // key order (matching extractComparableText's fuzzy-similarity text),
+    // while sameCall (the verbatim loop-breaker's own notion of identity)
+    // does not. A repeat with reordered keys was then excluded from
+    // clustering here as "the loop-breaker's job" while the loop-breaker
+    // itself never matched it -- evading both detectors.
+    const a = { name: "Grep", input: { a: 1, b: 2 } };
+    const b = { name: "Grep", input: { b: 2, a: 1 } };
+    expect(identityKey(a)).not.toBe(identityKey(b));
+    expect(sameCall(a, b)).toBe(false);
   });
 });
 
