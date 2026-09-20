@@ -11,10 +11,11 @@ that precedes it -- the command can itself contain a heredoc'd script whose
 source legitimately says `except SyntaxError:` or a syntax-check wrapper
 like `perl -c f.pl && echo OK`, and counting those would move the metric
 backwards for a run whose agent got better at self-checking, not worse.
-Truncated (`... [+N chars truncated]`) or deduplicated (`[... N duplicate
-line(s) collapsed ...]`) tool output means an error past that point, or a
-repeated one, can be under-counted -- this is a real trajectory-log limit,
-not fixable here, so treat this as a lower bound, not an exact count.
+Truncated (`... [+N chars omitted from this log preview; the model received
+the full output]`) or deduplicated (`[... N duplicate line(s) collapsed
+...]`) tool output means an error past that point, or a repeated one, can be
+under-counted -- this is a real trajectory-log limit, not fixable here, so
+treat this as a lower bound, not an exact count.
 
 Point it at one or more run directories (each holding many trial
 subdirectories) or trial directories directly; it tells the two apart by
