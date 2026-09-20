@@ -597,7 +597,7 @@ def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
 def test_environment_snapshot_write_lands_before_the_initial_state_snapshot():
     """Placement pin, restoring a guarantee an earlier refactor narrowed:
     environment_snapshot.json must land before _snapshot_initial_state (bounded
-    at 60s, including a docker-cp of up to 200MB) rather than after it, so it
+    at 75s, including a docker-cp of up to 200MB) rather than after it, so it
     survives even a mid-start termination during that stage+download. Nothing
     the env-snapshot write needs -- max_turns, timeout_info, the toolchain
     probe result -- depends on _snapshot_initial_state's outcome."""
@@ -922,9 +922,7 @@ def test_snapshot_returns_none_when_the_outer_backstop_fires(tmp_path, monkeypat
     """The download-specific timeout above is what normally degrades a hang
     without losing the outcome; this covers the other timeout -- the outer
     wait_for around the whole stage+download call, which exists only as a
-    backstop for a bound that somehow doesn't fire on its own. Left
-    untested, a regression that removed the inner download wait_for (or
-    shrank the outer bound below it) would go uncaught. Only
+    backstop for a bound that somehow doesn't fire on its own. Only
     _INITIAL_SNAPSHOT_TIMEOUT_SEC is shrunk here -- the download's own
     timeout stays at its real value, so it's the outer bound that fires
     first and cancels mid-download."""

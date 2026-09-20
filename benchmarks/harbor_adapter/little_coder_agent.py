@@ -524,11 +524,12 @@ async def _snapshot_initial_state(
     container at trial start, then pull it onto the host under
     logs_dir/INITIAL_SNAPSHOT_DIR_NAME.
 
-    Insurance only: must never raise into the trial, so every failure -- a
-    container without GNU coreutils, a download the environment backend
-    can't do, a slow docker-cp -- degrades to "no snapshot" and one log line.
-    That same swallowing is why the outcome is logged from the real rc and
-    real file count: a silent nothing here looks identical to success.
+    Insurance only: must never raise into the trial. A failed stage -- a
+    container without GNU coreutils, say -- degrades to "no snapshot" and
+    one log line; a download the environment backend can't do, or a slow
+    docker-cp, costs only the host-side copy. That same swallowing is why
+    the outcome is logged from the real rc and real file count: a silent
+    nothing here looks identical to success.
 
     The container-side copy is left in place afterwards rather than deleted.
     It gives the model an in-container restore source from turn 1 (`cp
@@ -1759,7 +1760,7 @@ class LittleCoderAgent(BaseAgent):
         # a trial. Sits after the toolchain probe so it can record what that
         # found, but deliberately AHEAD of _snapshot_initial_state below --
         # unlike the probe, nothing this snapshot writes depends on that
-        # snapshot's outcome, and _snapshot_initial_state is bounded at 60s
+        # snapshot's outcome, and _snapshot_initial_state is bounded at 75s
         # (including a docker-cp of up to 200MB) versus the probe's 10s.
         # environment_snapshot.json must land early enough to survive even a
         # mid-start termination, rather than depend on the initial-state
