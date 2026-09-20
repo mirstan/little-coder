@@ -469,12 +469,53 @@ def _classify_initial_snapshot(rc: int | None, file_count: int | None) -> _Initi
     )
 
 
+def _initial_snapshot_advertisement(
+    outcome: _InitialSnapshotOutcome | None,
+) -> str | None:
+    """The prompt paragraph telling the model the start-of-trial copy exists,
+    or None to say nothing. Pure/module-level, like _classify_initial_snapshot.
+
+    Silent on None/failed/refused: those are exactly the cases where the copy
+    may not be there, and pointing the model at a path that does not exist
+    costs it turns for nothing -- worse than never mentioning it.
+
+    The text is deliberately reactive, not a standing instruction to diff
+    against this copy as routine practice: it earns its place only when the
+    model already suspects a specific file was clobbered. And the restore
+    restraint is spelled out because the dangerous misreading is the obvious
+    one -- a model near its deadline "restoring" pristine originals over the
+    solution it just finished writing.
+    """
+    if outcome is None or outcome.outcome in ("failed", "refused"):
+        return None
+    app_copy = f"{INITIAL_SNAPSHOT_PUBLISH_PATH}/app"
+    text = (
+        "Recovery note: a reference copy of this task's starting files (taken "
+        "at trial start, before any of your changes) exists inside the "
+        f"container under `{app_copy}/` (e.g. `{app_copy}/somefile` mirrors "
+        "`/app/somefile`). If you ever suspect a task-provided file was "
+        "corrupted or overwritten — by a killed command, a buggy script, or "
+        "your own edit — diff against or restore from that copy instead of a "
+        "backup you made later. Restore from it only a file you believe you "
+        "corrupted — never over your own completed solution. Treat it as "
+        f"read-only and never write into `{INITIAL_SNAPSHOT_PUBLISH_PATH}`. It "
+        "may not contain very large (>10MB) or deeply nested files."
+    )
+    if outcome.outcome == "partial":
+        text += (
+            f" The copy hit its {SNAPSHOT_MAX_FILES}-file cap, so some starting "
+            "files are absent from it — absence there does not mean the file "
+            "didn't exist."
+        )
+    return text
+
+
 async def _snapshot_initial_state(
     proxy: "_HarborShellProxy",
     environment: BaseEnvironment,
     logs_dir: Path | None,
     logger: logging.Logger,
-) -> None:
+) -> _InitialSnapshotOutcome | None:
     """Stage a bounded copy of the task's pre-existing /app files inside the
     container at trial start, then pull it onto the host under
     logs_dir/INITIAL_SNAPSHOT_DIR_NAME.
@@ -492,19 +533,25 @@ async def _snapshot_initial_state(
     to 200MB of the same /tmp the deadline snapshot measures its own 500MB
     free-space reserve against, so on a disk-tight container it can be what
     makes that later snapshot refuse.
+
+    Returns the CONTAINER-side stage outcome (None when there isn't one), for
+    _initial_snapshot_advertisement to decide what the model gets told. That
+    is the copy the model can actually reach, so the host-side download
+    failing does not nullify it -- see the inner function.
     """
     if logs_dir is None:
         logger.info(
             "LittleCoderAgent: skipping initial snapshot -- no per-trial logs dir"
         )
-        return
+        return None
     try:
-        await asyncio.wait_for(
+        return await asyncio.wait_for(
             _snapshot_initial_state_inner(proxy, environment, logs_dir, logger),
             timeout=_INITIAL_SNAPSHOT_TIMEOUT_SEC,
         )
     except Exception as e:
         logger.info(f"LittleCoderAgent: initial snapshot failed (non-fatal): {e}")
+        return None
 
 
 async def _snapshot_initial_state_inner(
@@ -512,28 +559,41 @@ async def _snapshot_initial_state_inner(
     environment: BaseEnvironment,
     logs_dir: Path,
     logger: logging.Logger,
-) -> None:
+) -> _InitialSnapshotOutcome:
     """The two-step body _snapshot_initial_state wraps in its timeout and
-    catch-all: stage in the container, then download what got published."""
+    catch-all: stage in the container, then download what got published.
+
+    The two steps have independent value, so the download gets its own
+    try/except rather than riding the caller's: the model is pointed at the
+    CONTAINER-side copy, which a failed host-side docker-cp neither removes
+    nor invalidates. Letting that failure discard the stage outcome would
+    silence the recovery note over a problem the model never sees."""
     out = await proxy.run_harness(_INITIAL_SNAPSHOT_COMMAND, timeout=25)
     result = _classify_initial_snapshot(
         _extract_exit_code(out), _parse_initial_snapshot_file_count(out)
     )
     logger.info(f"LittleCoderAgent: initial snapshot {result.message}")
     if not result.download:
-        return
+        return result
     target = logs_dir / INITIAL_SNAPSHOT_DIR_NAME
-    # Required, not defensive: docker's download_dir runs `docker compose cp
-    # service:SRC/. DEST`, and `docker cp SRC/. DEST` needs DEST to already
-    # exist -- only download_dir_with_exclusions' base implementation mkdirs
-    # its own target. Without this the download fails on every trial, and the
-    # caller's catch-all would swallow it.
-    target.mkdir(parents=True, exist_ok=True)
-    await environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target)
+    try:
+        # Required, not defensive: docker's download_dir runs `docker compose
+        # cp service:SRC/. DEST`, and `docker cp SRC/. DEST` needs DEST to
+        # already exist -- only download_dir_with_exclusions' base
+        # implementation mkdirs its own target. Without this the download
+        # fails on every trial, and the catch-all would swallow it.
+        target.mkdir(parents=True, exist_ok=True)
+        await environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target)
+    except Exception as e:
+        logger.info(
+            f"LittleCoderAgent: initial snapshot download failed (non-fatal): {e}"
+        )
+        return result
     logger.info(
         f"LittleCoderAgent: initial snapshot downloaded to {target} "
         f"(container-side copy kept at {INITIAL_SNAPSHOT_PUBLISH_PATH})"
     )
+    return result
 
 
 # Start-of-trial toolchain probe. The image a TB task ships is minimal and
@@ -1740,7 +1800,9 @@ class LittleCoderAgent(BaseAgent):
         # run them in parallel inside the container, only add scheduling
         # complexity for no wall-clock benefit. Staying sequential keeps
         # this simple.
-        await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
+        initial_snapshot = await _snapshot_initial_state(
+            proxy, environment, self.logs_dir, self.logger
+        )
 
         # Composed here, after the initial-state snapshot, rather than right
         # after the probe above: _compose_prompt is pure and `prompt` isn't
@@ -1749,7 +1811,12 @@ class LittleCoderAgent(BaseAgent):
         # that a later change derives from _snapshot_initial_state's outcome
         # has somewhere to plug in without re-threading this function.
         prompt = _compose_prompt(
-            prompt_prefix, prompt_task_block, [_toolchain_probe_note(toolchain.tools)]
+            prompt_prefix,
+            prompt_task_block,
+            [
+                _toolchain_probe_note(toolchain.tools),
+                _initial_snapshot_advertisement(initial_snapshot),
+            ],
         )
 
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)

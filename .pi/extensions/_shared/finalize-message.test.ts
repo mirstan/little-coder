@@ -7,9 +7,10 @@ describe("resolveFinalizeMessage", () => {
     expect(msg).toMatch(/Answer: <value>/);
     expect(msg).toMatch(/EvidenceList/);
     expect(msg).not.toMatch(/ShellSession/);
-    // The /tmp/.lc-snapshot pointer is a container-file recovery mechanism;
-    // meaningless for GAIA's chat-reply scoring, so it must not leak here.
+    // Both container-file recovery pointers are meaningless for GAIA's
+    // chat-reply scoring, so neither may leak here.
     expect(msg).not.toMatch(/\/tmp\/\.lc-snapshot/);
+    expect(msg).not.toMatch(/\/tmp\/\.lc-initial/);
   });
 
   it("returns the Terminal-Bench-style message for benchmark=terminal_bench", () => {
@@ -27,6 +28,18 @@ describe("resolveFinalizeMessage", () => {
     // only -- the snapshot is a container-file mechanism, meaningless for
     // GAIA's chat-reply scoring.
     expect(msg).toMatch(/\/tmp\/\.lc-snapshot/);
+    // The start-of-trial copy of the task's ORIGINAL files, staged by
+    // little_coder_agent.py before the model's first turn. Hedged as "may
+    // exist" like the line above: this string is static and cannot see
+    // whether a given trial's copy actually got staged.
+    expect(msg).toMatch(/\/tmp\/\.lc-initial\/app\//);
+    // Restraint clause, asserted verbatim rather than via a shared constant:
+    // the failure it guards is a model near its deadline restoring pristine
+    // originals over its own finished solution, and a test that imported the
+    // wording could not notice that wording being softened.
+    expect(msg).toContain(
+      "restore from there only a file you believe you corrupted — never over your completed solution",
+    );
   });
 
   it("returns a generic fallback for undefined or any other benchmark", () => {
@@ -36,6 +49,7 @@ describe("resolveFinalizeMessage", () => {
       expect(msg).not.toMatch(/EvidenceList/);
       expect(msg).not.toMatch(/ShellSession/);
       expect(msg).not.toMatch(/\/tmp\/\.lc-snapshot/);
+      expect(msg).not.toMatch(/\/tmp\/\.lc-initial/);
       expect(msg.length).toBeGreaterThan(0);
     }
   });

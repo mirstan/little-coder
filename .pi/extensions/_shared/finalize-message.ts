@@ -23,7 +23,10 @@ export function resolveFinalizeMessage(benchmark: string | undefined): string {
       "is incomplete or uncertain, save it anyway: a rough answer on disk " +
       "beats a correct one that never got written. Then stop calling tools. " +
       "If you accidentally overwrote good work, a snapshot of files you " +
-      "changed as of ~10 minutes ago may exist under /tmp/.lc-snapshot/."
+      "changed as of ~10 minutes ago may exist under /tmp/.lc-snapshot/, " +
+      "and the task's original starting files may exist under " +
+      "/tmp/.lc-initial/app/ (restore from there only a file you believe " +
+      "you corrupted — never over your completed solution)."
     );
   }
   if (benchmark === "gaia") {
