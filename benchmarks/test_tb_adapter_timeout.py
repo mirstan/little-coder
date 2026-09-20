@@ -54,9 +54,8 @@ try:
     _spec.loader.exec_module(tba)
 finally:
     # tba keeps its own references to the stubbed classes, so the stubs have
-    # done their job. Leaving them in sys.modules would turn a sibling test
-    # file's `pytest.importorskip("terminal_bench")` into a false positive
-    # when this file is collected first (test_format_output.py's convention).
+    # done their job. Pop them so a fake importable `terminal_bench` doesn't
+    # leak into tests collected later (test_format_output.py's convention).
     for _name in reversed(_STUBBED_MODULES):
         sys.modules.pop(_name, None)
 

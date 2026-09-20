@@ -116,9 +116,9 @@ describe("tmux-proxy backend", () => {
   });
 
   it("reports the hedged unknown-state warning, not a killed claim, when the bridge never answers", async () => {
-    // ctx.ui.input resolving to a non-string means the parent TB adapter's
-    // tmux session never sent a response back within its own timeout --
-    // nothing on this side killed or interrupted anything.
+    // ctx.ui.input resolving to a non-string means no usable response came
+    // back from the parent TB adapter -- nothing on this side killed or
+    // interrupted anything.
     process.env.LITTLE_CODER_TB_MODE = "1";
     const ctx = { ui: { input: async () => undefined } };
 
