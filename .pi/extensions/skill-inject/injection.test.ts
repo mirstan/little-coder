@@ -207,19 +207,31 @@ function extractQuotedStrings(block: string): string[] {
   return out;
 }
 
-/** Rebuild the exact string little_coder_agent.py's `prompt = (...)` produces,
- *  by concatenating its quoted segments the way Python's implicit adjacent-
- *  string-literal concatenation does. The `f"TASK:\n{instruction}\n\n"` segment
- *  is extracted like any other literal (the `{instruction}` placeholder is
- *  left as literal text, then substituted below). */
+/** Rebuild the string a `NAME = (...)` parenthesized string-literal
+ *  concatenation produces, by joining its quoted segments the way Python's
+ *  implicit adjacent-string-literal concatenation does. An `f"...{x}..."`
+ *  segment is extracted like any other literal -- the `{x}` placeholder is
+ *  left as literal text for the caller to substitute. */
+function pySourceLiteral(src: string, name: string): string {
+  const block = src.match(new RegExp(`${name} = \\(\\n([\\s\\S]*?)\\n\\s*\\)\\n`));
+  if (!block) throw new Error(`could not find \`${name} = (...)\` in little_coder_agent.py`);
+  return extractQuotedStrings(block[1]).map(decodePyString).join("");
+}
+
+/** Rebuild `run()`'s prompt as `_compose_prompt` assembles it:
+ *  `prompt_prefix` + `_HARD_LIMITS_PARAGRAPH` + task block -- minus the
+ *  per-trial `notes` (toolchain probe, initial-snapshot advertisement),
+ *  which come from a live container this static extraction has no way
+ *  to run. */
 function harborPromptTemplate(): string {
   const src = readFileSync(
     join(repoRoot(), "benchmarks", "harbor_adapter", "little_coder_agent.py"),
     "utf-8",
   );
-  const block = src.match(/prompt = \(\n([\s\S]*?)\n\s*\)\n/);
-  if (!block) throw new Error("could not find `prompt = (...)` in little_coder_agent.py");
-  return extractQuotedStrings(block[1]).map(decodePyString).join("");
+  const prefix = pySourceLiteral(src, "prompt_prefix");
+  const hardLimits = pySourceLiteral(src, "_HARD_LIMITS_PARAGRAPH");
+  const taskBlock = pySourceLiteral(src, "prompt_task_block");
+  return `${prefix}${hardLimits}\n\n${taskBlock}`;
 }
 
 function harborPrompt(instruction: string): string {
@@ -286,6 +298,13 @@ describe("research directive gates on browse-tool availability", () => {
   it("the real Harbor boilerplate no longer smells like a research task by itself", () => {
     expect(harborPromptTemplate()).not.toContain("briefly research the task");
     expect(looksLikeResearchTask(harborPromptTemplate())).toBe(false);
+  });
+
+  it("reconstructs all three prompt pieces, not just prefix+task", () => {
+    // Pins the extraction itself: a silently dropped _HARD_LIMITS_PARAGRAPH
+    // wouldn't fail any research-detection assertion above (its text has no
+    // research-trigger words), so this checks the piece directly.
+    expect(harborPromptTemplate()).toContain("Hard limits of this environment");
   });
 
   it("looksLikeResearchTask still catches genuine research phrasing", () => {
