@@ -12,6 +12,10 @@ pre-existing files:
     directory it must create itself (harbor's docker download_dir does not),
     the container-side copy it must leave behind, and its three-way
     succeeded/partial/refused outcome decision
+  - what that outcome is then allowed to tell the model
+    (_initial_snapshot_advertisement), including the restore-restraint
+    sentence that keeps a deadline-pressed model from overwriting its own
+    finished solution with the pristine originals
   - _wrap_command() actually composing a parseable shell script -- both for
     a harness call's cwd=None form and a model call's cd/pwd-tracking form
     -- verified by actually feeding the composed string to `sh -n`/`bash -n`
@@ -435,9 +439,11 @@ def _run_initial_snapshot(env, logs_dir, logger=None):
     async def scenario():
         loop = asyncio.get_running_loop()
         proxy = lca._HarborShellProxy(env, loop, _logger())
-        await lca._snapshot_initial_state(proxy, env, logs_dir, logger or _logger())
+        return await lca._snapshot_initial_state(
+            proxy, env, logs_dir, logger or _logger()
+        )
 
-    asyncio.run(scenario())
+    return asyncio.run(scenario())
 
 
 def test_initial_snapshot_stages_then_downloads_into_the_trial_dir(tmp_path):
@@ -542,9 +548,10 @@ def test_initial_snapshot_download_failure_is_non_fatal(tmp_path):
 
 
 def test_initial_snapshot_hang_degrades_within_its_timeout(tmp_path, monkeypatch):
-    """A wedged docker-cp must cost the trial its snapshot, not its wall
-    clock."""
-    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    """A wedged docker-cp must not wedge the trial: the download's own
+    timeout turns the hang into a bounded wait. The outcome-preserving half
+    of this same scenario is test_snapshot_outcome_survives_a_hung_download."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC", 0.05)
     env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
 
     started = time.monotonic()
@@ -582,13 +589,15 @@ def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
     # Same indentation as the gate itself: one level deeper would mean it sits
     # inside some conditional.
     assert len(call_line) - len(call_line.lstrip()) == len(gate_line) - len(gate_line.lstrip())
-    assert call_line.lstrip().startswith("await _snapshot_initial_state(")
+    assert call_line.lstrip().startswith(
+        "initial_snapshot = await _snapshot_initial_state("
+    )
 
 
 def test_environment_snapshot_write_lands_before_the_initial_state_snapshot():
     """Placement pin, restoring a guarantee an earlier refactor narrowed:
     environment_snapshot.json must land before _snapshot_initial_state (bounded
-    at 60s, including a docker-cp of up to 200MB) rather than after it, so it
+    at 75s, including a docker-cp of up to 200MB) rather than after it, so it
     survives even a mid-start termination during that stage+download. Nothing
     the env-snapshot write needs -- max_turns, timeout_info, the toolchain
     probe result -- depends on _snapshot_initial_state's outcome."""
@@ -801,6 +810,147 @@ def test_environment_snapshot_records_the_probe_result_even_when_empty():
     )
     assert snapshot["toolchain_probe"] is None
     assert snapshot["toolchain_probe_status"] is None
+
+
+# ── 1g. What the outcome is allowed to tell the model ──────────────────────
+
+# Asserted verbatim, deliberately not imported from the module under test: the
+# failure this guards is the wording being softened, which a test sharing the
+# module's own constant could never notice.
+_RESTRAINT_SENTENCE = (
+    "Restore from there only a file you believe you corrupted — never over "
+    "your own completed solution."
+)
+
+
+@pytest.mark.parametrize("outcome", [None, "failed", "refused"])
+def test_advertisement_is_silent_when_the_copy_may_not_be_there(outcome):
+    """Pointing the model at a path that does not exist costs it turns for
+    nothing -- strictly worse than never mentioning the copy."""
+    arg = None if outcome is None else lca._InitialSnapshotOutcome(outcome, False, "msg")
+    assert lca._initial_snapshot_advertisement(arg) is None
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "partial"])
+def test_advertisement_points_at_the_real_published_path(outcome):
+    """Path comes from the constant the snapshot command itself publishes to,
+    never a second hardcoded copy that could drift."""
+    text = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome(outcome, True, "msg")
+    )
+    assert f"{lca.INITIAL_SNAPSHOT_PUBLISH_PATH}/app/" in text
+    # The stage command's `cp --parents` keeps the /app prefix, so the
+    # example's app/ layout is the published copy's real one.
+    assert f"{lca.INITIAL_SNAPSHOT_PUBLISH_PATH}/app/somefile" in text
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "partial"])
+def test_advertisement_keeps_the_restore_restraint_sentence(outcome):
+    text = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome(outcome, True, "msg")
+    )
+    assert _RESTRAINT_SENTENCE in text
+    assert "read-only" in text
+
+
+def test_advertisement_does_not_ask_for_routine_diffing():
+    """Reactive only: it earns its turns when a specific file is suspected of
+    being clobbered, not as a standing habit on every trial."""
+    text = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome("succeeded", True, "msg")
+    )
+    assert "If you ever suspect" in text
+    for nudge in ("before you start", "first thing", "always diff", "routinely"):
+        assert nudge not in text
+
+
+def test_partial_advertisement_adds_the_absence_caveat():
+    """A truncated copy must not read as evidence a missing file never
+    existed."""
+    text = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome("partial", True, "msg")
+    )
+    assert f"{lca.SNAPSHOT_MAX_FILES}-file cap" in text
+    assert "absence there does not mean the file didn't exist" in text
+    assert _RESTRAINT_SENTENCE in text
+
+
+def test_succeeded_advertisement_omits_the_absence_caveat():
+    text = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome("succeeded", True, "msg")
+    )
+    assert "-file cap" not in text
+
+
+def test_snapshot_outcome_survives_a_failing_host_side_download(tmp_path):
+    """The model is pointed at the CONTAINER-side copy, which a broken
+    docker-cp neither removes nor invalidates. Discarding the stage outcome
+    here would silence the recovery note over a problem the model can't
+    see."""
+    env = _InitialSnapshotEnv(file_count=3, download_error=RuntimeError("docker cp exploded"))
+    outcome = _run_initial_snapshot(env, tmp_path)
+
+    assert outcome is not None and outcome.outcome == "succeeded"
+    assert lca._initial_snapshot_advertisement(outcome) is not None
+
+
+@pytest.mark.parametrize(
+    "file_count, expected",
+    [(3, "succeeded"), (500, "partial"), (0, "refused"), (None, "failed")],
+)
+def test_snapshot_returns_the_classified_outcome(tmp_path, file_count, expected):
+    env = _InitialSnapshotEnv(file_count=file_count)
+    outcome = _run_initial_snapshot(env, tmp_path)
+    assert outcome is not None and outcome.outcome == expected
+
+
+def test_snapshot_returns_none_without_a_logs_dir():
+    assert _run_initial_snapshot(_InitialSnapshotEnv(file_count=3), None) is None
+
+
+def test_snapshot_outcome_survives_a_hung_download(tmp_path, monkeypatch):
+    """A timed-out download must degrade the same way a raised one does
+    (test_snapshot_outcome_survives_a_failing_host_side_download): the
+    container-side stage already succeeded and the model can still reach it,
+    so a slow docker-cp must not erase that outcome."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC", 0.05)
+    env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
+    outcome = _run_initial_snapshot(env, tmp_path)
+    assert outcome is not None and outcome.outcome == "succeeded"
+
+
+def test_snapshot_returns_none_when_the_outer_backstop_fires(tmp_path, monkeypatch):
+    """The download-specific timeout above is what normally degrades a hang
+    without losing the outcome; this covers the other timeout -- the outer
+    wait_for around the whole stage+download call, which exists only as a
+    backstop for a bound that somehow doesn't fire on its own. Only
+    _INITIAL_SNAPSHOT_TIMEOUT_SEC is shrunk here -- the download's own
+    timeout stays at its real value, so it's the outer bound that fires
+    first and cancels mid-download."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
+    assert _run_initial_snapshot(env, tmp_path) is None
+
+
+def test_prompt_splices_the_advertisement_between_limits_and_task():
+    """Same placement rule as the toolchain line: never after the closing
+    "say 'done'" sentence."""
+    ad = lca._initial_snapshot_advertisement(
+        lca._InitialSnapshotOutcome("succeeded", True, "msg")
+    )
+    prompt = lca._compose_prompt("PREFIX\n\n", "TASK:\ndo it", [None, ad])
+
+    assert ad in prompt
+    assert prompt.index(lca._HARD_LIMITS_PARAGRAPH) < prompt.index(ad) < prompt.index("TASK:")
+    assert prompt.endswith("TASK:\ndo it")
+
+
+def test_prompt_omits_the_advertisement_when_nothing_was_staged():
+    prompt = lca._compose_prompt(
+        "PREFIX\n\n", "TASK:\ndo it", [None, lca._initial_snapshot_advertisement(None)]
+    )
+    assert "Recovery note" not in prompt
+    assert lca._HARD_LIMITS_PARAGRAPH in prompt
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
