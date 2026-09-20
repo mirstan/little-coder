@@ -911,8 +911,9 @@ def _build_environment_snapshot(
     snapshot["adapter_file"] = str(Path(__file__).resolve())
     snapshot["adapter_mtime"] = _ADAPTER_MTIME
     snapshot["timeout_provenance"] = timeout_info
-    # Recorded even when it came back None and the prompt line was omitted:
-    # post-mortem needs to tell "probe found nothing" from "never ran".
+    # Recorded even when None: the field alone can't tell "found nothing"
+    # from "never completed" -- that's the paired, differently-worded
+    # logger.info line above (_probe_toolchain) to read alongside it.
     snapshot["toolchain_probe"] = toolchain
     return snapshot
 
