@@ -202,7 +202,7 @@ describe("shipped models.json", () => {
 
   it("still registers llamacpp and ollama alongside lmstudio", () => {
     const result = loadProviders(pkgRoot, {});
-    expect(Object.keys(result.providers).sort()).toEqual(["llamacpp", "lmstudio", "ollama"]);
+    expect(Object.keys(result.providers).sort()).toEqual(["llamacpp", "lmstudio", "ollama", "omlx"]);
   });
 });
 

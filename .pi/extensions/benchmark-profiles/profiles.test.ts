@@ -61,7 +61,11 @@ describe("benchmark-profiles resolution against real settings.json", () => {
     // without it they fall through to default_model_profile's 4096 default, which
     // unconditionally shadows LITTLE_CODER_THINKING_BUDGET. Every other shipped
     // profile is unaffected.
-    const REAL_BUDGET_PROFILES = new Set(["omlx/tiel-coder-oq4e", "rapidmlx/tiel-coder-oq4e"]);
+    const REAL_BUDGET_PROFILES = new Set([
+      "omlx/tiel-coder-oq4e",
+      "omlx/tiel-coder-oq6e-fp16",
+      "rapidmlx/tiel-coder-oq4e",
+    ]);
     for (const key of Object.keys(settings.model_profiles)) {
       const expected = REAL_BUDGET_PROFILES.has(key) ? 32768 : 4096;
       expect(resolveProfileFrom(settings, key).thinking_budget, key).toBe(expected);
