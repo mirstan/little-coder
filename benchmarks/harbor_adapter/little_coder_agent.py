@@ -38,6 +38,7 @@ import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -536,6 +537,150 @@ async def _snapshot_initial_state_inner(
     )
 
 
+# Start-of-trial toolchain probe. The image a TB task ships is minimal and
+# varies per task: write-compressor burned ~35 turns discovering by trial and
+# error that python3 was absent, then pivoting to Perl.
+#
+# Closed candidate list by design -- it is both what the probe asks about and
+# what _parse_toolchain_probe will accept back, so nothing outside it can
+# reach the model's prompt. Hence the prompt line's "others may exist".
+_TOOLCHAIN_CANDIDATES = (
+    "python3",
+    "python",
+    "perl",
+    "awk",
+    "gcc",
+    "cc",
+    "g++",
+    "make",
+    "node",
+)
+_TOOLCHAIN_PROBE_TIMEOUT_SEC = 10
+# Built from the tuple above so the two can never drift apart. Only stdout is
+# ever read: the loop's rc is non-zero whenever the LAST candidate happens to
+# be absent, the same rc-is-unusable trap _classify_initial_snapshot documents.
+_TOOLCHAIN_PROBE_COMMAND = (
+    "for c in "
+    + " ".join(_TOOLCHAIN_CANDIDATES)
+    + "; do command -v $c >/dev/null 2>&1 && printf '%s ' $c; done"
+)
+
+
+def _parse_toolchain_probe(out: str) -> list[str] | None:
+    """Pull the detected tools back out of run_harness's returned string.
+    Pure/module-level so it's directly testable without a fake proxy.
+
+    Filtered against _TOOLCHAIN_CANDIDATES rather than taken verbatim: the
+    string also carries _format_output's own footer line, and on a broken
+    image whatever the shell printed instead. This list is interpolated
+    straight into the model's prompt, so a fabricated tool name here is worse
+    than no line at all.
+
+    Returns None, never [], when nothing usable is found -- an empty result,
+    unparseable garbage and "no candidate present" are one case to every
+    caller: there is nothing safe to tell the model.
+    """
+    tokens = set((out or "").split())
+    found = [c for c in _TOOLCHAIN_CANDIDATES if c in tokens]
+    return found or None
+
+
+def _toolchain_probe_note(tools: list[str] | None) -> str | None:
+    """The prompt line a successful probe earns, or None to say nothing."""
+    if not tools:
+        return None
+    return (
+        "Toolchain probe — available in this container: "
+        + " ".join(tools)
+        + " (others may exist; probe before assuming)."
+    )
+
+
+class _ToolchainProbeResult(NamedTuple):
+    tools: list[str] | None
+    status: str
+
+
+async def _probe_toolchain(
+    proxy: "_HarborShellProxy", logger: logging.Logger
+) -> _ToolchainProbeResult:
+    """Run the probe once at trial start.
+
+    Best-effort like the snapshots either side of it: any failure degrades to
+    no prompt line, never to a wrong one. The returned `status` is what makes
+    that degradation legible after the fact: `tools` alone serializes to the
+    same JSON `null` whether the container call raised or the probe ran
+    cleanly and genuinely found none of the candidates -- `status` is the
+    raw record of which of those actually happened, for
+    environment_snapshot.json. (A run_harness timeout does not raise here --
+    _exec_async catches it in either shape, the docker backend's RuntimeError
+    or a raw asyncio.TimeoutError, and returns a normal error string -- so
+    that case is disclosed inside the raw output captured by the
+    non-exception branch below, not by the except.)
+    """
+    try:
+        out = await proxy.run_harness(
+            _TOOLCHAIN_PROBE_COMMAND, timeout=_TOOLCHAIN_PROBE_TIMEOUT_SEC
+        )
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: toolchain probe failed (non-fatal): {e}")
+        return _ToolchainProbeResult(None, f"probe failed: {e}")
+    tools = _parse_toolchain_probe(out)
+    logger.info(f"LittleCoderAgent: toolchain probe -> {tools}")
+    # Sliced, not the full string: on a broken image this is _format_output's
+    # whole footer-and-all output, up to the ~48KB per-call cap -- more than
+    # a status field needs to disclose "what actually happened" and needless
+    # bulk in a JSON file meant for a quick post-mortem read.
+    return _ToolchainProbeResult(
+        tools, f"probe ran, raw output: {out[:2000]!r}"
+    )
+
+
+# Stated up front rather than left to the ShellSession tool description
+# alone, which is demonstrably too weak: overfull-hbox's model never once
+# passed `timeout`, so every long command ran under the 30s default.
+#
+# The not-killed sentence is measured, not assumed: on timeout, harbor
+# terminates only the host-side docker-exec client -- reproduced against a
+# live container, the in-container command survived and its statements past
+# the timeout still ran.
+_HARD_LIMITS_PARAGRAPH = (
+    "Hard limits of this environment: each ShellSession call fails at its "
+    "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts) and everything the command printed is "
+    "discarded with it. The command itself is not killed — it may still be "
+    "running in the container and finish later, with none of its output "
+    "ever shown — so inspect actual state (files, processes) before "
+    "re-running anything non-idempotent. Output is capped at 200 "
+    "lines / ~48KB per call. The container image is minimal: check which "
+    "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+    "designing an approach around one."
+)
+
+
+def _compose_prompt(
+    prefix: str, task_block: str, notes: Sequence[str | None] = ()
+) -> str:
+    """Assemble run()'s prompt from its two fixed halves plus whatever the
+    start-of-trial container probes produced.
+
+    A seam, not decoration: the notes are only known after those probes run,
+    many lines below where the prefix literal is written. Notes land between
+    the prefix and TASK deliberately: appended after the closing "say 'done'"
+    sentence, they would displace the model's last instruction.
+
+    _HARD_LIMITS_PARAGRAPH is unconditional and lives here rather than at the
+    call site so no caller can compose a prompt without it.
+    """
+    parts = [prefix, _HARD_LIMITS_PARAGRAPH, "\n\n"]
+    for note in notes:
+        if note:
+            parts.append(note)
+            parts.append("\n\n")
+    parts.append(task_block)
+    return "".join(parts)
+
+
 def _fallback_timeout_info() -> dict:
     return {
         "cache_layout": None,
@@ -773,6 +918,8 @@ def _build_environment_snapshot(
     max_turns: int,
     ambient_max_turns_env: str | None,
     timeout_info: dict,
+    toolchain: list[str] | None = None,
+    toolchain_probe_status: str | None = None,
 ) -> dict:
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
@@ -794,6 +941,13 @@ def _build_environment_snapshot(
     snapshot["adapter_file"] = str(Path(__file__).resolve())
     snapshot["adapter_mtime"] = _ADAPTER_MTIME
     snapshot["timeout_provenance"] = timeout_info
+    # toolchain_probe alone can't tell "found nothing" from "never
+    # completed" -- both serialize as null. toolchain_probe_status is the
+    # raw record (the exception message, or the probe's actual stdout) that
+    # makes that distinction from the JSON file alone, without having to go
+    # find the matching logger.info line in the trial log.
+    snapshot["toolchain_probe"] = toolchain
+    snapshot["toolchain_probe_status"] = toolchain_probe_status
     return snapshot
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
@@ -945,7 +1099,9 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     when track_cwd=False): sound only for a command that never itself needs
     a starting cwd and never `cd`s in a way the caller needs reported back --
     true of every cwd=None caller today (both snapshot commands and the
-    start-marker touch), which use absolute paths (/app, /tmp) throughout.
+    start-marker touch, which use absolute paths (/app, /tmp) throughout;
+    the toolchain probe, whose only path resolution is `command -v`'s
+    PATH search).
     """
     body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
     if cwd is None:
@@ -1217,8 +1373,8 @@ class _HarborShellProxy:
         loop, no thread bridge, no fut.result().
 
         This is also why every harness-issued path -- the deadline-snapshot
-        task, the start-of-trial snapshot, the start-marker touch -- must use
-        ONLY run_harness, never run().
+        task, the start-of-trial snapshot, the toolchain probe, the
+        start-marker touch -- must use ONLY run_harness, never run().
 
         _exec_async's own _exec_lock still serializes this against
         model-issued commands (via run()), so a harness command and a model
@@ -1232,9 +1388,10 @@ class _HarborShellProxy:
         by a harness call (by construction, not by accident -- contrast the
         old docstring here, which claimed the same result but only held
         because every harness command happened to never `cd`). Sound because
-        every harness command today (both snapshot instantiations and the
-        start-marker touch) uses absolute paths (/app, /tmp) throughout and
-        needs no starting cwd.
+        every harness command today either uses absolute paths (/app, /tmp)
+        throughout (both snapshot instantiations, the start-marker touch) or
+        resolves paths only through `command -v`'s PATH search (the
+        toolchain probe), so none needs a starting cwd.
         """
         return await self._exec_async(command, timeout, track_cwd=False)
 
@@ -1371,7 +1528,10 @@ class LittleCoderAgent(BaseAgent):
                 return proxy.reset()
             return f"Error: unknown ShellSession op '{op}'"
 
-        prompt = (
+        # Two halves with a seam between them (see _compose_prompt): the
+        # paragraphs that belong there are produced by container probes that
+        # only run further down, after the environment is reachable.
+        prompt_prefix = (
             "You are solving a Terminal-Bench 2.0 task inside a Linux container.\n"
             "The ONLY way to interact with the container is the ShellSession tool; "
             "its cwd persists between calls (tracked by the adapter). Any shell "
@@ -1400,6 +1560,8 @@ class LittleCoderAgent(BaseAgent):
             "setup (like login credentials), that usually still means the server "
             "side of it must be functional and reachable, just that you're not "
             "responsible for the client's half.\n\n"
+        )
+        prompt_task_block = (
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
@@ -1564,11 +1726,26 @@ class LittleCoderAgent(BaseAgent):
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
         )
 
+        # One cheap probe of what the image actually ships, before the
+        # deadline is anchored so its cost is not charged to the model. Run
+        # ahead of the start-of-trial snapshot below for the same reason the
+        # env-snapshot write right below is ordered ahead of it too -- see
+        # that comment.
+        toolchain = await _probe_toolchain(proxy, self.logger)
+
         # Per-trial environment_snapshot.json: best-effort, must never fail
-        # a trial. Executes before the PiRpc-construction
-        # try/except below so it (and the config-provenance log line above)
-        # still land even if PiRpc itself fails to construct (e.g. PI_BIN
-        # missing) -- exactly the diagnostics that failure needs most.
+        # a trial. Sits after the toolchain probe so it can record what that
+        # found, but deliberately AHEAD of _snapshot_initial_state below --
+        # unlike the probe, nothing this snapshot writes depends on that
+        # snapshot's outcome, and _snapshot_initial_state is bounded at 60s
+        # (including a docker-cp of up to 200MB) versus the probe's 10s.
+        # environment_snapshot.json must land early enough to survive even a
+        # mid-start termination, rather than depend on the initial-state
+        # stage+download finishing first.
+        # Still ahead of the PiRpc-construction try/except further below so
+        # it (and the config-provenance log line) land even if PiRpc itself
+        # fails to construct (e.g. PI_BIN missing) -- exactly the
+        # diagnostics that failure needs most.
         if self.logs_dir:
             try:
                 snapshot = _build_environment_snapshot(
@@ -1576,6 +1753,8 @@ class LittleCoderAgent(BaseAgent):
                     max_turns=max_turns,
                     ambient_max_turns_env=ambient_max_turns_env,
                     timeout_info=timeout_info,
+                    toolchain=toolchain.tools,
+                    toolchain_probe_status=toolchain.status,
                 )
                 (self.logs_dir / "environment_snapshot.json").write_text(
                     json.dumps(snapshot, indent=2, default=str)
@@ -1599,7 +1778,24 @@ class LittleCoderAgent(BaseAgent):
         # prompt is even sent. Anchoring after means the model always gets
         # the full effective_timeout_sec, regardless of how long staging
         # and downloading this snapshot took.
+        #
+        # Both this and the toolchain probe above go through run_harness,
+        # which shares _exec_async's _exec_lock with every model-issued
+        # command -- so gathering the two concurrently would not actually
+        # run them in parallel inside the container, only add scheduling
+        # complexity for no wall-clock benefit. Staying sequential keeps
+        # this simple.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
+
+        # Composed here, after the initial-state snapshot, rather than right
+        # after the probe above: _compose_prompt is pure and `prompt` isn't
+        # read until prompt_with_error_retry far below, so nothing requires
+        # it to exist this early, and leaving it here means a prompt note
+        # that a later change derives from _snapshot_initial_state's outcome
+        # has somewhere to plug in without re-threading this function.
+        prompt = _compose_prompt(
+            prompt_prefix, prompt_task_block, [_toolchain_probe_note(toolchain.tools)]
+        )
 
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
         # The same instant as deadline_epoch_ms, on the monotonic clock the

@@ -21,6 +21,8 @@ pre-existing files:
     appended after it -- a bug that every existing substring-matching test
     missed, because none of them ever actually composed and parsed the real
     string.
+  - the start-of-trial toolchain probe that runs alongside them, and the
+    prompt assembly both it and the static hard-limits paragraph feed
   - _compute_snapshot_delay_sec()'s scheduling arithmetic (incl. the
     short-task skip edge case)
   - _HarborShellProxy.run_harness() staying on the caller's event loop
@@ -581,6 +583,224 @@ def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
     # inside some conditional.
     assert len(call_line) - len(call_line.lstrip()) == len(gate_line) - len(gate_line.lstrip())
     assert call_line.lstrip().startswith("await _snapshot_initial_state(")
+
+
+def test_environment_snapshot_write_lands_before_the_initial_state_snapshot():
+    """Placement pin, restoring a guarantee an earlier refactor narrowed:
+    environment_snapshot.json must land before _snapshot_initial_state (bounded
+    at 60s, including a docker-cp of up to 200MB) rather than after it, so it
+    survives even a mid-start termination during that stage+download. Nothing
+    the env-snapshot write needs -- max_turns, timeout_info, the toolchain
+    probe result -- depends on _snapshot_initial_state's outcome."""
+    src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
+    write_line = next(
+        line for line in src.splitlines() if '"environment_snapshot.json"' in line
+    )
+    snapshot_call_line = next(
+        line for line in src.splitlines() if "await _snapshot_initial_state(" in line
+    )
+    assert src.index(write_line) < src.index(snapshot_call_line), (
+        "environment_snapshot.json must be written before _snapshot_initial_state runs"
+    )
+
+
+# ── 1f. Start-of-trial toolchain probe + prompt assembly ───────────────────
+
+@pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
+@pytest.mark.parametrize("cwd", [None, "/app"], ids=["harness-form", "model-form"])
+def test_composed_toolchain_probe_parses_under_sh_n(shell, cwd):
+    """Same parse check the snapshot commands get: this file has a history of
+    a shell syntax error shipping past substring-only assertions."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not found on PATH")
+    composed = lca._wrap_command(lca._TOOLCHAIN_PROBE_COMMAND, cwd, "__LC_END_test__")
+    result = subprocess.run([shell, "-n"], input=composed, text=True, capture_output=True)
+    assert result.returncode == 0, f"{shell} -n rejected it: {result.stderr!r}"
+    assert result.stderr == ""
+
+
+def test_toolchain_probe_command_asks_for_every_candidate():
+    """The command and the accept-list are one tuple, so the probe can never
+    ask about a tool _parse_toolchain_probe would then discard."""
+    listed = lca._TOOLCHAIN_PROBE_COMMAND.split("for c in ", 1)[1].split(";", 1)[0]
+    assert listed.split() == list(lca._TOOLCHAIN_CANDIDATES)
+
+
+def test_toolchain_probe_command_last_line_has_no_trailing_inline_comment():
+    """Same 2.1 regression pin as the snapshot commands: _exec_async's
+    epilogue is appended directly onto the last line."""
+    assert "#" not in lca._TOOLCHAIN_PROBE_COMMAND.rsplit("\n", 1)[-1]
+
+
+def test_parse_toolchain_probe_normal_output():
+    out = "python3 gcc make \n[exit=0 cwd=/app timed_out=false backend=harbor-env]"
+    assert lca._parse_toolchain_probe(out) == ["python3", "gcc", "make"]
+
+
+def test_parse_toolchain_probe_orders_by_candidate_list_and_dedupes():
+    """Stable ordering: the line goes into a prompt, so it must not vary with
+    whatever order the container's loop happened to print."""
+    assert lca._parse_toolchain_probe("make gcc python3 gcc") == ["python3", "gcc", "make"]
+
+
+def test_parse_toolchain_probe_filters_non_candidate_tokens():
+    """The harness wrapper's own footer (and anything else a broken image
+    prints) shares this string. Nothing outside the candidate list may reach
+    the model's prompt as a "detected" tool."""
+    out = "python3 rustc definitely-not-a-tool perl\n[exit=0 cwd=/app]"
+    assert lca._parse_toolchain_probe(out) == ["python3", "perl"]
+
+
+@pytest.mark.parametrize(
+    "out",
+    ["", "\n", "[exit=0 cwd=/app]", "sh: 1: Syntax error: bad for loop variable"],
+    ids=["empty", "blank", "footer-only", "garbage"],
+)
+def test_parse_toolchain_probe_returns_none_not_empty_list(out):
+    """None, never [] -- the caller omits the prompt line entirely rather
+    than advertising an empty toolchain it cannot actually vouch for."""
+    assert lca._parse_toolchain_probe(out) is None
+
+
+def test_toolchain_note_names_the_tools_and_keeps_the_hedge():
+    note = lca._toolchain_probe_note(["python3", "gcc"])
+    assert "python3 gcc" in note
+    # The probe asks about nine tools; the container has more. Dropping this
+    # would turn a closed candidate list into a false exhaustive inventory.
+    assert "others may exist" in note
+
+
+@pytest.mark.parametrize("tools", [None, []], ids=["none", "empty"])
+def test_toolchain_note_is_none_when_nothing_was_detected(tools):
+    assert lca._toolchain_probe_note(tools) is None
+
+
+def test_prompt_always_carries_the_hard_limits_paragraph():
+    for notes in ([], [None], ["something"]):
+        prompt = lca._compose_prompt("PREFIX\n\n", "TASK:\nx", notes)
+        assert lca._HARD_LIMITS_PARAGRAPH in prompt
+
+
+def _shell_session_timeout_constants() -> tuple[int, int]:
+    """Read the ShellSession tool's own default/max timeout straight out of
+    .pi/extensions/shell-session -- the only place that actually enforces
+    them -- so the paragraph test below can't drift silently from the code
+    it claims to pin. Regex, not an import: this is TypeScript, and there is
+    no existing pattern in this repo for a Python test to load a TS module,
+    so parsing the two literals out of source is the cheap alternative to
+    either a shared JSON constants file or leaving the claim unverified.
+    """
+    ts_dir = lca._REPO_ROOT / ".pi" / "extensions" / "shell-session"
+    helpers_src = (ts_dir / "helpers.ts").read_text()
+    default_timeout = int(
+        re.search(r"DEFAULT_TIMEOUT\s*=\s*(\d+)", helpers_src).group(1)
+    )
+    index_src = (ts_dir / "index.ts").read_text()
+    max_timeout = int(
+        re.search(r"Math\.min\(rawTimeout,\s*(\d+)\)", index_src).group(1)
+    )
+    return default_timeout, max_timeout
+
+
+def test_hard_limits_paragraph_states_the_caps_the_harness_enforces():
+    """Pins the numbers to the code that enforces them -- a stale prompt here
+    is worse than none, since the model would trust it.
+
+    All four numbers are now actually derived from the enforcing side: the
+    200-line/48KB caps from this module's own MAX_LINES/MAX_BODY_*_BYTES
+    (which _exec_async's formatting path applies), and the 30s/600s timeout
+    bounds from .pi/extensions/shell-session's own source (the ShellSession
+    tool description these numbers used to only echo, hand-typed, with no
+    check that they still matched)."""
+    para = lca._HARD_LIMITS_PARAGRAPH
+    default_timeout, max_timeout = _shell_session_timeout_constants()
+    assert f"default {default_timeout}s" in para
+    assert f"up to {max_timeout}" in para
+    assert f"{lca.MAX_LINES} lines" in para
+    capped_kb = (lca.MAX_BODY_HEAD_BYTES + lca.MAX_BODY_TAIL_BYTES) // 1024
+    assert f"{capped_kb}KB" in para
+
+
+def test_prompt_splices_the_toolchain_line_before_the_task_block():
+    """Position, not just presence: after the final "say 'done'" sentence it
+    would displace the model's last instruction."""
+    note = lca._toolchain_probe_note(["python3", "gcc"])
+    prompt = lca._compose_prompt("PREFIX\n\n", "TASK:\ndo it", [note])
+
+    assert note in prompt
+    assert prompt.index(lca._HARD_LIMITS_PARAGRAPH) < prompt.index(note) < prompt.index("TASK:")
+    assert prompt.startswith("PREFIX")
+    assert prompt.endswith("TASK:\ndo it")
+
+
+def test_prompt_omits_the_toolchain_line_when_the_probe_found_nothing():
+    prompt = lca._compose_prompt(
+        "PREFIX\n\n", "TASK:\ndo it", [lca._toolchain_probe_note(None)]
+    )
+    assert "Toolchain probe" not in prompt
+    assert lca._HARD_LIMITS_PARAGRAPH in prompt
+    assert prompt.endswith("TASK:\ndo it")
+
+
+def test_probe_toolchain_returns_none_when_the_container_call_raises():
+    """Best-effort: a probe failure costs the prompt line, never the trial --
+    but the raw exception must still be recoverable from `status`, since
+    `tools=None` alone is indistinguishable from a probe that ran clean and
+    found nothing."""
+
+    class _ExplodingProxy:
+        async def run_harness(self, command, timeout):
+            raise RuntimeError("exec exploded")
+
+    result = asyncio.run(lca._probe_toolchain(_ExplodingProxy(), _logger()))
+    assert result.tools is None
+    assert "probe failed" in result.status
+    assert "exec exploded" in result.status
+
+
+def test_probe_toolchain_reads_stdout_and_ignores_a_nonzero_rc():
+    """The loop's own rc is non-zero whenever the LAST candidate is absent,
+    so rc must carry no weight here."""
+    env = _RecordingEnv()
+
+    async def scenario():
+        proxy = lca._HarborShellProxy(env, asyncio.get_running_loop(), _logger())
+
+        async def fake_exec(command, timeout, track_cwd=True):
+            return "perl awk\n[exit=127 cwd=/app timed_out=false backend=harbor-env]"
+
+        proxy._exec_async = fake_exec
+        return await lca._probe_toolchain(proxy, _logger())
+
+    result = asyncio.run(scenario())
+    assert result.tools == ["perl", "awk"]
+    assert "probe ran, raw output" in result.status
+
+
+def test_environment_snapshot_records_the_probe_result_even_when_empty():
+    """Post-mortem needs "probe found nothing" to be distinguishable from an
+    adapter build that never probed at all -- toolchain_probe alone can't do
+    that (both are JSON null), so toolchain_probe_status must carry the raw
+    record of what actually happened."""
+    info = lca._fallback_timeout_info()
+    for toolchain in (["python3"], None):
+        snapshot = lca._build_environment_snapshot(
+            "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+            timeout_info=info, toolchain=toolchain,
+            toolchain_probe_status="probe ran, raw output: 'python3 '",
+        )
+        assert "toolchain_probe" in snapshot
+        assert snapshot["toolchain_probe"] == toolchain
+        assert snapshot["toolchain_probe_status"] == "probe ran, raw output: 'python3 '"
+
+    # And the None/None case (probe never even attempted a status) still
+    # serializes cleanly rather than raising.
+    snapshot = lca._build_environment_snapshot(
+        "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+        timeout_info=info, toolchain=None, toolchain_probe_status=None,
+    )
+    assert snapshot["toolchain_probe"] is None
+    assert snapshot["toolchain_probe_status"] is None
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
