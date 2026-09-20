@@ -221,11 +221,52 @@ header comment still references a nonexistent predecessor file
 (`local/tools/shell_session.py`) — pre-existing staleness, unrelated to this
 round, correctly left out of scope by the implementer.
 
+## 4b. Priority 6 (LSP-alternative syntax-check) implementation round (2026-09-20)
+
+`docs/harness-improvement-plans/PLAN.md` and `STATE.md` (this file) were copied
+out of the session scratchpad and committed into the repo — branch
+`docs/harness-improvement-tracking`, worktree `little-coder-plan-docs`, not
+pushed — so the ranked list and this summary survive past the session.
+
+The carried-over LSP-alternative design (`syntax-check-lsp-alternative.md`, still
+scratchpad-only) went through a Fable adversarial critique against post-#54-57
+`dev` — verdict ready with 5 amendments, all folded into the doc (footer-parsing
+reuse, a real conflict with `truncated-view` caught and fixed, drifted line
+references corrected, the evidence baseline flagged for re-measurement, exit-code
+parsing detail). Then implemented by an Opus subagent in worktree
+`little-coder-syntax-check` (branch `feat/syntax-check`): new
+`.pi/extensions/syntax-check/` (Phase 1 MVP, 4 languages), `_shared/tb-proxy.ts`
+extracted from `shell-session` for reuse. The implementer proved the design's one
+unverified assumption (`ctx.ui.input` from a `tool_result` hook) with a real
+end-to-end smoke test before writing any checker logic, and ran 9 mutation tests
+of its own.
+
+I independently re-verified: reinstalled deps, re-ran the full suite myself,
+re-mutation-tested the diagnostic-above-footer insertion (the critique's real
+`truncated-view` conflict fix) by hand, and read both core source files in full
+for a `/code-comments` pass (no findings). Opened as **PR #58**.
+
+While verifying, found `.pi/extensions/skill-inject/injection.test.ts` had 3
+failing tests on plain `dev` itself — confirmed pre-existing and unrelated
+(reproduces without PR #58's changes). Root cause: the test file regex-extracts
+harbor's prompt template to test research-directive injection against the real
+boilerplate, and PR #56/#57's `_compose_prompt` refactor broke that regex.
+**Not caught by CI** — `.github/workflows/ci.yml` runs only `npm ci` and
+`python -m pytest benchmarks/`, no `npx vitest run` step at all, so the entire
+1000+-test vitest suite has zero CI enforcement; this bug was invisible until a
+manual full-suite run surfaced it. Fixed in a separate isolated worktree
+(`little-coder-skill-inject-fix`, branch `fix/skill-inject-test-prompt-regex`),
+mutation-tested, opened as **PR #59**.
+
 ## 5. Open loose ends
 
-- PR #53 needs an explicit "merge" instruction from the user.
-- The `/goal` that was watching the validation-pass trial is satisfied and closed
-  out (trial finished, confirmed twice via direct query, no further monitoring
-  scheduled for it).
-- PLAN.md's new ranked list has not yet been through the Fable design →
-  adversarial-critique → Sonnet/Opus-implement pipeline used for prior rounds.
+- PRs #58 and #59 need an explicit "merge" instruction from the user (CI running
+  as of this update — npm ci/pytest green on both, Cubic pending).
+- The vitest-not-in-CI gap (see above) is a standing risk worth its own fix at
+  some point — a `.github/workflows/ci.yml` job running `npx vitest run` — not
+  attempted here since it's outside the scope of what was asked.
+- Priorities 7-12 in `PLAN.md` have not been started.
+- The design's own flagged follow-up (re-run `benchmarks/syntax_error_report.py`
+  on a fresh write-compressor trial to confirm the 24.5%/2026-09-19 evidence
+  baseline still holds post-#54-57) is still outstanding — needs a live harbor
+  trial, not done as part of implementation.
