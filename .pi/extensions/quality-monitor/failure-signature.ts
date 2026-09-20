@@ -24,24 +24,47 @@ export interface FailsigOptions {
   minTokens: number;
 }
 
+// Named here, beside the only code that reads them -- see similarity.ts's
+// FUZZY_ENV.
+export const FAILSIG_ENV = {
+  tailLines: "LITTLE_CODER_FAILSIG_TAIL_LINES",
+  threshold: "LITTLE_CODER_FAILSIG_THRESHOLD",
+  streak: "LITTLE_CODER_FAILSIG_STREAK",
+  window: "LITTLE_CODER_FAILSIG_WINDOW",
+  minTokens: "LITTLE_CODER_FAILSIG_MIN_TOKENS",
+} as const;
+
 export function failsigOptionsFromEnv(overrides: Partial<FailsigOptions> = {}): FailsigOptions {
   return {
-    tailLines: envNumber("LITTLE_CODER_FAILSIG_TAIL_LINES", 40),
+    tailLines: envNumber(FAILSIG_ENV.tailLines, 40),
     // Tighter than the fuzzy detector's 0.85: "the identical outcome" is a
     // stronger claim than "a similar attempt".
-    threshold: envNumber("LITTLE_CODER_FAILSIG_THRESHOLD", 0.95),
-    streak: envNumber("LITTLE_CODER_FAILSIG_STREAK", 3),
-    window: envNumber("LITTLE_CODER_FAILSIG_WINDOW", 8),
-    minTokens: envNumber("LITTLE_CODER_FAILSIG_MIN_TOKENS", 4),
+    threshold: envNumber(FAILSIG_ENV.threshold, 0.95),
+    streak: envNumber(FAILSIG_ENV.streak, 3),
+    window: envNumber(FAILSIG_ENV.window, 8),
+    minTokens: envNumber(FAILSIG_ENV.minTokens, 4),
     ...overrides,
   };
 }
 
-// Without a footer the text still ends in pi's own appended status line
-// ("Command exited with code N", "Command timed out after N seconds"), so the
-// floor has to clear that before any real output counts. A footered result
-// has already had its harness text split off.
-const STATUS_LINE_ALLOWANCE = 4;
+// pi's own bash ends a failed result with one of these as its last line
+// (core/tools/bash.ts appendStatus, verified against the installed
+// package). It is the harness reporting the failure, not the command saying
+// anything about it, so it is removed before the floor is applied rather
+// than paid for with a token allowance -- an allowance is wrong in both
+// directions at once, letting "no such file" (3 tokens) through on the
+// strength of five status-line tokens while over-charging the 2-token
+// "Command aborted". A footered result has already had its harness text
+// split off by splitFooter.
+const STATUS_LINE_RE =
+  /^Command (?:exited with code -?\d+|timed out after [\d.]+ seconds?|aborted)$/;
+
+function stripStatusLine(body: string): string {
+  const lines = body.split("\n");
+  const last = lines[lines.length - 1] ?? "";
+  if (!STATUS_LINE_RE.test(last.trim())) return body;
+  return lines.slice(0, -1).join("\n");
+}
 
 export interface ResultFacts {
   /** The command failed, however this tool reports failure. */
@@ -71,10 +94,9 @@ export interface ResultFacts {
 export function readResult(text: string, isError: boolean, minTokens: number): ResultFacts {
   const { body, footer } = splitFooter(text);
   const exit = footerExit(footer);
-  const floor = footer === null ? minTokens + STATUS_LINE_ALLOWANCE : minTokens;
   return {
     failed: isError === true || (exit !== null && exit !== 0),
-    hasContent: tokenize(body).length >= floor,
+    hasContent: tokenize(stripStatusLine(body.trimEnd())).length >= minTokens,
   };
 }
 
@@ -105,6 +127,27 @@ export function normalizeTail(text: string, maxLines: number): string {
   return out.slice(Math.max(0, out.length - maxLines)).join("\n");
 }
 
+// Everything this module reads from a result is at its end: splitFooter
+// takes the last line, normalizeTail the last `tailLines`, and the content
+// floor a token count any output this size clears many times over. Holding
+// more buys nothing and keeps a whole turn's tool output -- every parallel
+// call's -- alive until turn_end.
+const MAX_RESULT_CHARS = 64 * 1024;
+
+/**
+ * The tail of a tool result, cut at a line boundary where there is one.
+ * Everything downstream reads the end of the text, so what this drops is
+ * output nothing looks at — except where 64 KiB does not reach back the
+ * `tailLines` the signature wants, and the signature is then taken over
+ * less.
+ */
+export function boundResultText(text: string): string {
+  if (text.length <= MAX_RESULT_CHARS) return text;
+  const cut = text.length - MAX_RESULT_CHARS;
+  const nl = text.indexOf("\n", cut);
+  return text.slice(nl === -1 ? cut : nl + 1);
+}
+
 export interface Signature {
   hash: string;
   shingles: Set<string>;
@@ -130,7 +173,13 @@ export interface ResultObservation {
 }
 
 export interface FailureSignatureDetection {
-  reason: "repeated_failure_signature";
+  /**
+   * Which of the two things repeated. A corroborated PASSING result is
+   * tracked too (see `record`), and calling that a failure would steer the
+   * model to explain an error it never got.
+   */
+  reason: "repeated_failure_signature" | "repeated_output_signature";
+  failed: boolean;
   toolName: string;
   count: number;
   sigKey: string;
@@ -143,6 +192,8 @@ export interface FailureSignatureDetection {
 
 interface Entry {
   toolName: string;
+  /** Constant per entry: failures and passing results take separate keys. */
+  failed: boolean;
   sig: Signature;
   count: number;
   lastInput: string;
@@ -211,6 +262,7 @@ export class FailureSignatureTracker {
       this.forget(key);
       this.entries.set(key, {
         toolName: obs.toolName,
+        failed: facts.failed,
         sig,
         count: 1,
         lastInput: input,
@@ -250,7 +302,8 @@ export class FailureSignatureTracker {
     const dueNow = (sent === 0 && entry.count >= streak) || (sent === 1 && entry.count >= streak + 2);
     if (!dueNow) return null;
     return {
-      reason: "repeated_failure_signature",
+      reason: entry.failed ? "repeated_failure_signature" : "repeated_output_signature",
+      failed: entry.failed,
       toolName: entry.toolName,
       count: entry.count,
       sigKey,

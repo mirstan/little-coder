@@ -12,6 +12,7 @@ import {
 } from "./quality.ts";
 import { FuzzyLoopTracker, type NearDuplicateDetection } from "./similarity.ts";
 import {
+  boundResultText,
   FailureSignatureTracker,
   type FailureSignatureDetection,
 } from "./failure-signature.ts";
@@ -87,6 +88,7 @@ function steerLoopDetection(
       buildFailureSignatureMessage(failsig.toolName, failsig.count, {
         corroborated: failsig.corroborated,
         escalated: failsig.escalated,
+        failed: failsig.failed,
       }),
       { deliverAs: "steer" },
     );
@@ -202,7 +204,9 @@ export default function (pi: ExtensionAPI) {
       toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : undefined,
       toolName: String(e.toolName ?? ""),
       input: e.input,
-      text,
+      // Bounded here rather than at turn_end: this buffer holds every result
+      // of a turn at once, and a turn can run several verbose calls.
+      text: boundResultText(text),
       isError: e.isError === true,
     });
   });

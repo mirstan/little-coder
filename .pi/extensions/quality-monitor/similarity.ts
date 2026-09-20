@@ -9,6 +9,7 @@
 // flag, an identifier) and silently stops matching when a new variation class
 // appears. A score degrades toward "not similar", i.e. toward not firing.
 
+import { createHash } from "node:crypto";
 import { envNumber } from "../_shared/env-number.ts";
 import type { ToolCall } from "./quality.ts";
 
@@ -120,6 +121,17 @@ export function extractComparableText(call: ToolCall): string {
   return text ?? stableStringify(input);
 }
 
+/**
+ * A call's identity, for excluding verbatim repeats from the clustering.
+ * Hashed rather than kept whole: a window entry outlives its call by up to
+ * `window` turns, and the serialized input of a multi-megabyte Write would
+ * otherwise be retained per entry -- the same unbounded retention
+ * sampleForCompare exists to prevent.
+ */
+export function identityKey(call: ToolCall): string {
+  return createHash("sha1").update(`${call.name} ${stableStringify(call.input)}`).digest("hex");
+}
+
 export interface FuzzyOptions {
   threshold: number;
   minTokens: number;
@@ -129,13 +141,23 @@ export interface FuzzyOptions {
   growthRatio: number;
 }
 
+// Named here, beside the only code that reads them, so the tests that have
+// to neutralize them cannot drift from the set that exists.
+export const FUZZY_ENV = {
+  threshold: "LITTLE_CODER_FUZZY_LOOP_THRESHOLD",
+  minTokens: "LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS",
+  window: "LITTLE_CODER_FUZZY_LOOP_WINDOW",
+  streak: "LITTLE_CODER_FUZZY_LOOP_STREAK",
+  growthRatio: "LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO",
+} as const;
+
 export function fuzzyOptionsFromEnv(overrides: Partial<FuzzyOptions> = {}): FuzzyOptions {
   return {
-    threshold: envNumber("LITTLE_CODER_FUZZY_LOOP_THRESHOLD", 0.85),
-    minTokens: envNumber("LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS", 20),
-    window: envNumber("LITTLE_CODER_FUZZY_LOOP_WINDOW", 8),
-    streak: envNumber("LITTLE_CODER_FUZZY_LOOP_STREAK", 3),
-    growthRatio: envNumber("LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO", 1.02),
+    threshold: envNumber(FUZZY_ENV.threshold, 0.85),
+    minTokens: envNumber(FUZZY_ENV.minTokens, 20),
+    window: envNumber(FUZZY_ENV.window, 8),
+    streak: envNumber(FUZZY_ENV.streak, 3),
+    growthRatio: envNumber(FUZZY_ENV.growthRatio, 1.02),
     ...overrides,
   };
 }
@@ -222,7 +244,7 @@ export class FuzzyLoopTracker {
         length: text.length,
       };
       const tool = call.name.toLowerCase();
-      const key = `${call.name} ${stableStringify(call.input)}`;
+      const key = identityKey(call);
 
       const matched: number[] = [];
       for (const entry of this.entries) {

@@ -1,37 +1,24 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { assessResponse, buildCorrectionMessage, phraseForUser } from "./quality.ts";
+import {
+  assessResponse,
+  buildCorrectionMessage,
+  buildFailureSignatureMessage,
+  phraseForUser,
+} from "./quality.ts";
 import setupQualityMonitor from "./index.ts";
+import { FUZZY_ENV } from "./similarity.ts";
+import { FAILSIG_ENV } from "./failure-signature.ts";
+import { pinEnv } from "../_shared/env-pin.ts";
 
 const known = new Set(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]);
 
 // The integration tests below drive the two detectors through the extension,
-// which builds them with their env-derived defaults -- the same knobs
-// similarity.test.ts and failure-signature.test.ts pin. A shell exporting any
-// of them would retune the detectors under these assertions.
-const DETECTOR_ENV = [
-  "LITTLE_CODER_FUZZY_LOOP_THRESHOLD",
-  "LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS",
-  "LITTLE_CODER_FUZZY_LOOP_WINDOW",
-  "LITTLE_CODER_FUZZY_LOOP_STREAK",
-  "LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO",
-  "LITTLE_CODER_FAILSIG_TAIL_LINES",
-  "LITTLE_CODER_FAILSIG_THRESHOLD",
-  "LITTLE_CODER_FAILSIG_STREAK",
-  "LITTLE_CODER_FAILSIG_WINDOW",
-  "LITTLE_CODER_FAILSIG_MIN_TOKENS",
-];
-let savedDetectorEnv: (string | undefined)[] = [];
-beforeEach(() => {
-  savedDetectorEnv = DETECTOR_ENV.map((k) => process.env[k]);
-  for (const k of DETECTOR_ENV) delete process.env[k];
-});
-afterEach(() => {
-  DETECTOR_ENV.forEach((k, i) => {
-    const v = savedDetectorEnv[i];
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  });
-});
+// which builds them with their env-derived defaults. Both knob lists come
+// from the modules that read them, so a knob added there cannot be missed
+// here.
+const pinned = pinEnv([...Object.values(FUZZY_ENV), ...Object.values(FAILSIG_ENV)]);
+beforeEach(() => pinned.clear());
+afterEach(() => pinned.restore());
 
 describe("assessResponse", () => {
   it("accepts text-only assistant response", () => {
@@ -141,6 +128,29 @@ describe("buildCorrectionMessage", () => {
   });
   it("falls back to generic on unknown reason", () => {
     expect(buildCorrectionMessage("weird_thing")).toContain("weird_thing");
+  });
+});
+
+describe("buildFailureSignatureMessage", () => {
+  it("does not claim every attempt in the streak was near-identical", () => {
+    // `corroborated` is sticky: one near-identical pair sets it for the whole
+    // count, so the suffix can only speak for some of the attempts.
+    const msg = buildFailureSignatureMessage("ShellSession", 4, { corroborated: true });
+    expect(msg).toContain("some of those attempts were themselves near-identical");
+  });
+  it("says nothing about a command for a tool that has none, on either branch", () => {
+    expect(buildFailureSignatureMessage("Write", 3, { failed: true })).not.toMatch(/\bcommand\b/i);
+    expect(buildFailureSignatureMessage("Write", 3, { failed: false })).not.toMatch(/\bcommand\b/i);
+  });
+  it("does not call a repeated passing result an error", () => {
+    const msg = buildFailureSignatureMessage("ShellSession", 3, { failed: false });
+    expect(msg).toContain("identical output");
+    expect(msg).not.toMatch(/error|failing|refusal/i);
+  });
+  it("keeps the error framing, and the guardrail carve-out, for a failure", () => {
+    const msg = buildFailureSignatureMessage("ShellSession", 3, { failed: true });
+    expect(msg).toContain("identical error or output");
+    expect(msg).toMatch(/refusal is the answer/i);
   });
 });
 
@@ -885,6 +895,22 @@ describe("quality-monitor repeated-failure watchdog", () => {
     // The cluster reaching three must not repeat what that message said.
     await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(2048) } }], [{ text: SHELL_FAIL }]);
     expect(h.followUps).toHaveLength(1);
+  });
+
+  it("steers about output, not failure, when the repeated results passed", async () => {
+    // Near-identical commands (a cluster) whose results keep succeeding with
+    // the same unsatisfying output: worth saying, but not as an error.
+    const passing = "compressed size 512 bytes, expected under 400\n[exit=0 cwd=/app timed_out=false backend=subprocess]";
+    // Three turns, not two: a passing result is only tracked once its own
+    // call is already in a cluster of two, so the streak starts on turn 2.
+    for (const w of [512, 1024, 2048]) {
+      await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(w) } }], [{ text: passing }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toContain("identical output");
+    expect(h.followUps[0].msg).not.toMatch(/error|failing/i);
+    expect(h.notifies.join("\n")).toMatch(/identical output/i);
+    expect(h.notifies.join("\n")).not.toMatch(/identical failure/i);
   });
 
   it("drops results that arrived before a turn_end carrying no message", async () => {

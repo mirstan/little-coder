@@ -3,36 +3,23 @@ import {
   bigrams,
   containment,
   extractComparableText,
+  FUZZY_ENV,
   FuzzyLoopTracker,
+  identityKey,
   jaccard,
   sampleForCompare,
   stableStringify,
   tokenize,
 } from "./similarity.ts";
+import { pinEnv } from "../_shared/env-pin.ts";
 
-// Every `new FuzzyLoopTracker()` below asserts against the built-in defaults,
-// which fuzzyOptionsFromEnv reads out of the environment. A shell (or a CI
-// matrix) that exports any of these would silently retune the detector under
-// the assertions, so the suite pins them rather than inheriting them.
-const FUZZY_ENV = [
-  "LITTLE_CODER_FUZZY_LOOP_THRESHOLD",
-  "LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS",
-  "LITTLE_CODER_FUZZY_LOOP_WINDOW",
-  "LITTLE_CODER_FUZZY_LOOP_STREAK",
-  "LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO",
-];
-let savedEnv: (string | undefined)[] = [];
-beforeEach(() => {
-  savedEnv = FUZZY_ENV.map((k) => process.env[k]);
-  for (const k of FUZZY_ENV) delete process.env[k];
-});
-afterEach(() => {
-  FUZZY_ENV.forEach((k, i) => {
-    const v = savedEnv[i];
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  });
-});
+// Every `new FuzzyLoopTracker()` below asserts against the built-in
+// defaults, which fuzzyOptionsFromEnv reads out of the environment. A shell
+// (or a CI matrix) exporting any of them would silently retune the detector
+// under the assertions.
+const pinned = pinEnv(Object.values(FUZZY_ENV));
+beforeEach(() => pinned.clear());
+afterEach(() => pinned.restore());
 
 const sim = (a: string, b: string) => jaccard(bigrams(tokenize(a)), bigrams(tokenize(b)));
 
@@ -194,6 +181,26 @@ describe("extractComparableText", () => {
   it("returns the whole text — bounding it is sampleForCompare's job", () => {
     const text = extractComparableText({ name: "Write", input: { path: "/a", content: "x".repeat(40000) } });
     expect(text.length).toBe(40003);
+  });
+});
+
+describe("identityKey", () => {
+  it("is the same length whatever the call carries", () => {
+    const small = identityKey({ name: "Write", input: { path: "/a.pl", content: "print 1;" } });
+    const large = identityKey({ name: "Write", input: { path: "/a.pl", content: "x".repeat(2_000_000) } });
+    expect(small).toHaveLength(40);
+    expect(large).toHaveLength(40);
+  });
+  it("separates calls that differ and matches calls that do not", () => {
+    const call = (content: string) => ({ name: "Write", input: { path: "/a.pl", content } });
+    expect(identityKey(call("a"))).toBe(identityKey(call("a")));
+    expect(identityKey(call("a"))).not.toBe(identityKey(call("b")));
+    expect(identityKey({ name: "Write", input: 1 })).not.toBe(identityKey({ name: "Edit", input: 1 }));
+  });
+  it("ignores object key order, as the comparison text does", () => {
+    expect(identityKey({ name: "Grep", input: { a: 1, b: 2 } })).toBe(
+      identityKey({ name: "Grep", input: { b: 2, a: 1 } }),
+    );
   });
 });
 

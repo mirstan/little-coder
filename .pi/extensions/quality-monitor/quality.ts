@@ -168,6 +168,7 @@ export function phraseForUser(reason: string): string {
     repeated_tool_call: "the model repeated its previous tool call verbatim",
     near_duplicate_loop: "the model is looping with near-identical attempts (varying only details)",
     repeated_failure_signature: "the model's differing attempts keep producing the identical failure",
+    repeated_output_signature: "the model's differing attempts keep producing the identical output",
   };
   return phrases[reason] ?? `quality issue (${reason})`;
 }
@@ -194,19 +195,35 @@ export function buildNearDuplicateLoopMessage(count: number, escalated: boolean)
   );
 }
 
-// The closing carve-out mirrors buildBlockedCallEscalationMessage's (issue
-// #94): a model probing a permission-gate refusal with varied phrasings is a
-// differing-inputs/identical-output streak and will land here, so the text
-// must not read as "find another route".
+// Two outcomes, not one: the watchdog also counts a PASSING result whose
+// fuzzy cluster corroborates it, and the failure text would tell a model to
+// explain an error it never got. `some of those` because `corroborated` is
+// sticky -- one near-identical pair in the streak sets it for the whole
+// count. `the input` rather than `the command` because Write and Edit reach
+// this too.
+//
+// The failure branch's carve-out mirrors buildBlockedCallEscalationMessage's
+// (issue #94): a model probing a permission-gate refusal with varied
+// phrasings is a differing-inputs/identical-output streak and will land
+// there, so that text must not read as "find another route".
 export function buildFailureSignatureMessage(
   toolName: string,
   count: number,
-  opts: { corroborated?: boolean; escalated?: boolean } = {},
+  opts: { corroborated?: boolean; escalated?: boolean; failed?: boolean } = {},
 ): string {
-  const also = opts.corroborated ? " -- and those attempts were themselves near-identical" : "";
+  const also = opts.corroborated ? " -- and some of those attempts were themselves near-identical" : "";
+  const outcome = opts.failed === false ? "output" : "error or output";
   const opening = opts.escalated
     ? `That is now ${count} ${toolName} attempts with the same outcome${also}.`
-    : `${count} of your recent ${toolName} attempts produced essentially the identical error or output, each one after you had changed the command${also}.`;
+    : `${count} of your recent ${toolName} attempts produced essentially the identical ${outcome}, each one after you changed the input${also}.`;
+  if (opts.failed === false) {
+    return (
+      `${opening} These attempts are completing, but the result is not ` +
+      "responding to what you change. Before the next attempt, state what " +
+      "that output actually shows, what you have ruled out, and which of " +
+      "your assumptions about the task might be wrong."
+    );
+  }
   return (
     `${opening} Changing details is not changing the outcome -- the approach ` +
     "itself is failing. Before the next attempt, state what the error " +
