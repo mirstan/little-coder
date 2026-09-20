@@ -420,6 +420,18 @@ describe("tb-finalize-guard", () => {
       expect(buildTriggerAMessage(30, "succeeded")).not.toContain("file-count cap");
     });
 
+    it("warns every baseline, including a fully-succeeded copy, may omit large or deep files", () => {
+      // Matches _initial_snapshot_advertisement's unconditional caveat: the
+      // per-file size cap and -maxdepth apply regardless of outcome, so
+      // "succeeded" alone doesn't mean the copy is exhaustive.
+      expect(buildTriggerAMessage(30, "succeeded")).toContain(
+        "may not contain very large (>10MB) or deeply nested files",
+      );
+      expect(buildTriggerAMessage(30, "partial")).toContain(
+        "may not contain very large (>10MB) or deeply nested files",
+      );
+    });
+
     it("reports the remaining minutes it was given", () => {
       expect(buildTriggerAMessage(7, undefined)).toContain("roughly 7 minutes");
     });

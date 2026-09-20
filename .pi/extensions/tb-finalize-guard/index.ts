@@ -346,14 +346,14 @@ export function buildTriggerAMessage(
         `diff just those files against the untouched start-of-trial copy under ` +
         `${INITIAL_SNAPSHOT_APP_DIR}/ (${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors ` +
         "/app/somefile); it predates every change you made, unlike a backup of your " +
-        "own. " +
+        "own. It may not contain very large (>10MB) or deeply nested files. " +
         // Mirrors _initial_snapshot_advertisement's own caveat: at the
         // file-count cap the copy is incomplete, and a model reading absence
         // there as "this file never existed" would draw the wrong conclusion
         // from a truncation.
         (baseline === "partial"
-          ? "That copy hit a file-count cap, so a file missing from it may still have " +
-            "existed at the start. "
+          ? "That copy also hit a file-count cap, so a file missing from it may still " +
+            "have existed at the start. "
           : "");
 
   return (
