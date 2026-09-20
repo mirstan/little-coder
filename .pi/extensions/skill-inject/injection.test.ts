@@ -218,12 +218,11 @@ function pySourceLiteral(src: string, name: string): string {
   return extractQuotedStrings(block[1]).map(decodePyString).join("");
 }
 
-/** Rebuilds what the model actually sees: `run()`'s prompt is now
- *  `prompt_prefix` + `_HARD_LIMITS_PARAGRAPH` + task block, assembled by
- *  `_compose_prompt` (see that function's own docstring) -- with the
- *  per-trial `notes` (toolchain probe, initial-snapshot advertisement)
- *  omitted here, since those come from a live container this static
- *  extraction has no way to run. */
+/** Rebuild `run()`'s prompt as `_compose_prompt` assembles it:
+ *  `prompt_prefix` + `_HARD_LIMITS_PARAGRAPH` + task block -- minus the
+ *  per-trial `notes` (toolchain probe, initial-snapshot advertisement),
+ *  which come from a live container this static extraction has no way
+ *  to run. */
 function harborPromptTemplate(): string {
   const src = readFileSync(
     join(repoRoot(), "benchmarks", "harbor_adapter", "little_coder_agent.py"),
