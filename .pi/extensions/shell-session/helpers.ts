@@ -166,14 +166,26 @@ function writeOverflowFile(cleaned: string, captureTruncated: boolean): string |
   return `${label}: ${path}`;
 }
 
-// Shared by both timedOut=true callers below (execSubprocess's real SIGTERM
-// and execTmuxProxy's no-response fallback, where nothing was killed) -- kept
-// mechanism-agnostic so it's never a lie on either path.
-const TIMED_OUT_WARNING =
-  "WARNING: this command hit its timeout and was cut off. Any file it was " +
+// execSubprocess's real SIGTERM path: Node actually killed the child, so the
+// process is confirmed gone and cleanup logic confirmed did not run.
+const KILLED_TIMED_OUT_WARNING =
+  "WARNING: this command hit its timeout and was killed. Any file it was " +
   "mid-way through writing may now be HALF-WRITTEN, and any cleanup/restore logic at " +
   "the end of a script did NOT run -- re-verify (cat/wc/diff) any file it touched " +
   "before trusting it. If it simply needed more time, re-run with a larger timeout.";
+
+// execTmuxProxy's no-response fallback: nothing was killed or interrupted --
+// the command is likely still executing in the tmux pane, and no output was
+// recovered at all (the "response" that would have carried it never came
+// back). Deliberately does NOT suggest a re-run: re-running a command that
+// may still be executing would start a duplicate copy with duplicate side
+// effects.
+const UNKNOWN_TIMED_OUT_WARNING =
+  "WARNING: this command hit its timeout with no response from the session -- nothing " +
+  "was killed or interrupted, and it is likely STILL RUNNING. No output was recovered " +
+  "for this call, and any file it is writing may be incomplete. Do NOT re-run it -- " +
+  "check whether it is still running first (e.g. capture the pane, or ps in the " +
+  "session) to avoid starting a duplicate copy.";
 
 export function formatOutput(
   raw: string,
@@ -181,7 +193,7 @@ export function formatOutput(
   cwd: string,
   timedOut: boolean,
   backendNote: string,
-  opts: { overflowFile?: boolean; captureTruncated?: boolean } = {},
+  opts: { overflowFile?: boolean; captureTruncated?: boolean; timedOutKind?: "killed" | "unknown" } = {},
 ): string {
   const cleaned = stripAnsi(raw).replace(/\r/g, "");
   const rawBytes = byteLen(cleaned);
@@ -197,7 +209,10 @@ export function formatOutput(
     if (note) body = body ? `${body}\n${note}` : note;
   }
 
-  if (timedOut) body = body ? `${body}\n${TIMED_OUT_WARNING}` : TIMED_OUT_WARNING;
+  if (timedOut) {
+    const warning = opts.timedOutKind === "unknown" ? UNKNOWN_TIMED_OUT_WARNING : KILLED_TIMED_OUT_WARNING;
+    body = body ? `${body}\n${warning}` : warning;
+  }
 
   const footerBits = [`exit=${code}`, `cwd=${cwd}`, `timed_out=${timedOut ? "true" : "false"}`];
   if (truncated || byteCapped) {

@@ -70,17 +70,29 @@ describe("formatOutput", () => {
     expect(out).toContain("green");
     expect(out).not.toContain("\x1b");
   });
-  it("appends a timeout warning above the footer when timedOut", () => {
+  it("appends a killed-timeout warning above the footer by default when timedOut", () => {
     const out = formatOutput("partial\n", -1, "/tmp", true, "backend=subprocess");
     expect(out).toContain("WARNING");
     expect(out).toContain("timeout");
+    expect(out).toContain("was killed");
     // Above the footer, not folded into its brackets.
     const footerLine = out.split("\n").pop()!;
     expect(footerLine).toBe("[exit=-1 cwd=/tmp timed_out=true backend=subprocess]");
   });
-  it("leaves non-timeout output byte-identical to before the warning existed", () => {
+  it("appends the hedged unknown-state warning when timedOutKind is 'unknown'", () => {
+    // execTmuxProxy's no-response fallback: nothing was killed, the command
+    // may still be running, and re-running it risks a duplicate side effect --
+    // none of that is true of execSubprocess's real SIGTERM, so this must be
+    // a different string, not a shared "was cut off" compromise.
+    const out = formatOutput("", -1, "?", true, "backend=tmux-proxy", { timedOutKind: "unknown" });
+    expect(out).toContain("WARNING");
+    expect(out).toContain("STILL RUNNING");
+    expect(out).toContain("nothing was killed");
+    expect(out).toContain("Do NOT re-run it");
+    expect(out).not.toContain("larger timeout");
+  });
+  it("leaves non-timeout output free of any warning", () => {
     const out = formatOutput("hello\nworld\n", 0, "/tmp", false, "backend=subprocess");
-    expect(out).toBe("hello\nworld\n\n[exit=0 cwd=/tmp timed_out=false backend=subprocess]");
     expect(out).not.toContain("WARNING");
   });
 });
