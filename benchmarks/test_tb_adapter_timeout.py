@@ -14,6 +14,7 @@ from pathlib import Path
 BENCHMARKS = Path(__file__).resolve().parent
 
 _STUBBED_ROOTS: set[str] = set()
+_STUBBED_MODULES: list[str] = []
 
 
 def _install_stub(dotted: str, *names: str) -> None:
@@ -31,6 +32,7 @@ def _install_stub(dotted: str, *names: str) -> None:
             mod = types.ModuleType(name)
             mod.__path__ = []
             sys.modules[name] = mod
+            _STUBBED_MODULES.append(name)
             if i > 1:
                 setattr(sys.modules[".".join(parts[: i - 1])], parts[i - 1], mod)
     leaf = sys.modules[dotted]
@@ -43,12 +45,20 @@ _install_stub("terminal_bench.agents.base_agent", "AgentResult", "BaseAgent")
 _install_stub("terminal_bench.agents.failure_mode", "FailureMode")
 _install_stub("terminal_bench.terminal.tmux_session", "TmuxSession")
 
-_spec = importlib.util.spec_from_file_location(
-    "_lca_tb_adapter_timeout", BENCHMARKS / "tb_adapter" / "little_coder_agent.py"
-)
-tba = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = tba
-_spec.loader.exec_module(tba)
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "_lca_tb_adapter_timeout", BENCHMARKS / "tb_adapter" / "little_coder_agent.py"
+    )
+    tba = importlib.util.module_from_spec(_spec)
+    sys.modules[_spec.name] = tba
+    _spec.loader.exec_module(tba)
+finally:
+    # tba keeps its own references to the stubbed classes, so the stubs have
+    # done their job. Leaving them in sys.modules would turn a sibling test
+    # file's `pytest.importorskip("terminal_bench")` into a false positive
+    # when this file is collected first (test_format_output.py's convention).
+    for _name in reversed(_STUBBED_MODULES):
+        sys.modules.pop(_name, None)
 
 
 class _FakeExecResult:
@@ -80,6 +90,30 @@ class _FakeTmux:
         return self._panes[idx]
 
 
+class _SendKeysRaisingTmux(_FakeTmux):
+    """send_keys raises on the run()-issued call (but not _init_once's), so
+    the command's `source <script>` was never actually typed into the pane --
+    a non-timeout failure that still lands in the sentinel-missing branch
+    because run() swallows the exception."""
+
+    def send_keys(self, *args, **kwargs):
+        if self._calls > 0:
+            raise RuntimeError("tmux client gone")
+
+
+class _CapturePaneRaisingTmux(_FakeTmux):
+    """capture_pane raises on the post-send_keys call, so run() falls back to
+    pane="" -- there is no output to show at all, regardless of whether the
+    command ran, is running, or never started."""
+
+    def capture_pane(self, capture_entire=True):
+        idx = self._calls
+        self._calls += 1
+        if idx == 0:
+            return self._panes[0]
+        raise RuntimeError("capture failed")
+
+
 def _footer(result: str) -> str:
     return result.rsplit("\n", 1)[-1]
 
@@ -91,8 +125,39 @@ def test_sentinel_missing_reports_timed_out_true_with_tmux_warning():
     assert "timed_out=true" in _footer(result)
     assert "exit=-1" in _footer(result)
     assert "partial output, no sentinel ever showed up" in result
-    assert "STILL RUNNING" in result
+    # Hedged, not asserted as settled fact: this branch also fires for
+    # non-timeout send_keys/capture_pane failures (see the two tests below),
+    # so the warning may not claim a real timeout or a definitely-running
+    # process.
+    assert "no completion sentinel was seen" in result
+    assert "may be STILL RUNNING" in result
     assert "its 30s timeout" in result
+
+
+def test_send_keys_failure_reports_hedged_warning_not_a_timeout_claim():
+    """send_keys can fail immediately for reasons that have nothing to do
+    with the {N}s timeout elapsing (e.g. the tmux client itself is gone).
+    run() swallows that exception, so this still lands in the
+    sentinel-missing branch -- the warning must not assert the command
+    'hit its timeout' as settled fact."""
+    tmux = _SendKeysRaisingTmux(["", "whatever was on the pane before"])
+    proxy = tba._TmuxShellProxy(tmux, "sess-1")
+    result = proxy.run("echo hi", 30)
+    assert "timed_out=true" in _footer(result)
+    assert "no completion sentinel was seen" in result
+    assert "failed to start" in result
+
+
+def test_capture_pane_failure_reports_hedged_warning_with_no_output():
+    """capture_pane raising leaves pane == "" -- there is no output to show
+    at all, so the warning must not claim the process is definitely still
+    running (it may have crashed, finished, or never started)."""
+    tmux = _CapturePaneRaisingTmux(["", "unused"])
+    proxy = tba._TmuxShellProxy(tmux, "sess-1")
+    result = proxy.run("echo hi", 30)
+    assert "timed_out=true" in _footer(result)
+    assert "no completion sentinel was seen" in result
+    assert "may not have been captured" in result
 
 
 def test_sentinel_present_has_no_warning():

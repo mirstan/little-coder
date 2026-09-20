@@ -157,14 +157,20 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
     return f"{body}\n{footer}" if body else footer
 
 
-# Unlike the harbor docker backend (host-side client killed, container
-# process may survive), tmux's sentinel just never showed up in time -- the
-# command is definitely still running in the pane.
+# This branch fires whenever no sentinel is found in the pane within the
+# {N}s budget -- which is not only the "command is still running" case.
+# send_keys/capture_pane exceptions are swallowed above (see run()), so this
+# also fires when send_keys failed immediately for a non-timeout reason, or
+# when capture_pane raised (pane == "" -> no output to show at all). State
+# only the observed fact (no sentinel seen) and hedge the process-state claim
+# rather than asserting a real timeout or a still-running process as settled
+# fact.
 _TMUX_TIMEOUT_WARNING = (
-    "WARNING: this command hit its {N}s timeout with no completion sentinel seen -- "
-    "it is likely STILL RUNNING in the terminal session. The output above is only "
-    "what has printed so far, and any file it is writing may be incomplete. Check on "
-    "it (e.g. capture the pane again, or ps) before trusting its output or files."
+    "WARNING: no completion sentinel was seen for this command within its {N}s timeout. "
+    "It may be STILL RUNNING in the terminal session, it may have failed to start, or its "
+    "pane output may not have been captured -- any output shown above is only what could "
+    "be read, and any file it was writing may be incomplete. Check on it (e.g. capture "
+    "the pane again, or ps) before trusting its output or files."
 )
 
 
