@@ -166,6 +166,15 @@ function writeOverflowFile(cleaned: string, captureTruncated: boolean): string |
   return `${label}: ${path}`;
 }
 
+// Shared by both timedOut=true callers below (execSubprocess's real SIGTERM
+// and execTmuxProxy's no-response fallback, where nothing was killed) -- kept
+// mechanism-agnostic so it's never a lie on either path.
+const TIMED_OUT_WARNING =
+  "WARNING: this command hit its timeout and was cut off. Any file it was " +
+  "mid-way through writing may now be HALF-WRITTEN, and any cleanup/restore logic at " +
+  "the end of a script did NOT run -- re-verify (cat/wc/diff) any file it touched " +
+  "before trusting it. If it simply needed more time, re-run with a larger timeout.";
+
 export function formatOutput(
   raw: string,
   code: number,
@@ -187,6 +196,8 @@ export function formatOutput(
     const note = writeOverflowFile(cleaned, opts.captureTruncated === true);
     if (note) body = body ? `${body}\n${note}` : note;
   }
+
+  if (timedOut) body = body ? `${body}\n${TIMED_OUT_WARNING}` : TIMED_OUT_WARNING;
 
   const footerBits = [`exit=${code}`, `cwd=${cwd}`, `timed_out=${timedOut ? "true" : "false"}`];
   if (truncated || byteCapped) {

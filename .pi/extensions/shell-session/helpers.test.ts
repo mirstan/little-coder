@@ -70,6 +70,19 @@ describe("formatOutput", () => {
     expect(out).toContain("green");
     expect(out).not.toContain("\x1b");
   });
+  it("appends a timeout warning above the footer when timedOut", () => {
+    const out = formatOutput("partial\n", -1, "/tmp", true, "backend=subprocess");
+    expect(out).toContain("WARNING");
+    expect(out).toContain("timeout");
+    // Above the footer, not folded into its brackets.
+    const footerLine = out.split("\n").pop()!;
+    expect(footerLine).toBe("[exit=-1 cwd=/tmp timed_out=true backend=subprocess]");
+  });
+  it("leaves non-timeout output byte-identical to before the warning existed", () => {
+    const out = formatOutput("hello\nworld\n", 0, "/tmp", false, "backend=subprocess");
+    expect(out).toBe("hello\nworld\n\n[exit=0 cwd=/tmp timed_out=false backend=subprocess]");
+    expect(out).not.toContain("WARNING");
+  });
 });
 
 describe("capBytesHeadTail", () => {
