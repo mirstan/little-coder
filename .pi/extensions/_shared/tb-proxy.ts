@@ -33,7 +33,11 @@ export function tbSessionId(): string {
  *
  * `null` (rather than a formatted error string) when no usable response came
  * back: callers disagree about what that should look like — ShellSession owes
- * the model a result with a footer, syntax-check owes it silence.
+ * the model a result with a footer, syntax-check owes it silence. Covers all
+ * three ways "no usable response" happens: a non-string reply, an empty one
+ * (the adapter never formats a genuinely empty result -- even a no-output
+ * command still carries a footer), and a rejected `ui.input` call, which
+ * `execTmuxProxy` has no catch of its own for.
  */
 export async function tbProxyRun(
   ctx: ProxyUiCtx,
@@ -42,6 +46,11 @@ export async function tbProxyRun(
   sessionId: string,
 ): Promise<string | null> {
   const payload = { op: "run", session_id: sessionId, command, timeout: timeoutSec };
-  const response = await ctx.ui.input(TB_PROXY_PREFIX + JSON.stringify(payload), "");
-  return typeof response === "string" ? response : null;
+  let response: unknown;
+  try {
+    response = await ctx.ui.input(TB_PROXY_PREFIX + JSON.stringify(payload), "");
+  } catch {
+    return null;
+  }
+  return typeof response === "string" && response.length > 0 ? response : null;
 }

@@ -18,18 +18,29 @@ import {
   syntaxCheckEnabled,
 } from "./helpers.ts";
 import { splitFooter } from "../truncated-view/truncation.ts";
+import { splitCommandChain } from "../_shared/shell-write.ts";
 import { formatOutput } from "../shell-session/helpers.ts";
 
 // The real footer shape, from the extension that writes it — a hand-typed
 // literal here would keep passing after the format moved.
 const FOOTER = formatOutput("", 0, "/app", false, "backend=harbor-env").split("\n").at(-1)!;
 
+// Snapshot/restore rather than unconditionally delete: a suite run with
+// LITTLE_CODER_SYNTAX_CHECK already exported (e.g. to disable the extension
+// while debugging something unrelated) must not have that value erased once
+// this file's tests are done with it.
+const ORIGINAL_SYNTAX_CHECK_ENV = process.env[SYNTAX_CHECK_ENV];
 afterEach(() => {
-  delete process.env[SYNTAX_CHECK_ENV];
+  if (ORIGINAL_SYNTAX_CHECK_ENV === undefined) delete process.env[SYNTAX_CHECK_ENV];
+  else process.env[SYNTAX_CHECK_ENV] = ORIGINAL_SYNTAX_CHECK_ENV;
 });
 
 describe("kill switch", () => {
   it("defaults on", () => {
+    // Cleared explicitly, not just assumed absent -- this test must reflect
+    // the true default regardless of what the ambient shell exported before
+    // the suite started.
+    delete process.env[SYNTAX_CHECK_ENV];
     expect(syntaxCheckEnabled()).toBe(true);
   });
 
@@ -109,43 +120,67 @@ describe("commandRunsFile", () => {
     "EOF",
   ].join("\n");
 
+  /** Tests `commandRunsFile` in isolation, against every segment of `cmd` --
+   *  `checkTargets` is what actually scopes this to segments after a write;
+   *  see its own describe block for that ordering behavior. */
+  function runs(cmd: string, rawPath: string): boolean {
+    return commandRunsFile(splitCommandChain(cmd), rawPath);
+  }
+
   it("skips the write-then-run chain the model overwhelmingly issues", () => {
-    expect(commandRunsFile(`${HEREDOC}\nperl /tmp/v3.pl`, "/tmp/v3.pl")).toBe(true);
+    expect(runs(`${HEREDOC}\nperl /tmp/v3.pl`, "/tmp/v3.pl")).toBe(true);
   });
 
   it("fires on a bare write with no run", () => {
-    expect(commandRunsFile(HEREDOC, "/tmp/v3.pl")).toBe(false);
+    expect(runs(HEREDOC, "/tmp/v3.pl")).toBe(false);
   });
 
   it("fires on a sed -i patch, the case the round trip is currently wasted on", () => {
-    expect(commandRunsFile("sed -i 's/foo/bar/' /tmp/v3.pl", "/tmp/v3.pl")).toBe(false);
+    expect(runs("sed -i 's/foo/bar/' /tmp/v3.pl", "/tmp/v3.pl")).toBe(false);
   });
 
   it("fires on write-then-separate-compile of a DIFFERENT file", () => {
-    expect(commandRunsFile("cat > a.c <<EOF\nx\nEOF\ngcc -o b b.c", "a.c")).toBe(false);
+    expect(runs("cat > a.c <<EOF\nx\nEOF\ngcc -o b b.c", "a.c")).toBe(false);
   });
 
   it("matches a relative spelling against a relative write target", () => {
-    expect(commandRunsFile("cat > f.pl <<EOF\nx\nEOF\nperl f.pl", "f.pl")).toBe(true);
-    expect(commandRunsFile("cat > f.pl <<EOF\nx\nEOF\nperl ./f.pl", "f.pl")).toBe(true);
+    expect(runs("cat > f.pl <<EOF\nx\nEOF\nperl f.pl", "f.pl")).toBe(true);
+    expect(runs("cat > f.pl <<EOF\nx\nEOF\nperl ./f.pl", "f.pl")).toBe(true);
+  });
+
+  it("matches a run against a backslash-escaped operand the same way the write detector unescapes it", () => {
+    // detectDeliverableWrites reports the write as "a b.pl" (its own unquote
+    // strips the backslash); a run spelled `perl a\ b.pl` must resolve to the
+    // same unescaped operand, not the literal `a\ b.pl`.
+    expect(runs("cat > a\\ b.pl <<EOF\nx\nEOF\nperl a\\ b.pl", "a b.pl")).toBe(true);
   });
 
   it("does not mistake a longer filename that ends in the target's name", () => {
-    expect(commandRunsFile("cat > t.sh <<EOF\nx\nEOF\nbash test.sh", "t.sh")).toBe(false);
+    expect(runs("cat > t.sh <<EOF\nx\nEOF\nbash test.sh", "t.sh")).toBe(false);
   });
 
   it("recognises an absolute or versioned interpreter", () => {
-    expect(commandRunsFile("cat > a.py <<EOF\nx\nEOF\n/usr/bin/python3 a.py", "a.py")).toBe(true);
-    expect(commandRunsFile("cat > a.py <<EOF\nx\nEOF\npython3.11 a.py", "a.py")).toBe(true);
+    expect(runs("cat > a.py <<EOF\nx\nEOF\n/usr/bin/python3 a.py", "a.py")).toBe(true);
+    expect(runs("cat > a.py <<EOF\nx\nEOF\npython3.11 a.py", "a.py")).toBe(true);
   });
 
   it("ignores a run that only appears inside the heredoc body being written", () => {
     const cmd = ["cat > /tmp/run.sh <<'EOF'", "perl /tmp/run.sh", "EOF"].join("\n");
-    expect(commandRunsFile(cmd, "/tmp/run.sh")).toBe(false);
+    expect(runs(cmd, "/tmp/run.sh")).toBe(false);
   });
 
   it("ignores a non-runner that merely names the file", () => {
-    expect(commandRunsFile("cat > a.py <<EOF\nx\nEOF\nchmod +x a.py", "a.py")).toBe(false);
+    expect(runs("cat > a.py <<EOF\nx\nEOF\nchmod +x a.py", "a.py")).toBe(false);
+  });
+
+  it("requires an exact match for a path with a directory component -- basename alone is not enough", () => {
+    // /app/f.pl and /tmp/f.pl share a basename but are different files; a run
+    // of one must not suppress the check on the other.
+    expect(runs("perl /tmp/f.pl", "/app/f.pl")).toBe(false);
+  });
+
+  it("still matches basename-only for a bare filename with no directory", () => {
+    expect(runs("perl f.pl", "f.pl")).toBe(true);
   });
 });
 
@@ -177,6 +212,19 @@ describe("checkTargets", () => {
   it("checks a file written twice in one command only once", () => {
     const targets = checkTargets("echo a > /tmp/x.py\necho b >> /tmp/x.py", "/app");
     expect(targets).toHaveLength(1);
+  });
+
+  it("still checks a file whose only run in the command came BEFORE the write", () => {
+    // perl f.pl runs the pre-write file; the write after it replaces the
+    // content with something the model has not executed at all.
+    const targets = checkTargets("perl f.pl; cat > f.pl <<EOF\nx\nEOF", "/app");
+    expect(targets.map((t) => t.raw)).toEqual(["f.pl"]);
+  });
+
+  it("still skips when the run comes after the write, in a multi-write command", () => {
+    const cmd = ["cat > a.py <<EOF", "x", "EOF", "cat > b.py <<EOF", "y", "EOF", "python3 b.py"].join("\n");
+    const targets = checkTargets(cmd, "/app");
+    expect(targets.map((t) => t.raw)).toEqual(["a.py"]);
   });
 });
 
@@ -212,6 +260,14 @@ describe("readCheckResult", () => {
   it("fails open when the checker is not installed", () => {
     const text = formatOutput(SKIP_SENTINEL, 0, "/app", false, "");
     expect(readCheckResult(text).kind).toBe("skip");
+  });
+
+  it("does not mistake a real error that merely quotes the sentinel for a missing checker", () => {
+    // A checker's own failure output could plausibly quote this token (this
+    // repo is self-hosted -- a source file testing marker strings, say);
+    // only the WHOLE trimmed output being the sentinel means "skipped".
+    const text = formatOutput(`syntax error near token ${SKIP_SENTINEL}`, 1, "/app", false, "");
+    expect(readCheckResult(text)).toMatchObject({ kind: "verdict", exit: 1 });
   });
 
   it("fails open on a timed-out check", () => {

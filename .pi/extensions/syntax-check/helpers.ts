@@ -110,34 +110,41 @@ function isRunner(word: string): boolean {
   return RUNNERS.has(name) || /^python\d[\d.]*$/.test(name);
 }
 
+// Matches _shared/shell-write.ts's own (unexported) unquote exactly: a
+// quoted word loses its quotes, an unquoted one loses backslash escapes
+// instead -- never both, since a real shell never applies both to one word.
+// Kept in sync by hand rather than importing, since that helper isn't
+// exported; drift here would only ever cost a redundant round trip (a missed
+// skip), not a wrong diagnostic, so it's a low-severity thing to keep in sync.
 function unquote(word: string): string {
-  const first = word[0];
-  if ((first === '"' || first === "'") && word[word.length - 1] === first) {
+  if (word.length >= 2 && (word[0] === '"' || word[0] === "'") && word[word.length - 1] === word[0]) {
     return word.slice(1, -1);
   }
-  return word;
+  return word.replace(/\\(.)/g, "$1");
 }
 
 /**
- * Does `cmd` already execute `rawPath`?
+ * Does `segments` (the command chain from the write onward) already execute
+ * `rawPath`?
  *
  * The model commonly writes `cat > f.pl <<EOF … EOF` and runs `perl f.pl` in
- * the same call, where the run itself reports the syntax error — a
- * second check would only duplicate it and pay another round trip. Matching is
- * on the path as SPELLED in the command (and its basename), not the resolved
- * absolute path, which never appears in the segment.
+ * the same call, where the run itself reports the syntax error — a second
+ * check would only duplicate it and pay another round trip. Matching is on
+ * the path as SPELLED in the command, not the resolved absolute path, which
+ * never appears in the segment. The basename-only fallback is scoped to a
+ * bare filename (no directory component) — `rawPath` naming a directory
+ * (`/app/f.pl`) requires an exact operand match, so a run of an unrelated
+ * `/tmp/f.pl` sharing the same basename can't false-match it.
  */
-export function commandRunsFile(cmd: string, rawPath: string): boolean {
-  const base = basename(rawPath);
-  if (!base) return false;
-  // splitCommandChain strips heredoc bodies itself, so a `perl` line inside
-  // the written file's text can't be mistaken for a run.
-  for (const segment of splitCommandChain(cmd)) {
+export function commandRunsFile(segments: string[], rawPath: string): boolean {
+  const bareBase = rawPath.includes("/") ? null : rawPath;
+  for (const segment of segments) {
     const words = splitWords(segment);
     if (words.length === 0 || !isRunner(words[0])) continue;
     for (const word of words.slice(1)) {
       const operand = unquote(word);
-      if (operand === rawPath || basename(operand) === base) return true;
+      if (operand === rawPath) return true;
+      if (bareBase !== null && basename(operand) === bareBase) return true;
     }
   }
   return false;
@@ -151,19 +158,31 @@ export interface CheckTarget {
   checker: Checker;
 }
 
-/** Files a command wrote that are worth checking, in command order. */
+/**
+ * Files a command wrote that are worth checking, in command order.
+ *
+ * Walks the chain one segment at a time so the skip heuristic only sees
+ * segments AFTER a given write -- `perl f.pl; cat > f.pl <<EOF …` ran the
+ * PRE-write file, so that run must not suppress the check on what just
+ * replaced it. `splitCommandChain` strips heredoc bodies itself, so a
+ * `perl` line inside the written file's own text can't be mistaken for a
+ * run in either this loop or `commandRunsFile`.
+ */
 export function checkTargets(cmd: string, cwd: string): CheckTarget[] {
   const targets: CheckTarget[] = [];
   const seen = new Set<string>();
-  for (const write of detectDeliverableWrites(cmd)) {
-    const checker = checkerFor(write.path);
-    if (!checker) continue;
-    if (commandRunsFile(cmd, write.path)) continue;
-    const path = resolveShellTarget(write.path, cwd);
-    if (seen.has(path)) continue;
-    seen.add(path);
-    targets.push({ raw: write.path, path, checker });
-    if (targets.length >= MAX_FILES_PER_COMMAND) break;
+  const segments = splitCommandChain(cmd);
+  outer: for (let i = 0; i < segments.length; i++) {
+    for (const write of detectDeliverableWrites(segments[i])) {
+      const checker = checkerFor(write.path);
+      if (!checker) continue;
+      if (commandRunsFile(segments.slice(i + 1), write.path)) continue;
+      const path = resolveShellTarget(write.path, cwd);
+      if (seen.has(path)) continue;
+      seen.add(path);
+      targets.push({ raw: write.path, path, checker });
+      if (targets.length >= MAX_FILES_PER_COMMAND) break outer;
+    }
   }
   return targets;
 }
@@ -196,8 +215,13 @@ export type CheckResult =
   /** Fail open: no footer, a timeout, nothing usable to say. */
   | { kind: "none" };
 
+// Every checker's `else` branch is a bare `echo SKIP_SENTINEL` with nothing
+// else on that shell invocation, so a genuine skip is the WHOLE trimmed
+// output, not merely a substring of it -- a real syntax error whose message
+// happens to quote this exact token (a file testing marker strings, say;
+// this repo is self-hosted) must not be mistaken for a missing checker.
 export function classifyCheckOutput(exit: number, output: string): CheckResult {
-  if (output.includes(SKIP_SENTINEL)) return { kind: "skip" };
+  if (output.trim() === SKIP_SENTINEL) return { kind: "skip" };
   return { kind: "verdict", exit, output };
 }
 
