@@ -38,7 +38,7 @@ describe("resolveFinalizeMessage", () => {
     // originals over its own finished solution, and a test that imported the
     // wording could not notice that wording being softened.
     expect(msg).toContain(
-      "restore from there only a file you believe you corrupted — never over your completed solution",
+      "restore from there only a file you believe you corrupted — never over your own completed solution",
     );
   });
 

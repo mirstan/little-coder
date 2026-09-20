@@ -26,7 +26,7 @@ export function resolveFinalizeMessage(benchmark: string | undefined): string {
       "changed as of ~10 minutes ago may exist under /tmp/.lc-snapshot/, " +
       "and the task's original starting files may exist under " +
       "/tmp/.lc-initial/app/ (restore from there only a file you believe " +
-      "you corrupted — never over your completed solution)."
+      "you corrupted — never over your own completed solution)."
     );
   }
   if (benchmark === "gaia") {

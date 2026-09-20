@@ -548,9 +548,10 @@ def test_initial_snapshot_download_failure_is_non_fatal(tmp_path):
 
 
 def test_initial_snapshot_hang_degrades_within_its_timeout(tmp_path, monkeypatch):
-    """A wedged docker-cp must cost the trial its snapshot, not its wall
-    clock."""
-    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    """A wedged docker-cp must cost the trial only wall-clock, not the stage
+    outcome it already has in hand -- see test_snapshot_outcome_survives_a_
+    hung_download for the outcome-preserving half of this same scenario."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC", 0.05)
     env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
 
     started = time.monotonic()
@@ -906,10 +907,15 @@ def test_snapshot_returns_none_without_a_logs_dir():
     assert _run_initial_snapshot(_InitialSnapshotEnv(file_count=3), None) is None
 
 
-def test_snapshot_returns_none_when_the_whole_thing_times_out(tmp_path, monkeypatch):
-    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+def test_snapshot_outcome_survives_a_hung_download(tmp_path, monkeypatch):
+    """A timed-out download must degrade the same way a raised one does
+    (test_snapshot_outcome_survives_a_failing_host_side_download): the
+    container-side stage already succeeded and the model can still reach it,
+    so a slow docker-cp must not erase that outcome."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC", 0.05)
     env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
-    assert _run_initial_snapshot(env, tmp_path) is None
+    outcome = _run_initial_snapshot(env, tmp_path)
+    assert outcome is not None and outcome.outcome == "succeeded"
 
 
 def test_prompt_splices_the_advertisement_between_limits_and_task():

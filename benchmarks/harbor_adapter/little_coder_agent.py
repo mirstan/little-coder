@@ -389,10 +389,14 @@ async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, lo
 _INITIAL_SNAPSHOT_COUNT_RE = re.compile(
     rf"^{_INITIAL_SNAPSHOT_COUNT_PREFIX}\s*(\d+)", re.MULTILINE
 )
-# Bounds the whole stage+download round trip. Generous next to run_harness's
-# own 25s container-side timeout, because the download that follows is a
-# docker-cp of up to 200MB.
-_INITIAL_SNAPSHOT_TIMEOUT_SEC = 60.0
+# Bounds only the docker-cp download. TimeoutError is an Exception subclass,
+# so this is caught by the same try/except that already preserves the stage
+# outcome on a raised download error.
+_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC = 35.0
+# Backstop only: the stage (run_harness's own 25s) and the download (above)
+# are each individually bounded and already preserve the stage outcome on
+# their own timeout. Sized for slack above both, not to race them.
+_INITIAL_SNAPSHOT_TIMEOUT_SEC = 75.0
 
 
 def _parse_initial_snapshot_file_count(formatted_output: str) -> int | None:
@@ -583,7 +587,10 @@ async def _snapshot_initial_state_inner(
         # implementation mkdirs its own target. Without this the download
         # fails on every trial, and the catch-all would swallow it.
         target.mkdir(parents=True, exist_ok=True)
-        await environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target)
+        await asyncio.wait_for(
+            environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target),
+            timeout=_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC,
+        )
     except Exception as e:
         logger.info(
             f"LittleCoderAgent: initial snapshot download failed (non-fatal): {e}"
