@@ -570,4 +570,18 @@ describe("recallSlice", () => {
     // A handful of boundary-padding bytes, nowhere near the archive's real size.
     expect(maxRequested).toBeLessThan(200);
   });
+
+  // stat succeeding but the read itself failing (e.g. the file vanished, or a
+  // transient fs error) must surface as an error, not a fake empty page that
+  // reads as "this archived pair had no content."
+  it("errors when the archive can be sized but not read", () => {
+    const flaky: RetentionArchive = {
+      save: () => true,
+      size: () => Buffer.byteLength(archived),
+      readRange: () => undefined,
+    };
+    const out = recallSlice("sr-x", flaky, 0, 100, recallOpts);
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("sr-x");
+  });
 });

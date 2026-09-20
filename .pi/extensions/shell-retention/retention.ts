@@ -400,7 +400,10 @@ export function recallSlice(
   const wantStart = Math.max(0, Math.min(Number.isFinite(offset as number) ? Number(offset) : 0, total));
   const readStart = Math.max(0, wantStart - UTF8_BOUNDARY_PAD);
   const readEnd = Math.min(total, wantStart + want + UTF8_BOUNDARY_PAD);
-  const buf = archive.readRange(id, readStart, readEnd - readStart) ?? Buffer.alloc(0);
+  const buf = archive.readRange(id, readStart, readEnd - readStart);
+  if (buf === undefined) {
+    return { text: `Error: failed to read archived shell observation '${id}'`, isError: true };
+  }
 
   let start = wantStart - readStart;
   while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
