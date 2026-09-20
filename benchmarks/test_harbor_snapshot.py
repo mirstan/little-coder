@@ -21,6 +21,8 @@ pre-existing files:
     appended after it -- a bug that every existing substring-matching test
     missed, because none of them ever actually composed and parsed the real
     string.
+  - the start-of-trial toolchain probe that runs alongside them, and the
+    prompt assembly both it and the static hard-limits paragraph feed
   - _compute_snapshot_delay_sec()'s scheduling arithmetic (incl. the
     short-task skip edge case)
   - _HarborShellProxy.run_harness() staying on the caller's event loop
@@ -581,6 +583,155 @@ def test_initial_snapshot_runs_before_and_outside_the_deadline_snapshot_gate():
     # inside some conditional.
     assert len(call_line) - len(call_line.lstrip()) == len(gate_line) - len(gate_line.lstrip())
     assert call_line.lstrip().startswith("await _snapshot_initial_state(")
+
+
+# ── 1f. Start-of-trial toolchain probe + prompt assembly ───────────────────
+
+@pytest.mark.parametrize("shell", _SHELLS_TO_TRY)
+@pytest.mark.parametrize("cwd", [None, "/app"], ids=["harness-form", "model-form"])
+def test_composed_toolchain_probe_parses_under_sh_n(shell, cwd):
+    """Same parse check the snapshot commands get: this file has a history of
+    a shell syntax error shipping past substring-only assertions."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not found on PATH")
+    composed = lca._wrap_command(lca._TOOLCHAIN_PROBE_COMMAND, cwd, "__LC_END_test__")
+    result = subprocess.run([shell, "-n"], input=composed, text=True, capture_output=True)
+    assert result.returncode == 0, f"{shell} -n rejected it: {result.stderr!r}"
+    assert result.stderr == ""
+
+
+def test_toolchain_probe_command_asks_for_every_candidate():
+    """The command and the accept-list are one tuple, so the probe can never
+    ask about a tool _parse_toolchain_probe would then discard."""
+    listed = lca._TOOLCHAIN_PROBE_COMMAND.split("for c in ", 1)[1].split(";", 1)[0]
+    assert listed.split() == list(lca._TOOLCHAIN_CANDIDATES)
+
+
+def test_toolchain_probe_command_last_line_has_no_trailing_inline_comment():
+    """Same 2.1 regression pin as the snapshot commands: _exec_async's
+    epilogue is appended directly onto the last line."""
+    assert "#" not in lca._TOOLCHAIN_PROBE_COMMAND.rsplit("\n", 1)[-1]
+
+
+def test_parse_toolchain_probe_normal_output():
+    out = "python3 gcc make \n[exit=0 cwd=/app timed_out=false backend=harbor-env]"
+    assert lca._parse_toolchain_probe(out) == ["python3", "gcc", "make"]
+
+
+def test_parse_toolchain_probe_orders_by_candidate_list_and_dedupes():
+    """Stable ordering: the line goes into a prompt, so it must not vary with
+    whatever order the container's loop happened to print."""
+    assert lca._parse_toolchain_probe("make gcc python3 gcc") == ["python3", "gcc", "make"]
+
+
+def test_parse_toolchain_probe_filters_non_candidate_tokens():
+    """The harness wrapper's own footer (and anything else a broken image
+    prints) shares this string. Nothing outside the candidate list may reach
+    the model's prompt as a "detected" tool."""
+    out = "python3 rustc definitely-not-a-tool perl\n[exit=0 cwd=/app]"
+    assert lca._parse_toolchain_probe(out) == ["python3", "perl"]
+
+
+@pytest.mark.parametrize(
+    "out",
+    ["", "\n", "[exit=0 cwd=/app]", "sh: 1: Syntax error: bad for loop variable"],
+    ids=["empty", "blank", "footer-only", "garbage"],
+)
+def test_parse_toolchain_probe_returns_none_not_empty_list(out):
+    """None, never [] -- the caller omits the prompt line entirely rather
+    than advertising an empty toolchain it cannot actually vouch for."""
+    assert lca._parse_toolchain_probe(out) is None
+
+
+def test_toolchain_note_names_the_tools_and_keeps_the_hedge():
+    note = lca._toolchain_probe_note(["python3", "gcc"])
+    assert "python3 gcc" in note
+    # The probe asks about nine tools; the container has more. Dropping this
+    # would turn a closed candidate list into a false exhaustive inventory.
+    assert "others may exist" in note
+
+
+@pytest.mark.parametrize("tools", [None, []], ids=["none", "empty"])
+def test_toolchain_note_is_none_when_nothing_was_detected(tools):
+    assert lca._toolchain_probe_note(tools) is None
+
+
+def test_prompt_always_carries_the_hard_limits_paragraph():
+    for notes in ([], [None], ["something"]):
+        prompt = lca._compose_prompt("PREFIX\n\n", "TASK:\nx", notes)
+        assert lca._HARD_LIMITS_PARAGRAPH in prompt
+
+
+def test_hard_limits_paragraph_states_the_caps_the_harness_enforces():
+    """Pins the numbers to the code that enforces them -- a stale prompt here
+    is worse than none, since the model would trust it."""
+    para = lca._HARD_LIMITS_PARAGRAPH
+    assert "default 30s" in para
+    assert "up to 600" in para
+    assert f"{lca.MAX_LINES} lines" in para
+    capped_kb = (lca.MAX_BODY_HEAD_BYTES + lca.MAX_BODY_TAIL_BYTES) // 1024
+    assert f"{capped_kb}KB" in para
+
+
+def test_prompt_splices_the_toolchain_line_before_the_task_block():
+    """Position, not just presence: after the final "say 'done'" sentence it
+    would displace the model's last instruction."""
+    note = lca._toolchain_probe_note(["python3", "gcc"])
+    prompt = lca._compose_prompt("PREFIX\n\n", "TASK:\ndo it", [note])
+
+    assert note in prompt
+    assert prompt.index(lca._HARD_LIMITS_PARAGRAPH) < prompt.index(note) < prompt.index("TASK:")
+    assert prompt.startswith("PREFIX")
+    assert prompt.endswith("TASK:\ndo it")
+
+
+def test_prompt_omits_the_toolchain_line_when_the_probe_found_nothing():
+    prompt = lca._compose_prompt(
+        "PREFIX\n\n", "TASK:\ndo it", [lca._toolchain_probe_note(None)]
+    )
+    assert "Toolchain probe" not in prompt
+    assert lca._HARD_LIMITS_PARAGRAPH in prompt
+    assert prompt.endswith("TASK:\ndo it")
+
+
+def test_probe_toolchain_returns_none_when_the_container_call_raises():
+    """Best-effort: a probe failure costs the prompt line, never the trial."""
+
+    class _ExplodingProxy:
+        async def run_harness(self, command, timeout):
+            raise RuntimeError("exec exploded")
+
+    assert asyncio.run(lca._probe_toolchain(_ExplodingProxy(), _logger())) is None
+
+
+def test_probe_toolchain_reads_stdout_and_ignores_a_nonzero_rc():
+    """The loop's own rc is non-zero whenever the LAST candidate is absent,
+    so rc must carry no weight here."""
+    env = _RecordingEnv()
+
+    async def scenario():
+        proxy = lca._HarborShellProxy(env, asyncio.get_running_loop(), _logger())
+
+        async def fake_exec(command, timeout, track_cwd=True):
+            return "perl awk\n[exit=127 cwd=/app timed_out=false backend=harbor-env]"
+
+        proxy._exec_async = fake_exec
+        return await lca._probe_toolchain(proxy, _logger())
+
+    assert asyncio.run(scenario()) == ["perl", "awk"]
+
+
+def test_environment_snapshot_records_the_probe_result_even_when_empty():
+    """Post-mortem needs "probe found nothing" to be distinguishable from an
+    adapter build that never probed at all."""
+    info = lca._fallback_timeout_info()
+    for toolchain in (["python3"], None):
+        snapshot = lca._build_environment_snapshot(
+            "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+            timeout_info=info, toolchain=toolchain,
+        )
+        assert "toolchain_probe" in snapshot
+        assert snapshot["toolchain_probe"] == toolchain
 
 
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────

@@ -331,6 +331,16 @@ class LittleCoderAgent(BaseAgent):
             "You are running as root in the container; /app is writable.\n"
             "File tools like Read/Write/Edit are NOT available — use shell commands "
             "(cat, sed -i, heredoc 'cat > file <<EOF') through ShellSession instead.\n\n"
+            # Kept in sync by hand with the harbor adapter's
+            # _HARD_LIMITS_PARAGRAPH, the same way _format_output is
+            # duplicated across the two adapters rather than shared.
+            "Hard limits of this environment: each ShellSession call is killed at "
+            "its timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+            "compiles/installs/long scripts; a killed command does not run its "
+            "cleanup and can leave files half-written). Output is capped at 200 "
+            "lines / ~48KB per call. The container image is minimal: check which "
+            "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+            "designing an approach around one.\n\n"
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )

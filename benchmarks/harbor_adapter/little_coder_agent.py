@@ -37,6 +37,7 @@ import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -535,6 +536,122 @@ async def _snapshot_initial_state_inner(
     )
 
 
+# Start-of-trial toolchain probe. The image a TB task ships is minimal and
+# varies per task: write-compressor burned ~35 turns discovering by trial and
+# error that python3 was absent, then pivoting to Perl.
+#
+# Closed candidate list by design -- it is both what the probe asks about and
+# what _parse_toolchain_probe will accept back, so nothing outside it can
+# reach the model's prompt. Hence the prompt line's "others may exist".
+_TOOLCHAIN_CANDIDATES = (
+    "python3",
+    "python",
+    "perl",
+    "awk",
+    "gcc",
+    "cc",
+    "g++",
+    "make",
+    "node",
+)
+_TOOLCHAIN_PROBE_TIMEOUT_SEC = 10
+# Built from the tuple above so the two can never drift apart. Only stdout is
+# ever read: the loop's rc is non-zero whenever the LAST candidate happens to
+# be absent, the same rc-is-unusable trap _classify_initial_snapshot documents.
+_TOOLCHAIN_PROBE_COMMAND = (
+    "for c in "
+    + " ".join(_TOOLCHAIN_CANDIDATES)
+    + "; do command -v $c >/dev/null 2>&1 && printf '%s ' $c; done"
+)
+
+
+def _parse_toolchain_probe(out: str) -> list[str] | None:
+    """Pull the detected tools back out of run_harness's returned string.
+    Pure/module-level so it's directly testable without a fake proxy.
+
+    Filtered against _TOOLCHAIN_CANDIDATES rather than taken verbatim: the
+    string also carries _format_output's own footer line, and on a broken
+    image whatever the shell printed instead. This list is interpolated
+    straight into the model's prompt, so a fabricated tool name here is worse
+    than no line at all.
+
+    Returns None, never [], when nothing usable is found -- an empty result,
+    unparseable garbage and "no candidate present" are one case to every
+    caller: there is nothing safe to tell the model.
+    """
+    tokens = set((out or "").split())
+    found = [c for c in _TOOLCHAIN_CANDIDATES if c in tokens]
+    return found or None
+
+
+def _toolchain_probe_note(tools: list[str] | None) -> str | None:
+    """The prompt line a successful probe earns, or None to say nothing."""
+    if not tools:
+        return None
+    return (
+        "Toolchain probe — available in this container: "
+        + " ".join(tools)
+        + " (others may exist; probe before assuming)."
+    )
+
+
+async def _probe_toolchain(
+    proxy: "_HarborShellProxy", logger: logging.Logger
+) -> list[str] | None:
+    """Run the probe once at trial start.
+
+    Best-effort like the snapshots either side of it: any failure degrades to
+    no prompt line, never to a wrong one.
+    """
+    try:
+        out = await proxy.run_harness(
+            _TOOLCHAIN_PROBE_COMMAND, timeout=_TOOLCHAIN_PROBE_TIMEOUT_SEC
+        )
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: toolchain probe failed (non-fatal): {e}")
+        return None
+    tools = _parse_toolchain_probe(out)
+    logger.info(f"LittleCoderAgent: toolchain probe -> {tools}")
+    return tools
+
+
+# Stated up front rather than left to the ShellSession tool description
+# alone, which is demonstrably too weak: overfull-hbox was killed by the 30s
+# default having never once passed `timeout`.
+_HARD_LIMITS_PARAGRAPH = (
+    "Hard limits of this environment: each ShellSession call is killed at "
+    "its timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts; a killed command does not run its "
+    "cleanup and can leave files half-written). Output is capped at 200 "
+    "lines / ~48KB per call. The container image is minimal: check which "
+    "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+    "designing an approach around one."
+)
+
+
+def _compose_prompt(
+    prefix: str, task_block: str, notes: Sequence[str | None] = ()
+) -> str:
+    """Assemble run()'s prompt from its two fixed halves plus whatever the
+    start-of-trial container probes produced.
+
+    A seam, not decoration: the notes are only known after those probes run,
+    many lines below where the prefix literal is written. Notes land between
+    the prefix and TASK deliberately: appended after the closing "say 'done'"
+    sentence, they would displace the model's last instruction.
+
+    _HARD_LIMITS_PARAGRAPH is unconditional and lives here rather than at the
+    call site so no caller can compose a prompt without it.
+    """
+    parts = [prefix, _HARD_LIMITS_PARAGRAPH, "\n\n"]
+    for note in notes:
+        if note:
+            parts.append(note)
+            parts.append("\n\n")
+    parts.append(task_block)
+    return "".join(parts)
+
+
 def _fallback_timeout_info() -> dict:
     return {
         "cache_layout": None,
@@ -772,6 +889,7 @@ def _build_environment_snapshot(
     max_turns: int,
     ambient_max_turns_env: str | None,
     timeout_info: dict,
+    toolchain: list[str] | None = None,
 ) -> dict:
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
@@ -793,6 +911,9 @@ def _build_environment_snapshot(
     snapshot["adapter_file"] = str(Path(__file__).resolve())
     snapshot["adapter_mtime"] = _ADAPTER_MTIME
     snapshot["timeout_provenance"] = timeout_info
+    # Recorded even when it came back None and the prompt line was omitted:
+    # post-mortem needs to tell "probe found nothing" from "never ran".
+    snapshot["toolchain_probe"] = toolchain
     return snapshot
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
@@ -1326,7 +1447,10 @@ class LittleCoderAgent(BaseAgent):
                 return proxy.reset()
             return f"Error: unknown ShellSession op '{op}'"
 
-        prompt = (
+        # Two halves with a seam between them (see _compose_prompt): the
+        # paragraphs that belong there are produced by container probes that
+        # only run further down, after the environment is reachable.
+        prompt_prefix = (
             "You are solving a Terminal-Bench 2.0 task inside a Linux container.\n"
             "The ONLY way to interact with the container is the ShellSession tool; "
             "its cwd persists between calls (tracked by the adapter). Any shell "
@@ -1355,6 +1479,8 @@ class LittleCoderAgent(BaseAgent):
             "setup (like login credentials), that usually still means the server "
             "side of it must be functional and reachable, just that you're not "
             "responsible for the client's half.\n\n"
+        )
+        prompt_task_block = (
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
@@ -1519,25 +1645,6 @@ class LittleCoderAgent(BaseAgent):
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
         )
 
-        # Per-trial environment_snapshot.json: best-effort, must never fail
-        # a trial. Executes before the PiRpc-construction
-        # try/except below so it (and the config-provenance log line above)
-        # still land even if PiRpc itself fails to construct (e.g. PI_BIN
-        # missing) -- exactly the diagnostics that failure needs most.
-        if self.logs_dir:
-            try:
-                snapshot = _build_environment_snapshot(
-                    model,
-                    max_turns=max_turns,
-                    ambient_max_turns_env=ambient_max_turns_env,
-                    timeout_info=timeout_info,
-                )
-                (self.logs_dir / "environment_snapshot.json").write_text(
-                    json.dumps(snapshot, indent=2, default=str)
-                )
-            except Exception as e:
-                self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
-
         # Start-of-trial snapshot of the task's pre-existing /app files.
         # Unconditional, and deliberately ahead of the deadline-snapshot gate
         # below rather than inside it: that gate's rationale is "this trial is
@@ -1555,6 +1662,35 @@ class LittleCoderAgent(BaseAgent):
         # the full effective_timeout_sec, regardless of how long staging
         # and downloading this snapshot took.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
+
+        # One cheap probe of what the image actually ships, before the
+        # deadline is anchored so its cost is not charged to the model.
+        toolchain = await _probe_toolchain(proxy, self.logger)
+        prompt = _compose_prompt(
+            prompt_prefix, prompt_task_block, [_toolchain_probe_note(toolchain)]
+        )
+
+        # Per-trial environment_snapshot.json: best-effort, must never fail
+        # a trial. Sits after the probes above so it can record what they
+        # found, and still ahead of the PiRpc-construction try/except below
+        # so it (and the config-provenance log line) land even if PiRpc
+        # itself fails to construct (e.g. PI_BIN missing) -- exactly the
+        # diagnostics that failure needs most. Safe to delay this far: every
+        # probe above is individually time-bounded.
+        if self.logs_dir:
+            try:
+                snapshot = _build_environment_snapshot(
+                    model,
+                    max_turns=max_turns,
+                    ambient_max_turns_env=ambient_max_turns_env,
+                    timeout_info=timeout_info,
+                    toolchain=toolchain,
+                )
+                (self.logs_dir / "environment_snapshot.json").write_text(
+                    json.dumps(snapshot, indent=2, default=str)
+                )
+            except Exception as e:
+                self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
 
         deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
         # The same instant as deadline_epoch_ms, on the monotonic clock the
