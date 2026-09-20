@@ -3,12 +3,14 @@ import {
   assessResponse,
   buildBlockedCallEscalationMessage,
   buildCorrectionMessage,
+  buildNearDuplicateLoopMessage,
   BLOCKED_CALL_REASON,
   phraseForUser,
   sameCall,
   type ToolCall,
 } from "./quality.ts";
-import { harnessIntervention } from "../_shared/intervention.ts";
+import { FuzzyLoopTracker, type NearDuplicateDetection } from "./similarity.ts";
+import { harnessIntervention, type InterventionCtx } from "../_shared/intervention.ts";
 
 // Port of local/quality.py. Hooks turn_end, inspects the assistant message
 // + previous turn's tool calls, and — if we detect a failure mode — sends
@@ -32,9 +34,46 @@ let tier2NotifiedKey: string | null = null;
 // not from turn_end's raw content-block extraction. Cleared once turn_end
 // consumes it for the turn that just ended.
 let turnValidatedCalls: ToolCall[] = [];
+// The loop the verbatim breaker above cannot see: calls that are
+// near-identical rather than identical. Steer-only, and it touches neither
+// consecutiveFailures nor blockedCall, so the hard block stays
+// verbatim-exact. Its lifetime matches the state above -- through a
+// compaction, not through a new prompt -- and it is rebuilt rather than
+// cleared so each reset re-reads the env knobs.
+let fuzzyTracker = new FuzzyLoopTracker();
+// Advanced only on assessed turns, so an aborted turn cannot age entries out
+// of the detector's window.
+let assessedTurns = 0;
 // Past this many consecutive failures, tier 1's plain correction has visibly
 // failed and turn_end escalates instead of going silent for the rest of the trial.
 const MAX_CONSECUTIVE_CORRECTIONS = 2;
+
+// pi's raw content blocks carry the call id the matching tool_result reports;
+// without one a call simply is not correlated, rather than every uncorrelated
+// call sharing a single undefined key.
+function callId(block: any): string | undefined {
+  const id = block?.id ?? block?.toolCallId;
+  return typeof id === "string" ? id : undefined;
+}
+
+function steerLoopDetection(
+  pi: ExtensionAPI,
+  ctx: InterventionCtx,
+  fuzzy: NearDuplicateDetection | null,
+): void {
+  if (fuzzy) {
+    fuzzyTracker.markNotified(fuzzy.clusterId);
+    harnessIntervention(ctx, `${phraseForUser(fuzzy.reason)} — redirecting it.`);
+    pi.sendUserMessage(buildNearDuplicateLoopMessage(fuzzy.count, fuzzy.escalated), {
+      deliverAs: "steer",
+    });
+  }
+}
+
+function resetLoopDetectors(): void {
+  fuzzyTracker = new FuzzyLoopTracker();
+  assessedTurns = 0;
+}
 
 export default function (pi: ExtensionAPI) {
   // Populate the known-tools set lazily by observing tool_execution events.
@@ -51,6 +90,7 @@ export default function (pi: ExtensionAPI) {
     blockedCall = null;
     tier2NotifiedKey = null;
     turnValidatedCalls = [];
+    resetLoopDetectors();
   });
 
   // A genuinely new prompt in the same session is a fresh task, not a
@@ -72,6 +112,7 @@ export default function (pi: ExtensionAPI) {
     blockedCall = null;
     tier2NotifiedKey = null;
     turnValidatedCalls = [];
+    resetLoopDetectors();
   });
 
   // Tier 2 for a repeat loop: reject the looping call outright. pi delivers a
@@ -152,19 +193,33 @@ export default function (pi: ExtensionAPI) {
       .filter((c: any) => c?.type === "text")
       .map((c: any) => c.text ?? "")
       .join("\n");
-    const currentCalls: ToolCall[] = content
-      .filter((c: any) => c?.type === "toolCall")
-      .map((c: any) => ({ name: c.name, input: c.arguments ?? c.input ?? {} }));
+    const callBlocks = content.filter((c: any) => c?.type === "toolCall");
+    const currentCalls: ToolCall[] = callBlocks.map((c: any) => ({
+      name: c.name,
+      input: c.arguments ?? c.input ?? {},
+    }));
 
     const verdict = assessResponse(text, currentCalls, previousToolCalls, knownTools);
 
     // Update rolling state for next turn regardless of verdict.
     previousToolCalls = currentCalls;
 
+    // Every assessed turn counts, including failing ones: a near-duplicate
+    // loop is a sequence of turns that each look individually fine, so
+    // skipping the turns the verdict already flagged would leave holes in a
+    // window that exists to span them. Only the SPEAKING is arbitrated below.
+    assessedTurns++;
+    const fuzzyDetection = fuzzyTracker.recordTurn(
+      assessedTurns,
+      currentCalls.map((call, i) => ({ call, id: callId(callBlocks[i]) })),
+    );
     if (verdict.ok) {
       consecutiveFailures = 0;
       blockedCall = null;
       tier2NotifiedKey = null;
+      // An ok verdict deliberately does NOT reset the tracker: its whole
+      // subject matter is loops made of individually-ok turns.
+      steerLoopDetection(pi, ctx, fuzzyDetection);
       return;
     }
 

@@ -556,3 +556,170 @@ describe("quality-monitor tier-2 escalation", () => {
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
   });
 });
+
+// ── near-duplicate (not verbatim) tool-call loops ──────────────────────────
+// Steer-only: no assertion below expects a block, and the positive case
+// checks that none armed.
+
+// pi's raw content blocks carry the id the matching tool_result reports; the
+// two detectors are only correlated through it.
+let idSeq = 0;
+function withIds(calls: { name: string; input: unknown }[]) {
+  return calls.map((c) => ({ ...c, id: `tc${++idSeq}` }));
+}
+function turnWithIds(calls: { name: string; input: unknown; id: string }[], text = "") {
+  return {
+    message: {
+      stopReason: "stop",
+      content: [
+        ...(text ? [{ type: "text", text }] : []),
+        ...calls.map((c) => ({ type: "toolCall", name: c.name, arguments: c.input, id: c.id })),
+      ],
+    },
+  };
+}
+// One realistic turn: pi fires tool_call per call, then turn_end.
+async function fireTurnWithIds(h: any, calls: { name: string; input: unknown }[], text = "") {
+  const ided = withIds(calls);
+  for (const c of ided) await fireToolCall(h, c.name, c.input);
+  return fire(h, "turn_end", turnWithIds(ided, text));
+}
+
+const VERBS = ["read", "parse", "scan", "fold", "merge", "emit", "flush", "count", "index", "hash", "pack", "trim"];
+function scriptLines(): string[] {
+  const lines = ["#!/usr/bin/perl", "use strict;", "use warnings;", 'my $buf = "";'];
+  for (let i = 0; i < 95; i++) {
+    const v = VERBS[i % VERBS.length];
+    lines.push(
+      i % 8 === 0
+        ? `  my $buf_${i} = ${v}_stage($fh, ${i});`
+        : `  $out[${i}] = ${v}_${i}($state, "${v}-${i}", ${i * 3 + 1});`,
+    );
+  }
+  return lines;
+}
+/** The same script with one cosmetic difference — a near-duplicate rewrite. */
+function scriptVariant(at: number): string {
+  return scriptLines()
+    .map((l, i) => (i === at ? `${l}  # attempt ${at}` : l))
+    .join("\n");
+}
+/** A long build-and-debug probe varying one constant, as a sweep loop makes. */
+function probe(window: number): string {
+  return [
+    "set -e",
+    "cd /app/build",
+    `printf 'window=%d\\n' ${window} > /tmp/probe.cfg`,
+    "gcc -O2 -g -fsanitize=address -o compressor compressor.c ring.c bitio.c -lm",
+    "./compressor --config /tmp/probe.cfg --input /data/corpus.bin --output /tmp/out.bin --threads 4 --verbose",
+    "gdb -batch -ex run -ex bt --args ./compressor --config /tmp/probe.cfg",
+  ].join("\n");
+}
+
+describe("quality-monitor near-duplicate loop detection", () => {
+  let h: ReturnType<typeof harness>;
+  beforeEach(async () => {
+    h = harness();
+    await fire(h, "session_start", {});
+  });
+
+  it("nudges a constant-sweep probe loop the verbatim breaker misses", async () => {
+    for (const w of [512, 1024, 2048]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command: probe(w) } }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/near-identical/i);
+    expect(h.followUps[0].opts).toEqual({ deliverAs: "steer" });
+    expect(h.notifies.join("\n")).toMatch(/near-identical/i);
+    // Steer-only: the next variant still runs.
+    expect(await fireToolCall(h, "ShellSession", { command: probe(4096) })).toBeUndefined();
+  });
+
+  it("nudges three near-identical rewrites of the same script", async () => {
+    for (const at of [7, 20, 31]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: scriptVariant(at) } }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/near-identical/i);
+  });
+
+  it("speaks once more at streak + 2, then falls silent for that cluster", async () => {
+    for (const at of [1, 2, 3, 4, 5, 6, 7]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: scriptVariant(at) } }]);
+    }
+    expect(h.followUps).toHaveLength(2);
+    expect(h.followUps[1].msg).toMatch(/still repeating/i);
+  });
+
+  it("does NOT nudge a file being written incrementally", async () => {
+    const lines = scriptLines();
+    for (const end of [60, 65, 70, 75, 80]) {
+      await fireTurnWithIds(h, [
+        { name: "Write", input: { path: "/app/squeeze.pl", content: lines.slice(0, end).join("\n") } },
+      ]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT nudge substantive rewrites of the same file", async () => {
+    const lines = scriptLines();
+    const rewrite = (from: number) =>
+      lines.map((l, i) => (i >= from && i < from + 30 ? `  $acc = reduce_window($acc, ${i}) or last;` : l)).join("\n");
+    for (const from of [10, 40, 60]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: rewrite(from) } }]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT nudge short varied commands", async () => {
+    for (const command of ["ls -la", "ls /tmp", "cat out.txt", "cat err.txt", "wc -l out.txt"]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command } }]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT double-fire alongside the verbatim loop-breaker", async () => {
+    const call = { name: "ShellSession", input: { command: probe(512) } };
+    for (let i = 0; i < 5; i++) await fireTurnWithIds(h, [call]);
+    expect(h.followUps.every((f: any) => !/near-identical/i.test(f.msg))).toBe(true);
+    expect(h.followUps[0].msg).toBe(buildCorrectionMessage("repeated_tool_call"));
+  });
+
+  it("stays silent on the turn a quality verdict already spoke, then says it later", async () => {
+    // The Read repeats verbatim while the Greps drift — one turn cannot carry
+    // two harness messages, and the suppressed one is not lost.
+    const read = { name: "Read", input: { path: "/app/notes.md" } };
+    const grep = (w: number) => ({ name: "Grep", input: { pattern: probe(w) } });
+    await fireTurnWithIds(h, [read, grep(512)]);
+    await fireTurnWithIds(h, [read, grep(1024)]);
+    await fireTurnWithIds(h, [read, grep(2048)]);
+    expect(h.followUps.map((f: any) => f.msg)).toEqual([
+      buildCorrectionMessage("repeated_tool_call"),
+      buildCorrectionMessage("repeated_tool_call"),
+    ]);
+    // Model drops the repeated Read; the cluster is still growing, so the
+    // nudge it was owed arrives now.
+    await fireTurnWithIds(h, [grep(4096)]);
+    expect(h.followUps).toHaveLength(3);
+    expect(h.followUps[2].msg).toMatch(/near-identical/i);
+  });
+
+  it("ignores calls from an aborted turn", async () => {
+    for (const w of [512, 1024]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command: probe(w) } }]);
+    }
+    await fireToolCall(h, "ShellSession", { command: probe(2048) });
+    await fire(h, "turn_end", { message: { stopReason: "aborted", content: [] } });
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("resets on a genuinely new prompt but not on its own steer", async () => {
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(7) } }]);
+    await fire(h, "input", { source: "extension", text: "..." });
+    await fire(h, "input", { source: "interactive", streamingBehavior: "queue", text: "..." });
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(20) } }]);
+    await fire(h, "input", { text: "new task" });
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(31) } }]);
+    expect(h.followUps).toHaveLength(0);
+  });
+});

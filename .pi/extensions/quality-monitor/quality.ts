@@ -166,6 +166,26 @@ export function phraseForUser(reason: string): string {
     empty_response: "the model returned an empty response",
     empty_tool_name: "the model emitted a tool call with no name",
     repeated_tool_call: "the model repeated its previous tool call verbatim",
+    near_duplicate_loop: "the model is looping with near-identical attempts (varying only details)",
   };
   return phrases[reason] ?? `quality issue (${reason})`;
+}
+
+// The near-duplicate detector's model-facing text (see quality-monitor's
+// similarity.ts). Steered like a tier-1 correction and blocking nothing: a
+// similarity match can never prove the NEXT attempt is wrong.
+//
+// The count is safe to state here, unlike in the tier-2 escalation: the
+// tracker counts exactly the attempts it is describing, not a mixed-reason
+// streak.
+export function buildNearDuplicateLoopMessage(count: number, escalated: boolean): string {
+  const opening = escalated
+    ? `You are still repeating the same action: ${count} of your attempts are now near-identical variations of each other.`
+    : `Your last ${count} attempts are near-identical variations of the same action -- only small details changed each time, and this has not converged.`;
+  return (
+    `${opening} Stop varying constants or cosmetic details. State explicitly ` +
+    "what hypothesis each attempt was testing and what you learned from it, " +
+    "then take a structurally different approach: a different tool, a " +
+    "different diagnostic, or a different reading of the problem."
+  );
 }
