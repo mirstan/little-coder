@@ -555,9 +555,9 @@ def _pi_env(
     child env as dict(os.environ) updated with this dict, so an omitted key
     does not clear one already present in THIS process's own environment
     (e.g. leaked from an earlier trial in the same worker/shell). Empty
-    still reads as "no copy" to every consumer -- initialSnapshotOutcome()'s
-    exact match on "succeeded"/"partial" and _initial_snapshot_is_present's
-    own outcome check both treat it the same as absent.
+    still reads as "no copy" to the var's one reader,
+    initialSnapshotOutcome(), whose exact match on "succeeded"/"partial"
+    treats it the same as absent.
     """
     env = {
         "LITTLE_CODER_PERMISSION_MODE": "accept-all",

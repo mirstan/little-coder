@@ -18,9 +18,11 @@ export type InitialSnapshotOutcome = "succeeded" | "partial";
  * The start-of-trial copy's classified outcome, or undefined when no copy is
  * known to be there.
  *
- * The adapter only exports LITTLE_CODER_INITIAL_SNAPSHOT for an outcome it
- * classified from a real container-side file count, and only for the two
- * outcomes that mean files were staged -- so undefined covers TB1.0 (whose
+ * The adapter sets LITTLE_CODER_INITIAL_SNAPSHOT non-empty only for an
+ * outcome it classified from a real container-side file count, and only for
+ * the two outcomes that mean files were staged; it exports the var as
+ * explicitly empty otherwise, so a value leaked from an earlier trial in the
+ * same process can't stand. Undefined here covers TB1.0 (whose
  * adapter stages no initial snapshot at all), interactive pi use, and any
  * harbor trial whose staging refused or failed. Callers must stay silent
  * about the path then: pointing a model at a directory that may not exist
@@ -32,7 +34,8 @@ export type InitialSnapshotOutcome = "succeeded" | "partial";
  */
 export function initialSnapshotOutcome(): InitialSnapshotOutcome | undefined {
   const raw = process.env.LITTLE_CODER_INITIAL_SNAPSHOT;
-  // Exact match on the two staged-something outcomes, which also disposes of
-  // deadline.ts's empty-but-exported case without a separate check.
+  // Exact match on the two staged-something outcomes -- the adapter's
+  // explicit empty "no copy staged" value falls through without a separate
+  // check, as does a stray empty export.
   return raw === "succeeded" || raw === "partial" ? raw : undefined;
 }

@@ -39,8 +39,8 @@ describe("initialSnapshotOutcome", () => {
   });
 
   it("is undefined for an empty or unrecognized value", () => {
-    // An empty-but-exported var is not a deliberate anything, same reading
-    // deadline.ts's own resolver gives it.
+    // "" is _pi_env's own explicit "no copy staged" value; the rest guard
+    // against a stray or garbled export reading as a real outcome.
     for (const raw of ["", "   ", "SUCCEEDED", "yes", "1"]) {
       process.env.LITTLE_CODER_INITIAL_SNAPSHOT = raw;
       expect(initialSnapshotOutcome()).toBeUndefined();
