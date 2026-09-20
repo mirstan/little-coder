@@ -435,6 +435,15 @@ describe("tb-finalize-guard", () => {
     it("reports the remaining minutes it was given", () => {
       expect(buildTriggerAMessage(7, undefined)).toContain("roughly 7 minutes");
     });
+
+    it("warns against restoring the baseline over a completed solution", () => {
+      // Matches _initial_snapshot_advertisement's own restraint: pointing a
+      // model at a "reference copy" without this warning risks it reading
+      // that as license to overwrite its own finished work with the
+      // pristine original.
+      expect(buildTriggerAMessage(30, "succeeded")).toContain("never over your own");
+      expect(buildTriggerAMessage(30, undefined)).not.toContain("never over your own");
+    });
   });
 
   describe("Trigger B — post-finalize-warn non-compliance", () => {
@@ -791,14 +800,20 @@ describe("tb-finalize-guard", () => {
     });
 
     it("sends exactly the recovery builder's text on the calm branch", async () => {
+      // Exact equality, not toContain: the delivered text is a fixed prefix
+      // concatenated with the builder's output, so toContain alone would
+      // also pass if unrelated text were appended after the builder's --
+      // pin the whole thing, matching the Trigger A sibling test above.
       process.env.LITTLE_CODER_INITIAL_SNAPSHOT = "succeeded";
       const h = makeHarness();
       setupExtension(h.pi as any);
       await newSession(h);
       await turn(h, assistantTurn({ stopReason: "error" }));
       await settle(h);
-      expect(h.sent[0].text).toContain(buildTriggerCRecoveryMessage("succeeded"));
-      expect(h.sent[0].text).toContain(INITIAL_SNAPSHOT_APP_DIR);
+      const prefix =
+        "Your previous turn ended with an error or an empty response. The task is NOT " +
+        "complete. ";
+      expect(h.sent[0].text).toBe(prefix + buildTriggerCRecoveryMessage("succeeded"));
     });
 
     it("says nothing about the start-of-trial copy on the calm branch when none was staged", async () => {
@@ -917,6 +932,27 @@ describe("tb-finalize-guard", () => {
       expect(withCopy).toContain("if you suspect a task-provided file was damaged");
       expect(withCopy).toContain(`${INITIAL_SNAPSHOT_APP_DIR}/`);
       expect(buildTriggerCRecoveryMessage(undefined)).not.toContain("/tmp/.lc-initial");
+    });
+
+    it("carries the same baseline caveats and restore restraint as Trigger A", () => {
+      // A missing baseline file must not read as "never existed" here
+      // either -- the same misreading Trigger A's own caveat exists to
+      // prevent -- and the same restore-restraint risk applies: a model
+      // "verifying... from where you left off" could misread this pointer
+      // as license to overwrite its own progress with the pristine original.
+      const partial = buildTriggerCRecoveryMessage("partial");
+      expect(partial).toContain("may not contain very large (>10MB) or deeply nested files");
+      expect(partial).toContain("file-count cap");
+      expect(buildTriggerCRecoveryMessage("succeeded")).not.toContain("file-count cap");
+      expect(buildTriggerCRecoveryMessage("succeeded")).toContain("never over your own");
+      expect(buildTriggerCRecoveryMessage(undefined)).not.toContain("never over your own");
+    });
+
+    it("does not double-punctuate the sentence the baseline clause closes", () => {
+      // Regression: the baseline clause and the fixed "Remember the task..."
+      // continuation each supplied a sentence-ending period independently.
+      expect(buildTriggerCRecoveryMessage("succeeded")).not.toMatch(/\.\.\s/);
+      expect(buildTriggerCRecoveryMessage(undefined)).not.toMatch(/\.\.\s/);
     });
   });
 

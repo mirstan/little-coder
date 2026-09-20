@@ -317,6 +317,28 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
+// Every caveat the baseline copy's own limits require, shared by Trigger A
+// and C so their baseline mentions can't drift apart on what the copy
+// actually guarantees -- mirrors _initial_snapshot_advertisement's own two
+// caveats exactly (unconditional size/depth limit; the file-count-cap
+// absence caveat only for "partial").
+function baselineCaveats(baseline: InitialSnapshotOutcome): string {
+  const partial =
+    baseline === "partial"
+      ? "That copy also hit a file-count cap, so a file missing from it may still " +
+        "have existed at the start. "
+      : "";
+  return `It may not contain very large (>10MB) or deeply nested files. ${partial}`;
+}
+
+// Mirrors _initial_snapshot_advertisement's own restraint, for the same
+// reason it states there: the dangerous misreading of "a reference copy
+// exists" is a model near a stopping point restoring pristine originals over
+// the solution it just finished writing.
+const RESTORE_RESTRAINT =
+  "Restore from it only a file you believe was corrupted — never over your own " +
+  "completed solution; treat it as read-only.";
+
 /**
  * Trigger A's nudge text.
  *
@@ -346,15 +368,7 @@ export function buildTriggerAMessage(
         `diff just those files against the untouched start-of-trial copy under ` +
         `${INITIAL_SNAPSHOT_APP_DIR}/ (${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors ` +
         "/app/somefile); it predates every change you made, unlike a backup of your " +
-        "own. It may not contain very large (>10MB) or deeply nested files. " +
-        // Mirrors _initial_snapshot_advertisement's own caveat: at the
-        // file-count cap the copy is incomplete, and a model reading absence
-        // there as "this file never existed" would draw the wrong conclusion
-        // from a truncation.
-        (baseline === "partial"
-          ? "That copy also hit a file-count cap, so a file missing from it may still " +
-            "have existed at the start. "
-          : "");
+        `own. ${baselineCaveats(baseline)}${RESTORE_RESTRAINT}`;
 
   return (
     `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
@@ -392,17 +406,23 @@ export function buildTriggerAMessage(
 export function buildTriggerCRecoveryMessage(
   baseline: InitialSnapshotOutcome | undefined,
 ): string {
+  // Ends the sentence itself (a period either way), rather than relying on
+  // the closing " Remember..." to supply one -- RESTORE_RESTRAINT already
+  // ends in a period, and a second one right after it would read as a typo.
+  const sessionClause =
+    baseline === undefined
+      ? "."
+      : "; if you suspect a task-provided file was damaged, the untouched " +
+        `start-of-trial copy under ${INITIAL_SNAPSHOT_APP_DIR}/ is the one reference ` +
+        `that predates your changes. ${baselineCaveats(baseline)}${RESTORE_RESTRAINT}`;
+
   return (
     "You still have ample time and turn budget remaining, so do not wrap up — " +
     "retry your last action or continue working from where you left off, " +
     "verifying and testing as you normally would — against the task's own data or " +
     "by a different method, never against another file you created this session" +
-    (baseline === undefined
-      ? ""
-      : "; if you suspect a task-provided file was damaged, the untouched " +
-        `start-of-trial copy under ${INITIAL_SNAPSHOT_APP_DIR}/ is the one reference ` +
-        "that predates your changes") +
-    ". Remember the task is graded " +
+    sessionClause +
+    " Remember the task is graded " +
     "by inspecting the container's files/state afterward, not this chat, so " +
     "make sure your results end up saved there."
   );
