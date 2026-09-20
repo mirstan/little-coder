@@ -19,6 +19,7 @@ from pathlib import Path
 BENCHMARKS = Path(__file__).resolve().parent
 
 _STUBBED_ROOTS: set[str] = set()
+_STUBBED_MODULES: list[str] = []
 
 
 def _install_stub(dotted: str, *names: str) -> None:
@@ -40,6 +41,7 @@ def _install_stub(dotted: str, *names: str) -> None:
             mod = types.ModuleType(name)
             mod.__path__ = []  # marks it a package, so submodule imports resolve
             sys.modules[name] = mod
+            _STUBBED_MODULES.append(name)
             if i > 1:
                 setattr(sys.modules[".".join(parts[: i - 1])], parts[i - 1], mod)
     leaf = sys.modules[dotted]
@@ -52,12 +54,20 @@ _install_stub("harbor.agents.base", "BaseAgent")
 _install_stub("harbor.environments.base", "BaseEnvironment")
 _install_stub("harbor.models.agent.context", "AgentContext")
 
-_spec = importlib.util.spec_from_file_location(
-    "_lca_harbor_exec_timeout", BENCHMARKS / "harbor_adapter" / "little_coder_agent.py"
-)
-lca = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = lca
-_spec.loader.exec_module(lca)
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "_lca_harbor_exec_timeout", BENCHMARKS / "harbor_adapter" / "little_coder_agent.py"
+    )
+    lca = importlib.util.module_from_spec(_spec)
+    sys.modules[_spec.name] = lca
+    _spec.loader.exec_module(lca)
+finally:
+    # lca keeps its own references to the stubbed classes, so the stubs have
+    # done their job. Leaving them in sys.modules would turn a sibling test
+    # file's `pytest.importorskip("harbor")` into a false positive when this
+    # file is collected first (test_format_output.py's convention).
+    for _name in reversed(_STUBBED_MODULES):
+        sys.modules.pop(_name, None)
 
 
 class _ExecResult:
@@ -133,7 +143,13 @@ def test_bridge_timeout_reports_timed_out_true(monkeypatch):
     result = proxy.run("sleep 100", 30)
     assert "timed_out=true" in _footer(result)
     assert "shell proxy error" in result
-    assert "this command hit its 30s timeout" in result
+    # Unlike the confirmed-kill docker/asyncio timeout paths, the bridge
+    # timeout only means _exec_async hasn't returned yet -- it must NOT claim
+    # the connection was killed, and must hedge that the command may still be
+    # running (and warn against a duplicate re-run).
+    assert "its connection was killed" not in result
+    assert "may still be running" in result
+    assert "duplicate" in result
 
 
 def test_mutation_regex_substring_would_over_match():

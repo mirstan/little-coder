@@ -1003,6 +1003,22 @@ _TIMEOUT_KILL_WARNING = (
     "running in the container (check with ps). If the command simply needs more time, "
     "re-run it with a larger `timeout` parameter (up to 600 seconds)."
 )
+# Distinct from _TIMEOUT_KILL_WARNING: run()'s bridge timeout (below) means only
+# that _exec_async has not returned to the reader thread within timeout+30s --
+# it says nothing about env.exec()'s own state. _exec_async may still be
+# running, may be about to return normally, or may already have hit the real
+# docker timeout above; we simply don't know from here. So this warning must
+# not claim the connection was killed, and must not tell the model to re-run
+# (a still-running command re-run now would duplicate its side effects).
+_BRIDGE_TIMEOUT_WARNING = (
+    "WARNING: this command hit its {N}s timeout and was cut off from this side -- "
+    "its connection was NOT confirmed killed, and the command may still be running in "
+    "the container. Any file it was mid-way through writing may now be HALF-WRITTEN, "
+    "and any cleanup/restore logic at the end of a script may not have run — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. Check whether it is still "
+    "running (ps) before doing anything else; re-running it now risks starting a "
+    "duplicate copy of a command that hasn't actually stopped."
+)
 
 
 class _HarborShellProxy:
@@ -1182,9 +1198,12 @@ class _HarborShellProxy:
             return fut.result(timeout=timeout + 30)
         except concurrent.futures.TimeoutError as e:
             # This layer's own timeout+30 margin expired -- _exec_async is
-            # still running (or stuck) on self.loop; same truth gap as the
-            # docker RuntimeError case above.
-            warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+            # still running (or stuck) on self.loop. Unlike the docker
+            # RuntimeError case above, we have no confirmation env.exec()'s
+            # connection was ever killed -- _BRIDGE_TIMEOUT_WARNING is
+            # deliberately hedged instead of reusing _TIMEOUT_KILL_WARNING's
+            # confirmed-killed wording.
+            warning = _BRIDGE_TIMEOUT_WARNING.format(N=timeout)
             return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
