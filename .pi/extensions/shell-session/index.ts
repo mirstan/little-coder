@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execSync } from "node:child_process";
 import { formatOutput, DEFAULT_TIMEOUT } from "./helpers.ts";
+import { TB_PROXY_PREFIX, inTbMode, tbProxyRun } from "../_shared/tb-proxy.ts";
 
 // Port of local/tools/shell_session.py. Two backends implemented:
 //   1. tmux-proxy — when LITTLE_CODER_TB_MODE=1, route every command to the
@@ -13,13 +14,6 @@ import { formatOutput, DEFAULT_TIMEOUT } from "./helpers.ts";
 // The sentinel-prompt pexpect backend from the Python version (persistent
 // bash process with state between calls) is deliberately skipped because
 // neither Terminal-Bench nor GAIA requires it; TB uses tmux, GAIA uses Bash.
-
-const TB_MODE_ENV = "LITTLE_CODER_TB_MODE";
-const TB_PROXY_PREFIX = "__LC_TB_SHELL__:";
-
-function inTbMode(): boolean {
-  return process.env[TB_MODE_ENV] === "1";
-}
 
 // Quoted as "~10MB" by helpers.ts's Partial-output note and by the tool
 // description below; change all three together.
@@ -61,18 +55,8 @@ async function execTmuxProxy(
   timeoutSec: number,
   sessionId: string,
 ): Promise<string> {
-  const payload = {
-    op: "run",
-    session_id: sessionId,
-    command,
-    timeout: timeoutSec,
-  };
-  // Use ctx.ui.input as a generic data-carrying channel. The Python TB adapter
-  // intercepts extension_ui_request with title prefix __LC_TB_SHELL__ and
-  // responds with the formatted tool output string.
-  const title = TB_PROXY_PREFIX + JSON.stringify(payload);
-  const response = await ctx.ui.input(title, "");
-  if (typeof response === "string") return response;
+  const response = await tbProxyRun(ctx, command, timeoutSec, sessionId);
+  if (response !== null) return response;
   // Nothing was killed here -- no usable response came back over the
   // ui.input channel, so the command's actual state (still running,
   // finished, crashed) is unknown from this side. See
