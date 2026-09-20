@@ -35,9 +35,10 @@ export interface Checker {
 }
 
 // Only checks a container running this language already has the binary for
-// (if the model wrote .pl it is about to run perl). Syntax-only throughout:
-// no imports resolved, no project flags — a not-yet-installed dependency or a
-// missing -D must never surface as "your file is wrong".
+// (if the model wrote .pl it is about to run perl). Syntax-only: no project
+// flags, and — except perl's -c, below — no imports resolved, so a
+// not-yet-installed dependency or a missing -D doesn't surface as "your
+// file is wrong".
 const CHECKERS: Record<string, Checker> = {};
 
 function register(extensions: string[], checker: Checker): void {
@@ -131,7 +132,7 @@ function unquote(word: string): string {
  * the same call, where the run itself reports the syntax error — a second
  * check would only duplicate it and pay another round trip. Matching is on
  * the path as SPELLED in the command, not the resolved absolute path, which
- * never appears in the segment. The basename-only fallback is scoped to a
+ * need not appear in the segment. The basename-only fallback is scoped to a
  * bare filename (no directory component) — `rawPath` naming a directory
  * (`/app/f.pl`) requires an exact operand match, so a run of an unrelated
  * `/tmp/f.pl` sharing the same basename can't false-match it.
