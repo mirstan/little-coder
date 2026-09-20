@@ -36,7 +36,8 @@ export interface Checker {
 
 // Only checks a container running this language already has the binary for
 // (if the model wrote .pl it is about to run perl). Syntax-only: no project
-// flags, and — except perl's -c, below — no imports resolved, so a
+// flags, and — except perl's -c (runs BEGIN/use) and gcc/cc's -fsyntax-only
+// (must resolve #include headers via -I.) — no imports resolved, so a
 // not-yet-installed dependency or a missing -D doesn't surface as "your
 // file is wrong".
 const CHECKERS: Record<string, Checker> = {};

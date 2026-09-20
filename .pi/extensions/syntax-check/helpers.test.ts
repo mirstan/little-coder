@@ -180,7 +180,7 @@ describe("commandRunsFile", () => {
   });
 
   it("still matches basename-only for a bare filename with no directory", () => {
-    expect(runs("perl f.pl", "f.pl")).toBe(true);
+    expect(runs("perl dir/f.pl", "f.pl")).toBe(true);
   });
 });
 
