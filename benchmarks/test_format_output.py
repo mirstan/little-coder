@@ -218,7 +218,7 @@ def test_small_output_floor_skips_the_line_cap(ad):
 
 def test_small_output_floor_does_not_change_larger_line_capped_output(ad):
     """Same 300 lines, padded to ~6KB total -- above the floor, so the
-    200-line cap still fires exactly as before this change."""
+    200-line cap still fires."""
     text = "\n".join(f"{i:04d}" + "x" * 15 for i in range(300))
     assert len(text.encode()) > ad.mod.SMALL_OUTPUT_FLOOR_BYTES
     out = ad.fmt(text)

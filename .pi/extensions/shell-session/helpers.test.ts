@@ -165,7 +165,7 @@ describe("formatOutput byte cap", () => {
   });
 
   it("still applies the line cap once padded past the 4KB floor", () => {
-    // Same 300 lines, padded to ~6KB total -- unchanged from before this fix.
+    // Same 300 lines, padded to ~6KB total -- above the floor.
     const text = Array.from({ length: 300 }, (_, i) => String(i).padStart(4, "0") + "x".repeat(15)).join(
       "\n",
     );
