@@ -63,7 +63,14 @@ export interface RecallOptions {
 export interface RetentionArchive {
   /** False when the copy could not be stored, which cancels the demotion. */
   save(id: string, text: string): boolean;
-  get(id: string): string | undefined;
+  /** Total archived byte size for `id`, or undefined when `id` is unknown. */
+  size(id: string): number | undefined;
+  /**
+   * Up to `length` bytes starting at byte `start` — never the whole archive,
+   * so paging a small slice out of a large one can't itself re-inflate the
+   * memory usage this extension exists to reduce.
+   */
+  readRange(id: string, start: number, length: number): Buffer | undefined;
 }
 
 export function resolveOptions(): RetentionOptions {
@@ -367,33 +374,44 @@ export function demoteMessages(
   return { messages: result, demotedCount };
 }
 
+// UTF-8 continuation bytes span at most 3 extra bytes on either side of a
+// requested boundary — padding the disk read by this much gives the
+// alignment walk real neighboring bytes to inspect without reading further.
+const UTF8_BOUNDARY_PAD = 3;
+
 /** One page of an archived pair, in ShellLog's paging-header style. */
 export function recallSlice(
   id: string,
-  archived: string | undefined,
+  archive: RetentionArchive,
   offset: number | undefined,
   bytes: number | undefined,
   opts: RecallOptions,
 ): { text: string; isError: boolean } {
   if (!id) return { text: "Error: id is required", isError: true };
-  if (archived === undefined) {
+  const total = archive.size(id);
+  if (total === undefined) {
     return { text: `Error: no archived shell observation with id '${id}'`, isError: true };
   }
 
-  const buf = Buffer.from(archived, "utf-8");
   const want = Math.max(
     1,
     Math.min(Number.isFinite(bytes as number) ? Number(bytes) : opts.defaultBytes, opts.maxBytes),
   );
-  let start = Math.max(0, Math.min(Number.isFinite(offset as number) ? Number(offset) : 0, buf.length));
+  const wantStart = Math.max(0, Math.min(Number.isFinite(offset as number) ? Number(offset) : 0, total));
+  const readStart = Math.max(0, wantStart - UTF8_BOUNDARY_PAD);
+  const readEnd = Math.min(total, wantStart + want + UTF8_BOUNDARY_PAD);
+  const buf = archive.readRange(id, readStart, readEnd - readStart) ?? Buffer.alloc(0);
+
+  let start = wantStart - readStart;
   while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
   let end = Math.min(start + want, buf.length);
   while (end < buf.length && (buf[end] & 0xc0) === 0x80) end++;
 
-  const header = `[${id} bytes ${start}–${end} of ${buf.length}]`;
+  const absEnd = readStart + end;
+  const header = `[${id} bytes ${readStart + start}–${absEnd} of ${total}]`;
   const slice = buf.subarray(start, end).toString("utf-8");
-  const more = end < buf.length
-    ? `\n[has_more=true — call ShellRecall with offset=${end} for the next page]`
+  const more = absEnd < total
+    ? `\n[has_more=true — call ShellRecall with offset=${absEnd} for the next page]`
     : "";
   return { text: `${header}\n${slice}${more}`, isError: false };
 }

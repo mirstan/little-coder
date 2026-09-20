@@ -96,15 +96,22 @@ function memArchive(): RetentionArchive & { entries: Map<string, string> } {
       entries.set(id, text);
       return true;
     },
-    get(id) {
-      return entries.get(id);
+    size(id) {
+      const text = entries.get(id);
+      return text === undefined ? undefined : Buffer.byteLength(text, "utf-8");
+    },
+    readRange(id, start, length) {
+      const text = entries.get(id);
+      if (text === undefined) return undefined;
+      return Buffer.from(text, "utf-8").subarray(start, start + length);
     },
   };
 }
 
 const failingArchive: RetentionArchive = {
   save: () => false,
-  get: () => undefined,
+  size: () => undefined,
+  readRange: () => undefined,
 };
 
 /** `count` pairs of a small command and a `bodyBytes` result, ids `${tag}N`. */
@@ -221,7 +228,7 @@ describe("demoteMessages", () => {
     expect(archived).toContain(resultText);
 
     const sentinelOffset = Buffer.byteLength(archived.slice(0, archived.indexOf("int MIDDLE_SENTINEL")), "utf-8");
-    const recalled = recallSlice(id, archived, sentinelOffset, 200, {
+    const recalled = recallSlice(id, archive, sentinelOffset, 200, {
       defaultBytes: DEFAULT_RECALL_BYTES,
       maxBytes: DEFAULT_RECALL_MAX,
     });
@@ -501,8 +508,14 @@ describe("recallSlice", () => {
   const recallOpts = { defaultBytes: DEFAULT_RECALL_BYTES, maxBytes: DEFAULT_RECALL_MAX };
   const archived = archiveText("echo hi", filler(60000, "body"));
 
+  function archiveOf(id: string, text: string): RetentionArchive {
+    const a = memArchive();
+    a.save(id, text);
+    return a;
+  }
+
   it("returns the default slice from the start", () => {
-    const out = recallSlice("sr-abcd1234", archived, undefined, undefined, recallOpts);
+    const out = recallSlice("sr-abcd1234", archiveOf("sr-abcd1234", archived), undefined, undefined, recallOpts);
     expect(out.isError).toBe(false);
     expect(out.text.split("\n")[0]).toBe(
       `[sr-abcd1234 bytes 0–${DEFAULT_RECALL_BYTES} of ${Buffer.byteLength(archived)}]`,
@@ -511,12 +524,12 @@ describe("recallSlice", () => {
   });
 
   it("honors explicit offset and byte count", () => {
-    const out = recallSlice("sr-abcd1234", archived, 100, 50, recallOpts);
+    const out = recallSlice("sr-abcd1234", archiveOf("sr-abcd1234", archived), 100, 50, recallOpts);
     expect(out.text.split("\n")[0]).toBe(`[sr-abcd1234 bytes 100–150 of ${Buffer.byteLength(archived)}]`);
   });
 
   it("clamps an oversized request to the recall max", () => {
-    const out = recallSlice("sr-abcd1234", archived, 0, 999999, recallOpts);
+    const out = recallSlice("sr-abcd1234", archiveOf("sr-abcd1234", archived), 0, 999999, recallOpts);
     expect(out.text.split("\n")[0]).toBe(
       `[sr-abcd1234 bytes 0–${DEFAULT_RECALL_MAX} of ${Buffer.byteLength(archived)}]`,
     );
@@ -524,18 +537,37 @@ describe("recallSlice", () => {
 
   it("returns an empty slice for an offset past the end", () => {
     const total = Buffer.byteLength(archived);
-    const out = recallSlice("sr-abcd1234", archived, total + 5000, 100, recallOpts);
+    const out = recallSlice("sr-abcd1234", archiveOf("sr-abcd1234", archived), total + 5000, 100, recallOpts);
     expect(out.isError).toBe(false);
     expect(out.text).toBe(`[sr-abcd1234 bytes ${total}–${total} of ${total}]\n`);
   });
 
   it("errors on an unknown id", () => {
-    const out = recallSlice("sr-deadbeef", undefined, 0, 100, recallOpts);
+    const out = recallSlice("sr-deadbeef", memArchive(), 0, 100, recallOpts);
     expect(out.isError).toBe(true);
     expect(out.text).toContain("sr-deadbeef");
   });
 
   it("errors on a missing id", () => {
-    expect(recallSlice("", undefined, 0, 100, recallOpts).isError).toBe(true);
+    expect(recallSlice("", memArchive(), 0, 100, recallOpts).isError).toBe(true);
+  });
+
+  // The bounded-read fix must not change what a caller receives: reading a
+  // window slightly wider than requested (for UTF-8 boundary alignment) is
+  // an internal implementation detail, not a change to the returned slice.
+  it("reads only a bounded window from the archive, not the whole thing", () => {
+    let maxRequested = 0;
+    const bounded: RetentionArchive = {
+      save: () => true,
+      size: () => Buffer.byteLength(archived),
+      readRange(_id, start, length) {
+        maxRequested = Math.max(maxRequested, length);
+        return Buffer.from(archived, "utf-8").subarray(start, start + length);
+      },
+    };
+    const out = recallSlice("sr-x", bounded, 100, 50, recallOpts);
+    expect(out.text.split("\n")[0]).toBe(`[sr-x bytes 100–150 of ${Buffer.byteLength(archived)}]`);
+    // A handful of boundary-padding bytes, nowhere near the archive's real size.
+    expect(maxRequested).toBeLessThan(200);
   });
 });

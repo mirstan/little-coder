@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { envNumber } from "../_shared/env-number.ts";
@@ -49,6 +49,23 @@ function signature(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+// bg-shell's session_shutdown removes its own job state the same way — a
+// directory made for one session must not outlive it on a long-lived host.
+function cleanupArchive(): void {
+  if (dir) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Best-effort: an orphaned tmp dir is a disk-space nit, not a correctness
+      // issue, and the process is exiting either way.
+    }
+  }
+  entries.clear();
+  dir = null;
+  dirUnavailable = false;
+  bytesWritten = 0;
+}
+
 const hostArchive: RetentionArchive = {
   save(id, text) {
     const sig = signature(text);
@@ -72,19 +89,44 @@ const hostArchive: RetentionArchive = {
     entries.set(id, { path, sig });
     return true;
   },
-  get(id) {
+  size(id) {
     const path = entries.get(id)?.path;
     if (!path) return undefined;
     try {
-      return readFileSync(path, "utf-8");
+      return statSync(path).size;
     } catch {
       return undefined;
+    }
+  },
+  readRange(id, start, length) {
+    const path = entries.get(id)?.path;
+    if (!path || length <= 0) return undefined;
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, "r");
+      const buf = Buffer.alloc(length);
+      const read = readSync(fd, buf, 0, length, start);
+      return buf.subarray(0, read);
+    } catch {
+      return undefined;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Already the failure path for a read; nothing further to recover.
+        }
+      }
     }
   },
 };
 
 export default function (pi: ExtensionAPI) {
   if (process.env.LITTLE_CODER_NO_SHELL_RETENTION === "1") return;
+
+  pi.on("session_shutdown", async () => {
+    cleanupArchive();
+  });
 
   pi.on("context", async (event) => {
     const { messages, demotedCount } = demoteMessages(
@@ -113,7 +155,7 @@ export default function (pi: ExtensionAPI) {
       const id = String(params.id ?? "").trim();
       const out = recallSlice(
         id,
-        hostArchive.get(id),
+        hostArchive,
         params.offset as number | undefined,
         params.bytes as number | undefined,
         resolveRecallOptions(),
