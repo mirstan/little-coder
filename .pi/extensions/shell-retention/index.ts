@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +30,7 @@ const DEFAULT_BUDGET = 256 * 1024 * 1024;
 // Archived output is arbitrary command output — env dumps, credential files,
 // private source — so mkdtemp's 0700 unguessable directory, not a predictable
 // path in a shared /tmp. Process lifetime is one trial.
-const paths = new Map<string, string>();
+const entries = new Map<string, { path: string; sig: string }>();
 let dir: string | null = null;
 let dirUnavailable = false;
 let bytesWritten = 0;
@@ -44,9 +45,19 @@ function ensureDir(): string | null {
   return dir;
 }
 
+function signature(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
 const hostArchive: RetentionArchive = {
   save(id, text) {
-    if (paths.has(id)) return true;
+    const sig = signature(text);
+    const existing = entries.get(id);
+    // A different signature under the same id means the id's hash collided
+    // with a different pair's — refuse rather than let a later recall
+    // silently return that other pair's content.
+    if (existing) return existing.sig === sig;
+
     const bytes = byteLen(text);
     if (bytesWritten + bytes > envNumber(ENV_BUDGET, DEFAULT_BUDGET)) return false;
     const d = ensureDir();
@@ -58,11 +69,11 @@ const hostArchive: RetentionArchive = {
       return false;
     }
     bytesWritten += bytes;
-    paths.set(id, path);
+    entries.set(id, { path, sig });
     return true;
   },
   get(id) {
-    const path = paths.get(id);
+    const path = entries.get(id)?.path;
     if (!path) return undefined;
     try {
       return readFileSync(path, "utf-8");

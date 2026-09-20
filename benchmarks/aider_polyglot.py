@@ -86,6 +86,7 @@ ALLOWED_TOOLS = [
     "write", "Write",
     "edit", "Edit",
     "bash", "Bash",
+    "ShellRecall",
     "glob", "Glob",
     "grep", "Grep",
     "webfetch", "WebFetch",

@@ -86,7 +86,7 @@ export function resolveRecallOptions(): RecallOptions {
 
 /** Archive id for a pair. Deterministic so every re-projection maps to one file. */
 export function archiveId(toolCallId: string): string {
-  return `sr-${createHash("sha256").update(toolCallId).digest("hex").slice(0, 8)}`;
+  return `sr-${createHash("sha256").update(toolCallId).digest("hex").slice(0, 16)}`;
 }
 
 function contentText(m: any): string {
@@ -118,8 +118,10 @@ export function splitHeadTail(
 
   let headEnd = Math.max(0, headBytes);
   // A negative byteOffset would search backward from the END of the buffer.
+  // The `> 0` guard rejects a boundary newline that would leave head empty —
+  // a long first line must still contribute something, not vanish entirely.
   const headNl = headEnd > 0 ? buf.lastIndexOf(0x0a, headEnd - 1) : -1;
-  if (headNl >= 0) {
+  if (headNl > 0) {
     headEnd = headNl;
   } else {
     while (headEnd > 0 && (buf[headEnd] & 0xc0) === 0x80) headEnd--;
@@ -127,7 +129,10 @@ export function splitHeadTail(
 
   let tailStart = buf.length - Math.max(0, tailBytes);
   const tailNl = buf.indexOf(0x0a, tailStart);
-  if (tailNl >= 0) {
+  // The `+ 1 < buf.length` guard rejects a boundary newline that would leave
+  // tail empty — the real failure signal often sits on the output's last
+  // line, so silently dropping it here defeats the whole point of the tail.
+  if (tailNl >= 0 && tailNl + 1 < buf.length) {
     tailStart = tailNl + 1;
   } else {
     while (tailStart < buf.length && (buf[tailStart] & 0xc0) === 0x80) tailStart++;
@@ -141,15 +146,24 @@ export function splitHeadTail(
   };
 }
 
+// A real footer (the `[exit=…]` line, or GAIA's plain last line) is always
+// short. Without this cap, a giant single-line result — no newline at all,
+// or a huge final line like a recalled minified file — gets its whole body
+// mistaken for "the footer" and copied verbatim, defeating demotion entirely.
+const MAX_FOOTER_BYTES = 512;
+
 /**
  * Split off the trailing `[exit=… cwd=… timed_out=…]` footer, or — for GAIA's
- * built-in bash, which has no such footer — the last literal line.
+ * built-in bash, which has no such footer — the last literal line. Returns
+ * an empty footer when the last line is too large to plausibly be one, so
+ * the whole text is treated as body instead.
  */
 export function splitFooter(text: string): { body: string; footer: string } {
   const lines = text.split("\n");
   let f = lines.length - 1;
   // Trailing blank lines would otherwise be kept in place of the footer.
   while (f > 0 && lines[f].trim() === "") f--;
+  if (byteLen(lines[f]) > MAX_FOOTER_BYTES) return { body: text, footer: "" };
   return { body: lines.slice(0, f).join("\n"), footer: lines.slice(f).join("\n") };
 }
 
@@ -183,7 +197,8 @@ export function demoteResultText(
   if (toolName === "ShellLog") {
     lines.push("[ShellLog re-pages the live job buffer, which may have dropped its oldest lines]");
   }
-  lines.push(head, `  [... ${formatSize(dropped)} demoted ...]`, tail, footer);
+  lines.push(head, `  [... ${formatSize(dropped)} demoted ...]`, tail);
+  if (footer) lines.push(footer);
 
   const next = lines.join("\n");
   return byteLen(next) < byteLen(resultText) ? next : null;
@@ -254,14 +269,36 @@ function collectPairs(messages: any[]): Pair[] {
         ? call.block.arguments.command
         : "",
       resultText: contentText(m),
-      signed: call?.block?.thoughtSignature !== undefined,
+      // A signature can land on a sibling text/thinking block rather than the
+      // toolCall block itself (google-shared.js: "can appear on ANY part
+      // type... does NOT necessarily correspond to the functionCall") —
+      // the whole message counts as signed, not just its toolCall block.
+      signed: call ? isSignedMessage(messages[call.msgIdx]) : false,
     });
   }
   return pairs;
 }
 
+function isSignedMessage(m: any): boolean {
+  if (!Array.isArray(m?.content)) return false;
+  return m.content.some(
+    (b: any) =>
+      b?.thoughtSignature !== undefined ||
+      b?.textSignature !== undefined ||
+      b?.thinkingSignature !== undefined,
+  );
+}
+
+// Anchored to the exact marker shape (including the sr-<hex> id), not a
+// loose substring match — this repo is self-hosted, so a command that
+// heredocs this very file's source could otherwise contain CMD_DEMOTED_INFIX
+// as plain text and get mistaken for an already-demoted pair forever.
+const CMD_DEMOTED_MARKER_RE = /^\[\.\.\. \S+ of command text demoted — ShellRecall id=sr-[0-9a-f]{16} \.\.\.\]$/m;
+
 function alreadyDemoted(p: Pair): boolean {
-  return p.resultText.startsWith(RESULT_DEMOTED_PREFIX) || p.command.includes(CMD_DEMOTED_INFIX);
+  return (
+    p.resultText.startsWith(RESULT_DEMOTED_PREFIX) && /ShellRecall id=sr-[0-9a-f]{16} /.test(p.resultText)
+  ) || CMD_DEMOTED_MARKER_RE.test(p.command);
 }
 
 /**

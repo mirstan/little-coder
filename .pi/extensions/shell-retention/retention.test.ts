@@ -379,6 +379,79 @@ describe("demoteMessages", () => {
     expect(Buffer.byteLength(demoted)).toBeLessThan(1024);
   });
 
+  // A final content line at/near the tail budget's own byte size makes the
+  // line-boundary search land exactly at buf.length, which can collapse the
+  // kept tail to nothing even though the tail-keep budget is non-zero.
+  it("keeps a real failure signal even when it sits on a line near the tail budget's size", () => {
+    // Marker at the line's END: it must survive even under the raw-byte-slice
+    // fallback a line longer than the tail budget falls back to, isolating
+    // the boundary bug (tail collapsing to nothing) from that separate,
+    // already-correct partial-slice behavior.
+    for (const len of [254, 255, 256, 300]) {
+      const failureLine = "x".repeat(Math.max(0, len - 16)) + "SEGFAULT-MARKER";
+      // Trailing "\n" matters: real ShellSession output has a blank line
+      // before its footer (formatOutput preserves split("\n")'s trailing
+      // empty element), which is exactly the shape the boundary bug needs.
+      const body = `${filler(10000, "out")}\n${failureLine}\n`;
+      const msgs = [userMsg("t"), assistantShell("z", "./a.out"), shellResult("z", body), ...pairs(4, "n")];
+      const out = demoteMessages(msgs, memArchive(), opts());
+      expect(textOf(out.messages[2])).toContain("SEGFAULT-MARKER");
+    }
+  });
+
+  // An unbounded "last line is the footer" assumption lets a giant single
+  // line (no newline at all, or a huge final line) get treated as the
+  // footer and copied verbatim, defeating demotion entirely.
+  it("still demotes a giant single-line result with no footer at all", () => {
+    const body = "z".repeat(200000); // no newline anywhere — GAIA's bash has no [exit=…] footer
+    const msgs = [userMsg("t"), assistantShell("z", "minify.sh"), shellResult("z", body, null, "bash"), ...pairs(4, "n")];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect(out.demotedCount).toBeGreaterThan(0);
+    expect(Buffer.byteLength(textOf(out.messages[2]))).toBeLessThan(2000);
+  });
+
+  it("still demotes a result whose final line is itself huge", () => {
+    const body = `${filler(2000, "out")}\n${"z".repeat(300000)}`;
+    const msgs = [userMsg("t"), assistantShell("z", "cat recalled"), shellResult("z", body, null, "ShellRecall"), ...pairs(4, "n")];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect(Buffer.byteLength(textOf(out.messages[2]))).toBeLessThan(2000);
+  });
+
+  // This repo is self-hosted, so a command that heredocs retention.ts's own
+  // source can contain CMD_DEMOTED_INFIX as plain text. That must not be
+  // mistaken for an actual demotion marker and permanently skip the pair.
+  it("does not mistake a command that merely quotes the demotion marker text for an already-demoted one", () => {
+    const command = `cat > retention.ts <<'EOF'\nexport const CMD_DEMOTED_INFIX = "${CMD_DEMOTED_INFIX}";\n${filler(4000, "src")}\nEOF`;
+    const msgs = [userMsg("t"), assistantShell("z", command), shellResult("z", "ok"), ...pairs(4, "n")];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect(out.demotedCount).toBe(1);
+    expect(commandOf(out.messages[1])).toContain(CMD_DEMOTED_INFIX + archiveId("z"));
+  });
+
+  // A thoughtSignature on a sibling text/thinking block (not the toolCall
+  // block itself) must still block the command rewrite — pi's
+  // google-shared.js states the signature "can appear on ANY part type".
+  it("skips the command rewrite when the signature sits on a sibling text block, not the tool call", () => {
+    const command = `cat > /tmp/a.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/a /tmp/a.c && echo compiled`;
+    const msgs = [
+      userMsg("t"),
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Let's compile it.", textSignature: "CtYBsibling123" },
+          { type: "toolCall", id: "sig2", name: "ShellSession", arguments: { command } },
+        ],
+      },
+      shellResult("sig2", filler(8192, "out")),
+      ...pairs(4, "n"),
+    ];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    const assistantOut = out.messages[1] as any;
+    expect(assistantOut.content[1].arguments.command).toBe(command);
+    // Result-side demotion stays allowed regardless of the sibling signature.
+    expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+  });
+
   it("honors env overrides for retainRaw and the size floor", () => {
     const prevRetain = process.env[ENV_RETAIN_RAW];
     const prevFloor = process.env[ENV_MIN_PAIR_BYTES];
