@@ -918,6 +918,21 @@ def test_snapshot_outcome_survives_a_hung_download(tmp_path, monkeypatch):
     assert outcome is not None and outcome.outcome == "succeeded"
 
 
+def test_snapshot_returns_none_when_the_outer_backstop_fires(tmp_path, monkeypatch):
+    """The download-specific timeout above is what normally degrades a hang
+    without losing the outcome; this covers the other timeout -- the outer
+    wait_for around the whole stage+download call, which exists only as a
+    backstop for a bound that somehow doesn't fire on its own. Left
+    untested, a regression that removed the inner download wait_for (or
+    shrank the outer bound below it) would go uncaught. Only
+    _INITIAL_SNAPSHOT_TIMEOUT_SEC is shrunk here -- the download's own
+    timeout stays at its real value, so it's the outer bound that fires
+    first and cancels mid-download."""
+    monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
+    assert _run_initial_snapshot(env, tmp_path) is None
+
+
 def test_prompt_splices_the_advertisement_between_limits_and_task():
     """Same placement rule as the toolchain line: never after the closing
     "say 'done'" sentence."""
