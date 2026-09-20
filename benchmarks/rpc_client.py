@@ -1327,7 +1327,6 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # No boundary at all (one unbroken token wider than the budget) leaves
     # `cut` as the hard slice -- unavoidable, and still better than also
     # losing the footer.
-    # Explicitly log-only: past incidents mistook this for what the model saw.
     marker = (
         f"… [+{len(body) - len(cut)} chars omitted from this log preview; "
         "the model received the full output]"
