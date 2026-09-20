@@ -80,12 +80,14 @@ DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
 
 # Allowed tools for Polyglot — the core filesystem + bash toolbox. Ports
 # the whitepaper's Polyglot configuration (no TB-style ShellSession, no
-# GAIA-style Browser/Evidence).
+# GAIA-style Browser/Evidence), plus ShellRecall (not in the whitepaper --
+# needed so shell-retention's demoted placeholders are recoverable here too).
 ALLOWED_TOOLS = [
     "read", "Read",
     "write", "Write",
     "edit", "Edit",
     "bash", "Bash",
+    "ShellRecall",
     "glob", "Glob",
     "grep", "Grep",
     "webfetch", "WebFetch",

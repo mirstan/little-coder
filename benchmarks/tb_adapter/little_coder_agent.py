@@ -29,7 +29,7 @@ from rpc_client import (  # noqa: E402
 )
 
 
-DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
+DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset", "ShellRecall"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
 #: Wall-clock budget for the single prompt this adapter issues. TB 1.0 gives
 #: the agent no per-task budget to read (unlike Harbor, which the sibling

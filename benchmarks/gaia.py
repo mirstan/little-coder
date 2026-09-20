@@ -61,6 +61,7 @@ ALLOWED_TOOLS = [
     "grep", "Grep",
     # Shell — used for processing attachments (PDF, audio, image -> python)
     "bash", "Bash",
+    "ShellRecall",  # not in the whitepaper mirror -- recovers shell-retention's demoted placeholders
     # Web research surface
     "webfetch", "WebFetch",
     "websearch", "WebSearch",
