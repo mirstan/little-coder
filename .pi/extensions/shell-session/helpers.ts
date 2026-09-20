@@ -166,13 +166,32 @@ function writeOverflowFile(cleaned: string, captureTruncated: boolean): string |
   return `${label}: ${path}`;
 }
 
+// execSubprocess's real SIGTERM path: Node actually killed the child, so the
+// process is confirmed gone. Cleanup is hedged, not asserted absent: a shell
+// trap on TERM can still run (and even re-raise the signal itself) before
+// the process actually exits, so "ran to completion" is the only thing we
+// can't confirm, not "ran at all".
+const KILLED_TIMED_OUT_WARNING =
+  "WARNING: this command hit its timeout and was killed. Any file it was " +
+  "mid-way through writing may now be HALF-WRITTEN, and any cleanup/restore logic at " +
+  "the end of a script may not have completed -- re-verify (cat/wc/diff) any file it " +
+  "touched before trusting it. If it simply needed more time, re-run with a larger timeout.";
+
+// execTmuxProxy's no-response fallback.
+const UNKNOWN_TIMED_OUT_WARNING =
+  "WARNING: this command hit its timeout with no response from the session -- nothing " +
+  "was killed or interrupted, and it is likely STILL RUNNING. No output was recovered " +
+  "for this call, and any file it is writing may be incomplete. Do NOT re-run it -- " +
+  "check whether it is still running first (e.g. capture the pane, or ps in the " +
+  "session) to avoid starting a duplicate copy.";
+
 export function formatOutput(
   raw: string,
   code: number,
   cwd: string,
   timedOut: boolean,
   backendNote: string,
-  opts: { overflowFile?: boolean; captureTruncated?: boolean } = {},
+  opts: { overflowFile?: boolean; captureTruncated?: boolean; timedOutKind?: "killed" | "unknown" } = {},
 ): string {
   const cleaned = stripAnsi(raw).replace(/\r/g, "");
   const rawBytes = byteLen(cleaned);
@@ -186,6 +205,11 @@ export function formatOutput(
   if (byteCapped && opts.overflowFile) {
     const note = writeOverflowFile(cleaned, opts.captureTruncated === true);
     if (note) body = body ? `${body}\n${note}` : note;
+  }
+
+  if (timedOut) {
+    const warning = opts.timedOutKind === "unknown" ? UNKNOWN_TIMED_OUT_WARNING : KILLED_TIMED_OUT_WARNING;
+    body = body ? `${body}\n${warning}` : warning;
   }
 
   const footerBits = [`exit=${code}`, `cwd=${cwd}`, `timed_out=${timedOut ? "true" : "false"}`];

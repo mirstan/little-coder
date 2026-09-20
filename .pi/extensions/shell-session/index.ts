@@ -73,9 +73,14 @@ async function execTmuxProxy(
   const title = TB_PROXY_PREFIX + JSON.stringify(payload);
   const response = await ctx.ui.input(title, "");
   if (typeof response === "string") return response;
+  // Nothing was killed here -- no usable response came back over the
+  // ui.input channel, so the command's actual state (still running,
+  // finished, crashed) is unknown from this side. See
+  // UNKNOWN_TIMED_OUT_WARNING in helpers.ts.
   return formatOutput(
     "Error: tmux proxy returned no response",
     -1, "?", true, "backend=tmux-proxy",
+    { timedOutKind: "unknown" },
   );
 }
 

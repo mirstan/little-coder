@@ -114,4 +114,20 @@ describe("tmux-proxy backend", () => {
     expect(text).not.toContain("Partial output");
     expect(execSyncMock).not.toHaveBeenCalled();
   });
+
+  it("reports the hedged unknown-state warning, not a killed claim, when the bridge never answers", async () => {
+    // ctx.ui.input resolving to a non-string means no usable response came
+    // back from the parent TB adapter -- nothing on this side killed or
+    // interrupted anything.
+    process.env.LITTLE_CODER_TB_MODE = "1";
+    const ctx = { ui: { input: async () => undefined } };
+
+    const res = await toolsOf().get("ShellSession").execute("id", { command: "sleep 999" }, undefined, undefined, ctx);
+    const text = res.content[0].text;
+
+    expect(text).toContain("timed_out=true");
+    expect(text).toContain("STILL RUNNING");
+    expect(text).toContain("nothing was killed");
+    expect(text).toContain("Do NOT re-run it");
+  });
 });

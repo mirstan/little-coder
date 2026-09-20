@@ -26,6 +26,7 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -990,6 +991,36 @@ def _stage_overflow_file(fd: int, cleaned: str) -> None:
         f.write(cleaned)
 
 
+# Pinned to harbor 0.22.0's exact RuntimeError text (docker.py:682/741) --
+# re-check this match on any harbor upgrade. timeout_sec is always int here,
+# so no decimal-seconds alternate is needed.
+_HARBOR_TIMEOUT_MSG_RE = re.compile(r"^Command timed out after \d+ seconds$")
+_TIMEOUT_KILL_WARNING = (
+    "WARNING: this command hit its {N}s timeout and its connection was killed. "
+    "Any file it was mid-way through writing may now be HALF-WRITTEN, and any "
+    "cleanup/restore logic at the end of a script may not have completed — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. A compute-bound process may "
+    "even still be running in the container (check with ps). If the command simply "
+    "needs more time, re-run it with a larger `timeout` parameter (up to 600 seconds)."
+)
+# Distinct from _TIMEOUT_KILL_WARNING: run()'s bridge timeout (below) means only
+# that _exec_async has not returned to the reader thread within timeout+30s --
+# it says nothing about env.exec()'s own state. _exec_async may still be
+# running, may be about to return normally, or may already have hit the real
+# docker timeout above; we simply don't know from here. So this warning must
+# not claim the connection was killed, and must not tell the model to re-run
+# (a still-running command re-run now would duplicate its side effects).
+_BRIDGE_TIMEOUT_WARNING = (
+    "WARNING: this command hit its {N}s timeout and was cut off from this side -- "
+    "its connection was NOT confirmed killed, and the command may still be running in "
+    "the container. Any file it was mid-way through writing may now be HALF-WRITTEN, "
+    "and any cleanup/restore logic at the end of a script may not have run — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. Check whether it is still "
+    "running (ps) before doing anything else; re-running it now risks starting a "
+    "duplicate copy of a command that hasn't actually stopped."
+)
+
+
 class _HarborShellProxy:
     """Stateful shell proxy over harbor's BaseEnvironment.exec().
 
@@ -1130,8 +1161,16 @@ class _HarborShellProxy:
                             self.cwd = cwd_line[0].strip()
                     out = out[:marker].rstrip()
         except asyncio.TimeoutError:
-            return _format_output("", "command timed out", -1, self.cwd, True)
+            # Dead for the docker backend today (harbor swallows this and
+            # raises RuntimeError instead -- see below), kept for other
+            # backends/future harbor versions where it may still fire.
+            warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+            return _format_output("", f"command timed out\n{warning}", -1, self.cwd, True)
         except Exception as e:
+            if _HARBOR_TIMEOUT_MSG_RE.fullmatch(str(e)):
+                # The real timeout path for docker -- see asyncio.TimeoutError branch above.
+                warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+                return _format_output("", f"env.exec error: {e}\n{warning}", -1, self.cwd, True)
             return _format_output("", f"env.exec error: {e}", -1, self.cwd, False)
         result_str = _format_output(out, err, code, self.cwd, False)
         # byte_capped=true, not output_truncated=true: the latter also fires
@@ -1157,6 +1196,9 @@ class _HarborShellProxy:
         fut = asyncio.run_coroutine_threadsafe(self._exec_async(command, timeout), self.loop)
         try:
             return fut.result(timeout=timeout + 30)
+        except concurrent.futures.TimeoutError as e:
+            warning = _BRIDGE_TIMEOUT_WARNING.format(N=timeout)
+            return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
 

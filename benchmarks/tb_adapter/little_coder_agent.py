@@ -157,6 +157,20 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
     return f"{body}\n{footer}" if body else footer
 
 
+# This branch fires whenever no sentinel is found in the pane within the
+# {N}s budget -- which is not only the "command is still running" case.
+# send_keys/capture_pane exceptions are swallowed above (see run()), so this
+# also fires when send_keys failed immediately for a non-timeout reason, or
+# when capture_pane raised (pane == "" -> no output to show at all).
+_TMUX_TIMEOUT_WARNING = (
+    "WARNING: no completion sentinel was seen for this command within its {N}s timeout. "
+    "It may be STILL RUNNING in the terminal session, it may have failed to start, or its "
+    "pane output may not have been captured -- any output shown above is only what could "
+    "be read, and any file it was writing may be incomplete. Check on it (e.g. capture "
+    "the pane again, or ps) before trusting its output or files."
+)
+
+
 class _TmuxShellProxy:
     """Routes ShellSession calls from pi back to a TB TmuxSession.
 
@@ -224,7 +238,8 @@ class _TmuxShellProxy:
         marker = pane.rfind(sentinel + ":")
         if marker < 0:
             body = pane[prev_cursor:] if prev_cursor <= len(pane) else ""
-            return _format_output(body.strip(), -1, "?", True, "backend=tmux-proxy")
+            warning = _TMUX_TIMEOUT_WARNING.format(N=timeout)
+            return _format_output(f"{body.strip()}\n{warning}".strip(), -1, "?", True, "backend=tmux-proxy")
 
         tail = pane[marker + len(sentinel) + 1:]
         parts = tail.split(":", 1)
