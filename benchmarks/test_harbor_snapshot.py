@@ -981,18 +981,19 @@ def test_pi_env_stays_silent_when_no_copy_was_staged(outcome):
     assert lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
 
 
-def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process():
-    """rpc_client.PiRpc builds the child's env as a copy of this process's
-    own os.environ, updated with _pi_env's dict -- a key _pi_env omitted
-    would pass through untouched. If LITTLE_CODER_INITIAL_SNAPSHOT were
-    still set in this process from an earlier trial (same worker, same
-    shell), a run with no real copy staged would wrongly advertise one."""
-    os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"] = "succeeded"
-    try:
-        env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=None)
-        assert env["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
-    finally:
-        del os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"]
+def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process(monkeypatch):
+    """_pi_env itself is pure and never reads os.environ -- the leak this
+    guards against happens one layer up, in rpc_client.PiRpc's own
+    full_env = dict(os.environ); full_env.update(_pi_env(...)). Replicate
+    that merge directly, not just _pi_env's return value, so this test
+    proves the actual protection (a leaked key gets overwritten) rather
+    than only that _pi_env always includes the key. monkeypatch.setenv
+    restores whatever this process had (or didn't have) afterward, unlike
+    an unconditional del."""
+    monkeypatch.setenv("LITTLE_CODER_INITIAL_SNAPSHOT", "succeeded")
+    full_env = dict(os.environ)
+    full_env.update(lca._pi_env(deadline_epoch_ms=1, initial_snapshot=None))
+    assert full_env["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
 
 
 @pytest.mark.parametrize("outcome", [None, "failed", "refused", "succeeded", "partial"])
