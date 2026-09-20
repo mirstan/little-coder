@@ -953,6 +953,73 @@ def test_prompt_omits_the_advertisement_when_nothing_was_staged():
     assert lca._HARD_LIMITS_PARAGRAPH in prompt
 
 
+# ── 1b. What the snapshot outcome tells pi's extensions (_pi_env) ──────────
+
+def _outcome(name: str) -> lca._InitialSnapshotOutcome:
+    return lca._InitialSnapshotOutcome(name, name in ("succeeded", "partial"), "msg")
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "partial"])
+def test_pi_env_publishes_the_outcome_when_a_copy_was_staged(outcome):
+    """The extensions' only evidence that /tmp/.lc-initial is really there.
+    The outcome string itself, not a flag: a reader has to be able to repeat
+    the cap-truncation caveat that "partial" carries."""
+    env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=_outcome(outcome))
+    assert env["LITTLE_CODER_INITIAL_SNAPSHOT"] == outcome
+
+
+@pytest.mark.parametrize("outcome", [None, "failed", "refused"])
+def test_pi_env_stays_silent_when_no_copy_was_staged(outcome):
+    """Empty, not omitted: PiRpc's child env starts as a copy of this
+    process's own os.environ, so an omitted key doesn't clear one already
+    present there (e.g. leaked from an earlier trial in the same
+    worker/shell) -- explicitly empty clobbers it either way. Every
+    consumer already treats empty the same as absent, the same cost
+    _initial_snapshot_advertisement refuses to pay by pointing at a path
+    that does not exist."""
+    arg = None if outcome is None else _outcome(outcome)
+    assert lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+
+
+def test_pi_env_clobbers_a_snapshot_var_leaked_from_the_calling_process(monkeypatch):
+    """_pi_env itself is pure and never reads os.environ -- the leak this
+    guards against happens one layer up, in rpc_client.PiRpc's own
+    full_env = dict(os.environ); full_env.update(_pi_env(...)). Replicate
+    that merge directly, not just _pi_env's return value, so this test
+    proves the actual protection (a leaked key gets overwritten) rather
+    than only that _pi_env always includes the key. monkeypatch.setenv
+    restores whatever this process had (or didn't have) afterward, unlike
+    an unconditional del."""
+    monkeypatch.setenv("LITTLE_CODER_INITIAL_SNAPSHOT", "succeeded")
+    full_env = dict(os.environ)
+    full_env.update(lca._pi_env(deadline_epoch_ms=1, initial_snapshot=None))
+    assert full_env["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+
+
+@pytest.mark.parametrize("outcome", [None, "failed", "refused", "succeeded", "partial"])
+def test_pi_env_gate_agrees_with_the_prompt_advertisement(outcome):
+    """One gate, two consumers: the model must never be told about the copy
+    in the prompt and not in the nudges, or the reverse."""
+    arg = None if outcome is None else _outcome(outcome)
+    advertised = lca._initial_snapshot_advertisement(arg) is not None
+    in_env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=arg)["LITTLE_CODER_INITIAL_SNAPSHOT"] != ""
+    assert advertised == in_env
+
+
+def test_pi_env_always_carries_the_deadline_and_permission_mode():
+    env = lca._pi_env(deadline_epoch_ms=1700000000000, initial_snapshot=None)
+    assert env["LITTLE_CODER_DEADLINE_EPOCH_MS"] == "1700000000000"
+    assert env["LITTLE_CODER_PERMISSION_MODE"] == "accept-all"
+
+
+def test_run_hands_pi_env_to_the_rpc_client():
+    """Wiring pin. Every assertion above is on a pure helper, so a run()
+    that built its own literal dict instead would pass all of them."""
+    src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
+    assert "env=_pi_env(" in src
+    assert "initial_snapshot=initial_snapshot," in src
+
+
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
 
 def test_snapshot_delay_normal_budget_fires_lead_seconds_before_deadline():

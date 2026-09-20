@@ -474,6 +474,16 @@ def _classify_initial_snapshot(rc: int | None, file_count: int | None) -> _Initi
     )
 
 
+def _initial_snapshot_is_present(outcome: _InitialSnapshotOutcome | None) -> bool:
+    """True when staging actually published files the model can read.
+
+    The single gate for everything that points the model at the copy, so the
+    prompt paragraph and the extensions' env var can never disagree about
+    whether the path exists.
+    """
+    return outcome is not None and outcome.outcome not in ("failed", "refused")
+
+
 def _initial_snapshot_advertisement(
     outcome: _InitialSnapshotOutcome | None,
 ) -> str | None:
@@ -491,7 +501,7 @@ def _initial_snapshot_advertisement(
     one -- a model near its deadline "restoring" pristine originals over the
     solution it just finished writing.
     """
-    if outcome is None or outcome.outcome in ("failed", "refused"):
+    if not _initial_snapshot_is_present(outcome):
         return None
     app_copy = f"{INITIAL_SNAPSHOT_PUBLISH_PATH}/app"
     text = (
@@ -513,6 +523,50 @@ def _initial_snapshot_advertisement(
             "didn't exist."
         )
     return text
+
+
+def _pi_env(
+    *,
+    deadline_epoch_ms: int,
+    initial_snapshot: _InitialSnapshotOutcome | None,
+) -> dict[str, str]:
+    """The env pi's extensions are handed for this trial. Pure/module-level,
+    like _initial_snapshot_advertisement, so its contents are assertable
+    without standing up a whole run.
+
+    permission-gate's SAFE_PREFIXES whitelist is meant to guard a real user's
+    own machine during interactive use, and its own header documents this
+    opt-out for benchmark runs. Docker is the actual isolation boundary for a
+    TB trial, and every other TB agent (bare pi, codex) already runs here with
+    unrestricted tool access. Observed directly: fix-git blocked on `cd`/`git
+    -C`, prove-plus-comm blocked on `coqc`, configure-git-webserver blocked on
+    `setsid`/`nc`/`socat`/`crontab` -- three different tools across three
+    unrelated tasks, not a pattern fixable by allow-listing one command at a
+    time.
+
+    LITTLE_CODER_INITIAL_SNAPSHOT is what lets an extension mention the
+    start-of-trial copy: tb-finalize-guard runs on TB1.0 too, whose adapter
+    stages no such copy, so an unconditional pointer there would send the
+    model after a path that does not exist. Carrying the classified outcome
+    rather than a bare flag also lets the reader pass on the same
+    cap-truncation caveat the prompt paragraph carries.
+
+    Set to empty, not omitted, when no copy was staged: PiRpc builds the
+    child env as dict(os.environ) updated with this dict, so an omitted key
+    does not clear one already present in THIS process's own environment
+    (e.g. leaked from an earlier trial in the same worker/shell). Empty
+    still reads as "no copy" to the var's one reader,
+    initialSnapshotOutcome(), whose exact match on "succeeded"/"partial"
+    treats it the same as absent.
+    """
+    env = {
+        "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+        "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+    }
+    env["LITTLE_CODER_INITIAL_SNAPSHOT"] = (
+        initial_snapshot.outcome if _initial_snapshot_is_present(initial_snapshot) else ""
+    )
+    return env
 
 
 async def _snapshot_initial_state(
@@ -1916,21 +1970,10 @@ class LittleCoderAgent(BaseAgent):
                 tb_mode=True,
                 max_turns=max_turns,
                 tb_shell_handler=tb_shell_handler,
-                # permission-gate's SAFE_PREFIXES whitelist is meant to guard
-                # a real user's own machine during interactive use, and its
-                # own header documents this opt-out for benchmark runs.
-                # Docker is the actual isolation boundary for a TB trial, and
-                # every other TB agent (bare pi, codex) already runs here with
-                # unrestricted tool access. Observed directly: fix-git blocked
-                # on `cd`/`git -C`, prove-plus-comm blocked on `coqc`,
-                # configure-git-webserver blocked on `setsid`/`nc`/`socat`/
-                # `crontab` -- three different tools across three unrelated
-                # tasks, not a pattern fixable by allow-listing one command at
-                # a time.
-                env={
-                    "LITTLE_CODER_PERMISSION_MODE": "accept-all",
-                    "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
-                },
+                env=_pi_env(
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    initial_snapshot=initial_snapshot,
+                ),
             )
             try:
                 # Retried in place on a provider-error completion rather than
