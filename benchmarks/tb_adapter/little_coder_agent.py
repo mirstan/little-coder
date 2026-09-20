@@ -65,12 +65,14 @@ MAX_RAW_TAIL_BYTES = 128 * 1024
 # _format_output is duplicated across the two adapters rather than shared.
 # test_format_output.py pins that shared substring across both paragraphs.
 #
-# The timeout sentence is NOT kept in sync, and never should be: harbor's
-# docker-exec timeout actually kills the process, but _TmuxShellProxy.run
-# only passes the timeout to tmux's send_keys(block=True) and moves on --
-# nothing here sends a C-c or kills anything, so a command that overruns
-# keeps running in the background. Telling the model it was "killed" would
-# be false on this backend.
+# The timeout sentence is NOT kept in sync, and never should be: neither
+# backend kills an overrun command (_TmuxShellProxy.run only passes the
+# timeout to tmux's send_keys(block=True) and sends no C-c; harbor's
+# timeout terminates just the host-side docker-exec client -- reproduced
+# against a live container, the in-container command survived it), but what
+# the model then sees differs. Harbor discards the timed-out call's output
+# outright, while this pane keeps collecting it, so overrun output can
+# interleave with, or show up ahead of, a later command's own.
 _HARD_LIMITS_PARAGRAPH = (
     "Hard limits of this environment: each ShellSession call has a "
     "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "

@@ -321,19 +321,23 @@ def test_syntax_error_report_still_finds_the_result_body(ad):
     assert "SyntaxError" in bodies[0]
 
 
-# ── _HARD_LIMITS_PARAGRAPH: shared caps, divergent kill semantics ─────────
+# ── _HARD_LIMITS_PARAGRAPH: shared caps, divergent timeout semantics ──────
 
 
-def test_hard_limits_paragraphs_share_caps_but_diverge_on_kill_semantics(ad):
+def test_hard_limits_paragraphs_share_caps_but_diverge_on_timeout_semantics(ad):
     """The output-caps / minimal-image sentence is hand-kept identical across
     both adapters' hard-limits paragraphs (see each module's comment above
-    its _HARD_LIMITS_PARAGRAPH); the timeout-kill sentence must NOT match,
-    because it isn't true on both backends: harbor's docker-exec timeout
-    actually kills the overrun process, but TB 1.0's _TmuxShellProxy.run only
-    passes the timeout to tmux's send_keys(block=True) and sends no C-c or
-    kill -- an overrun command keeps running in the background there. Runs
-    once (guarded on ad.name) since it inspects both modules directly rather
-    than through the per-adapter `fmt` callable.
+    its _HARD_LIMITS_PARAGRAPH); the timeout sentence must NOT match, and
+    neither paragraph may claim an overrun command is killed, because
+    neither backend kills one: harbor's timeout terminates only the
+    host-side docker-exec client (reproduced against a live container --
+    the in-container command survived and its statements past the timeout
+    still ran), and TB 1.0's _TmuxShellProxy.run only passes the timeout to
+    tmux's send_keys(block=True) and sends no C-c or kill. What diverges is
+    the overrun output: harbor discards it, tmux's pane shows what arrived
+    and keeps collecting the rest into later captures. Runs once (guarded
+    on ad.name) since it inspects both modules directly rather than through
+    the per-adapter `fmt` callable.
     """
     if ad.name != "harbor":
         pytest.skip("runs once -- inspects both modules directly, not ad.fmt")
@@ -352,15 +356,19 @@ def test_hard_limits_paragraphs_share_caps_but_diverge_on_kill_semantics(ad):
     assert shared in _HARBOR._HARD_LIMITS_PARAGRAPH
     assert shared in _TB._HARD_LIMITS_PARAGRAPH
 
-    assert "call is killed at its timeout" in _HARBOR._HARD_LIMITS_PARAGRAPH
-    assert "does not run its cleanup" in _HARBOR._HARD_LIMITS_PARAGRAPH
-    # TB's paragraph may mention "killed" only to disclaim it (see the
-    # module comment above _HARD_LIMITS_PARAGRAPH) -- it must never assert
-    # that a call IS killed or that cleanup does not run, since neither is
-    # true on the tmux backend.
-    assert "call is killed at its timeout" not in _TB._HARD_LIMITS_PARAGRAPH
-    assert "does not run its cleanup" not in _TB._HARD_LIMITS_PARAGRAPH
+    # Either paragraph may mention "killed" only to disclaim it (see the
+    # module comment above each _HARD_LIMITS_PARAGRAPH) -- neither may
+    # assert that a call IS killed or that cleanup was skipped, since
+    # neither is true on either backend.
+    for para in (_HARBOR._HARD_LIMITS_PARAGRAPH, _TB._HARD_LIMITS_PARAGRAPH):
+        assert "call is killed at its timeout" not in para
+        assert "does not run its cleanup" not in para
+    # The divergent halves: harbor discards a timed-out call's output and
+    # says so; tmux shows what arrived and keeps collecting.
+    assert "is not killed" in _HARBOR._HARD_LIMITS_PARAGRAPH
+    assert "discarded" in _HARBOR._HARD_LIMITS_PARAGRAPH
     assert "keeps running in the background" in _TB._HARD_LIMITS_PARAGRAPH
+    assert "its output so far is shown" in _TB._HARD_LIMITS_PARAGRAPH
 
 
 def test_tb_adapter_sets_accept_all_permission_mode(ad):
@@ -369,7 +377,7 @@ def test_tb_adapter_sets_accept_all_permission_mode(ad):
     tells the model to run first (`command -v python3 perl gcc ...`). This
     adapter must set accept-all, same as harbor/gaia/aider_polyglot, or that
     first probe (and any other command the whitelist doesn't happen to
-    cover) gets silently refused with no human present to grant it. Source
+    cover) gets refused with no human present to grant it. Source
     inspection, not a live PiRpc: exercising perform_task() end to end would
     need a real TmuxSession/container, which nothing else in this file sets
     up either.

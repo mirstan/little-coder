@@ -612,9 +612,10 @@ async def _probe_toolchain(
     cleanly and genuinely found none of the candidates -- `status` is the
     raw record of which of those actually happened, for
     environment_snapshot.json. (A run_harness timeout does not raise here --
-    _exec_async catches its own asyncio.TimeoutError and returns a normal
-    "command timed out" string -- so that case is disclosed inside the raw
-    output captured by the non-exception branch below, not by the except.)
+    _exec_async catches it in either shape, the docker backend's RuntimeError
+    or a raw asyncio.TimeoutError, and returns a normal error string -- so
+    that case is disclosed inside the raw output captured by the
+    non-exception branch below, not by the except.)
     """
     try:
         out = await proxy.run_harness(
@@ -637,11 +638,19 @@ async def _probe_toolchain(
 # Stated up front rather than left to the ShellSession tool description
 # alone, which is demonstrably too weak: overfull-hbox's model never once
 # passed `timeout`, so every long command ran under the 30s default.
+#
+# The not-killed sentence is measured, not assumed: on timeout, harbor
+# terminates only the host-side docker-exec client -- reproduced against a
+# live container, the in-container command survived and its statements past
+# the timeout still ran.
 _HARD_LIMITS_PARAGRAPH = (
-    "Hard limits of this environment: each ShellSession call is killed at "
-    "its timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
-    "compiles/installs/long scripts; a killed command does not run its "
-    "cleanup and can leave files half-written). Output is capped at 200 "
+    "Hard limits of this environment: each ShellSession call fails at its "
+    "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts) and everything the command printed is "
+    "discarded with it. The command itself is not killed — it may still be "
+    "running in the container and finish later, with none of its output "
+    "ever shown — so inspect actual state (files, processes) before "
+    "re-running anything non-idempotent. Output is capped at 200 "
     "lines / ~48KB per call. The container image is minimal: check which "
     "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
     "designing an approach around one."
@@ -1087,7 +1096,8 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     a starting cwd and never `cd`s in a way the caller needs reported back --
     true of every cwd=None caller today (both snapshot commands and the
     start-marker touch, which use absolute paths (/app, /tmp) throughout;
-    the toolchain probe, which touches the filesystem not at all).
+    the toolchain probe, whose only path resolution is `command -v`'s
+    PATH search).
     """
     body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
     if cwd is None:
@@ -1335,8 +1345,8 @@ class _HarborShellProxy:
         because every harness command happened to never `cd`). Sound because
         every harness command today either uses absolute paths (/app, /tmp)
         throughout (both snapshot instantiations, the start-marker touch) or
-        touches the filesystem not at all (the toolchain probe), so none
-        needs a starting cwd.
+        resolves paths only through `command -v`'s PATH search (the
+        toolchain probe), so none needs a starting cwd.
         """
         return await self._exec_async(command, timeout, track_cwd=False)
 
