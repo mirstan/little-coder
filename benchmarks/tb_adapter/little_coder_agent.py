@@ -219,14 +219,20 @@ def _pi_env(*, budget_start_epoch_ms: int, deadline_epoch_ms: int) -> dict[str, 
     its very first probe). Whitelisting one command at a time is whack-a-mole;
     every other TB agent already runs with unrestricted tool access here.
 
-    LITTLE_CODER_INITIAL_SNAPSHOT is deliberately absent: this adapter stages
-    no start-of-trial copy, so an extension reading it must stay silent about
-    one. See the harbor adapter's _pi_env, which does set it.
+    LITTLE_CODER_INITIAL_SNAPSHOT is set to empty, not omitted: this adapter
+    stages no start-of-trial copy, and PiRpc's child env starts as a copy of
+    this process's own os.environ (full_env = dict(os.environ), updated with
+    this dict) -- an omitted key does not clear one already present there,
+    e.g. leaked from a prior harbor trial run in the same process/shell.
+    Empty clobbers it either way; initialSnapshotOutcome() on the TS side
+    treats anything but "succeeded"/"partial" as no snapshot. See the harbor
+    adapter's _pi_env, which sets the real classified value instead.
     """
     return {
         "LITTLE_CODER_PERMISSION_MODE": "accept-all",
         "LITTLE_CODER_BUDGET_START_EPOCH_MS": str(budget_start_epoch_ms),
         "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+        "LITTLE_CODER_INITIAL_SNAPSHOT": "",
     }
 
 

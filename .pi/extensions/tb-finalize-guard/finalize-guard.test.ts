@@ -1185,6 +1185,32 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 8
       expect(h.sent).toHaveLength(1);
     });
+
+    it("does not also fire Trigger A on the very turn it just nudged", async () => {
+      // Trigger D fires at this turn's turn_start; if that same turn's own
+      // response is toolless, Trigger A's turn_end would otherwise stack a
+      // second, different steer right behind it -- pi delivers every queued
+      // steer, it does not coalesce them.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5); // 60 minutes left -- clears Trigger A's own gate
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "Let me think about this." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toBe(buildTriggerDMessage(0.5, 60, false));
+    });
+
+    it("lets Trigger A fire normally on a later turn once D has already spoken", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setBudget(120, 0.5);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "Let me think about this." })); // D fires
+      expect(h.sent).toHaveLength(1);
+      await turn(h, assistantTurn({ text: "Still thinking." })); // a later, separate turn
+      expect(h.sent).toHaveLength(2);
+      expect(h.sent[1].text).toBe(buildTriggerAMessage(60, undefined));
+    });
   });
 
   describe("buildTriggerDMessage", () => {

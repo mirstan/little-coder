@@ -25,6 +25,13 @@ describe("PROGRESS_MILESTONES", () => {
       expect(m).toBeLessThan(1);
     }
   });
+
+  it("is exactly the 50%/75% marks this feature was built around", () => {
+    // The invariant checks above (ascending, strictly inside the trial)
+    // would keep passing under a silent retune -- e.g. to [0.4, 0.8] --
+    // that shifts when Trigger D actually fires. Pin the real values too.
+    expect([...PROGRESS_MILESTONES]).toEqual([0.5, 0.75]);
+  });
 });
 
 describe("resolveBudgetStartEpochMs", () => {

@@ -264,6 +264,11 @@ let lastTurnMessage: any = undefined;
 let milestonesFired = new Set<number>();
 let deliverableWriteEverSeen = false;
 let startForRun = 0;
+// Run-scoped: which turn (if any) Trigger D fired at, so Trigger A's own
+// turn_end for that SAME turn can skip -- both are separately queued
+// steering messages (pi delivers each one, never coalesces them), so
+// firing both stacks two different nudges on the turn D already spoke to.
+let triggerDFiredAtTurn = 0;
 
 function isTerminalBench(): boolean {
   return process.env.LITTLE_CODER_BENCHMARK === "terminal_bench";
@@ -338,6 +343,7 @@ export default function (pi: ExtensionAPI) {
     armedAtTurn = 0;
     consecutiveNoWriteTurns = 0;
     lastTurnMessage = undefined;
+    triggerDFiredAtTurn = 0;
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -550,6 +556,9 @@ function maybeFireTriggerA(
 ): boolean {
   if (triggerAFireCount >= MAX_TRIGGER_A_FIRES) return false;
   if (message.stopReason === "aborted" || message.stopReason === "error") return false;
+  // Trigger D already queued a steer for the turn this response answers --
+  // firing another one here would stack two different nudges back to back.
+  if (triggerDFiredAtTurn === turnsThisRun) return false;
 
   const hasText = text.trim().length > 0;
   const shapeMatches = hasText && toolCallCount === 0;
@@ -737,6 +746,7 @@ function maybeFireTriggerD(pi: ExtensionAPI, ctx: any): void {
   for (const m of PROGRESS_MILESTONES) {
     if (m <= milestone) milestonesFired.add(m);
   }
+  triggerDFiredAtTurn = turnsThisRun;
   harnessIntervention(
     ctx,
     `about ${Math.round(fraction * 100)}% of the wall-clock budget is spent with ` +

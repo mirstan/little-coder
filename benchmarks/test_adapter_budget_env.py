@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import os
 import sys
 import textwrap
 import types
@@ -142,7 +143,22 @@ def test_the_trial_entrypoint_derives_both_ends_from_one_instant(mod, entrypoint
 
 
 def test_only_the_harbor_adapter_can_publish_an_initial_snapshot():
-    """TB1.0 stages no start-of-trial copy, so its env must never carry the
-    var that tells an extension one exists."""
-    assert "LITTLE_CODER_INITIAL_SNAPSHOT" not in _env(_TB)
+    """TB1.0 stages no start-of-trial copy, so its env must never tell an
+    extension one exists -- explicitly empty, not merely omitted (see the
+    leak test below for why omission isn't enough)."""
+    assert _env(_TB)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
     assert "initial_snapshot" not in inspect.signature(_TB._pi_env).parameters
+
+
+def test_tb_clobbers_an_initial_snapshot_var_leaked_from_the_calling_process():
+    """rpc_client.PiRpc builds the child's env as a copy of this process's own
+    os.environ, updated with _pi_env's dict -- a key _pi_env does not mention
+    would pass through untouched. If LITTLE_CODER_INITIAL_SNAPSHOT were still
+    set in this process from an earlier harbor trial (same worker, same
+    shell), an extension in a TB1.0 trial would wrongly read a snapshot as
+    real and point the model at a path that was never staged."""
+    os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"] = "succeeded"
+    try:
+        assert _env(_TB)["LITTLE_CODER_INITIAL_SNAPSHOT"] == ""
+    finally:
+        del os.environ["LITTLE_CODER_INITIAL_SNAPSHOT"]
