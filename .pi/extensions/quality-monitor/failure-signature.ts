@@ -223,9 +223,10 @@ export class FailureSignatureTracker {
 
   /**
    * Fold one result into its tool's streak, returning the detection due a
-   * message. Successes are tracked only when the producing call is already in
-   * a fuzzy cluster, and then under a cluster-scoped key so a passing result
-   * can never overwrite a live error signature.
+   * message. Successes are tracked only when the producing call's fuzzy
+   * cluster already holds near-identical attempts (`corroborated`), and then
+   * under a cluster-scoped key so a passing result can never overwrite a live
+   * error signature.
    */
   record(obs: ResultObservation, turn: number): FailureSignatureDetection | null {
     if (this.opts.streak <= 0) return null;

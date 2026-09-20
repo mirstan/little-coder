@@ -203,7 +203,7 @@ interface Shingled {
 
 interface WindowEntry extends Shingled {
   tool: string;
-  /** name + stable input, for excluding verbatim repeats. */
+  /** The call's identityKey, for excluding verbatim repeats. */
   key: string;
   turn: number;
   cluster: number;
