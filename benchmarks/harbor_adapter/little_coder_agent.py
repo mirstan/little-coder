@@ -635,8 +635,8 @@ async def _probe_toolchain(
 
 
 # Stated up front rather than left to the ShellSession tool description
-# alone, which is demonstrably too weak: overfull-hbox was killed by the 30s
-# default having never once passed `timeout`.
+# alone, which is demonstrably too weak: overfull-hbox's model never once
+# passed `timeout`, so every long command ran under the 30s default.
 _HARD_LIMITS_PARAGRAPH = (
     "Hard limits of this environment: each ShellSession call is killed at "
     "its timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
@@ -1317,8 +1317,8 @@ class _HarborShellProxy:
         loop, no thread bridge, no fut.result().
 
         This is also why every harness-issued path -- the deadline-snapshot
-        task, the start-of-trial snapshot, the start-marker touch -- must use
-        ONLY run_harness, never run().
+        task, the start-of-trial snapshot, the toolchain probe, the
+        start-marker touch -- must use ONLY run_harness, never run().
 
         _exec_async's own _exec_lock still serializes this against
         model-issued commands (via run()), so a harness command and a model
@@ -1332,9 +1332,10 @@ class _HarborShellProxy:
         by a harness call (by construction, not by accident -- contrast the
         old docstring here, which claimed the same result but only held
         because every harness command happened to never `cd`). Sound because
-        every harness command today (both snapshot instantiations and the
-        start-marker touch) uses absolute paths (/app, /tmp) throughout and
-        needs no starting cwd.
+        every harness command today either uses absolute paths (/app, /tmp)
+        throughout (both snapshot instantiations, the start-marker touch) or
+        touches the filesystem not at all (the toolchain probe), so none
+        needs a starting cwd.
         """
         return await self._exec_async(command, timeout, track_cwd=False)
 
@@ -1681,10 +1682,10 @@ class LittleCoderAgent(BaseAgent):
         # found, but deliberately AHEAD of _snapshot_initial_state below --
         # unlike the probe, nothing this snapshot writes depends on that
         # snapshot's outcome, and _snapshot_initial_state is bounded at 60s
-        # (including a docker-cp of up to 200MB) versus the probe's 10s. The
-        # original guarantee this restores: environment_snapshot.json lands
-        # early enough to survive even a mid-start termination, rather than
-        # depending on the initial-state stage+download finishing first.
+        # (including a docker-cp of up to 200MB) versus the probe's 10s.
+        # environment_snapshot.json must land early enough to survive even a
+        # mid-start termination, rather than depend on the initial-state
+        # stage+download finishing first.
         # Still ahead of the PiRpc-construction try/except further below so
         # it (and the config-provenance log line) land even if PiRpc itself
         # fails to construct (e.g. PI_BIN missing) -- exactly the
@@ -1727,7 +1728,7 @@ class LittleCoderAgent(BaseAgent):
         # command -- so gathering the two concurrently would not actually
         # run them in parallel inside the container, only add scheduling
         # complexity for no wall-clock benefit. Staying sequential keeps
-        # this simple; only the write order above changed.
+        # this simple.
         await _snapshot_initial_state(proxy, environment, self.logs_dir, self.logger)
 
         # Composed here, after the initial-state snapshot, rather than right
