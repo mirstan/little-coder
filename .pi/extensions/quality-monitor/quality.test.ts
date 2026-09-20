@@ -1,8 +1,24 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { assessResponse, buildCorrectionMessage, phraseForUser } from "./quality.ts";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import {
+  assessResponse,
+  buildCorrectionMessage,
+  buildFailureSignatureMessage,
+  phraseForUser,
+} from "./quality.ts";
 import setupQualityMonitor from "./index.ts";
+import { FUZZY_ENV } from "./similarity.ts";
+import { FAILSIG_ENV } from "./failure-signature.ts";
+import { pinEnv } from "../_shared/env-pin.ts";
 
 const known = new Set(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]);
+
+// The integration tests below drive the two detectors through the extension,
+// which builds them with their env-derived defaults. Both knob lists come
+// from the modules that read them, so a knob added there cannot be missed
+// here.
+const pinned = pinEnv([...Object.values(FUZZY_ENV), ...Object.values(FAILSIG_ENV)]);
+beforeEach(() => pinned.clear());
+afterEach(() => pinned.restore());
 
 describe("assessResponse", () => {
   it("accepts text-only assistant response", () => {
@@ -112,6 +128,29 @@ describe("buildCorrectionMessage", () => {
   });
   it("falls back to generic on unknown reason", () => {
     expect(buildCorrectionMessage("weird_thing")).toContain("weird_thing");
+  });
+});
+
+describe("buildFailureSignatureMessage", () => {
+  it("does not claim every attempt in the streak was near-identical", () => {
+    // `corroborated` is sticky: one near-identical pair sets it for the whole
+    // count, so the suffix can only speak for some of the attempts.
+    const msg = buildFailureSignatureMessage("ShellSession", 4, { corroborated: true });
+    expect(msg).toContain("some of those attempts were themselves near-identical");
+  });
+  it("says nothing about a command for a tool that has none, on either branch", () => {
+    expect(buildFailureSignatureMessage("Write", 3, { failed: true })).not.toMatch(/\bcommand\b/i);
+    expect(buildFailureSignatureMessage("Write", 3, { failed: false })).not.toMatch(/\bcommand\b/i);
+  });
+  it("does not call a repeated passing result an error", () => {
+    const msg = buildFailureSignatureMessage("ShellSession", 3, { failed: false });
+    expect(msg).toContain("identical output");
+    expect(msg).not.toMatch(/error|failing|refusal/i);
+  });
+  it("keeps the error framing, and the guardrail carve-out, for a failure", () => {
+    const msg = buildFailureSignatureMessage("ShellSession", 3, { failed: true });
+    expect(msg).toContain("identical error or output");
+    expect(msg).toMatch(/refusal is the answer/i);
   });
 });
 
@@ -554,5 +593,348 @@ describe("quality-monitor tier-2 escalation", () => {
     // would false-positive on that).
     expect(escalation).not.toMatch(/times|in a row/i);
     expect(await fireToolCall(h, bash.name, bash.input)).toMatchObject({ block: true });
+  });
+});
+
+// ── near-duplicate loops and repeated failure signatures ───────────────────
+// Both are steer-only: no assertion below expects a block, and one test per
+// detector ("nudges a constant-sweep probe loop..." and "fires on
+// ShellSession failures...") confirms with fireToolCall that none armed.
+
+// pi's raw content blocks carry the id the matching tool_result reports; the
+// two detectors are only correlated through it.
+let idSeq = 0;
+function withIds(calls: { name: string; input: unknown }[]) {
+  return calls.map((c) => ({ ...c, id: `tc${++idSeq}` }));
+}
+function turnWithIds(calls: { name: string; input: unknown; id: string }[], text = "") {
+  return {
+    message: {
+      stopReason: "stop",
+      content: [
+        ...(text ? [{ type: "text", text }] : []),
+        ...calls.map((c) => ({ type: "toolCall", name: c.name, arguments: c.input, id: c.id })),
+      ],
+    },
+  };
+}
+async function fireToolResult(h: any, r: { toolCallId?: string; toolName: string; input: unknown; text: string; isError?: boolean }) {
+  for (const fn of h.pi.handlers["tool_result"] ?? []) {
+    await fn(
+      {
+        type: "tool_result",
+        toolCallId: r.toolCallId,
+        toolName: r.toolName,
+        input: r.input,
+        content: [{ type: "text", text: r.text }],
+        isError: r.isError === true,
+      },
+      h.ctx,
+    );
+  }
+}
+// One realistic turn: pi fires tool_call, then tool_result mid-turn, then
+// turn_end — the order the corroboration path depends on.
+async function fireTurnWithResults(
+  h: any,
+  calls: { name: string; input: unknown }[],
+  results: ({ text: string; isError?: boolean } | null)[] = [],
+  text = "",
+) {
+  const ided = withIds(calls);
+  for (const c of ided) await fireToolCall(h, c.name, c.input);
+  for (let i = 0; i < ided.length; i++) {
+    const r = results[i];
+    if (r) {
+      await fireToolResult(h, {
+        toolCallId: ided[i].id,
+        toolName: ided[i].name,
+        input: ided[i].input,
+        text: r.text,
+        isError: r.isError,
+      });
+    }
+  }
+  return fire(h, "turn_end", turnWithIds(ided, text));
+}
+/** The same, for a turn whose results no test inspects. */
+async function fireTurnWithIds(h: any, calls: { name: string; input: unknown }[], text = "") {
+  return fireTurnWithResults(h, calls, [], text);
+}
+
+const VERBS = ["read", "parse", "scan", "fold", "merge", "emit", "flush", "count", "index", "hash", "pack", "trim"];
+function scriptLines(): string[] {
+  const lines = ["#!/usr/bin/perl", "use strict;", "use warnings;", 'my $buf = "";'];
+  for (let i = 0; i < 95; i++) {
+    const v = VERBS[i % VERBS.length];
+    lines.push(
+      i % 8 === 0
+        ? `  my $buf_${i} = ${v}_stage($fh, ${i});`
+        : `  $out[${i}] = ${v}_${i}($state, "${v}-${i}", ${i * 3 + 1});`,
+    );
+  }
+  return lines;
+}
+/** The same script with one cosmetic difference — a near-duplicate rewrite. */
+function scriptVariant(at: number): string {
+  return scriptLines()
+    .map((l, i) => (i === at ? `${l}  # attempt ${at}` : l))
+    .join("\n");
+}
+/** A long build-and-debug probe varying one constant, as a sweep loop makes. */
+function probe(window: number): string {
+  return [
+    "set -e",
+    "cd /app/build",
+    `printf 'window=%d\\n' ${window} > /tmp/probe.cfg`,
+    "gcc -O2 -g -fsanitize=address -o compressor compressor.c ring.c bitio.c -lm",
+    "./compressor --config /tmp/probe.cfg --input /data/corpus.bin --output /tmp/out.bin --threads 4 --verbose",
+    "gdb -batch -ex run -ex bt --args ./compressor --config /tmp/probe.cfg",
+  ].join("\n");
+}
+
+const SHELL_FOOTER = "[exit=139 cwd=/app timed_out=false backend=subprocess]";
+// A ShellSession failure: no isError anywhere, the exit code only in the footer.
+const SHELL_FAIL = `reading corpus from /data\nSegmentation fault (core dumped)\n${SHELL_FOOTER}`;
+// The same failure through pi's built-in bash, which throws instead.
+const BASH_FAIL = "reading corpus from /data\nSegmentation fault (core dumped)\nCommand exited with code 139";
+
+describe("quality-monitor near-duplicate loop detection", () => {
+  let h: ReturnType<typeof harness>;
+  beforeEach(async () => {
+    h = harness();
+    await fire(h, "session_start", {});
+  });
+
+  it("nudges a constant-sweep probe loop the verbatim breaker misses", async () => {
+    for (const w of [512, 1024, 2048]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command: probe(w) } }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/near-identical/i);
+    expect(h.followUps[0].opts).toEqual({ deliverAs: "steer" });
+    expect(h.notifies.join("\n")).toMatch(/near-identical/i);
+    // Steer-only: the next variant still runs.
+    expect(await fireToolCall(h, "ShellSession", { command: probe(4096) })).toBeUndefined();
+  });
+
+  it("nudges three near-identical rewrites of the same script", async () => {
+    for (const at of [7, 20, 31]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: scriptVariant(at) } }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/near-identical/i);
+  });
+
+  it("speaks once more at streak + 2, then falls silent for that cluster", async () => {
+    for (const at of [1, 2, 3, 4, 5, 6, 7]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: scriptVariant(at) } }]);
+    }
+    expect(h.followUps).toHaveLength(2);
+    expect(h.followUps[1].msg).toMatch(/still repeating/i);
+  });
+
+  it("does NOT nudge a file being written incrementally", async () => {
+    const lines = scriptLines();
+    for (const end of [60, 65, 70, 75, 80]) {
+      await fireTurnWithIds(h, [
+        { name: "Write", input: { path: "/app/squeeze.pl", content: lines.slice(0, end).join("\n") } },
+      ]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT nudge substantive rewrites of the same file", async () => {
+    const lines = scriptLines();
+    const rewrite = (from: number) =>
+      lines.map((l, i) => (i >= from && i < from + 30 ? `  $acc = reduce_window($acc, ${i}) or last;` : l)).join("\n");
+    for (const from of [10, 40, 60]) {
+      await fireTurnWithIds(h, [{ name: "Write", input: { path: "/app/squeeze.pl", content: rewrite(from) } }]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT nudge short varied commands", async () => {
+    for (const command of ["ls -la", "ls /tmp", "cat out.txt", "cat err.txt", "wc -l out.txt"]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command } }]);
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT double-fire alongside the verbatim loop-breaker", async () => {
+    const call = { name: "ShellSession", input: { command: probe(512) } };
+    for (let i = 0; i < 5; i++) await fireTurnWithIds(h, [call]);
+    expect(h.followUps.every((f: any) => !/near-identical/i.test(f.msg))).toBe(true);
+    expect(h.followUps[0].msg).toBe(buildCorrectionMessage("repeated_tool_call"));
+  });
+
+  it("stays silent on the turn a quality verdict already spoke, then says it later", async () => {
+    // The Read repeats verbatim while the Greps drift — one turn cannot carry
+    // two harness messages, and the suppressed one is not lost.
+    const read = { name: "Read", input: { path: "/app/notes.md" } };
+    const grep = (w: number) => ({ name: "Grep", input: { pattern: probe(w) } });
+    await fireTurnWithIds(h, [read, grep(512)]);
+    await fireTurnWithIds(h, [read, grep(1024)]);
+    await fireTurnWithIds(h, [read, grep(2048)]);
+    expect(h.followUps.map((f: any) => f.msg)).toEqual([
+      buildCorrectionMessage("repeated_tool_call"),
+      buildCorrectionMessage("repeated_tool_call"),
+    ]);
+    // Model drops the repeated Read; the cluster is still growing, so the
+    // nudge it was owed arrives now.
+    await fireTurnWithIds(h, [grep(4096)]);
+    expect(h.followUps).toHaveLength(3);
+    expect(h.followUps[2].msg).toMatch(/near-identical/i);
+  });
+
+  it("ignores calls from an aborted turn", async () => {
+    for (const w of [512, 1024]) {
+      await fireTurnWithIds(h, [{ name: "ShellSession", input: { command: probe(w) } }]);
+    }
+    await fireToolCall(h, "ShellSession", { command: probe(2048) });
+    await fire(h, "turn_end", { message: { stopReason: "aborted", content: [] } });
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("resets on a genuinely new prompt but not on its own steer", async () => {
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(7) } }]);
+    await fire(h, "input", { source: "extension", text: "..." });
+    await fire(h, "input", { source: "interactive", streamingBehavior: "queue", text: "..." });
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(20) } }]);
+    await fire(h, "input", { text: "new task" });
+    await fireTurnWithIds(h, [{ name: "Write", input: { path: "/a.pl", content: scriptVariant(31) } }]);
+    expect(h.followUps).toHaveLength(0);
+  });
+});
+
+describe("quality-monitor repeated-failure watchdog", () => {
+  let h: ReturnType<typeof harness>;
+  beforeEach(async () => {
+    h = harness();
+    await fire(h, "session_start", {});
+  });
+
+  // Commands short enough to stay below the fuzzy floor, so these exercise
+  // the watchdog alone.
+  const run = (n: number) => ({ name: "ShellSession", input: { command: `./compressor --mode ${n}` } });
+
+  it("fires on ShellSession failures, which never set isError", async () => {
+    for (const n of [1, 2, 3]) {
+      await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/identical error or output/i);
+    expect(h.followUps[0].msg).toContain("3 of your recent ShellSession attempts");
+    expect(h.followUps[0].opts).toEqual({ deliverAs: "steer" });
+    expect(h.notifies.join("\n")).toMatch(/identical failure/i);
+    // Steer-only: the next attempt still runs.
+    expect(await fireToolCall(h, "ShellSession", run(4).input)).toBeUndefined();
+  });
+
+  it("fires on pi's built-in bash failures, which throw instead", async () => {
+    for (const n of [1, 2, 3]) {
+      await fireTurnWithResults(
+        h,
+        [{ name: "Bash", input: { command: `./compressor --mode ${n}` } }],
+        [{ text: BASH_FAIL, isError: true }],
+      );
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/identical error or output/i);
+  });
+
+  it("carries the guardrail carve-out rather than pushing for another route", async () => {
+    for (const n of [1, 2, 3]) await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    expect(h.followUps[0].msg).toMatch(/refusal is the answer/i);
+  });
+
+  it("does NOT fire on three distinct silent failures", async () => {
+    const silent = "[exit=1 cwd=/app timed_out=false backend=subprocess]";
+    for (const p of ["alpha", "beta", "gamma"]) {
+      await fireTurnWithResults(
+        h,
+        [{ name: "ShellSession", input: { command: `grep -r ${p} src/` } }],
+        [{ text: silent }],
+      );
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT fire on a passing suite re-run between edits", async () => {
+    const passing = "all 42 tests passed in 3 seconds\n[exit=0 cwd=/app timed_out=false backend=subprocess]";
+    for (const n of [1, 2, 3]) {
+      await fireTurnWithResults(
+        h,
+        [
+          { name: "Edit", input: { path: "/app/ring.c", edits: [{ oldText: `x${n}`, newText: `y${n}` }] } },
+          { name: "ShellSession", input: { command: `make test TARGET=${n}` } },
+        ],
+        [null, { text: passing }],
+      );
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("does NOT fire while the failures themselves keep changing", async () => {
+    for (const n of [1, 2, 3, 4]) {
+      await fireTurnWithResults(
+        h,
+        [run(n)],
+        [{ text: `stage ${n} of the pipeline rejected the header record\n[exit=${n + 1} cwd=/app timed_out=false backend=subprocess]` }],
+      );
+    }
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("fires an attempt sooner, and only once, when the attempts are near-identical too", async () => {
+    await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(512) } }], [{ text: SHELL_FAIL }]);
+    await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(1024) } }], [{ text: SHELL_FAIL }]);
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toMatch(/near-identical/i);
+    expect(h.followUps[0].msg).toMatch(/identical error or output/i);
+    // The cluster reaching three must not repeat what that message said.
+    await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(2048) } }], [{ text: SHELL_FAIL }]);
+    expect(h.followUps).toHaveLength(1);
+  });
+
+  it("steers about output, not failure, when the repeated results passed", async () => {
+    // Near-identical commands (a cluster) whose results keep succeeding with
+    // the same unsatisfying output: worth saying, but not as an error.
+    const passing = "compressed size 512 bytes, expected under 400\n[exit=0 cwd=/app timed_out=false backend=subprocess]";
+    // Three turns, not two: a passing result is only tracked once its own
+    // call is already in a cluster of two, so the streak starts on turn 2.
+    for (const w of [512, 1024, 2048]) {
+      await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(w) } }], [{ text: passing }]);
+    }
+    expect(h.followUps).toHaveLength(1);
+    expect(h.followUps[0].msg).toContain("identical output");
+    expect(h.followUps[0].msg).not.toMatch(/error|failing/i);
+    expect(h.notifies.join("\n")).toMatch(/identical output/i);
+    expect(h.notifies.join("\n")).not.toMatch(/identical failure/i);
+  });
+
+  it("drops results that arrived before a turn_end carrying no message", async () => {
+    // Whatever produces a message-less turn_end, the results that arrived
+    // under it end with it: carried forward, they would be counted as the
+    // NEXT turn's output and could complete a streak on their own.
+    for (const n of [1, 2]) await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    await fireToolResult(h, { toolName: "ShellSession", input: { command: "./compressor --mode 3" }, text: SHELL_FAIL });
+    await fire(h, "turn_end", {});
+    await fireTurnWithResults(h, [{ name: "Read", input: { path: "/app/notes.md" } }], [null]);
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("drops results that arrived during an aborted turn", async () => {
+    for (const n of [1, 2]) await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    await fireToolResult(h, { toolName: "ShellSession", input: { command: "./compressor --mode 3" }, text: SHELL_FAIL });
+    await fire(h, "turn_end", { message: { stopReason: "aborted", content: [] } });
+    expect(h.followUps).toHaveLength(0);
+  });
+
+  it("resets on a genuinely new prompt", async () => {
+    for (const n of [1, 2]) await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    await fire(h, "input", { text: "different task" });
+    await fireTurnWithResults(h, [run(3)], [{ text: SHELL_FAIL }]);
+    expect(h.followUps).toHaveLength(0);
   });
 });
