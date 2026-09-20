@@ -105,7 +105,7 @@ from rpc_client import (  # noqa: E402
 )
 
 
-DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
+DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset", "ShellRecall"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
 
 # Fallback when the real per-task timeout can't be derived (see

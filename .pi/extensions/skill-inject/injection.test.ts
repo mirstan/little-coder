@@ -244,11 +244,12 @@ function gaiaAllowedTools(): string[] {
 }
 
 describe("research directive gates on browse-tool availability", () => {
-  it("DEFAULT_ALLOWED_TOOLS is ShellSession-only (sanity check on the extraction itself)", () => {
+  it("DEFAULT_ALLOWED_TOOLS is shell-only, no browse tools (sanity check on the extraction itself)", () => {
     expect(harborDefaultAllowedTools()).toEqual([
       "ShellSession",
       "ShellSessionCwd",
       "ShellSessionReset",
+      "ShellRecall",
     ]);
   });
 
