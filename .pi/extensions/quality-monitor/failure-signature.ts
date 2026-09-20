@@ -151,8 +151,8 @@ interface Entry {
   clusterId?: number;
 }
 
-// Bounded because a long session touches many tools; the oldest slot is the
-// least likely to be mid-loop.
+// Bounded because a long session touches many tools; the least recently
+// updated slot is the least likely to be mid-loop.
 const MAX_TRACKED = 16;
 
 /**
@@ -188,7 +188,10 @@ export class FailureSignatureTracker {
     const input = stableStringify(obs.input);
     const prev = this.entries.get(key);
 
-    if (prev && this.matches(prev.sig, sig) && turn - prev.lastTurn <= this.opts.window) {
+    // `window` turns INCLUSIVE of both ends, matching the fuzzy tracker's
+    // rolling span: with the default 8, turns 1 and 8 still count together
+    // and turns 1 and 9 do not.
+    if (prev && this.matches(prev.sig, sig) && turn - prev.lastTurn < this.opts.window) {
       // Identical input producing identical output is the verbatim
       // loop-breaker's case; counting it here would double-cover it. The
       // point of this watchdog is changed attempt, unchanged outcome.
@@ -198,9 +201,14 @@ export class FailureSignatureTracker {
         prev.lastTurn = turn;
         prev.corroborated = prev.corroborated || obs.corroborated === true;
         if (obs.corroborated) prev.clusterId = obs.clusterId;
+        // Re-inserted to keep Map order recency order: evict() drops the
+        // front, so an entry that only ever matches would be evicted
+        // mid-streak.
+        this.entries.delete(key);
+        this.entries.set(key, prev);
       }
     } else {
-      this.entries.delete(key);
+      this.forget(key);
       this.entries.set(key, {
         toolName: obs.toolName,
         sig,
@@ -256,7 +264,19 @@ export class FailureSignatureTracker {
     while (this.entries.size > MAX_TRACKED) {
       const oldest = this.entries.keys().next().value as string | undefined;
       if (oldest === undefined) return;
-      this.entries.delete(oldest);
+      this.forget(oldest);
     }
+  }
+
+  /**
+   * Drop an entry and the message budget spent on it, so `notified` stays
+   * bounded by the tracked entries rather than by how long the session runs.
+   * Safe because a live streak's `sig` is never replaced, so its notify key
+   * does not move while it is being counted.
+   */
+  private forget(key: string): void {
+    const entry = this.entries.get(key);
+    if (entry) this.notified.delete(this.notifyKey(key, entry.sig));
+    this.entries.delete(key);
   }
 }

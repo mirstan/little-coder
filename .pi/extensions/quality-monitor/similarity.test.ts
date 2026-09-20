@@ -1,13 +1,38 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import {
   bigrams,
   containment,
   extractComparableText,
   FuzzyLoopTracker,
   jaccard,
+  sampleForCompare,
   stableStringify,
   tokenize,
 } from "./similarity.ts";
+
+// Every `new FuzzyLoopTracker()` below asserts against the built-in defaults,
+// which fuzzyOptionsFromEnv reads out of the environment. A shell (or a CI
+// matrix) that exports any of these would silently retune the detector under
+// the assertions, so the suite pins them rather than inheriting them.
+const FUZZY_ENV = [
+  "LITTLE_CODER_FUZZY_LOOP_THRESHOLD",
+  "LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS",
+  "LITTLE_CODER_FUZZY_LOOP_WINDOW",
+  "LITTLE_CODER_FUZZY_LOOP_STREAK",
+  "LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO",
+];
+let savedEnv: (string | undefined)[] = [];
+beforeEach(() => {
+  savedEnv = FUZZY_ENV.map((k) => process.env[k]);
+  for (const k of FUZZY_ENV) delete process.env[k];
+});
+afterEach(() => {
+  FUZZY_ENV.forEach((k, i) => {
+    const v = savedEnv[i];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  });
+});
 
 const sim = (a: string, b: string) => jaccard(bigrams(tokenize(a)), bigrams(tokenize(b)));
 
@@ -94,13 +119,50 @@ describe("similarity calibration", () => {
     expect(tokenize("ls -la").length).toBeLessThan(20);
     expect(tokenize("cat /tmp/out.txt").length).toBeLessThan(20);
   });
-  it("needs roughly thirty tokens before a single changed token scores 0.85", () => {
-    // Bigram similarity for one changed token in n tokens is (n-3)/(n+1), so
-    // a short command varying one constant is below threshold by
-    // construction — the detector's reach starts at long commands and files.
-    const short = (n: number) => `./compressor --window ${n} --input corpus.bin --output out.bin --threads 4`;
-    expect(tokenize(short(512)).length).toBeLessThan(30);
-    expect(sim(short(512), short(1024))).toBeLessThan(0.85);
+  // Over n distinct tokens there are n-1 bigrams. Changing one INTERIOR
+  // token rewrites the two bigrams it sits in, leaving n-3 shared out of a
+  // union of n+1: (n-3)/(n+1), which reaches 0.85 at n = 26. Changing the
+  // FIRST or LAST token rewrites only one bigram: (n-2)/n, which reaches
+  // 0.85 at n = 14 — well inside the eligible range, since the min-token
+  // floor is 20. So similarity alone does NOT keep a short command with one
+  // varying constant quiet; where the constant usually sits (trailing, as in
+  // `--window 512`) it scores ≥ 0.90 as soon as the command is long enough
+  // to be looked at, and the min-token floor is the whole of what excludes
+  // shorter ones. Firing on a long command that sweeps a trailing constant
+  // is this detector's headline case, not a false positive.
+  it("takes 26 tokens for one changed interior token to reach 0.85", () => {
+    const seq = (n: number, at: number) =>
+      Array.from({ length: n }, (_, i) => (i === at ? "changed" : `tok_${i}`)).join(" ");
+    const interior = (n: number) => sim(seq(n, -1), seq(n, Math.floor(n / 2)));
+    expect(interior(25)).toBeCloseTo(22 / 26, 6);
+    expect(interior(25)).toBeLessThan(0.85);
+    expect(interior(26)).toBeCloseTo(23 / 27, 6);
+    expect(interior(26)).toBeGreaterThanOrEqual(0.85);
+  });
+  it("takes 14 tokens for one changed trailing token to reach 0.85", () => {
+    const seq = (n: number, at: number) =>
+      Array.from({ length: n }, (_, i) => (i === at ? "changed" : `tok_${i}`)).join(" ");
+    const trailing = (n: number) => sim(seq(n, -1), seq(n, n - 1));
+    expect(trailing(13)).toBeCloseTo(11 / 13, 6);
+    expect(trailing(13)).toBeLessThan(0.85);
+    expect(trailing(14)).toBeCloseTo(12 / 14, 6);
+    expect(trailing(14)).toBeGreaterThanOrEqual(0.85);
+  });
+});
+
+describe("sampleForCompare", () => {
+  const big = (fill: string) => fill.repeat(Math.ceil(40000 / fill.length)).slice(0, 40000);
+  it("returns text at or under the cap unchanged", () => {
+    expect(sampleForCompare("make test")).toBe("make test");
+  });
+  it("bounds a large text to the cap plus its own join", () => {
+    expect(sampleForCompare(big("abcdefgh")).length).toBe(16 * 1024 + 1);
+  });
+  it("keeps both ends, so a shared prefix alone is not the whole comparison", () => {
+    const text = `${"head ".repeat(4000)}TAILMARKER`;
+    const sampled = sampleForCompare(text);
+    expect(sampled.startsWith("head head")).toBe(true);
+    expect(sampled.endsWith("TAILMARKER")).toBe(true);
   });
 });
 
@@ -129,9 +191,9 @@ describe("extractComparableText", () => {
     const b = extractComparableText({ name: "Grep", input: { b: 2, a: 1 } });
     expect(a).toBe(b);
   });
-  it("caps the extracted text at 16 KB", () => {
+  it("returns the whole text — bounding it is sampleForCompare's job", () => {
     const text = extractComparableText({ name: "Write", input: { path: "/a", content: "x".repeat(40000) } });
-    expect(text.length).toBe(16 * 1024);
+    expect(text.length).toBe(40003);
   });
 });
 
@@ -230,11 +292,20 @@ describe("FuzzyLoopTracker", () => {
     const patch = (from: number, tag: string, note = "") =>
       scriptLines()
         .map((l, i) =>
-          i >= from && i < from + 6
+          i >= from && i < from + 5
             ? `  $accumulator_${tag}_${i} = reduce_${tag}($acc, ${i}, $limit, $state, "${tag}-${i}") or last_${tag}();${note}`
             : l,
         )
         .join("\n");
+    // Both directions of this fixture have to hold at once, and the assertions
+    // below say nothing if either lands within noise of the threshold. Five
+    // patched lines keeps every margin at ~5%: each patch scores ~0.895
+    // against the unpatched script (merge) and ~0.804 against the other patch
+    // (separation). Six lines put the merge at ~0.876, a 3% margin that a
+    // changed verb or line length could flip.
+    expect(sim(patch(10, "v"), scriptLines().join("\n"))).toBeGreaterThan(0.89);
+    expect(sim(patch(60, "w"), scriptLines().join("\n"))).toBeGreaterThan(0.89);
+    expect(sim(patch(10, "v"), patch(60, "w"))).toBeLessThan(0.81);
     const t = new FuzzyLoopTracker({ window: 20 });
     t.recordTurn(1, [write(patch(10, "v"))]);
     t.recordTurn(2, [write(patch(10, "v", " # retry"))]);
@@ -245,6 +316,61 @@ describe("FuzzyLoopTracker", () => {
     t.markNotified(first!.clusterId);
     const merged = t.recordTurn(6, [write(scriptLines().join("\n"))]);
     expect(merged).toMatchObject({ escalated: true });
+  });
+
+  it("leaves short commands alone even when they score above the threshold", () => {
+    // The min-token floor, not the similarity math, is what keeps short
+    // commands out: this pair is 15 tokens and scores 0.867, because a
+    // changed LAST token moves only one bigram. Without the floor these three
+    // turns would cluster and steer.
+    const cmd = (n: number) =>
+      `./compressor --input /data/corpus.bin --output /tmp/out.bin --threads 4 --level 9 --window ${n}`;
+    expect(tokenize(cmd(512)).length).toBe(15);
+    expect(sim(cmd(512), cmd(1024))).toBeGreaterThan(0.85);
+    const t = new FuzzyLoopTracker();
+    t.recordTurn(1, [call("ShellSession", { command: cmd(512) })]);
+    t.recordTurn(2, [call("ShellSession", { command: cmd(1024) })]);
+    expect(t.recordTurn(3, [call("ShellSession", { command: cmd(2048) })])).toBeNull();
+  });
+
+  it("does not match two large files on a shared prefix alone", () => {
+    // Past the sampling cap a head-only comparison sees nothing but the
+    // shared preamble and scores 1.0 on unrelated bodies.
+    const body = (tag: string) =>
+      Array.from({ length: 200 }, (_, i) => `  $out_${tag}[${i}] = ${tag}_${i}($state_${tag}, ${i * 3});`).join("\n");
+    const preamble = [body("hdr_a"), body("hdr_b")].join("\n");
+    expect(preamble.length).toBeGreaterThan(16 * 1024);
+    const t = new FuzzyLoopTracker();
+    t.recordTurn(1, [write(`${preamble}\n${body("alpha")}`)]);
+    t.recordTurn(2, [write(`${preamble}\n${body("beta")}`)]);
+    expect(t.recordTurn(3, [write(`${preamble}\n${body("gamma")}`)])).toBeNull();
+  });
+
+  it("exempts a file built up past the sampling cap", () => {
+    // The growth exemption has to survive sampling: the shingle count of a
+    // sampled file stops growing with it, and its tail sample slides as the
+    // file is appended to, so neither can be what growth is read from.
+    const upTo = (n: number) =>
+      Array.from({ length: n }, (_, i) => `  $out[${i}] = stage_${i}($state, "row-${i}", ${i * 3 + 1});`).join("\n");
+    expect(upTo(400).length).toBeGreaterThan(16 * 1024);
+    const t = new FuzzyLoopTracker();
+    t.recordTurn(1, [write(upTo(400))]);
+    t.recordTurn(2, [write(upTo(420))]);
+    expect(t.recordTurn(3, [write(upTo(440))])).toBeNull();
+  });
+
+  it("does not re-report a cluster on a turn that did not grow it", () => {
+    // A detection a higher-priority verdict suppressed is not queued; it is
+    // re-derived. It must therefore stop being due once the loop stops,
+    // rather than repeating for every turn its members stay in the window.
+    const t = new FuzzyLoopTracker({ window: 20 });
+    t.recordTurn(1, [write(script(1))]);
+    t.recordTurn(2, [write(script(2))]);
+    expect(t.recordTurn(3, [write(script(3))])).toMatchObject({ count: 3 });
+    // Nothing marked notified: the harness spoke about something else this
+    // turn. The model then moves on to unrelated work.
+    expect(t.recordTurn(4, [call("ShellSession", { command: script(4) })])).toBeNull();
+    expect(t.recordTurn(5, [])).toBeNull();
   });
 
   it("is disabled by a streak of 0", () => {

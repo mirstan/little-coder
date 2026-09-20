@@ -179,11 +179,13 @@ export function phraseForUser(reason: string): string {
 
 // Counts are safe to state in these two, unlike the tier-2 escalation's: each
 // tracker counts exactly the attempts it is describing, not a mixed-reason
-// streak.
+// streak. Neither is a SPAN, though -- the fuzzy count is distinct turns in
+// one cluster, the failure count is attempts matching one signature, and
+// other turns can sit between them -- so neither opening says "your last N".
 export function buildNearDuplicateLoopMessage(count: number, escalated: boolean): string {
   const opening = escalated
-    ? `You are still repeating the same action: ${count} of your attempts are now near-identical variations of each other.`
-    : `Your last ${count} attempts are near-identical variations of the same action -- only small details changed each time, and this has not converged.`;
+    ? `You are still repeating the same action: ${count} of your recent turns are now near-identical variations of each other.`
+    : `Across ${count} of your recent turns you have made near-identical variations of the same action -- only small details changed each time, and this has not converged.`;
   return (
     `${opening} Stop varying constants or cosmetic details. State explicitly ` +
     "what hypothesis each attempt was testing and what you learned from it, " +
@@ -204,7 +206,7 @@ export function buildFailureSignatureMessage(
   const also = opts.corroborated ? " -- and those attempts were themselves near-identical" : "";
   const opening = opts.escalated
     ? `That is now ${count} ${toolName} attempts with the same outcome${also}.`
-    : `Your last ${count} ${toolName} attempts produced essentially the identical error or output, even though the attempts themselves differed${also}.`;
+    : `${count} of your recent ${toolName} attempts produced essentially the identical error or output, each one after you had changed the command${also}.`;
   return (
     `${opening} Changing details is not changing the outcome -- the approach ` +
     "itself is failing. Before the next attempt, state what the error " +

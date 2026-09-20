@@ -68,9 +68,22 @@ export function stableStringify(value: unknown, depth = 0): string {
   return `{${parts.join(",")}}`;
 }
 
-// Tokenizing a whole multi-megabyte Write bounds nothing; a prefix of a large
-// near-duplicate is still overwhelmingly similar to its neighbour's prefix.
+// Tokenizing a whole multi-megabyte Write bounds nothing. Head AND tail,
+// rather than a prefix: two files sharing a long generated preamble and
+// nothing else would compare as that preamble alone and score 1.0.
 const MAX_COMPARE_CHARS = 16 * 1024;
+const SAMPLE_HALF = MAX_COMPARE_CHARS / 2;
+
+/**
+ * At most `MAX_COMPARE_CHARS` of `text`, taken from both ends. A change in
+ * the middle of a file larger than that is invisible to the comparison, so
+ * this can still report two such files as similar — it cannot make two files
+ * that differ at either end look alike.
+ */
+export function sampleForCompare(text: string): string {
+  if (text.length <= MAX_COMPARE_CHARS) return text;
+  return `${text.slice(0, SAMPLE_HALF)}\n${text.slice(text.length - SAMPLE_HALF)}`;
+}
 
 function str(value: unknown): string | null {
   return typeof value === "string" ? value : null;
@@ -80,6 +93,10 @@ function str(value: unknown): string | null {
  * The part of a call that carries its meaning, per tool. Reads well-known
  * property names with typeof checks and falls back to the whole input, so an
  * unknown tool or a missing field is still comparable rather than skipped.
+ *
+ * Returned whole; `sampleForCompare` bounds what is tokenized. The full
+ * length is what the growth exemption measures, which a bounded sample can
+ * no longer report.
  */
 export function extractComparableText(call: ToolCall): string {
   const input = call.input;
@@ -100,7 +117,7 @@ export function extractComparableText(call: ToolCall): string {
       }
     }
   }
-  return (text ?? stableStringify(input)).slice(0, MAX_COMPARE_CHARS);
+  return text ?? stableStringify(input);
 }
 
 export interface FuzzyOptions {
@@ -125,10 +142,12 @@ export function fuzzyOptionsFromEnv(overrides: Partial<FuzzyOptions> = {}): Fuzz
 
 // A later version containing nearly all of an earlier one AND being larger is
 // a file being built up, not an attempt being retried. Containment is measured
-// over shingle sets, so it needs no notion of what changed. The ratio is small
-// because the two cases are already close: appending ~8% of a file scores
-// ~0.92 against its predecessor, while retrying it with cosmetic edits keeps
-// the size within ~1%.
+// over shingle sets, so it needs no notion of what changed; size is measured
+// in characters of the whole text, because past MAX_COMPARE_CHARS a sampled
+// shingle count stops growing with the file. The ratio is small because the
+// two cases are already close: appending ~8% of a file scores ~0.92 against
+// its predecessor, while retrying it with cosmetic edits keeps the size
+// within ~1%.
 const GROWTH_CONTAINMENT = 0.95;
 
 export interface NearDuplicateDetection {
@@ -140,11 +159,23 @@ export interface NearDuplicateDetection {
   escalated: boolean;
 }
 
-interface WindowEntry {
+/** What one call contributes to the comparison, already shingled. */
+interface Shingled {
+  shingles: Set<string>;
+  /**
+   * Bigrams of the leading half of the sample alone. Identical to `shingles`
+   * unless the text was sampled: appending to a file slides the tail sample
+   * but cannot move its head, so the growth exemption reads this instead.
+   */
+  head: Set<string>;
+  /** Characters of comparable text before sampling — the growth measure. */
+  length: number;
+}
+
+interface WindowEntry extends Shingled {
   tool: string;
   /** name + stable input, for excluding verbatim repeats. */
   key: string;
-  shingles: Set<string>;
   turn: number;
   cluster: number;
 }
@@ -178,10 +209,18 @@ export class FuzzyLoopTracker {
     if (this.opts.streak <= 0) return null;
     this.prune(turn);
 
+    const added: WindowEntry[] = [];
     for (const { call, id } of calls) {
-      const tokens = tokenize(extractComparableText(call));
+      const text = extractComparableText(call);
+      const sample = sampleForCompare(text);
+      const tokens = tokenize(sample);
       if (tokens.length < this.opts.minTokens) continue;
       const shingles = bigrams(tokens);
+      const now: Shingled = {
+        shingles,
+        head: sample === text ? shingles : bigrams(tokenize(sample.slice(0, SAMPLE_HALF))),
+        length: text.length,
+      };
       const tool = call.name.toLowerCase();
       const key = `${call.name} ${stableStringify(call.input)}`;
 
@@ -191,7 +230,7 @@ export class FuzzyLoopTracker {
         // Verbatim repeats belong to the existing loop-breaker; clustering
         // them here would double-fire with it.
         if (entry.key === key) continue;
-        if (this.isGrowth(entry.shingles, shingles)) continue;
+        if (this.isGrowth(entry, now)) continue;
         if (jaccard(entry.shingles, shingles) >= this.opts.threshold) matched.push(entry.cluster);
       }
 
@@ -210,11 +249,15 @@ export class FuzzyLoopTracker {
         for (const c of matched) this.notified.delete(c);
         if (sent > 0) this.notified.set(cluster, sent);
       }
-      this.entries.push({ tool, key, shingles, turn, cluster });
+      const entry: WindowEntry = { ...now, tool, key, turn, cluster };
+      this.entries.push(entry);
+      added.push(entry);
       if (id !== undefined) this.clusterIds.set(id, cluster);
     }
 
-    return this.due();
+    // The entries, not the cluster ids read off them: a later call in this
+    // same turn can merge clusters, which renumbers `entry.cluster` in place.
+    return this.due(added);
   }
 
   clusterIdForToolCallId(id: string | undefined): number | undefined {
@@ -234,16 +277,20 @@ export class FuzzyLoopTracker {
     this.notified.set(cluster, (this.notified.get(cluster) ?? 0) + 1);
   }
 
-  private isGrowth(earlier: Set<string>, later: Set<string>): boolean {
+  private isGrowth(earlier: Shingled, later: Shingled): boolean {
     if (this.opts.growthRatio <= 1) return false;
-    if (later.size < earlier.size * this.opts.growthRatio) return false;
-    return containment(earlier, later) >= GROWTH_CONTAINMENT;
+    if (later.length < earlier.length * this.opts.growthRatio) return false;
+    return containment(earlier.head, later.head) >= GROWTH_CONTAINMENT;
   }
 
-  private due(): NearDuplicateDetection | null {
+  // Only clusters this turn added a call to. A cluster that merely survives
+  // in the window is not news: without this, a detection a higher-priority
+  // intervention suppressed would re-fire on every later turn until its last
+  // member aged out, long after the loop it described had stopped.
+  private due(added: WindowEntry[]): NearDuplicateDetection | null {
     const seen = new Set<number>();
     let best: NearDuplicateDetection | null = null;
-    for (const entry of this.entries) {
+    for (const entry of added) {
       if (seen.has(entry.cluster)) continue;
       seen.add(entry.cluster);
       const count = this.clusterSize(entry.cluster);

@@ -208,15 +208,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    const message = (event as any).message;
-    if (!message) return;
-
-    // Consumed unconditionally, before any early return below: any tool_call
-    // events recorded while THIS turn was in flight belong to this turn no
-    // matter how it concludes. Leaving this cleared only on the normal path
-    // let an aborted/errored turn's calls leak into the NEXT turn's
-    // offending-call lookup, misarming the block on a stale entry from a
-    // turn that was never even assessed.
+    // Consumed unconditionally, before every early return below — the
+    // missing-message one included: any tool_call events recorded while THIS
+    // turn was in flight belong to this turn no matter how it concludes.
+    // Leaving this cleared only on the normal path let an aborted/errored
+    // turn's calls leak into the NEXT turn's offending-call lookup, misarming
+    // the block on a stale entry from a turn that was never even assessed.
     const thisTurnValidatedCalls = turnValidatedCalls;
     turnValidatedCalls = [];
     // Same reasoning, and the same consequence for an aborted turn: results
@@ -224,6 +221,9 @@ export default function (pi: ExtensionAPI) {
     // counted toward a streak on a turn that was never assessed.
     const thisTurnResults = turnResults;
     turnResults = [];
+
+    const message = (event as any).message;
+    if (!message) return;
 
     // Skip turns that were interrupted/aborted — by the user pressing ESC OR by
     // a harness abort (thinking-budget, turn-cap). pi marks these with

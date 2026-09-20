@@ -1,10 +1,35 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import {
   FailureSignatureTracker,
   normalizeTail,
   readResult,
   signatureOf,
 } from "./failure-signature.ts";
+
+// The assertions below are written against the built-in defaults (streak 3,
+// threshold 0.95, window 8, tail 40 lines), which failsigOptionsFromEnv reads
+// out of the environment. These knobs are advertised for CI and local tuning,
+// so a shell that sets one would otherwise retune the watchdog under the
+// tests instead of being pinned out of them.
+const FAILSIG_ENV = [
+  "LITTLE_CODER_FAILSIG_TAIL_LINES",
+  "LITTLE_CODER_FAILSIG_THRESHOLD",
+  "LITTLE_CODER_FAILSIG_STREAK",
+  "LITTLE_CODER_FAILSIG_WINDOW",
+  "LITTLE_CODER_FAILSIG_MIN_TOKENS",
+];
+let savedEnv: (string | undefined)[] = [];
+beforeEach(() => {
+  savedEnv = FAILSIG_ENV.map((k) => process.env[k]);
+  for (const k of FAILSIG_ENV) delete process.env[k];
+});
+afterEach(() => {
+  FAILSIG_ENV.forEach((k, i) => {
+    const v = savedEnv[i];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  });
+});
 
 // What ShellSession actually returns: the failure is in the footer, and the
 // result is never flagged as an error.
@@ -137,6 +162,55 @@ describe("FailureSignatureTracker", () => {
     t.record(obs("./run --a", SHELL_FAIL), 1);
     t.record(obs("./run --b", SHELL_FAIL), 2);
     expect(t.record(obs("./run --c", SHELL_FAIL), 30)).toBeNull();
+  });
+
+  it("spans `window` turns inclusive, as the fuzzy tracker's window does", () => {
+    // Turns 1 and 8 are eight turns of history; turns 1 and 9 are nine, and
+    // the fuzzy tracker has already dropped turn 1 by then. Counting them
+    // together here would let one detector corroborate a span the other no
+    // longer holds.
+    const inside = new FailureSignatureTracker({ window: 8, streak: 2 });
+    inside.record(obs("./run --a", SHELL_FAIL), 1);
+    expect(inside.record(obs("./run --b", SHELL_FAIL), 8)).toMatchObject({ count: 2 });
+    const outside = new FailureSignatureTracker({ window: 8, streak: 2 });
+    outside.record(obs("./run --a", SHELL_FAIL), 1);
+    expect(outside.record(obs("./run --b", SHELL_FAIL), 9)).toBeNull();
+  });
+
+  // Enough other tools to overflow MAX_TRACKED (16) and force one eviction.
+  const fillOtherTools = (t: FailureSignatureTracker, from: number, count: number, turn: number) => {
+    for (let i = 0; i < count; i++) {
+      t.record(
+        { toolName: `Tool${from + i}`, input: { command: "./x" }, text: SHELL_FAIL, isError: false },
+        turn + i,
+      );
+    }
+  };
+
+  it("keeps a still-counting streak through an eviction", () => {
+    // Eviction drops the front of the map, so an entry that keeps matching
+    // has to be moved to the back as it counts -- otherwise the tool that
+    // started the session is the first one dropped, however live its streak.
+    const t = new FailureSignatureTracker({ window: 50 });
+    t.record(obs("./run --a", SHELL_FAIL), 1);
+    fillOtherTools(t, 1, 8, 2);
+    t.record(obs("./run --b", SHELL_FAIL), 10);
+    fillOtherTools(t, 9, 8, 11);
+    expect(t.record(obs("./run --c", SHELL_FAIL), 19)).toMatchObject({ count: 3 });
+  });
+
+  it("forgets an evicted signature's spent messages along with it", () => {
+    // The message budget is keyed by signature, so a record outliving its
+    // entry both grows without bound and silences the same failure if it
+    // comes back.
+    const t = new FailureSignatureTracker({ window: 50 });
+    for (const n of [1, 2]) t.record(obs(`./run --${n}`, SHELL_FAIL), n);
+    const first = t.record(obs("./run --3", SHELL_FAIL), 3);
+    expect(first).toMatchObject({ count: 3 });
+    t.markNotified(first!.sigKey);
+    fillOtherTools(t, 1, 16, 4);
+    for (const n of [4, 5] as const) t.record(obs(`./run --${n}`, SHELL_FAIL), 20 + n);
+    expect(t.record(obs("./run --6", SHELL_FAIL), 26)).toMatchObject({ count: 3 });
   });
 
   it("ignores failures with nothing to identify them by", () => {

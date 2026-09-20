@@ -1,8 +1,37 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { assessResponse, buildCorrectionMessage, phraseForUser } from "./quality.ts";
 import setupQualityMonitor from "./index.ts";
 
 const known = new Set(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]);
+
+// The integration tests below drive the two detectors through the extension,
+// which builds them with their env-derived defaults -- the same knobs
+// similarity.test.ts and failure-signature.test.ts pin. A shell exporting any
+// of them would retune the detectors under these assertions.
+const DETECTOR_ENV = [
+  "LITTLE_CODER_FUZZY_LOOP_THRESHOLD",
+  "LITTLE_CODER_FUZZY_LOOP_MIN_TOKENS",
+  "LITTLE_CODER_FUZZY_LOOP_WINDOW",
+  "LITTLE_CODER_FUZZY_LOOP_STREAK",
+  "LITTLE_CODER_FUZZY_LOOP_GROWTH_RATIO",
+  "LITTLE_CODER_FAILSIG_TAIL_LINES",
+  "LITTLE_CODER_FAILSIG_THRESHOLD",
+  "LITTLE_CODER_FAILSIG_STREAK",
+  "LITTLE_CODER_FAILSIG_WINDOW",
+  "LITTLE_CODER_FAILSIG_MIN_TOKENS",
+];
+let savedDetectorEnv: (string | undefined)[] = [];
+beforeEach(() => {
+  savedDetectorEnv = DETECTOR_ENV.map((k) => process.env[k]);
+  for (const k of DETECTOR_ENV) delete process.env[k];
+});
+afterEach(() => {
+  DETECTOR_ENV.forEach((k, i) => {
+    const v = savedDetectorEnv[i];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  });
+});
 
 describe("assessResponse", () => {
   it("accepts text-only assistant response", () => {
@@ -558,8 +587,9 @@ describe("quality-monitor tier-2 escalation", () => {
 });
 
 // ── near-duplicate loops and repeated failure signatures ───────────────────
-// Both are steer-only: no assertion below expects a block, and every one of
-// them checks that none armed.
+// Both are steer-only: no assertion below expects a block, and one test per
+// detector ("nudges a constant-sweep probe loop..." and "fires on
+// ShellSession failures...") confirms with fireToolCall that none armed.
 
 // pi's raw content blocks carry the id the matching tool_result reports; the
 // two detectors are only correlated through it.
@@ -784,9 +814,11 @@ describe("quality-monitor repeated-failure watchdog", () => {
     }
     expect(h.followUps).toHaveLength(1);
     expect(h.followUps[0].msg).toMatch(/identical error or output/i);
-    expect(h.followUps[0].msg).toContain("3 ShellSession attempts");
+    expect(h.followUps[0].msg).toContain("3 of your recent ShellSession attempts");
     expect(h.followUps[0].opts).toEqual({ deliverAs: "steer" });
     expect(h.notifies.join("\n")).toMatch(/identical failure/i);
+    // Steer-only: the next attempt still runs.
+    expect(await fireToolCall(h, "ShellSession", run(4).input)).toBeUndefined();
   });
 
   it("fires on pi's built-in bash failures, which throw instead", async () => {
@@ -853,6 +885,17 @@ describe("quality-monitor repeated-failure watchdog", () => {
     // The cluster reaching three must not repeat what that message said.
     await fireTurnWithResults(h, [{ name: "ShellSession", input: { command: probe(2048) } }], [{ text: SHELL_FAIL }]);
     expect(h.followUps).toHaveLength(1);
+  });
+
+  it("drops results that arrived before a turn_end carrying no message", async () => {
+    // Whatever produces a message-less turn_end, the results that arrived
+    // under it end with it: carried forward, they would be counted as the
+    // NEXT turn's output and could complete a streak on their own.
+    for (const n of [1, 2]) await fireTurnWithResults(h, [run(n)], [{ text: SHELL_FAIL }]);
+    await fireToolResult(h, { toolName: "ShellSession", input: { command: "./compressor --mode 3" }, text: SHELL_FAIL });
+    await fire(h, "turn_end", {});
+    await fireTurnWithResults(h, [{ name: "Read", input: { path: "/app/notes.md" } }], [null]);
+    expect(h.followUps).toHaveLength(0);
   });
 
   it("drops results that arrived during an aborted turn", async () => {
