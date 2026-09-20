@@ -182,7 +182,6 @@ export function formatOutput(
   const pre = capBytesHeadTail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES);
   const dedupped = dedupLines(pre.text.split("\n"));
   const dedupJoined = dedupped.join("\n");
-  // Byte caps below still bound anything genuinely large.
   const skipLineCap = byteLen(dedupJoined) <= SMALL_OUTPUT_FLOOR_BYTES;
   const { lines, truncated } = skipLineCap
     ? { lines: dedupped, truncated: false }

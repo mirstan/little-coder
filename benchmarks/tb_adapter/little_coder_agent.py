@@ -134,7 +134,6 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
         deduped.append(f"  [... {dup} duplicate line(s) collapsed ...]")
     # truncate
     truncated = False
-    # Byte caps below still bound anything genuinely large.
     if len(deduped) > MAX_LINES and len("\n".join(deduped).encode("utf-8")) > SMALL_OUTPUT_FLOOR_BYTES:
         head = MAX_LINES // 2
         tail = MAX_LINES // 4
