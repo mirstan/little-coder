@@ -10,6 +10,7 @@ import {
   capBytesHeadTail,
   byteLen,
   MAX_LINES,
+  SMALL_OUTPUT_FLOOR_BYTES,
 } from "./helpers.ts";
 
 describe("stripAnsi", () => {
@@ -61,7 +62,8 @@ describe("formatOutput", () => {
     expect(out.startsWith("[")).toBe(true);
   });
   it("appends output_truncated when head/tail cut", () => {
-    const big = Array.from({ length: 500 }, (_, i) => `line${i}`).join("\n");
+    // Padded past the 4KB small-output floor so the line cap still fires.
+    const big = Array.from({ length: 500 }, (_, i) => `line${i}`.padEnd(20, "x")).join("\n");
     const out = formatOutput(big, 0, "/", false, "");
     expect(out).toContain("output_truncated=true");
   });
@@ -148,6 +150,30 @@ describe("formatOutput byte cap", () => {
     expect(out).toContain("output_truncated=true");
     expect(byteLen(out)).toBeLessThanOrEqual(48 * 1024);
     expect(out.split("\n").length).toBeLessThanOrEqual(MAX_LINES);
+  });
+
+  it("skips the line cap for small-but-many-lines output (below the 4KB floor)", () => {
+    // 300 lines, ~1.5KB total -- e.g. `ls -1` on a big sparse directory.
+    const lines = Array.from({ length: 300 }, (_, i) => String(i).padStart(4, "0"));
+    const text = lines.join("\n");
+    expect(byteLen(text)).toBeLessThan(SMALL_OUTPUT_FLOOR_BYTES);
+
+    const out = formatOutput(text, 0, "/tmp", false, "");
+    expect(out).not.toContain("lines truncated");
+    expect(out).not.toContain("output_truncated=true");
+    for (const line of lines) expect(out).toContain(line);
+  });
+
+  it("still applies the line cap once padded past the 4KB floor", () => {
+    // Same 300 lines, padded to ~6KB total -- unchanged from before this fix.
+    const text = Array.from({ length: 300 }, (_, i) => String(i).padStart(4, "0") + "x".repeat(15)).join(
+      "\n",
+    );
+    expect(byteLen(text)).toBeGreaterThan(SMALL_OUTPUT_FLOOR_BYTES);
+
+    const out = formatOutput(text, 0, "/tmp", false, "");
+    expect(out).toContain("lines truncated");
+    expect(out).toContain("output_truncated=true");
   });
 
   it("still lets dedup rescue a flood of identical lines", () => {

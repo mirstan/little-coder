@@ -9,6 +9,9 @@ import { join } from "node:path";
 
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 export const MAX_LINES = 200;
+// Tiny relative to the 32KB/16KB byte caps below, which still catch anything
+// past this that's actually large.
+export const SMALL_OUTPUT_FLOOR_BYTES = 4 * 1024;
 export const DEFAULT_TIMEOUT = 30;
 
 // Byte caps, which the line cap alone cannot enforce: one 1MB line is one
@@ -178,8 +181,17 @@ export function formatOutput(
   const rawBytes = byteLen(cleaned);
   const pre = capBytesHeadTail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES);
   const dedupped = dedupLines(pre.text.split("\n"));
-  const { lines, truncated } = truncateLines(dedupped);
-  const post = capBytesHeadTail(lines.join("\n"), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES);
+  const dedupJoined = dedupped.join("\n");
+  // Byte caps below still bound anything genuinely large.
+  const skipLineCap = byteLen(dedupJoined) <= SMALL_OUTPUT_FLOOR_BYTES;
+  const { lines, truncated } = skipLineCap
+    ? { lines: dedupped, truncated: false }
+    : truncateLines(dedupped);
+  const post = capBytesHeadTail(
+    skipLineCap ? dedupJoined : lines.join("\n"),
+    MAX_BODY_HEAD_BYTES,
+    MAX_BODY_TAIL_BYTES,
+  );
   let body = post.text;
   const byteCapped = pre.dropped > 0 || post.dropped > 0;
 

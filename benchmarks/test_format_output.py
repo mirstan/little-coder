@@ -192,13 +192,38 @@ def test_byte_capped_true_only_when_the_byte_cap_actually_fired(ad):
     assert "output_truncated=true" in giant
     assert "byte_capped=true" in giant
 
-    # 300 short lines (a few KB total) trips only the 200-line cap -- nowhere
-    # near either byte-cap stage (384KB raw pre-cap, 48KB body cap), unlike
-    # test_caps_many_short_lines_by_line_count's 300,000-line/~12MB input,
-    # which is large enough in aggregate to trip the raw pre-cap too.
-    small_many_lines = ad.fmt("\n".join(f"line {i}" for i in range(300)))
+    # 300 lines of ~6KB total -- above the 4KB small-output floor, so the
+    # 200-line cap still fires, but nowhere near either byte-cap stage (384KB
+    # raw pre-cap, 48KB body cap), unlike test_caps_many_short_lines_by_line_
+    # count's 300,000-line/~12MB input, which is large enough in aggregate to
+    # trip the raw pre-cap too.
+    small_many_lines = ad.fmt("\n".join(f"{i:04d}" + "x" * 15 for i in range(300)))
     assert "output_truncated=true" in small_many_lines
     assert "byte_capped=true" not in small_many_lines
+
+
+def test_small_output_floor_skips_the_line_cap(ad):
+    """300 lines but ~1.5KB total -- under the 4KB floor, so the middle
+    survives even though line count alone would otherwise trip the cap
+    (e.g. `ls -1` on a big sparse directory, `seq` output)."""
+    lines = [f"{i:04d}" for i in range(300)]
+    text = "\n".join(lines)
+    assert len(text.encode()) < ad.mod.SMALL_OUTPUT_FLOOR_BYTES
+    out = ad.fmt(text)
+    assert "lines truncated" not in out
+    assert "output_truncated=true" not in out
+    for line in lines:
+        assert line in out
+
+
+def test_small_output_floor_does_not_change_larger_line_capped_output(ad):
+    """Same 300 lines, padded to ~6KB total -- above the floor, so the
+    200-line cap still fires exactly as before this change."""
+    text = "\n".join(f"{i:04d}" + "x" * 15 for i in range(300))
+    assert len(text.encode()) > ad.mod.SMALL_OUTPUT_FLOOR_BYTES
+    out = ad.fmt(text)
+    assert "lines truncated" in out
+    assert "output_truncated=true" in out
 
 
 def test_dedup_still_rescues_identical_lines(ad):
