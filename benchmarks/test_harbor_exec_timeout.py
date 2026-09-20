@@ -153,8 +153,7 @@ def test_bridge_timeout_reports_timed_out_true(monkeypatch):
 
 
 def test_mutation_regex_substring_would_over_match():
-    """Pins the finding from this PR's by-hand mutation test: loosening
-    _HARBOR_TIMEOUT_MSG_RE's anchors AND its call site's .fullmatch() to
+    """Loosening _HARBOR_TIMEOUT_MSG_RE's anchors AND its call site's .fullmatch() to
     .search() together made test_unrelated_runtimeerror_does_not_over_match
     fail (loosening only one of the two left it passing -- .fullmatch()
     enforces a full-string match regardless of anchors). This asserts the

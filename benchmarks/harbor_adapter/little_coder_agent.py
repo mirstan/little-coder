@@ -1197,12 +1197,6 @@ class _HarborShellProxy:
         try:
             return fut.result(timeout=timeout + 30)
         except concurrent.futures.TimeoutError as e:
-            # This layer's own timeout+30 margin expired -- _exec_async is
-            # still running (or stuck) on self.loop. Unlike the docker
-            # RuntimeError case above, we have no confirmation env.exec()'s
-            # connection was ever killed -- _BRIDGE_TIMEOUT_WARNING is
-            # deliberately hedged instead of reusing _TIMEOUT_KILL_WARNING's
-            # confirmed-killed wording.
             warning = _BRIDGE_TIMEOUT_WARNING.format(N=timeout)
             return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
         except Exception as e:

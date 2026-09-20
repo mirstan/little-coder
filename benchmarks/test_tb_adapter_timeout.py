@@ -1,8 +1,8 @@
 """_TmuxShellProxy.run()'s sentinel-missing timeout path.
 
-Loaded with `terminal_bench` stubbed (test_format_output.py's convention):
-neither package is installed next to these tests, and the tmux-timeout logic
-under test touches neither package's real behavior.
+Loaded with `terminal_bench` stubbed (test_format_output.py's convention): it
+is not installed next to these tests, and the tmux-timeout logic under test
+touches none of its real behavior.
 """
 from __future__ import annotations
 

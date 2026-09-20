@@ -161,10 +161,7 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
 # {N}s budget -- which is not only the "command is still running" case.
 # send_keys/capture_pane exceptions are swallowed above (see run()), so this
 # also fires when send_keys failed immediately for a non-timeout reason, or
-# when capture_pane raised (pane == "" -> no output to show at all). State
-# only the observed fact (no sentinel seen) and hedge the process-state claim
-# rather than asserting a real timeout or a still-running process as settled
-# fact.
+# when capture_pane raised (pane == "" -> no output to show at all).
 _TMUX_TIMEOUT_WARNING = (
     "WARNING: no completion sentinel was seen for this command within its {N}s timeout. "
     "It may be STILL RUNNING in the terminal session, it may have failed to start, or its "

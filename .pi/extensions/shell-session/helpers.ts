@@ -177,12 +177,7 @@ const KILLED_TIMED_OUT_WARNING =
   "the end of a script may not have completed -- re-verify (cat/wc/diff) any file it " +
   "touched before trusting it. If it simply needed more time, re-run with a larger timeout.";
 
-// execTmuxProxy's no-response fallback: nothing was killed or interrupted --
-// the command is likely still executing in the tmux pane, and no output was
-// recovered at all (the "response" that would have carried it never came
-// back). Deliberately does NOT suggest a re-run: re-running a command that
-// may still be executing would start a duplicate copy with duplicate side
-// effects.
+// execTmuxProxy's no-response fallback.
 const UNKNOWN_TIMED_OUT_WARNING =
   "WARNING: this command hit its timeout with no response from the session -- nothing " +
   "was killed or interrupted, and it is likely STILL RUNNING. No output was recovered " +
