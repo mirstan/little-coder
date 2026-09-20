@@ -500,7 +500,7 @@ def _initial_snapshot_advertisement(
         "`/app/somefile`). If you ever suspect a task-provided file was "
         "corrupted or overwritten — by a killed command, a buggy script, or "
         "your own edit — diff against or restore from that copy instead of a "
-        "backup you made later. Restore from it only a file you believe you "
+        "backup you made later. Restore from there only a file you believe you "
         "corrupted — never over your own completed solution. Treat it as "
         f"read-only and never write into `{INITIAL_SNAPSHOT_PUBLISH_PATH}`. It "
         "may not contain very large (>10MB) or deeply nested files."
@@ -1812,12 +1812,11 @@ class LittleCoderAgent(BaseAgent):
             proxy, environment, self.logs_dir, self.logger
         )
 
-        # Composed here, after the initial-state snapshot, rather than right
-        # after the probe above: _compose_prompt is pure and `prompt` isn't
-        # read until prompt_with_error_retry far below, so nothing requires
-        # it to exist this early, and leaving it here means a prompt note
-        # that a later change derives from _snapshot_initial_state's outcome
-        # has somewhere to plug in without re-threading this function.
+        # Composed here rather than right after the probe above:
+        # _initial_snapshot_advertisement derives from the initial-state
+        # snapshot's outcome, so composition has to wait for it -- and
+        # `prompt` isn't read until prompt_with_error_retry far below, so
+        # waiting costs nothing.
         prompt = _compose_prompt(
             prompt_prefix,
             prompt_task_block,

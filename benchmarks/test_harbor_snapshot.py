@@ -548,9 +548,9 @@ def test_initial_snapshot_download_failure_is_non_fatal(tmp_path):
 
 
 def test_initial_snapshot_hang_degrades_within_its_timeout(tmp_path, monkeypatch):
-    """A wedged docker-cp must cost the trial only wall-clock, not the stage
-    outcome it already has in hand -- see test_snapshot_outcome_survives_a_
-    hung_download for the outcome-preserving half of this same scenario."""
+    """A wedged docker-cp must not wedge the trial: the download's own
+    timeout turns the hang into a bounded wait. The outcome-preserving half
+    of this same scenario is test_snapshot_outcome_survives_a_hung_download."""
     monkeypatch.setattr(lca, "_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC", 0.05)
     env = _InitialSnapshotEnv(file_count=3, download_delay_sec=60)
 
@@ -818,8 +818,8 @@ def test_environment_snapshot_records_the_probe_result_even_when_empty():
 # failure this guards is the wording being softened, which a test sharing the
 # module's own constant could never notice.
 _RESTRAINT_SENTENCE = (
-    "Restore from it only a file you believe you corrupted — never over your "
-    "own completed solution."
+    "Restore from there only a file you believe you corrupted — never over "
+    "your own completed solution."
 )
 
 
@@ -839,7 +839,8 @@ def test_advertisement_points_at_the_real_published_path(outcome):
         lca._InitialSnapshotOutcome(outcome, True, "msg")
     )
     assert f"{lca.INITIAL_SNAPSHOT_PUBLISH_PATH}/app/" in text
-    # The host-side download lands app/input.tex under this same layout.
+    # The stage command's `cp --parents` keeps the /app prefix, so the
+    # example's app/ layout is the published copy's real one.
     assert f"{lca.INITIAL_SNAPSHOT_PUBLISH_PATH}/app/somefile" in text
 
 
