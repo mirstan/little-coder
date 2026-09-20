@@ -3,7 +3,15 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
-import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
+import {
+  finalizeWarnTurnWindowOpen,
+  finalizeWarnWouldFire,
+} from "../_shared/finalize-warn-trigger.ts";
+import {
+  PROGRESS_MILESTONES,
+  budgetFractionUsed,
+  resolveBudgetStartEpochMs,
+} from "../_shared/budget-progress.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import {
   INITIAL_SNAPSHOT_APP_DIR,
@@ -11,7 +19,7 @@ import {
   type InitialSnapshotOutcome,
 } from "../_shared/snapshot-paths.ts";
 
-// tb-finalize-guard: a merged guard for Terminal-Bench with three independent
+// tb-finalize-guard: a merged guard for Terminal-Bench with four independent
 // trigger conditions, scoped to LITTLE_CODER_BENCHMARK === "terminal_bench"
 // only. GAIA has its own separate gaia-finalize-guard, and the two must
 // never fire on the same benchmark's sessions.
@@ -162,6 +170,47 @@ import {
 // session.
 //
 // ---------------------------------------------------------------------------
+// Trigger D — budget-progress checkpoint
+// ---------------------------------------------------------------------------
+// Otherwise the first time-pressure signal a trial ever gets is
+// finalize-warn's, 10 minutes or 5 turns from the end. One observed trial
+// spent ~70% of its budget on read-only exploration and wrote its first
+// non-scratch file with a sliver of the clock left; the only real code it
+// produced came after that warning. Nothing had told it at half-time that a
+// deliverable should exist by then.
+//
+// So this fires once per session at each of PROGRESS_MILESTONES — fractions
+// of the [trial start, deadline] interval, which is why it needs the start
+// instant _shared/budget-progress.ts resolves and not just the deadline
+// every other trigger here reads. An adapter that publishes neither end
+// (GAIA, aider_polyglot, interactive pi) disables this trigger outright.
+//
+// The earliest milestone is gated on evidence — any non-scratch write seen
+// this session, judged by the same detectDeliverableWrites/isScratchPath
+// pair Trigger B measures compliance with — because interrupting a run that
+// is demonstrably writing costs it a turn for nothing. Later milestones
+// fire either way, with milder wording when that evidence exists. The
+// asymmetry is deliberate: the evidence heuristic answers "does a
+// deliverable-shaped artifact exist", not "does a working one", so letting
+// it decide WHETHER a trial gets a mid-run signal at all would put a
+// heuristic between a model and its only early warning. Deciding only the
+// wording, a wrong answer costs a sentence.
+//
+// Whether the deliverable works is demanded of the model, not detected:
+// many TB deliverables are not programs (a repaired .tex file, a git state,
+// a value written to a path), so the text asks for a real check of whichever
+// shape applies rather than for the file to be run. The deliverable's actual
+// path stays unknowable here for the reason isScratchPath's own comment
+// records — recovering it from the task text was considered and rejected.
+//
+// Endgame turns belong to finalize-warn and Trigger B, so this stands down
+// while their window is open. That check can use neither Trigger B's
+// `armed` latch alone, which stops re-latching once Trigger B has fired,
+// nor `finalizeWarnWouldFire` alone, whose turn half is edge-triggered and
+// so reads false on every turn of the window but one — hence the
+// level-triggered finalizeWarnTurnWindowOpen alongside both.
+//
+// ---------------------------------------------------------------------------
 // Shared instrumentation
 // ---------------------------------------------------------------------------
 // On every terminal_bench turn_end, log the turn's stopReason and a coarse
@@ -204,6 +253,22 @@ let triggerBFired = false;
 // Trigger C reads the last turn_end's assistant message, captured below.
 let triggerCFireCount = 0;
 let lastTurnMessage: any = undefined;
+
+// ---- Trigger D state ----
+// Both latches are session-scoped, like triggerBFired: the interval they
+// are measured against is the whole trial's, which spans pi's internal run
+// boundaries, so a continuation must neither resurrect a milestone already
+// spent nor forget a write from an earlier run. `startForRun` is run-scoped
+// only to be resolved next to deadlineForRun; the env var behind it does
+// not change within a session.
+let milestonesFired = new Set<number>();
+let deliverableWriteEverSeen = false;
+let startForRun = 0;
+// Run-scoped: which turn (if any) Trigger D fired at, so Trigger A's own
+// turn_end for that SAME turn can skip -- both are separately queued
+// steering messages (pi delivers each one, never coalesces them), so
+// firing both stacks two different nudges on the turn D already spoke to.
+let triggerDFiredAtTurn = 0;
 
 function isTerminalBench(): boolean {
   return process.env.LITTLE_CODER_BENCHMARK === "terminal_bench";
@@ -265,25 +330,32 @@ export default function (pi: ExtensionAPI) {
     triggerAFireCount = 0;
     triggerBFired = false;
     triggerCFireCount = 0;
+    milestonesFired = new Set<number>();
+    deliverableWriteEverSeen = false;
   });
 
   pi.on("before_agent_start", async (event) => {
     turnsThisRun = 0;
     capForRun = resolveTurnCap(event);
     deadlineForRun = resolveDeadlineEpochMs(event);
+    startForRun = resolveBudgetStartEpochMs(event);
     armed = false;
     armedAtTurn = 0;
     consecutiveNoWriteTurns = 0;
     lastTurnMessage = undefined;
+    triggerDFiredAtTurn = 0;
   });
 
-  pi.on("turn_start", async () => {
+  pi.on("turn_start", async (_event, ctx) => {
     turnsThisRun++;
     if (!isTerminalBench()) return;
     if (!armed && !triggerBFired && finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) {
       armed = true;
       armedAtTurn = turnsThisRun;
     }
+    // After the arming check, so a turn that arms finalize-warn's window is
+    // already inside the endgame Trigger D defers to.
+    maybeFireTriggerD(pi, ctx);
   });
 
   pi.on("turn_end", async (event, ctx) => {
@@ -305,10 +377,16 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
+    // Computed for every turn, not just the ones Trigger B is armed for:
+    // Trigger D's evidence flag has to be complete from turn 1, long before
+    // Trigger B starts judging compliance.
+    const wroteDeliverable = hasNonScratchWrite(shellCommandsIn(toolCalls));
+    if (wroteDeliverable) deliverableWriteEverSeen = true;
+
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
 
-    maybeAdvanceTriggerB(pi, ctx, toolCalls);
+    maybeAdvanceTriggerB(pi, ctx, wroteDeliverable);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
@@ -430,6 +508,45 @@ export function buildTriggerCRecoveryMessage(
   );
 }
 
+/**
+ * Trigger D's nudge text, for a `fraction` of the budget spent and
+ * `minutesLeft` remaining. Exported and pure for the same reason as
+ * `buildTriggerAMessage`.
+ *
+ * The verification demand is shape-conditional on purpose: a TB deliverable
+ * is often not a program, and "run it" would then be a demand the model
+ * cannot satisfy — spending exactly the turns this nudge exists to save.
+ */
+export function buildTriggerDMessage(
+  fraction: number,
+  minutesLeft: number,
+  hasDeliverableEvidence: boolean,
+): string {
+  const spent =
+    `Progress check: about ${Math.round(fraction * 100)}% of this task's time budget ` +
+    `is spent (~${minutesLeft} minutes remain)`;
+  const check =
+    "check it for real instead of assuming: if your deliverable is a program or " +
+    "script, run it and read its actual output; otherwise compare the file or state " +
+    "you produced against exactly what the task asked for.";
+
+  if (hasDeliverableEvidence) {
+    return (
+      `${spent}. Make sure your best current version is saved at the task's required ` +
+      `path right now, and ${check} Spend what is left improving what you have rather ` +
+      "than restarting."
+    );
+  }
+  return (
+    `${spent} and nothing has been written outside /tmp yet. This task is graded by ` +
+    "inspecting the container's files/state afterward, not this chat. Stop " +
+    "investigating and write a first complete version of your deliverable to its real " +
+    `path NOW, even if it is rough or incomplete — then ${check} Keep improving it in ` +
+    "place from there: a rough deliverable on disk beats a perfect plan that never got " +
+    "written."
+  );
+}
+
 function maybeFireTriggerA(
   pi: ExtensionAPI,
   ctx: any,
@@ -439,6 +556,9 @@ function maybeFireTriggerA(
 ): boolean {
   if (triggerAFireCount >= MAX_TRIGGER_A_FIRES) return false;
   if (message.stopReason === "aborted" || message.stopReason === "error") return false;
+  // Trigger D already queued a steer for the turn this response answers --
+  // firing another one here would stack two different nudges back to back.
+  if (triggerDFiredAtTurn === turnsThisRun) return false;
 
   const hasText = text.trim().length > 0;
   const shapeMatches = hasText && toolCallCount === 0;
@@ -473,7 +593,7 @@ function maybeFireTriggerA(
   return true;
 }
 
-function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, toolCalls: any[]): void {
+function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, wroteDeliverable: boolean): void {
   if (triggerBFired) return;
   if (!armed) return;
   // The turn during which arming happened is the same turn finalize-warn's
@@ -481,8 +601,7 @@ function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, toolCalls: any[]): voi
   // hasn't seen it yet, so this turn can't be judged for compliance.
   if (turnsThisRun <= armedAtTurn) return;
 
-  const commands = shellCommandsIn(toolCalls);
-  if (hasNonScratchWrite(commands)) {
+  if (wroteDeliverable) {
     consecutiveNoWriteTurns = 0;
     return;
   }
@@ -579,5 +698,61 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
       (nearDeadline
         ? "telling the model to save its best-effort result now."
         : "telling the model to retry and keep working."),
+  );
+}
+
+function maybeFireTriggerD(pi: ExtensionAPI, ctx: any): void {
+  const fraction = budgetFractionUsed({ startForRun, deadlineForRun });
+  if (fraction === undefined) return; // no budget published -> no milestones
+
+  if (armed || finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) return;
+  if (finalizeWarnTurnWindowOpen({ turnsThisRun, capForRun })) return;
+
+  // Several milestones can come due at once — one very long turn, or a run
+  // idle across a continuation — and the model needs where the clock is
+  // now, not a backlog.
+  let milestone: number | undefined;
+  for (const m of PROGRESS_MILESTONES) {
+    if (fraction >= m && !milestonesFired.has(m)) milestone = m;
+  }
+  if (milestone === undefined) return;
+
+  // Spent silently rather than left unspent: the fraction never falls back
+  // below a milestone, so an unspent one would come due again on every
+  // later turn, duplicating the next milestone's job.
+  if (milestone === PROGRESS_MILESTONES[0] && deliverableWriteEverSeen) {
+    milestonesFired.add(milestone);
+    return;
+  }
+
+  // Turn-cap headroom: same clause as Triggers A/B/C. Deliberately no
+  // marking — past the cap there is no later turn for a retry to land on
+  // anyway, and a new run re-opens the question honestly.
+  if (capForRun > 0 && turnsThisRun >= capForRun) return;
+
+  const minutesLeft = Math.max(0, Math.round((deadlineForRun - Date.now()) / 60000));
+  const msg = buildTriggerDMessage(fraction, minutesLeft, deliverableWriteEverSeen);
+
+  try {
+    pi.sendUserMessage(msg, { deliverAs: "steer" });
+  } catch {
+    // Mark nothing: the condition is level-triggered (the fraction only
+    // grows), so the next turn_start retries on its own -- no equivalent of
+    // finalize-warn's dueThisRun latch needed.
+    return;
+  }
+  // Smaller milestones go down with it: they are strictly less urgent
+  // restatements of a message just delivered.
+  for (const m of PROGRESS_MILESTONES) {
+    if (m <= milestone) milestonesFired.add(m);
+  }
+  triggerDFiredAtTurn = turnsThisRun;
+  harnessIntervention(
+    ctx,
+    `about ${Math.round(fraction * 100)}% of the wall-clock budget is spent with ` +
+      (deliverableWriteEverSeen
+        ? "a deliverable already written"
+        : "nothing written outside /tmp") +
+      " — sending a progress checkpoint.",
   );
 }

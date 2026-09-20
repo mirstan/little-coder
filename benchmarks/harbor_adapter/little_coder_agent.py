@@ -527,6 +527,7 @@ def _initial_snapshot_advertisement(
 
 def _pi_env(
     *,
+    budget_start_epoch_ms: int,
     deadline_epoch_ms: int,
     initial_snapshot: _InitialSnapshotOutcome | None,
 ) -> dict[str, str]:
@@ -543,6 +544,13 @@ def _pi_env(
     `setsid`/`nc`/`socat`/`crontab` -- three different tools across three
     unrelated tasks, not a pattern fixable by allow-listing one command at a
     time.
+
+    LITTLE_CODER_BUDGET_START_EPOCH_MS is the other end of the same interval
+    the deadline closes. Only the pair says what FRACTION of the trial is
+    gone, which is what tb-finalize-guard's progress checkpoints fire on; the
+    deadline alone says how long is left and nothing about how long that was
+    out of. Absolute epoch ms on both ends rather than a duration on one, so
+    a reader resolves them by one rule.
 
     LITTLE_CODER_INITIAL_SNAPSHOT is what lets an extension mention the
     start-of-trial copy: tb-finalize-guard runs on TB1.0 too, whose adapter
@@ -561,6 +569,7 @@ def _pi_env(
     """
     env = {
         "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+        "LITTLE_CODER_BUDGET_START_EPOCH_MS": str(budget_start_epoch_ms),
         "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
     }
     env["LITTLE_CODER_INITIAL_SNAPSHOT"] = (
@@ -1925,7 +1934,8 @@ class LittleCoderAgent(BaseAgent):
             ],
         )
 
-        deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
+        budget_start_epoch_ms = int(time.time() * 1000)
+        deadline_epoch_ms = budget_start_epoch_ms + int(effective_timeout_sec * 1000)
         # The same instant as deadline_epoch_ms, on the monotonic clock the
         # error-retry loop measures against. Derived from one shared
         # effective_timeout_sec rather than re-read later, so a retry can
@@ -1971,6 +1981,7 @@ class LittleCoderAgent(BaseAgent):
                 max_turns=max_turns,
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
+                    budget_start_epoch_ms=budget_start_epoch_ms,
                     deadline_epoch_ms=deadline_epoch_ms,
                     initial_snapshot=initial_snapshot,
                 ),
