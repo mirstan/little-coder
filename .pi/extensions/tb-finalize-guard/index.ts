@@ -5,6 +5,11 @@ import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
 import { finalizeWarnWouldFire } from "../_shared/finalize-warn-trigger.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
+import {
+  INITIAL_SNAPSHOT_APP_DIR,
+  initialSnapshotOutcome,
+  type InitialSnapshotOutcome,
+} from "../_shared/snapshot-paths.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with three independent
 // trigger conditions, scoped to LITTLE_CODER_BENCHMARK === "terminal_bench"
@@ -40,6 +45,22 @@ import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 // of at every individual turn_end, so it only reacts to a turn that stayed
 // erroring/empty. The turn_end instrumentation below remains useful
 // independently of that, since it's the finer-grained per-turn record.
+//
+// The nudge demands adversarial re-verification rather than any re-check.
+// Observed failures passed re-checks that could not have failed: one re-ran
+// the same analysis that produced the wrong answer and re-confirmed it,
+// another diffed a task file against a backup made after the file was
+// already corrupted. So the text states a protocol — name the falsifying
+// result first, use a different method, never compare against another
+// artifact from this same session — and names the one reference that
+// predates the model's own changes, the adapter's start-of-trial copy.
+//
+// That pointer is gated on the adapter-classified outcome in
+// _shared/snapshot-paths.ts, because TB1.0 runs under this same benchmark
+// name with no such copy, and it is scoped to inputs the model already has
+// reason to suspect, matching the adapter's own reactive-only framing of the
+// copy. A standing "diff against it" directive would spend turns on every
+// trial, including tasks whose only input file is a multi-hundred-MB binary.
 //
 // ---------------------------------------------------------------------------
 // Trigger B — post-finalize-warn non-compliance
@@ -296,6 +317,97 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
+/**
+ * Trigger A's nudge text.
+ *
+ * Exported and pure so tests can assert against the builder's own output
+ * instead of stitching prose regexes over the delivered message — the
+ * shape `resolveFinalizeMessage` already uses.
+ *
+ * `baseline` is the start-of-trial copy's outcome, or undefined to say
+ * nothing about it at all (see _shared/snapshot-paths.ts).
+ */
+export function buildTriggerAMessage(
+  minutesLeft: number,
+  baseline: InitialSnapshotOutcome | undefined,
+): string {
+  // (1) names a verification protocol rather than asking for a "spot-check":
+  // both observed failures were re-checks incapable of failing. (2)/(3)
+  // cover the other two ways a finished-looking trial still fails grading —
+  // leftover files that weren't asked for, and an ambiguity resolved by
+  // guessing at grader intent. "use ShellSession" stays explicit: this fires
+  // on a toolless text turn, so a nudge answerable with another toolless
+  // text turn would just burn the second fire on the same pattern.
+  const baselineClause =
+    baseline === undefined
+      ? ""
+      : "If some task-provided input your answer depends on could have been changed " +
+        "this session — by your own edit, a script, or a command that died partway — " +
+        `diff just those files against the untouched start-of-trial copy under ` +
+        `${INITIAL_SNAPSHOT_APP_DIR}/ (${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors ` +
+        "/app/somefile); it predates every change you made, unlike a backup of your " +
+        "own. " +
+        // Mirrors _initial_snapshot_advertisement's own caveat: at the
+        // file-count cap the copy is incomplete, and a model reading absence
+        // there as "this file never existed" would draw the wrong conclusion
+        // from a truncation.
+        (baseline === "partial"
+          ? "That copy hit a file-count cap, so a file missing from it may still have " +
+            "existed at the start. "
+          : "");
+
+  return (
+    `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
+    "remain and this task is graded by inspecting the container's files/state " +
+    "afterward — not this chat. Re-read the task instructions above and use " +
+    "ShellSession to re-check your work — not just that the required files exist: " +
+    "(1) re-verify adversarially, not by re-reading your own output: first say what " +
+    "result would prove your answer WRONG, then run a check that could actually " +
+    "produce that result — re-running the same procedure that produced the answer, " +
+    "or looking over the file you wrote, does not count. Recompute the result by a " +
+    "different method, or test a consequence of it against the task's own data. " +
+    "Never verify by comparing your output against another file you created this " +
+    "session (a backup, an earlier copy, an intermediate): both can be wrong the " +
+    "same way; " +
+    "(2) if you created files the task didn't ask for (leftover scaffolding, " +
+    "intermediate outputs), remove only ones you created yourself and that " +
+    "nothing else needs — never anything that was already there; " +
+    "(3) if you were ever unsure what's expected, resolve it " +
+    "by the most literal reading of the task text. " +
+    baselineClause +
+    "If this recheck passes, say so " +
+    "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
+    "do not give up early."
+  );
+}
+
+/**
+ * Trigger C's calm recovery text — the branch for a dead run that is NOT
+ * near its deadline. The near-deadline branch uses `resolveFinalizeMessage`
+ * instead and is deliberately left alone: it tells the model to stop
+ * verifying and save, the opposite regime from this one.
+ *
+ * Exported and pure for the same reason as `buildTriggerAMessage`.
+ */
+export function buildTriggerCRecoveryMessage(
+  baseline: InitialSnapshotOutcome | undefined,
+): string {
+  return (
+    "You still have ample time and turn budget remaining, so do not wrap up — " +
+    "retry your last action or continue working from where you left off, " +
+    "verifying and testing as you normally would — against the task's own data or " +
+    "by a different method, never against another file you created this session" +
+    (baseline === undefined
+      ? ""
+      : "; if you suspect a task-provided file was damaged, the untouched " +
+        `start-of-trial copy under ${INITIAL_SNAPSHOT_APP_DIR}/ is the one reference ` +
+        "that predates your changes") +
+    ". Remember the task is graded " +
+    "by inspecting the container's files/state afterward, not this chat, so " +
+    "make sure your results end up saved there."
+  );
+}
+
 function maybeFireTriggerA(
   pi: ExtensionAPI,
   ctx: any,
@@ -321,29 +433,7 @@ function maybeFireTriggerA(
   if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   const minutesLeft = Math.max(0, Math.round(remainingMs / 60000));
-  // Deliberately asks for more than "does the required file exist": a
-  // present, well-formed file can still have wrong content, and correct
-  // content can still fail grading if something extra was left behind that
-  // wasn't asked for. (1)/(2)/(3) below map to those two failure modes plus
-  // resolving self-noticed ambiguity literally rather than by guessing at
-  // grader intent. "use ShellSession" stays explicit: this fires on a
-  // toolless text turn, so a nudge answerable with another toolless text
-  // turn would just burn the second fire on the same pattern.
-  const msg =
-    `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
-    "remain and this task is graded by inspecting the container's files/state " +
-    "afterward — not this chat. Re-read the task instructions above and use " +
-    "ShellSession to re-check your work — not just that the required files exist: " +
-    "(1) spot-check that the actual content/result is correct — run it, test it, " +
-    "or recompute it independently where possible; inspecting the file is fine, " +
-    "assuming it's right just because you wrote it is not; " +
-    "(2) if you created files the task didn't ask for (leftover scaffolding, " +
-    "intermediate outputs), remove only ones you created yourself and that " +
-    "nothing else needs — never anything that was already there; " +
-    "(3) if you were ever unsure what's expected, resolve it " +
-    "by the most literal reading of the task text. If this recheck passes, say so " +
-    "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
-    "do not give up early.";
+  const msg = buildTriggerAMessage(minutesLeft, initialSnapshotOutcome());
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });
@@ -450,12 +540,7 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
     "complete. ";
   const msg = nearDeadline
     ? prefix + resolveFinalizeMessage("terminal_bench")
-    : prefix +
-      "You still have ample time and turn budget remaining, so do not wrap up — " +
-      "retry your last action or continue working from where you left off, " +
-      "verifying and testing as you normally would. Remember the task is graded " +
-      "by inspecting the container's files/state afterward, not this chat, so " +
-      "make sure your results end up saved there.";
+    : prefix + buildTriggerCRecoveryMessage(initialSnapshotOutcome());
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });

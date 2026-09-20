@@ -1,3 +1,5 @@
+import { DEADLINE_SNAPSHOT_DIR, INITIAL_SNAPSHOT_APP_DIR } from "./snapshot-paths.ts";
+
 // Shared message text for the "you're running low, finalize now" nudge.
 // finalize-warn's turn-count trigger and its wall-clock trigger both funnel
 // through this so the two triggers can never present different instructions
@@ -23,9 +25,9 @@ export function resolveFinalizeMessage(benchmark: string | undefined): string {
       "is incomplete or uncertain, save it anyway: a rough answer on disk " +
       "beats a correct one that never got written. Then stop calling tools. " +
       "If you accidentally overwrote good work, a snapshot of files you " +
-      "changed as of ~10 minutes ago may exist under /tmp/.lc-snapshot/, " +
+      `changed as of ~10 minutes ago may exist under ${DEADLINE_SNAPSHOT_DIR}/, ` +
       "and the task's original starting files may exist under " +
-      "/tmp/.lc-initial/app/ (restore from there only a file you believe " +
+      `${INITIAL_SNAPSHOT_APP_DIR}/ (restore from there only a file you believe ` +
       "you corrupted — never over your own completed solution)."
     );
   }

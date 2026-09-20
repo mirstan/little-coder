@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import setupExtension from "./index.ts";
+import setupExtension, { buildTriggerAMessage, buildTriggerCRecoveryMessage } from "./index.ts";
+import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
+import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
 
 interface Handler {
   (event: any, ctx: any): Promise<unknown> | unknown;
@@ -128,6 +130,9 @@ describe("tb-finalize-guard", () => {
     delete process.env.LITTLE_CODER_BENCHMARK;
     delete process.env.LITTLE_CODER_MAX_TURNS;
     delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+    // Left unset by default everywhere else in this suite, so every other
+    // test also covers the no-baseline path a TB1.0 trial actually runs.
+    delete process.env.LITTLE_CODER_INITIAL_SNAPSHOT;
     Date.now = REAL_NOW;
   });
 
@@ -181,8 +186,12 @@ describe("tb-finalize-guard", () => {
       expect(h.sent[0].text).toMatch(/stopped without calling a tool/i);
       // Asks for more than existence: a present, well-formed file can still
       // have wrong content, or correct content plus extra scaffolding a
-      // strict grader flags.
-      expect(h.sent[0].text).toMatch(/spot-check.*recompute it independently/i);
+      // strict grader flags. Literal substrings rather than a `.*`-stitched
+      // prose regex -- the clause's exact wording is pinned by the builder
+      // unit tests below, and this only needs to prove the delivered message
+      // is the demanding one.
+      expect(h.sent[0].text).toContain("re-verify adversarially");
+      expect(h.sent[0].text).toContain("could actually produce that result");
       // Cleanup is scoped to self-created files, never pre-existing content --
       // an unscoped "remove what's extra" could convert a passing trial into
       // a failing one.
@@ -330,6 +339,89 @@ describe("tb-finalize-guard", () => {
       h.state.sendThrows = false;
       await turn(h, assistantTurn({ text: "Two." }));
       expect(h.sent).toHaveLength(1);
+    });
+
+    it("sends exactly the builder's text, including the baseline pointer", async () => {
+      process.env.LITTLE_CODER_INITIAL_SNAPSHOT = "succeeded";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      // Exact equality, so the builder unit tests below are pinning the text
+      // that is genuinely delivered rather than a parallel copy of it.
+      expect(h.sent[0].text).toBe(buildTriggerAMessage(30, "succeeded"));
+    });
+
+    it("says nothing about the start-of-trial copy when the adapter staged none", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      // What a TB1.0 trial gets: same benchmark name, no container-side copy.
+      expect(h.sent[0].text).toBe(buildTriggerAMessage(30, undefined));
+      expect(h.sent[0].text).not.toContain(INITIAL_SNAPSHOT_APP_DIR);
+    });
+  });
+
+  describe("buildTriggerAMessage", () => {
+    it("demands a falsifiable check by a different method", () => {
+      const msg = buildTriggerAMessage(30, undefined);
+      expect(msg).toContain("prove your answer WRONG");
+      expect(msg).toContain("could actually produce that result");
+      expect(msg).toContain("Recompute the result by a different method");
+    });
+
+    it("forbids verifying against the model's own artifacts", () => {
+      // The overfull-hbox failure: a task file diffed against a backup the
+      // model made after corrupting it, reported as "changed positions: 0".
+      const msg = buildTriggerAMessage(30, undefined);
+      expect(msg).toContain("another file you created this session");
+      expect(msg).toContain("both can be wrong the same way");
+    });
+
+    it("keeps the cleanup-scoping and literal-reading clauses", () => {
+      const msg = buildTriggerAMessage(30, undefined);
+      expect(msg).toContain("remove only ones you created yourself");
+      expect(msg).toContain("never anything that was already there");
+      expect(msg).toContain("most literal reading of the task text");
+      expect(msg).toContain("ShellSession");
+    });
+
+    it("mentions no snapshot path at all without a baseline", () => {
+      const msg = buildTriggerAMessage(30, undefined);
+      expect(msg).not.toContain(INITIAL_SNAPSHOT_APP_DIR);
+      expect(msg).not.toContain("/tmp/.lc-initial");
+    });
+
+    it("points at the start-of-trial copy when one exists", () => {
+      const msg = buildTriggerAMessage(30, "succeeded");
+      expect(msg).toContain(`${INITIAL_SNAPSHOT_APP_DIR}/`);
+      expect(msg).toContain(`${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors /app/somefile`);
+      expect(msg).toContain("predates every change you made");
+    });
+
+    it("scopes the baseline diff to suspect inputs instead of directing a blanket one", () => {
+      // The pointer must stay reactive, matching the adapter's own framing
+      // of this copy: a standing "diff your inputs against it" costs a turn
+      // on every trial, and some tasks' only input is a huge binary.
+      const msg = buildTriggerAMessage(30, "succeeded");
+      expect(msg).toContain("could have been changed this session");
+      expect(msg).toContain("diff just those files");
+      expect(msg).not.toContain("confirm those inputs are still intact");
+    });
+
+    it("adds the truncation caveat only for a partial copy", () => {
+      const partial = buildTriggerAMessage(30, "partial");
+      expect(partial).toContain("file-count cap");
+      expect(partial).toContain("may still have existed at the start");
+      expect(buildTriggerAMessage(30, "succeeded")).not.toContain("file-count cap");
+    });
+
+    it("reports the remaining minutes it was given", () => {
+      expect(buildTriggerAMessage(7, undefined)).toContain("roughly 7 minutes");
     });
   });
 
@@ -686,6 +778,42 @@ describe("tb-finalize-guard", () => {
       expect(h.sent[0].text).toMatch(/very little time left/i);
     });
 
+    it("sends exactly the recovery builder's text on the calm branch", async () => {
+      process.env.LITTLE_CODER_INITIAL_SNAPSHOT = "succeeded";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent[0].text).toContain(buildTriggerCRecoveryMessage("succeeded"));
+      expect(h.sent[0].text).toContain(INITIAL_SNAPSHOT_APP_DIR);
+    });
+
+    it("says nothing about the start-of-trial copy on the calm branch when none was staged", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent[0].text).toContain(buildTriggerCRecoveryMessage(undefined));
+      expect(h.sent[0].text).not.toContain("/tmp/.lc-initial");
+    });
+
+    it("leaves the near-deadline branch as the unmodified finalize message", async () => {
+      // That message tells the model to stop verifying and save -- the
+      // opposite regime from the recovery branch, so a staged baseline must
+      // not pull any verification demand into it.
+      process.env.LITTLE_CODER_INITIAL_SNAPSHOT = "succeeded";
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(5);
+      await newSession(h);
+      await turn(h, assistantTurn({ stopReason: "error" }));
+      await settle(h);
+      expect(h.sent[0].text).toContain(resolveFinalizeMessage("terminal_bench"));
+      expect(h.sent[0].text).not.toContain("re-verify adversarially");
+    });
+
     it("is suppressed when the run ended at its turn-cap (would grant a capped-out run a fresh turn budget)", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
@@ -753,6 +881,30 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
       await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
       expect(h.sent).toHaveLength(5);
+    });
+  });
+
+  describe("buildTriggerCRecoveryMessage", () => {
+    it("keeps the keep-working framing", () => {
+      const msg = buildTriggerCRecoveryMessage(undefined);
+      expect(msg).toContain("ample time");
+      expect(msg).toContain("do not wrap up");
+      expect(msg).toContain("verifying and testing as you normally would");
+    });
+
+    it("forbids verifying against the model's own artifacts either way", () => {
+      for (const baseline of [undefined, "succeeded", "partial"] as const) {
+        expect(buildTriggerCRecoveryMessage(baseline)).toContain(
+          "never against another file you created this session",
+        );
+      }
+    });
+
+    it("offers the start-of-trial copy only on suspicion, and only when it exists", () => {
+      const withCopy = buildTriggerCRecoveryMessage("succeeded");
+      expect(withCopy).toContain("if you suspect a task-provided file was damaged");
+      expect(withCopy).toContain(`${INITIAL_SNAPSHOT_APP_DIR}/`);
+      expect(buildTriggerCRecoveryMessage(undefined)).not.toContain("/tmp/.lc-initial");
     });
   });
 

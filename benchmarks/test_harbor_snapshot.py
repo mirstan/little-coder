@@ -953,6 +953,58 @@ def test_prompt_omits_the_advertisement_when_nothing_was_staged():
     assert lca._HARD_LIMITS_PARAGRAPH in prompt
 
 
+# ── 1b. What the snapshot outcome tells pi's extensions (_pi_env) ──────────
+
+def _outcome(name: str) -> lca._InitialSnapshotOutcome:
+    return lca._InitialSnapshotOutcome(name, name in ("succeeded", "partial"), "msg")
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "partial"])
+def test_pi_env_publishes_the_outcome_when_a_copy_was_staged(outcome):
+    """The extensions' only evidence that /tmp/.lc-initial is really there.
+    The outcome string itself, not a flag: a reader has to be able to repeat
+    the cap-truncation caveat that "partial" carries."""
+    env = lca._pi_env(deadline_epoch_ms=1, initial_snapshot=_outcome(outcome))
+    assert env["LITTLE_CODER_INITIAL_SNAPSHOT"] == outcome
+
+
+@pytest.mark.parametrize("outcome", [None, "failed", "refused"])
+def test_pi_env_stays_silent_when_no_copy_was_staged(outcome):
+    """Unset, not a falsy value: an extension reading an empty string as
+    "there is a copy" would point the model at a path that does not exist --
+    the same cost _initial_snapshot_advertisement refuses to pay."""
+    arg = None if outcome is None else _outcome(outcome)
+    assert "LITTLE_CODER_INITIAL_SNAPSHOT" not in lca._pi_env(
+        deadline_epoch_ms=1, initial_snapshot=arg
+    )
+
+
+@pytest.mark.parametrize("outcome", [None, "failed", "refused", "succeeded", "partial"])
+def test_pi_env_gate_agrees_with_the_prompt_advertisement(outcome):
+    """One gate, two consumers: the model must never be told about the copy
+    in the prompt and not in the nudges, or the reverse."""
+    arg = None if outcome is None else _outcome(outcome)
+    advertised = lca._initial_snapshot_advertisement(arg) is not None
+    in_env = "LITTLE_CODER_INITIAL_SNAPSHOT" in lca._pi_env(
+        deadline_epoch_ms=1, initial_snapshot=arg
+    )
+    assert advertised == in_env
+
+
+def test_pi_env_always_carries_the_deadline_and_permission_mode():
+    env = lca._pi_env(deadline_epoch_ms=1700000000000, initial_snapshot=None)
+    assert env["LITTLE_CODER_DEADLINE_EPOCH_MS"] == "1700000000000"
+    assert env["LITTLE_CODER_PERMISSION_MODE"] == "accept-all"
+
+
+def test_run_hands_pi_env_to_the_rpc_client():
+    """Wiring pin. Every assertion above is on a pure helper, so a run()
+    that built its own literal dict instead would pass all of them."""
+    src = textwrap.dedent(inspect.getsource(lca.LittleCoderAgent.run))
+    assert "env=_pi_env(" in src
+    assert "initial_snapshot=initial_snapshot," in src
+
+
 # ── 2. Scheduling arithmetic (_compute_snapshot_delay_sec) ─────────────────
 
 def test_snapshot_delay_normal_budget_fires_lead_seconds_before_deadline():
