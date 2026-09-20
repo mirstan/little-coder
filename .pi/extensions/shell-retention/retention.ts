@@ -289,16 +289,20 @@ function isSignedMessage(m: any): boolean {
   );
 }
 
-// Anchored to the exact marker shape (including the sr-<hex> id), not a
-// loose substring match — this repo is self-hosted, so a command that
-// heredocs this very file's source could otherwise contain CMD_DEMOTED_INFIX
-// as plain text and get mistaken for an already-demoted pair forever.
-const CMD_DEMOTED_MARKER_RE = /^\[\.\.\. \S+ of command text demoted — ShellRecall id=sr-[0-9a-f]{16} \.\.\.\]$/m;
+// Anchored to the exact marker shape and capture the id — a loose match
+// (even one requiring the right shape) can't tell this pair's own marker
+// apart from a complete, validly-shaped one copied from a different pair
+// (e.g. quoted as an example in a heredoc) — this repo is self-hosted, so
+// that shape can appear as plain command text with no demotion involved.
+const CMD_DEMOTED_MARKER_RE = /^\[\.\.\. \S+ of command text demoted — ShellRecall id=(sr-[0-9a-f]{16}) \.\.\.\]$/m;
+const RESULT_DEMOTED_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16}) /;
 
 function alreadyDemoted(p: Pair): boolean {
-  return (
-    p.resultText.startsWith(RESULT_DEMOTED_PREFIX) && /ShellRecall id=sr-[0-9a-f]{16} /.test(p.resultText)
-  ) || CMD_DEMOTED_MARKER_RE.test(p.command);
+  const ownId = archiveId(p.toolCallId);
+  const resultMatch = p.resultText.startsWith(RESULT_DEMOTED_PREFIX) && RESULT_DEMOTED_ID_RE.exec(p.resultText);
+  if (resultMatch && resultMatch[1] === ownId) return true;
+  const cmdMatch = CMD_DEMOTED_MARKER_RE.exec(p.command);
+  return cmdMatch !== null && cmdMatch[1] === ownId;
 }
 
 /**

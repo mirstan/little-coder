@@ -428,6 +428,18 @@ describe("demoteMessages", () => {
     expect(commandOf(out.messages[1])).toContain(CMD_DEMOTED_INFIX + archiveId("z"));
   });
 
+  // A complete, validly-shaped marker copied from a DIFFERENT pair (e.g.
+  // quoted as an example) must not be mistaken for this pair's own — the
+  // marker's id has to match archiveId(p.toolCallId), not just look right.
+  it("does not mistake another pair's marker, copied verbatim, for this pair's own", () => {
+    const copiedMarker = `[... 5.2KB ${CMD_DEMOTED_INFIX}sr-1234567890abcdef ...]`;
+    const command = `cat > notes.md <<EOF\nExample:\n${copiedMarker}\n${filler(4000, "src")}\nEOF`;
+    const msgs = [userMsg("t"), assistantShell("victim", command), shellResult("victim", "ok"), ...pairs(4, "n")];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect(commandOf(out.messages[1])).not.toBe(command);
+    expect(commandOf(out.messages[1])).toContain(CMD_DEMOTED_INFIX + archiveId("victim"));
+  });
+
   // A thoughtSignature on a sibling text/thinking block (not the toolCall
   // block itself) must still block the command rewrite — pi's
   // google-shared.js states the signature "can appear on ANY part type".
