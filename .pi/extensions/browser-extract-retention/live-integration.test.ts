@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import { pruneMessages, buildPlaceholder } from "./index.ts";
 
@@ -11,6 +12,14 @@ import { pruneMessages, buildPlaceholder } from "./index.ts";
 //
 // Skipped automatically if Playwright isn't installed (e.g. on CI
 // images that don't have chromium).
+
+let chromiumInstalled = false;
+try {
+  const { chromium } = await import("playwright");
+  chromiumInstalled = existsSync(chromium.executablePath());
+} catch {
+  chromiumInstalled = false;
+}
 
 const CHUNK_SIZE = 2048;
 
@@ -54,7 +63,7 @@ function chunk(text: string, cursor = 0): { chunk: string; next: number | null; 
   return { chunk: text.slice(cursor, end), next: hasMore ? end : null, total: text.length, hasMore };
 }
 
-describe("live integration — Wikipedia extraction + retention", () => {
+describe.skipIf(!chromiumInstalled)("live integration — Wikipedia extraction + retention", () => {
   it("extracts Wikipedia Test page and produces reasonable chunks", async () => {
     const url = "https://en.wikipedia.org/wiki/Terminal_Bench";
     const full = await extractPageText(url);
