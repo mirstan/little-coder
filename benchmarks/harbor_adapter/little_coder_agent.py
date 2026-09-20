@@ -998,10 +998,10 @@ _HARBOR_TIMEOUT_MSG_RE = re.compile(r"^Command timed out after \d+ seconds$")
 _TIMEOUT_KILL_WARNING = (
     "WARNING: this command hit its {N}s timeout and its connection was killed. "
     "Any file it was mid-way through writing may now be HALF-WRITTEN, and any "
-    "cleanup/restore logic at the end of a script did NOT run — re-verify (cat/wc/diff) "
-    "any file it touched before trusting it. A compute-bound process may even still be "
-    "running in the container (check with ps). If the command simply needs more time, "
-    "re-run it with a larger `timeout` parameter (up to 600 seconds)."
+    "cleanup/restore logic at the end of a script may not have completed — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. A compute-bound process may "
+    "even still be running in the container (check with ps). If the command simply "
+    "needs more time, re-run it with a larger `timeout` parameter (up to 600 seconds)."
 )
 # Distinct from _TIMEOUT_KILL_WARNING: run()'s bridge timeout (below) means only
 # that _exec_async has not returned to the reader thread within timeout+30s --

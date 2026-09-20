@@ -167,12 +167,15 @@ function writeOverflowFile(cleaned: string, captureTruncated: boolean): string |
 }
 
 // execSubprocess's real SIGTERM path: Node actually killed the child, so the
-// process is confirmed gone and cleanup logic confirmed did not run.
+// process is confirmed gone. Cleanup is hedged, not asserted absent: a shell
+// trap on TERM can still run (and even re-raise the signal itself) before
+// the process actually exits, so "ran to completion" is the only thing we
+// can't confirm, not "ran at all".
 const KILLED_TIMED_OUT_WARNING =
   "WARNING: this command hit its timeout and was killed. Any file it was " +
   "mid-way through writing may now be HALF-WRITTEN, and any cleanup/restore logic at " +
-  "the end of a script did NOT run -- re-verify (cat/wc/diff) any file it touched " +
-  "before trusting it. If it simply needed more time, re-run with a larger timeout.";
+  "the end of a script may not have completed -- re-verify (cat/wc/diff) any file it " +
+  "touched before trusting it. If it simply needed more time, re-run with a larger timeout.";
 
 // execTmuxProxy's no-response fallback: nothing was killed or interrupted --
 // the command is likely still executing in the tmux pane, and no output was
