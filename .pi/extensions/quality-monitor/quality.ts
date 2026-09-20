@@ -167,15 +167,17 @@ export function phraseForUser(reason: string): string {
     empty_tool_name: "the model emitted a tool call with no name",
     repeated_tool_call: "the model repeated its previous tool call verbatim",
     near_duplicate_loop: "the model is looping with near-identical attempts (varying only details)",
+    repeated_failure_signature: "the model's differing attempts keep producing the identical failure",
   };
   return phrases[reason] ?? `quality issue (${reason})`;
 }
 
-// The near-duplicate detector's model-facing text (see quality-monitor's
-// similarity.ts). Steered like a tier-1 correction and blocking nothing: a
-// similarity match can never prove the NEXT attempt is wrong.
-//
-// The count is safe to state here, unlike in the tier-2 escalation: the
+// The two output-of-the-loop detectors' model-facing text (see
+// quality-monitor's similarity.ts and failure-signature.ts). Both are steered
+// like a tier-1 correction and neither blocks anything: a similarity match
+// can never prove the NEXT attempt is wrong.
+
+// Counts are safe to state in these two, unlike the tier-2 escalation's: each
 // tracker counts exactly the attempts it is describing, not a mixed-reason
 // streak.
 export function buildNearDuplicateLoopMessage(count: number, escalated: boolean): string {
@@ -187,5 +189,28 @@ export function buildNearDuplicateLoopMessage(count: number, escalated: boolean)
     "what hypothesis each attempt was testing and what you learned from it, " +
     "then take a structurally different approach: a different tool, a " +
     "different diagnostic, or a different reading of the problem."
+  );
+}
+
+// The closing carve-out mirrors buildBlockedCallEscalationMessage's (issue
+// #94): a model probing a permission-gate refusal with varied phrasings is a
+// differing-inputs/identical-output streak and will land here, so the text
+// must not read as "find another route".
+export function buildFailureSignatureMessage(
+  toolName: string,
+  count: number,
+  opts: { corroborated?: boolean; escalated?: boolean } = {},
+): string {
+  const also = opts.corroborated ? " -- and those attempts were themselves near-identical" : "";
+  const opening = opts.escalated
+    ? `That is now ${count} ${toolName} attempts with the same outcome${also}.`
+    : `Your last ${count} ${toolName} attempts produced essentially the identical error or output, even though the attempts themselves differed${also}.`;
+  return (
+    `${opening} Changing details is not changing the outcome -- the approach ` +
+    "itself is failing. Before the next attempt, state what the error " +
+    "actually means, what you have ruled out, and which of your assumptions " +
+    "might be wrong. If the repeated message is a guardrail refusal (a " +
+    "permission or whitelist message), that refusal is the answer -- report " +
+    "it and move on rather than seeking another route to the same effect."
   );
 }
