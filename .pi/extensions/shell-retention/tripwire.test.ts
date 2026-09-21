@@ -47,9 +47,7 @@ describe("findMarkerEchoIds", () => {
     });
   }
 
-  // A longer hex run is a different token, not this id with noise after it:
-  // truncating it to its first 16 characters would hand the caller an id the
-  // text never carried, and blocking on that is a block of an innocent call.
+  // Truncating a longer run would report an id the text never carried.
   it("ignores an id followed by more hex characters", () => {
     expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}0` })).toEqual([]);
     expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}deadbeef` })).toEqual([]);
@@ -118,12 +116,9 @@ async function fireToolCall(handlers: Record<string, Array<(event: any, ctx: any
 }
 
 // The wired tests drive the real `context` hook, which resolves every knob
-// from the environment, and `setupShellRetention` returns without registering
-// anything when retention is switched off. An ambient value for any of these
-// — a developer shell, a benchmark harness, CI — would break the fixture's
-// deliberately narrow margins (60 turns of traffic against a staleDistance of
-// 50) and surface as a misleading "expected the context hook to demote" error.
-// Pin them to the documented defaults for the duration, restore after.
+// from the environment. The fixture's margins are narrow on purpose (60 turns
+// of traffic against a staleDistance of 50), so an ambient override surfaces
+// not as a knob mismatch but as "expected the context hook to demote".
 const PINNED_ENV: Record<string, string | undefined> = {
   [ENV_STALE_DISTANCE]: String(DEFAULT_STALE_DISTANCE),
   [ENV_RETAIN_RAW]: String(DEFAULT_RETAIN_RAW),
@@ -131,9 +126,8 @@ const PINNED_ENV: Record<string, string | undefined> = {
   [ENV_KEEP_RESULT_HEAD]: String(DEFAULT_KEEP_RESULT_HEAD),
   [ENV_KEEP_RESULT_TAIL]: String(DEFAULT_KEEP_RESULT_TAIL),
   [ENV_CMD_KEEP]: String(DEFAULT_CMD_KEEP),
-  // Both live in index.ts and are read there, not via resolveOptions: the
-  // budget gates hostArchive.save (a refused save cancels the demotion), and
-  // the kill switch makes the extension register no hooks at all.
+  // Not from resolveOptions: index.ts reads these itself. A refused save
+  // cancels the demotion; the kill switch registers no hooks at all.
   LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),
   LITTLE_CODER_NO_SHELL_RETENTION: undefined,
 };

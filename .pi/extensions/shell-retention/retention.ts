@@ -337,18 +337,17 @@ const MARKER_ECHO_GATE = "ShellRecall id=sr-";
 // this stricter than MARKER_ECHO_GATE, opening a gap where the pre-gate
 // admits a call this regex then fails to catch.
 //
-// The trailing lookahead is that byte-exactness enforced: without it a longer
-// hex run (`id=sr-<16 hex><more hex>`) still yields its first 16 characters,
-// and if those happen to name a live archive entry the guard blocks a call
-// that never carried that id. A real marker always ends the id on a space, so
-// requiring a non-hex boundary costs no genuine match.
+// The lookahead is that byte-exactness enforced. Without it a longer hex run
+// still yields its first 16 characters, and if those name a live entry the
+// guard blocks a call that never carried that id. Both marker shapes put a
+// space right after the id, so the boundary costs no genuine match.
 const MARKER_ECHO_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16})(?![0-9a-fA-F])/g;
 
 /**
  * All sr-… ids that appear, anywhere among `input`'s string leaves, in
  * demotion-marker shape. Doesn't check liveness — the caller cross-checks
- * against the archive so a marker-shaped id from a fixture or a since-evicted
- * pair doesn't trip the guard.
+ * against the archive, so a marker-shaped id naming nothing there (a fixture's,
+ * or one left in a file by an earlier session) doesn't trip the guard.
  */
 export function findMarkerEchoIds(input: unknown): string[] {
   const ids = new Set<string>();
