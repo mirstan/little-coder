@@ -1,7 +1,9 @@
 # Plan: second-round harness improvements (2026-09-19 trajectory analysis)
 
-Status: **priorities 1-10 merged (PRs #54-63, 2026-09-20); priorities 11-12 not yet
-started.** See `STATE.md` for how this fits into the overall project.
+Status: **priorities 1-11 done (1-10 merged as PRs #54-63, 2026-09-20; 11 found
+already done via PR #36, 2026-09-12/13 — status corrected 2026-09-20). Priority
+12 is the only item left.** See `STATE.md` for how this fits into the overall
+project.
 
 ## Source
 
