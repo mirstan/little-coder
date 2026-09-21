@@ -59,6 +59,7 @@ def test_thinking_cli_value_wins_over_agent_dir_settings(tmp_path, monkeypatch):
     assert out == {
         "cli_value": "low", "pi_default_setting": "high",
         "pi_default_setting_file": str(agent_dir / "settings.json"),
+        "pi_default_setting_source": "agent_dir",
         "resolved": "low", "source": "cli", "confirmed_live": None,
     }
 
@@ -102,6 +103,8 @@ def test_thinking_ignores_a_stale_latch_in_the_bench_agent_dir(tmp_path):
     _write_json(RC._BENCH_AGENT_DIR / "settings.json", {"defaultThinkingLevel": "off"})
     out = RC._resolve_thinking(None)
     assert out["pi_default_setting"] is None
+    assert out["pi_default_setting_file"] is None
+    assert out["pi_default_setting_source"] == "bench_agent_dir_cleared"
     assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL
 
 
@@ -227,16 +230,16 @@ def test_snapshot_records_error_for_malformed_model_string(tmp_path):
     assert snap["server_sampling"]["note"] == "not introspectable for this provider"
 
 
-def test_a_relative_agent_dir_naming_the_bench_dir_is_still_recognized(tmp_path, monkeypatch):
-    """The stale-latch guard compares resolved paths, not path text: a
-    relative PI_CODING_AGENT_DIR names the same directory but compares
-    unequal lexically, which would put the stale latch back into the
-    snapshot."""
-    bench = RC._BENCH_AGENT_DIR
-    bench.mkdir(parents=True, exist_ok=True)
-    _write_json(bench / "settings.json", {"defaultThinkingLevel": "off"})
-    monkeypatch.chdir(bench.parent)
-    monkeypatch.setenv("PI_CODING_AGENT_DIR", f"./{bench.name}")
+def test_a_relative_agent_dir_is_reported_as_unresolvable(tmp_path, monkeypatch):
+    """pi resolves a relative PI_CODING_AGENT_DIR against the CHILD's cwd,
+    which PiRpc sets per caller, so this process cannot know which file that
+    is. Naming one resolved against the harness's own cwd would be a guess
+    presented as provenance."""
+    monkeypatch.chdir(tmp_path)
+    _write_json(tmp_path / "rel-agent" / "settings.json", {"defaultThinkingLevel": "off"})
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "./rel-agent")
     out = RC._resolve_thinking(None)
     assert out["pi_default_setting"] is None
+    assert out["pi_default_setting_file"] is None
+    assert out["pi_default_setting_source"] == "relative_agent_dir"
     assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL

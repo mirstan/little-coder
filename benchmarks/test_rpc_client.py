@@ -358,3 +358,23 @@ def test_a_correct_bin_symlink_is_left_alone(tmp_path, monkeypatch):
 
     RC._bench_agent_dir()
     assert (scratch / "bin").readlink() == real_bin
+
+
+def test_the_redirect_guard_runs_before_the_mkdir_it_protects(tmp_path, monkeypatch):
+    """mkdir(parents=True) is itself one of the mutations being guarded: with
+    .cache/ symlinked into ~/.pi and the leaf not yet created, a guard placed
+    after it would already have made a directory inside the config it exists
+    to protect."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".pi" / "agent").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".cache").symlink_to(fake_home / ".pi", target_is_directory=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", repo / ".cache" / "pi-bench-agent")
+
+    with pytest.raises(RuntimeError, match="refusing to touch it"):
+        RC._bench_agent_dir()
+    assert not (fake_home / ".pi" / "pi-bench-agent").exists()
+    assert sorted(p.name for p in (fake_home / ".pi").iterdir()) == ["agent"]

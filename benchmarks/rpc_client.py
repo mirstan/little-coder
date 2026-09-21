@@ -99,14 +99,19 @@ def _bench_agent_dir() -> str:
     this redirect. No benchmark drives one today; one that did would have to
     export PI_CODING_AGENT_DIR itself to opt out.
     """
-    _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
-    # mkdir(exist_ok=True) succeeds on a symlink to a directory, so the
-    # delete below follows one wherever it points -- and pointing it back at
-    # ~/.pi/agent both destroys the user's settings.json and silently undoes
-    # the isolation, since every later latch then writes through the link.
+    # Ahead of the mkdir, which is itself one of the mutations being guarded:
+    # mkdir(parents=True) through a symlinked .cache/ would create the leaf
+    # inside ~/.pi before any later check could object. resolve() follows a
+    # redirect at .cache/ as well as at the leaf, and tolerates the leaf not
+    # existing yet.
+    #
+    # The hazard: mkdir(exist_ok=True) succeeds on a symlink to a directory,
+    # so the delete below follows one wherever it points -- and pointing it
+    # back at ~/.pi/agent both destroys the user's settings.json and silently
+    # undoes the isolation, since every later latch writes through the link.
     # Worth guarding because polyglot and gaia hand the model under test an
-    # unsandboxed host shell, which is enough to plant it. resolve() catches
-    # a redirect at .cache/ as well as at the leaf.
+    # unsandboxed host shell, which is enough to plant it.
+    #
     # Only ~/.pi is refused, not everywhere outside the repo: relocating
     # .cache/ to another disk is legitimate, and the scratch dir only ever
     # holds files pi put there.
@@ -119,6 +124,7 @@ def _bench_agent_dir() -> str:
             f"protect, so refusing to touch it. Remove the redirect, or export "
             f"PI_CODING_AGENT_DIR to manage the agent dir yourself."
         )
+    _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
     # Start each session from a known thinking level. thinking-budget's
     # latch calls pi.setThinkingLevel(), which settings-manager.js persists
     # to <agent dir>/settings.json under the GLOBAL scope -- so without this
@@ -126,6 +132,11 @@ def _bench_agent_dir() -> str:
     # default of every later run sharing this dir. Only pi itself ever
     # writes this file, so nothing hand-authored is lost; bin/ and auth.json
     # are deliberately kept (see above).
+    #
+    # Assumes one pi at a time per checkout, which every harness satisfies
+    # today (the pilots pin --n-concurrent 1). Raising that would need a
+    # per-session dir instead: a second trial's delete lands between a
+    # running trial's latch write and a third pi's startup read.
     try:
         (_BENCH_AGENT_DIR / "settings.json").unlink()
     except OSError:
@@ -1619,16 +1630,32 @@ def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     return out
 
 
-def _pi_global_settings_path() -> Path:
-    """The settings.json pi itself will read as its GLOBAL scope this run.
+def _pi_global_settings_path() -> tuple[Optional[Path], str]:
+    """The settings.json pi will read as its GLOBAL scope, and its path.
 
     pi derives it from PI_CODING_AGENT_DIR, not from $HOME
     (config.js::getAgentDir -> getSettingsPath), and PiRpc points every
     benchmark subprocess at _BENCH_AGENT_DIR -- so ~/.pi/agent/settings.json,
     which this provenance used to read, is a file pi no longer opens for
-    these runs. Follows PiRpc.__init__'s rule for the exported case: an
-    already-exported PI_CODING_AGENT_DIR wins, otherwise the scratch dir
-    applies. Only the exported case -- PiRpc also honours the var in a
+    these runs.
+
+    A None path means "pi will read no global settings", for one of two
+    reasons named by the returned string:
+
+    bench_agent_dir_cleared -- no exported var, so PiRpc supplies the scratch
+    dir and clears its settings.json on every construction. Anything on disk
+    there is a prior run's thinking-budget latch that pi never sees, and the
+    snapshot can be built either side of that delete (harbor writes it before
+    PiRpc, polyglot before the run loop), so ignoring it is the only
+    ordering-independent answer.
+
+    relative_agent_dir -- an exported but relative PI_CODING_AGENT_DIR. pi
+    resolves it against the CHILD's cwd, which PiRpc sets per caller (the
+    per-exercise work dir for polyglot), so this process cannot say which
+    file that is. Reporting a guess resolved against the harness's own cwd
+    would name a file pi may never open.
+
+    Only the exported case is followed: PiRpc also honours the var from a
     caller's env= dict, which os.environ cannot see. No caller passes one.
 
     Not pi's whole picture -- settings-manager.js merges
@@ -1636,19 +1663,17 @@ def _pi_global_settings_path() -> Path:
     defaultThinkingLevel, so this is the only scope that can supply one.
     """
     env = os.environ.get("PI_CODING_AGENT_DIR")
-    base = Path(env).expanduser() if env else _BENCH_AGENT_DIR
-    return base / "settings.json"
+    if not env:
+        return None, "bench_agent_dir_cleared"
+    base = Path(env).expanduser()
+    if not base.is_absolute():
+        return None, "relative_agent_dir"
+    return base / "settings.json", "agent_dir"
 
 
 def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
-    settings_path = _pi_global_settings_path()
-    if settings_path.parent.resolve() == _BENCH_AGENT_DIR.resolve():
-        # _bench_agent_dir() deletes this file on every PiRpc construction,
-        # so anything on disk here is a prior run's thinking-budget latch
-        # that pi will never read. Reporting it would just relocate the
-        # stale-provenance bug, and the snapshot can be built either side of
-        # that delete (harbor writes it before PiRpc, polyglot before the
-        # run loop), so ignoring it is the only ordering-independent answer.
+    settings_path, path_status = _pi_global_settings_path()
+    if settings_path is None:
         pi_default = None
     else:
         settings = _read_json(settings_path)
@@ -1666,9 +1691,11 @@ def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
     return {
         "cli_value": cli_thinking,
         "pi_default_setting": pi_default,
-        # Which file the pi_default_setting above was (or would have been)
-        # read from -- the agent dir moves, so the value alone is ambiguous.
-        "pi_default_setting_file": str(settings_path),
+        # Which file the pi_default_setting above was read from -- the agent
+        # dir moves, so the value alone is ambiguous. None when pi will read
+        # no global settings at all; path_status says which case that is.
+        "pi_default_setting_file": str(settings_path) if settings_path else None,
+        "pi_default_setting_source": path_status,
         "resolved": resolved,
         "source": source,
         # Filled in later by the caller once a live PiRpc session exists and
@@ -1755,6 +1782,7 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
         errors.append({"source": "thinking", "error": f"{type(exc).__name__}: {exc}"})
         thinking = {"cli_value": cli_thinking, "pi_default_setting": None,
                     "pi_default_setting_file": None,
+                    "pi_default_setting_source": "error",
                     "resolved": None, "source": "error", "confirmed_live": None}
     try:
         max_tokens = _find_model_max_tokens(provider, model_id)

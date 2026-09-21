@@ -1126,7 +1126,13 @@ def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
             "error": f"{type(exc).__name__}: {exc}",
         })
     try:
-        path.write_text(json.dumps(snapshot, indent=2, default=str))
+        # Temp file + os.replace, not write_text: write_text truncates first,
+        # so a trial killed mid-rewrite would replace a complete snapshot
+        # with unparseable JSON -- losing the toolchain probe and timeout
+        # provenance too, not just the field being added.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2, default=str))
+        os.replace(tmp, path)
     except Exception as e:
         logger.warning(f"LittleCoderAgent: environment snapshot rewrite failed: {e}")
 
