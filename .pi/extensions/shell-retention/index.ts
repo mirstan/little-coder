@@ -154,8 +154,8 @@ export default function (pi: ExtensionAPI) {
         `To get the original text back, call ShellRecall with that id.\n` +
         `\n` +
         `If you're instead trying to remove a placeholder already written into a file, don't ` +
-        `quote the marker text — that re-trips this same guard, an \`edit\` whose ` +
-        `\`old_string\` is the marker line included. Delete or replace it by line number ` +
+        `quote the marker text — that re-trips this same guard, as would an \`edit\` whose ` +
+        `\`old_string\` includes the marker line. Delete or replace it by line number ` +
         `instead: \`grep -n 'sr-' file\` finds the line without quoting the marker, then ` +
         `\`sed -i '42d' file\`.`,
     };
