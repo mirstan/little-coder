@@ -481,9 +481,10 @@ class LittleCoderAgent(BaseAgent):
                 max_turns=self._max_turns,
                 # See harbor_adapter's identical kwarg for why this is safe
                 # to pass unconditionally (pi clamps it to "off" for
-                # non-reasoning models) and necessary (pi's reasoningEffort
-                # defaults to "off" otherwise, silently no-op'ing any
-                # thinkingFormat gated on it).
+                # non-reasoning models) and necessary (otherwise pi falls
+                # back to the machine-local defaultThinkingLevel, which can
+                # silently no-op any thinkingFormat gated on
+                # reasoningEffort).
                 thinking="high",
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(

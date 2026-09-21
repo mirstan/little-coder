@@ -2012,9 +2012,10 @@ class LittleCoderAgent(BaseAgent):
                 # thinking_budget, i.e. wants reasoning on; pi's own
                 # clampThinkingLevel degrades this to "off" for models with
                 # reasoning=false, so this is safe to pass unconditionally.
-                # Without it, pi's reasoningEffort/thinkingLevel defaults to
-                # "off" and any thinkingFormat gated on reasoningEffort
-                # (e.g. "qwen") silently never enables thinking.
+                # Without it, pi falls back to the machine-local
+                # defaultThinkingLevel setting (pi's built-in fallback is
+                # "medium"); a machine set to "off" silently no-ops any
+                # thinkingFormat gated on reasoningEffort (e.g. "qwen").
                 thinking="high",
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
