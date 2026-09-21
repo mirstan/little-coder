@@ -1083,6 +1083,51 @@ def _build_environment_snapshot(
     snapshot["toolchain_probe_status"] = toolchain_probe_status
     return snapshot
 
+
+def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
+    """Backfill thinking.confirmed_live from pi's own resolved session state,
+    then rewrite `path`.
+
+    The rest of the snapshot records what this adapter REQUESTED. pi does not
+    necessarily honour it: clampThinkingLevel degrades any level to "off" for
+    a model registered with reasoning=false, so a non-reasoning model can run
+    with no thinking at all under a snapshot that says "high". Rather than
+    re-deriving that clamp in Python -- a second copy of pi's rules, free to
+    drift -- ask pi, exactly as aider_polyglot.py does.
+
+    Best-effort in every direction: a failed probe is recorded in the
+    snapshot's own `errors` (silence would be indistinguishable from "pi
+    agreed") and never propagates, because provenance must not fail a trial.
+    Rewrites rather than deferring the first write, which is deliberately
+    ordered ahead of PiRpc so it survives a construction failure.
+    """
+    try:
+        state = rpc.get_state()
+        level = state.get("thinkingLevel")
+        if level:
+            snapshot.setdefault("thinking", {})["confirmed_live"] = level
+            if level != snapshot.get("thinking", {}).get("resolved"):
+                logger.warning(
+                    "LittleCoderAgent: pi resolved thinkingLevel="
+                    f"{level!r}, not the requested "
+                    f"{snapshot['thinking'].get('resolved')!r} "
+                    "(expected for a model registered with reasoning=false)"
+                )
+        else:
+            snapshot.setdefault("errors", []).append({
+                "source": "confirmed_thinking",
+                "error": f"get_state succeeded but returned no thinkingLevel: {state!r}",
+            })
+    except Exception as exc:
+        snapshot.setdefault("errors", []).append({
+            "source": "confirmed_thinking",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    try:
+        path.write_text(json.dumps(snapshot, indent=2, default=str))
+    except Exception as e:
+        logger.warning(f"LittleCoderAgent: environment snapshot rewrite failed: {e}")
+
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1917,6 +1962,10 @@ class LittleCoderAgent(BaseAgent):
         # it (and the config-provenance log line) land even if PiRpc itself
         # fails to construct (e.g. PI_BIN missing) -- exactly the
         # diagnostics that failure needs most.
+        # Kept in scope past the write so the post-PiRpc confirmation below
+        # can amend and rewrite it; None means "never successfully built",
+        # which that step treats as nothing to confirm.
+        snapshot: dict | None = None
         if self.logs_dir:
             try:
                 snapshot = _build_environment_snapshot(
@@ -1932,6 +1981,7 @@ class LittleCoderAgent(BaseAgent):
                     json.dumps(snapshot, indent=2, default=str)
                 )
             except Exception as e:
+                snapshot = None
                 self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
 
         # Start-of-trial snapshot of the task's pre-existing /app files.
@@ -2035,6 +2085,14 @@ class LittleCoderAgent(BaseAgent):
                     initial_snapshot=initial_snapshot,
                 ),
             )
+            if snapshot is not None and self.logs_dir:
+                await asyncio.to_thread(
+                    _confirm_live_thinking,
+                    rpc,
+                    snapshot,
+                    self.logs_dir / "environment_snapshot.json",
+                    self.logger,
+                )
             try:
                 # Retried in place on a provider-error completion rather than
                 # called bare: a single errored completion used to end the

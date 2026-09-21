@@ -203,6 +203,34 @@ def test_agent_dir_is_isolated_from_the_users_real_pi_config(tmp_path, monkeypat
         rpc.close(timeout=1)
 
 
+def test_each_session_clears_a_previous_runs_thinking_latch(tmp_path, monkeypatch):
+    """thinking-budget calls setThinkingLevel() mid-trial and pi persists it
+    to <agent dir>/settings.json. Because the scratch dir is a fixed path
+    reused by every later run, a run that latched to "off" would otherwise
+    become the startup default of unrelated runs. bin/ must survive the
+    reset -- it is the ripgrep symlink that keeps pi's Grep tool from
+    downloading mid-trial."""
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    scratch = tmp_path / "scratch-agent"
+    scratch.mkdir()
+    (scratch / "settings.json").write_text('{"defaultThinkingLevel": "off"}')
+    (scratch / "bin").mkdir()
+    (scratch / "auth.json").write_text("{}")
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+    monkeypatch.setattr(RC.subprocess, "Popen", _FakeProc)
+
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path))
+    try:
+        assert not (scratch / "settings.json").exists()
+        assert (scratch / "bin").is_dir()
+        assert (scratch / "auth.json").exists()
+    finally:
+        rpc.close(timeout=1)
+
+
 def test_an_exported_agent_dir_still_wins(tmp_path, monkeypatch):
     """The isolation only fills the var in when absent, so an operator who
     deliberately exports PI_CODING_AGENT_DIR keeps control of where pi's

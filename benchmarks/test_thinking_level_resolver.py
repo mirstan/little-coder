@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client as RC  # noqa: E402
@@ -178,6 +181,39 @@ def test_non_string_thinking_level_falls_back(monkeypatch):
     settings = {"model_profiles": {"omlx/m": {"thinking_level": 3}}}
     monkeypatch.setattr(RC, "_load_little_coder_settings", lambda: settings)
     assert resolve_thinking_level("omlx/m") == DEFAULT_THINKING_LEVEL
+
+
+def test_a_level_outside_pis_vocabulary_falls_back_and_warns(monkeypatch, capsys):
+    """pi's cli/args.js demotes an unrecognized --thinking to a warning and
+    DROPS the flag, so passing a typo through would run at pi's own default
+    while the environment snapshot recorded the typo as source="cli".
+    thinking_level is not schema-validated, so a typo is the realistic path."""
+    settings = {"model_profiles": {"omlx/m": {"thinking_level": "hihg"}}}
+    monkeypatch.setattr(RC, "_load_little_coder_settings", lambda: settings)
+    assert resolve_thinking_level("omlx/m") == DEFAULT_THINKING_LEVEL
+    assert "hihg" in capsys.readouterr().err
+
+
+def test_the_resolver_accepts_every_level_pi_accepts(monkeypatch):
+    for level in RC.PI_THINKING_LEVELS:
+        settings = {"model_profiles": {"omlx/m": {"thinking_level": level}}}
+        monkeypatch.setattr(RC, "_load_little_coder_settings", lambda: settings)
+        assert resolve_thinking_level("omlx/m") == level
+
+
+def test_the_vocabulary_matches_the_vendored_pi(monkeypatch):
+    """PI_THINKING_LEVELS is a hand copy of pi's VALID_THINKING_LEVELS. pi is
+    vendored here, so the copy can be checked against the real thing rather
+    than trusted -- this fails on a pi bump that changes the vocabulary."""
+    args_js = (
+        RC.REPO_ROOT / "node_modules" / "@earendil-works" / "pi-coding-agent"
+        / "dist" / "cli" / "args.js"
+    )
+    if not args_js.is_file():
+        pytest.skip(f"vendored pi not installed at {args_js}")
+    match = re.search(r"VALID_THINKING_LEVELS\s*=\s*\[([^\]]*)\]", args_js.read_text())
+    assert match, "VALID_THINKING_LEVELS not found -- pi's args.js changed shape"
+    assert set(re.findall(r'"([^"]+)"', match.group(1))) == set(RC.PI_THINKING_LEVELS)
 
 
 def test_settings_load_prefers_the_project_file(monkeypatch, tmp_path):

@@ -80,13 +80,37 @@ def _bench_agent_dir() -> str:
     ~/.pi/agent/settings.json, whose defaultThinkingLevel a benchmark run
     was observed silently overwriting.
 
-    Auth is deliberately not isolated by this and does not need to be:
-    ~/.pi/agent/auth.json holds only hosted-provider OAuth, while the local
-    providers these benchmarks drive take their key from models.json or a
-    *_API_KEY env var, and models.json resolves from ~/.config/little-coder
-    (see _resolve_little_coder_models_file), never from the agent dir.
+    This redirects EVERYTHING pi derives from getAgentDir() (config.js),
+    not just settings.json: auth.json, pi's own models.json/models-store.json,
+    bin/, tools/, sessions/. pi recreates what it needs, so the practical
+    effect is that a benchmark pi starts from an empty agent config.
+
+    That is harmless for these runs, but for a narrower reason than it may
+    look. Auth IS redirected -- pi writes a fresh empty auth.json here -- and
+    the local providers these benchmarks drive simply don't use it: their key
+    comes from a *_API_KEY env var (set in PiRpc.__init__) or from
+    little-coder's own models.json, a DIFFERENT file that resolves from
+    ~/.config/little-coder (see _resolve_little_coder_models_file) and is
+    unaffected by the agent dir. Likewise pi's own agent-dir models.json is
+    redirected, but llamacpp/omlx/mlx-serve register through this repo's
+    extensions rather than that file.
+
+    A hosted-provider run (OAuth in ~/.pi/agent/auth.json) would NOT survive
+    this redirect. No benchmark drives one today; one that did would have to
+    export PI_CODING_AGENT_DIR itself to opt out.
     """
     _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    # Start each session from a known thinking level. thinking-budget's
+    # latch calls pi.setThinkingLevel(), which settings-manager.js persists
+    # to <agent dir>/settings.json under the GLOBAL scope -- so without this
+    # a run that latched to "off" would leave that behind as the startup
+    # default of every later run sharing this dir. Only pi itself ever
+    # writes this file, so nothing hand-authored is lost; bin/ and auth.json
+    # are deliberately kept (see above).
+    try:
+        (_BENCH_AGENT_DIR / "settings.json").unlink()
+    except OSError:
+        pass
     # pi's Grep tool calls ensureTool("rg"), which downloads ripgrep from
     # GitHub when <agent dir>/bin has no copy -- a mid-trial download, or a
     # dead Grep tool offline. A download pi does still perform then lands in
@@ -1417,9 +1441,21 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
 #: Applied when no matched profile names a thinking_level, and when the
 #: settings file is missing or malformed. "high" is what the harness
 #: hardcoded before thinking_level existed; a None here would send no
-#: --thinking flag at all, leaving pi on the machine-local
-#: defaultThinkingLevel (built-in fallback "medium").
+#: --thinking flag at all, leaving pi on whatever defaultThinkingLevel its
+#: agent dir supplies -- under PiRpc's isolation, none, so pi's built-in
+#: PI_BUILTIN_THINKING_LEVEL.
 DEFAULT_THINKING_LEVEL = "high"
+
+#: pi's own vocabulary, copied from its cli/args.js VALID_THINKING_LEVELS.
+#: Safe to duplicate because pi is vendored in this repo's node_modules, so
+#: the list and the pi that consumes it move together on every bump.
+PI_THINKING_LEVELS = frozenset(
+    ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+)
+
+#: pi's compiled-in level when neither --thinking nor a defaultThinkingLevel
+#: setting supplies one (core/defaults.js::DEFAULT_THINKING_LEVEL).
+PI_BUILTIN_THINKING_LEVEL = "medium"
 
 
 def _load_little_coder_settings() -> dict:
@@ -1496,15 +1532,29 @@ def resolve_thinking_level(model: str, benchmark: Optional[str] = None) -> str:
     an explicit thinking_level "off" means thinking is off no matter what
     budget the same profile carries, since there is then nothing to cap.
 
-    Valid values are pi's own vocabulary: off, minimal, low, medium, high,
-    xhigh, max. Unrecognized strings are passed through to pi rather than
-    rejected here, so this never becomes a second place to update when pi's
-    vocabulary grows.
+    Values outside pi's own vocabulary (PI_THINKING_LEVELS) fall back to
+    DEFAULT_THINKING_LEVEL with a warning rather than being passed through.
+    Passing them through would be silently lossy, not permissive: pi's
+    cli/args.js demotes an unrecognized --thinking to a *warning diagnostic*
+    and drops the flag entirely, so pi would quietly run at its own default
+    while the environment snapshot recorded the typo as `source: "cli"`.
+    settings.json's thinking_level is not schema-validated, so a typo there
+    is the realistic way this happens.
     """
     level = _resolve_profile_from(
         _load_little_coder_settings(), model, benchmark
     ).get("thinking_level")
-    return level if isinstance(level, str) and level else DEFAULT_THINKING_LEVEL
+    if not isinstance(level, str) or not level:
+        return DEFAULT_THINKING_LEVEL
+    if level not in PI_THINKING_LEVELS:
+        print(
+            f"[rpc_client] settings.json thinking_level={level!r} is not one of "
+            f"{sorted(PI_THINKING_LEVELS)}; pi would silently ignore it. "
+            f"Using {DEFAULT_THINKING_LEVEL!r} instead.",
+            file=sys.stderr,
+        )
+        return DEFAULT_THINKING_LEVEL
+    return level
 
 
 def _find_model_max_tokens(provider: str, model_id: str) -> dict:
@@ -1538,18 +1588,54 @@ def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     return out
 
 
+def _pi_global_settings_path() -> Path:
+    """The settings.json pi itself will read as its GLOBAL scope this run.
+
+    pi derives it from PI_CODING_AGENT_DIR, not from $HOME
+    (config.js::getAgentDir -> getSettingsPath), and PiRpc points every
+    benchmark subprocess at _BENCH_AGENT_DIR -- so ~/.pi/agent/settings.json,
+    which this provenance used to read, is a file pi no longer opens for
+    these runs. Mirrors PiRpc.__init__'s own rule: an already-exported
+    PI_CODING_AGENT_DIR wins, otherwise the scratch dir applies.
+
+    Not pi's whole picture -- settings-manager.js merges
+    <cwd>/.pi/settings.json over this scope -- but no benchmark cwd ships a
+    defaultThinkingLevel, so this is the only scope that can supply one.
+    """
+    env = os.environ.get("PI_CODING_AGENT_DIR")
+    base = Path(env).expanduser() if env else _BENCH_AGENT_DIR
+    return base / "settings.json"
+
+
 def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
-    settings = _read_json(_PI_SETTINGS_PATH)
-    pi_default = settings.get("defaultThinkingLevel") if settings else None
+    settings_path = _pi_global_settings_path()
+    if settings_path.parent == _BENCH_AGENT_DIR:
+        # _bench_agent_dir() deletes this file on every PiRpc construction,
+        # so anything on disk here is a prior run's thinking-budget latch
+        # that pi will never read. Reporting it would just relocate the
+        # stale-provenance bug, and the snapshot can be built either side of
+        # that delete (harbor writes it before PiRpc, polyglot before the
+        # run loop), so ignoring it is the only ordering-independent answer.
+        pi_default = None
+    else:
+        settings = _read_json(settings_path)
+        pi_default = settings.get("defaultThinkingLevel") if settings else None
     if cli_thinking:
         resolved, source = cli_thinking, "cli"
     elif pi_default:
         resolved, source = pi_default, "pi_default_settings"
     else:
-        resolved, source = None, "unresolved"
+        # Not "unresolved": pi does resolve this case, to its own compiled-in
+        # level. Recording None here claimed ignorance about a value that is
+        # in fact knowable, which is how a benchmark ran at "medium" while
+        # its snapshot said nothing at all.
+        resolved, source = PI_BUILTIN_THINKING_LEVEL, "pi_builtin_default"
     return {
         "cli_value": cli_thinking,
         "pi_default_setting": pi_default,
+        # Which file the pi_default_setting above was (or would have been)
+        # read from -- the agent dir moves, so the value alone is ambiguous.
+        "pi_default_setting_file": str(settings_path),
         "resolved": resolved,
         "source": source,
         # Filled in later by the caller once a live PiRpc session exists and
@@ -1590,8 +1676,9 @@ def _capture_omlx_sampling(model_id: str, errors: list[dict]) -> dict:
 
 def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None, agent: str = "pi") -> dict:
     """Best-effort snapshot of config that affects generation but isn't visible
-    to the harness's own CLI args: the machine-local default thinking level
-    pi falls back to when --thinking is unset, the model's maxTokens, the
+    to the harness's own CLI args: the default thinking level pi falls back
+    to when --thinking is unset (from whichever agent dir this run points pi
+    at -- see _pi_global_settings_path), the model's maxTokens, the
     model server's sampling params (temperature/top_p/top_k/repetition_penalty
     -- omlx only for now; rapid-mlx's sampling flags are CLI-launch-time only
     with no queryable file, so that provider degrades to a note rather than a
@@ -1634,6 +1721,7 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
     except Exception as exc:
         errors.append({"source": "thinking", "error": f"{type(exc).__name__}: {exc}"})
         thinking = {"cli_value": cli_thinking, "pi_default_setting": None,
+                    "pi_default_setting_file": None,
                     "resolved": None, "source": "error", "confirmed_live": None}
     try:
         max_tokens = _find_model_max_tokens(provider, model_id)
