@@ -4,10 +4,12 @@ import { createHash } from "node:crypto";
 import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { harnessIntervention } from "../_shared/intervention.ts";
 import { envNumber } from "../_shared/env-number.ts";
 import { byteLen } from "../shell-session/helpers.ts";
 import {
   demoteMessages,
+  findMarkerEchoIds,
   recallSlice,
   resolveOptions,
   resolveRecallOptions,
@@ -126,6 +128,36 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     cleanupArchive();
+  });
+
+  // A model can echo a demoted placeholder verbatim into a NEW tool call —
+  // e.g. "reconstructing" a file from the marker text left in its own
+  // context — baking a corrupted line into real output instead of paging
+  // the original back in with ShellRecall. Block those calls before they
+  // execute; ShellRecall's own input legitimately carries a live id.
+  pi.on("tool_call", async (event, ctx) => {
+    if (String((event as any).toolName ?? "") === "ShellRecall") return;
+    const input = (event as any).input;
+    if (input == null) return;
+
+    const liveIds = findMarkerEchoIds(input).filter((id) => hostArchive.size(id) !== undefined);
+    if (liveIds.length === 0) return;
+
+    harnessIntervention(ctx, "blocked a tool call echoing a demoted shell-retention placeholder.");
+    return {
+      block: true,
+      reason:
+        `This call quotes a shell-retention placeholder (${liveIds.join(", ")}) instead of ` +
+        `real content — the marker text is not the original command/output, so copying it ` +
+        `into a file or command reproduces the placeholder, not what it stands for.\n` +
+        `\n` +
+        `To get the original text back, call ShellRecall with that id.\n` +
+        `\n` +
+        `If you're instead trying to remove a placeholder already written into a file, don't ` +
+        `quote the marker text in the command (that re-trips this same guard) — delete or ` +
+        `replace it by line number instead, e.g. \`sed -i '42d' file\` or an edit targeted at ` +
+        `that line.`,
+    };
   });
 
   pi.on("context", async (event) => {
