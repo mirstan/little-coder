@@ -110,6 +110,7 @@ def test_environment_snapshot_includes_provenance_keys():
     snapshot = lca._build_environment_snapshot(
         "llamacpp/qwen3.6-35b-a3b",
         max_turns=0,
+        thinking_level="high",
         ambient_max_turns_env="40",
         timeout_info=timeout_info,
     )
@@ -134,6 +135,7 @@ def test_environment_snapshot_is_json_serializable():
     snapshot = lca._build_environment_snapshot(
         "llamacpp/qwen3.6-35b-a3b",
         max_turns=0,
+        thinking_level="high",
         ambient_max_turns_env=None,
         timeout_info=timeout_info,
     )

@@ -35,6 +35,7 @@ TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 # (not inlined) so tests can monkeypatch each one independently, matching how
 # REPO_ROOT/PI_BIN are already overridden in tests.
 _PI_SETTINGS_PATH = Path.home() / ".pi" / "agent" / "settings.json"
+_PI_PROJECT_SETTINGS_PATH = REPO_ROOT / ".pi" / "settings.json"
 _LC_MODELS_SHIPPED_DEFAULT = REPO_ROOT / "models.json"
 _OMLX_SETTINGS = Path.home() / ".omlx" / "settings.json"
 _OMLX_MODEL_SETTINGS = Path.home() / ".omlx" / "model_settings.json"
@@ -62,6 +63,42 @@ def _extension_paths() -> list[str]:
         if child.is_dir() and (child / "index.ts").exists():
             paths.append(str(child / "index.ts"))
     return paths
+
+
+#: Scratch agent dir for benchmark pi subprocesses. Repo-scoped rather than a
+#: per-process temp dir so the bin/ symlink and whatever a run wrote survive
+#: for post-mortem, and so two checkouts never share one.
+_BENCH_AGENT_DIR = REPO_ROOT / ".cache" / "pi-bench-agent"
+
+
+def _bench_agent_dir() -> str:
+    """Prepare and return the PI_CODING_AGENT_DIR every benchmark pi gets.
+
+    thinking-budget's latches call pi.setThinkingLevel() mid-trial, which
+    pi writes straight through to <agent dir>/settings.json. At the default
+    agent dir that file is the user's own interactive
+    ~/.pi/agent/settings.json, whose defaultThinkingLevel a benchmark run
+    was observed silently overwriting.
+
+    Auth is deliberately not isolated by this and does not need to be:
+    ~/.pi/agent/auth.json holds only hosted-provider OAuth, while the local
+    providers these benchmarks drive take their key from models.json or a
+    *_API_KEY env var, and models.json resolves from ~/.config/little-coder
+    (see _resolve_little_coder_models_file), never from the agent dir.
+    """
+    _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    # pi's Grep tool calls ensureTool("rg"), which downloads ripgrep from
+    # GitHub when <agent dir>/bin has no copy -- a mid-trial download, or a
+    # dead Grep tool offline. A download pi does still perform then lands in
+    # the real bin dir, exactly as it would without this isolation.
+    real_bin = Path.home() / ".pi" / "agent" / "bin"
+    link = _BENCH_AGENT_DIR / "bin"
+    if real_bin.is_dir() and not link.exists():
+        try:
+            link.symlink_to(real_bin, target_is_directory=True)
+        except OSError:
+            pass
+    return str(_BENCH_AGENT_DIR)
 
 
 class PiProcessExited(RuntimeError):
@@ -158,6 +195,9 @@ class PiRpc:
         # Required api-key envs (pi requires SOMETHING even for local providers)
         full_env.setdefault("LLAMACPP_API_KEY", "noop")
         full_env.setdefault("OLLAMA_API_KEY", "noop")
+        # Not setdefault: an exported value must also skip the mkdir.
+        if "PI_CODING_AGENT_DIR" not in full_env:
+            full_env["PI_CODING_AGENT_DIR"] = _bench_agent_dir()
         if benchmark:
             full_env["LITTLE_CODER_BENCHMARK"] = benchmark
         if allowed_tools:
@@ -1372,6 +1412,98 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
     if xdg:
         return Path(xdg) / "little-coder" / "models.json", "env:XDG_CONFIG_HOME"
     return Path.home() / ".config" / "little-coder" / "models.json", "home_default"
+
+
+#: Applied when no matched profile names a thinking_level, and when the
+#: settings file is missing or malformed. "high" is what the harness
+#: hardcoded before thinking_level existed; a None here would send no
+#: --thinking flag at all, leaving pi's reasoningEffort at its "off" default.
+DEFAULT_THINKING_LEVEL = "high"
+
+
+def _load_little_coder_settings() -> dict:
+    """The `little_coder` block, from the first settings file that has one.
+
+    Mirrors .pi/extensions/benchmark-profiles/index.ts::loadSettings() --
+    kept in sync by hand, there is no shared source of truth between this
+    Python harness and that TS extension. The home-directory candidate stays
+    the real ~/.pi/agent/settings.json even though PiRpc now points the
+    subprocess elsewhere (see _bench_agent_dir): the TS side resolves it from
+    homedir(), not from PI_CODING_AGENT_DIR, so this matches what the
+    extension actually reads.
+    """
+    for path in (_PI_PROJECT_SETTINGS_PATH, _PI_SETTINGS_PATH):
+        data = _read_json(path)
+        if data is None:
+            continue
+        little_coder = data.get("little_coder")
+        if isinstance(little_coder, dict):
+            return little_coder
+    return {}
+
+
+def _norm_key(s: str) -> str:
+    """Port of benchmark-profiles/index.ts::normKey(). Its `/:/g` regex is a
+    plain str.replace here -- identical for a single literal character, and
+    with no `re` dependency."""
+    return s.replace(":", "-")
+
+
+def _resolve_profile_from(
+    settings: dict,
+    provider_slash_model: str,
+    bench: Optional[str] = None,
+) -> dict:
+    """Port of benchmark-profiles/index.ts::resolveProfileFrom() -- kept in
+    sync by hand; benchmarks/test_thinking_level_resolver.py pins the two to
+    the same cases. Exact key match, then separator-insensitive prefix match,
+    then default_model_profile, then benchmark_overrides[bench] layered on.
+
+    Note the fallback is whole-profile, not per-field: a profile that matches
+    but omits a field does NOT inherit that field from default_model_profile.
+    """
+    profiles = _as_dict(settings.get("model_profiles"))
+    target = _norm_key(provider_slash_model)
+
+    base = profiles.get(provider_slash_model)
+    if not isinstance(base, dict):
+        base = None
+        for pattern, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            normalized = _norm_key(pattern)
+            if target == normalized or target.startswith(normalized):
+                base = profile
+                break
+    if base is None:
+        base = _as_dict(settings.get("default_model_profile"))
+
+    resolved = {k: v for k, v in base.items() if k != "benchmark_overrides"}
+    overrides = _as_dict(base.get("benchmark_overrides"))
+    if bench and isinstance(overrides.get(bench), dict):
+        resolved.update(overrides[bench])
+    return resolved
+
+
+def resolve_thinking_level(model: str, benchmark: Optional[str] = None) -> str:
+    """The `--thinking` level for a `provider/model`, from settings.json's
+    little_coder.model_profiles (see _resolve_profile_from for the lookup).
+
+    Orthogonal to thinking_budget: the level is a construction-time
+    instruction for how hard to think, the budget a runtime token cap the
+    thinking-budget extension enforces. Where they conflict the level wins --
+    an explicit thinking_level "off" means thinking is off no matter what
+    budget the same profile carries, since there is then nothing to cap.
+
+    Valid values are pi's own vocabulary: off, minimal, low, medium, high,
+    xhigh, max. Unrecognized strings are passed through to pi rather than
+    rejected here, so this never becomes a second place to update when pi's
+    vocabulary grows.
+    """
+    level = _resolve_profile_from(
+        _load_little_coder_settings(), model, benchmark
+    ).get("thinking_level")
+    return level if isinstance(level, str) and level else DEFAULT_THINKING_LEVEL
 
 
 def _find_model_max_tokens(provider: str, model_id: str) -> dict:

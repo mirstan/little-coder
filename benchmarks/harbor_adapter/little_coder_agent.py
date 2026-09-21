@@ -104,6 +104,7 @@ from rpc_client import (  # noqa: E402
     capture_environment_snapshot,
     preview_tool_result,
     prompt_with_error_retry,
+    resolve_thinking_level,
 )
 
 
@@ -1047,6 +1048,7 @@ def _build_environment_snapshot(
     model: str,
     *,
     max_turns: int,
+    thinking_level: str,
     ambient_max_turns_env: str | None,
     timeout_info: dict,
     toolchain: list[str] | None = None,
@@ -1055,8 +1057,8 @@ def _build_environment_snapshot(
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
     introspection, plus the config values this adapter itself resolved --
-    the active turn cap, the ambient env var seen at process entry, this
-    process's own code identity, and the FULL timeout-provenance dict from
+    the active turn cap, the resolved thinking level, the ambient env var
+    seen at process entry, this process's own code identity, and the FULL timeout-provenance dict from
     _resolve_trial_timeout_info() (not just the effective float) so a
     reader can tell exactly which task.toml/cache-layout produced it.
 
@@ -1064,7 +1066,7 @@ def _build_environment_snapshot(
     PiRpc/environment. Never raises on its own logic; capture_environment_
     snapshot() already guarantees no-raise for its half.
     """
-    snapshot = capture_environment_snapshot(model)
+    snapshot = capture_environment_snapshot(model, cli_thinking=thinking_level)
     snapshot["max_turns"] = max_turns
     snapshot["ambient_max_turns_env"] = ambient_max_turns_env
     snapshot["little_coder_version"] = _AGENT_VERSION
@@ -1727,8 +1729,10 @@ class LittleCoderAgent(BaseAgent):
         # Throttled so a fast-streaming turn doesn't turn this into a flush
         # storm.
         HEARTBEAT_INTERVAL_SEC = 30.0
-        heartbeat_last_ts = 0.0
-        heartbeat_turn_start_ts = 0.0
+        # Seeded to "now", not 0.0: a zero start makes the very first delta
+        # satisfy the throttle and emit a "0s elapsed" line every turn.
+        heartbeat_last_ts = time.time()
+        heartbeat_turn_start_ts = heartbeat_last_ts
         heartbeat_delta_chars = 0
 
         def on_event(ev: dict) -> None:
@@ -1741,7 +1745,10 @@ class LittleCoderAgent(BaseAgent):
                 delta_type = delta.get("type")
                 if delta_type == "text_delta":
                     pending_text.append(delta.get("delta", ""))
-                if delta_type in ("text_delta", "thinking_delta"):
+                # toolcall_delta too: a long shell command or heredoc
+                # streams entirely as tool-call arguments, and that is the
+                # dominant shape of a Terminal-Bench turn.
+                if delta_type in ("text_delta", "thinking_delta", "toolcall_delta"):
                     heartbeat_delta_chars += len(delta.get("delta", ""))
                     now = time.time()
                     if now - heartbeat_last_ts >= HEARTBEAT_INTERVAL_SEC:
@@ -1812,7 +1819,7 @@ class LittleCoderAgent(BaseAgent):
             elif t == "agent_start":
                 turn_counter += 1
                 heartbeat_turn_start_ts = time.time()
-                heartbeat_last_ts = 0.0
+                heartbeat_last_ts = heartbeat_turn_start_ts
                 heartbeat_delta_chars = 0
                 live_log_fh.write(f"=== turn {turn_counter} start ===\n")
                 live_log_fh.flush()
@@ -1878,9 +1885,13 @@ class LittleCoderAgent(BaseAgent):
         # can never diverge.
         max_turns = 0
         ambient_max_turns_env = os.environ.get("LITTLE_CODER_MAX_TURNS")
+        # Hoisted for the same reason as max_turns: the log line, the
+        # environment snapshot and the PiRpc kwarg must all read one value.
+        thinking_level = resolve_thinking_level(model, "terminal_bench")
         self.logger.info(
             "LittleCoderAgent: config provenance "
             f"max_turns={max_turns} "
+            f"thinking_level={thinking_level} "
             f"ambient_LITTLE_CODER_MAX_TURNS={ambient_max_turns_env!r} "
             f"code_sha={_CODE_SHA} "
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
@@ -1911,6 +1922,7 @@ class LittleCoderAgent(BaseAgent):
                 snapshot = _build_environment_snapshot(
                     model,
                     max_turns=max_turns,
+                    thinking_level=thinking_level,
                     ambient_max_turns_env=ambient_max_turns_env,
                     timeout_info=timeout_info,
                     toolchain=toolchain.tools,
@@ -2008,15 +2020,14 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=max_turns,
-                # Every configured model_profiles entry has a nonzero
-                # thinking_budget, i.e. wants reasoning on; pi's own
-                # clampThinkingLevel degrades this to "off" for models with
-                # reasoning=false, so this is safe to pass unconditionally.
-                # Without it, pi falls back to the machine-local
-                # defaultThinkingLevel setting (pi's built-in fallback is
-                # "medium"); a machine set to "off" silently no-ops any
-                # thinkingFormat gated on reasoningEffort (e.g. "qwen").
-                thinking="high",
+                # pi's own clampThinkingLevel degrades this to "off" for
+                # models with reasoning=false, so it is safe to pass
+                # unconditionally. Without it, pi falls back to the
+                # machine-local defaultThinkingLevel setting (pi's built-in
+                # fallback is "medium"); a machine set to "off" silently
+                # no-ops any thinkingFormat gated on reasoningEffort (e.g.
+                # "qwen").
+                thinking=thinking_level,
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,

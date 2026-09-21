@@ -41,3 +41,6 @@ brainstorm_outputs/
 
 # deep-research batch eval artifacts
 benchmarks/deep_research_runs/
+
+# Scratch pi agent dir for benchmark subprocesses (rpc_client._BENCH_AGENT_DIR)
+/.cache/

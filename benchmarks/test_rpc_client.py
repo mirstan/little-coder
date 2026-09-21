@@ -182,6 +182,45 @@ def test_max_turns_explicit_zero_clobbers_ambient_env(tmp_path, monkeypatch):
         rpc.close(timeout=1)
 
 
+def test_agent_dir_is_isolated_from_the_users_real_pi_config(tmp_path, monkeypatch):
+    """Every benchmark pi subprocess must get PI_CODING_AGENT_DIR pointed at
+    the scratch dir, never the default ~/.pi/agent: thinking-budget's
+    setThinkingLevel() latches persist through it, and a run was observed
+    rewriting the user's own interactive defaultThinkingLevel."""
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    scratch = tmp_path / "scratch-agent"
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+    monkeypatch.setattr(RC.subprocess, "Popen", _FakeProc)
+
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path))
+    try:
+        assert _FakeProc.captured_env["PI_CODING_AGENT_DIR"] == str(scratch)
+        assert scratch.is_dir()
+    finally:
+        rpc.close(timeout=1)
+
+
+def test_an_exported_agent_dir_still_wins(tmp_path, monkeypatch):
+    """The isolation only fills the var in when absent, so an operator who
+    deliberately exports PI_CODING_AGENT_DIR keeps control of where pi's
+    state goes."""
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "/somewhere/deliberate")
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", tmp_path / "scratch-agent")
+    monkeypatch.setattr(RC.subprocess, "Popen", _FakeProc)
+
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path))
+    try:
+        assert _FakeProc.captured_env["PI_CODING_AGENT_DIR"] == "/somewhere/deliberate"
+    finally:
+        rpc.close(timeout=1)
+
+
 def test_max_turns_unset_leaves_ambient_env_untouched(tmp_path, monkeypatch):
     """max_turns=None (the default, e.g. interactive use / callers that
     never pass the kwarg) must NOT touch LITTLE_CODER_MAX_TURNS at all --

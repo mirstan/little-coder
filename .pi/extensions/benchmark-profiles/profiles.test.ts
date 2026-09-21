@@ -154,6 +154,17 @@ describe("before_agent_start publishes a model-window contextLimit", () => {
     expect(lc.contextLimit).toBe(32768);
   });
 
+  it("republishes thinking_level, which only default_model_profile declares today", () => {
+    // Observability only -- rpc_client.py::resolve_thinking_level is what
+    // actually applies the level, via pi's --thinking flag at launch. The
+    // undefined below is the whole-profile fallback showing through: a
+    // profile that matches does not inherit default_model_profile's fields.
+    const matched = fireWith({ provider: "llamacpp", id: "qwen3.6-35b-a3b", contextWindow: 131072 });
+    expect(matched.thinkingLevel).toBeUndefined();
+    const unmatched = fireWith({ provider: "nope", id: "nope", contextWindow: 131072 });
+    expect(unmatched.thinkingLevel).toBe("high");
+  });
+
   it("an explicit gaia override still wins over the live window", () => {
     const lc = fireWith(
       { provider: "llamacpp", id: "qwen3.6-35b-a3b", contextWindow: 131072 },
