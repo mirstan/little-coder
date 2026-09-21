@@ -289,12 +289,79 @@ gated on each PR's Cubic scan being clear and zero unresolved review threads.
   (this repo's established convention, matching PRs #54-57's merge-commit
   style). All three fully green and thread-clean at merge time.
 
+## 4d. Priorities 7-10 implementation round (2026-09-20)
+
+Fable design → Fable adversarial critique → Opus implement, same pipeline as
+priorities 1-6. Two grouped design tracks, chosen by shared file surface:
+Group A (priority 7 + 8, both touch `tb-finalize-guard`'s trigger logic) and
+Group B (priority 9 + 10, both extend `quality-monitor`'s detection state).
+Before implementing, evaluated the user's suggestion of using "jev" (a hosted
+TypeSafe AI "typed decision" classifier) for Group B — confirmed via direct
+research it's the wrong tool (a structured yes/no/score classifier, not a
+similarity/embedding engine; its own ecosystem's docs say "reranking alone did
+not beat vector retrieval") and architecturally unfit regardless (an external
+API call from inside an hours-long, sandboxed, unattended trial container is
+exactly the dependency this harness has avoided everywhere else). Declined,
+recorded in both designs' critique passes.
+
+Both critiques came back "ready with N amendments," no redesign needed — same
+shape as priority 6's round. Group A: 4 amendments (Trigger D's deliverable
+wording, an endgame-suppression gap, a standing-vs-reactive baseline-diff
+tension, a missing Python test fixture). Group B: 4 amendments, the headline
+being that the failure-signature watchdog as designed would have been INERT
+on Terminal-Bench — the exact task type it was built for — because it gated
+on `isError`, which `ShellSession` (TB's shell path) never sets.
+
+Implemented as PR #61 (priority 7), PR #63 (priority 8, stacked on #61 —
+real file conflicts if built in parallel), PR #62 (priorities 9+10, one
+branch). Post-implementation review was unusually extensive:
+
+- **PR #62** went through 4 rounds of Cubic findings before landing clean:
+  round 1 found 15 issues (14 real fixes + 1 resolved by independently
+  re-deriving the bigram-Jaccard math from first principles, concluding no
+  code change was needed but for a different reason than either side
+  claimed — the min-token floor does the work, not the similarity
+  threshold); round 2 found 8 more, including a genuine functional bug (a
+  PASSING result could reach the model mislabeled as a failure, verified
+  end-to-end); round 3 found 1 more (`identityKey` silently disagreed with
+  the loop-breaker's own `sameCall` on object-key ordering, letting a
+  reordered-key repeat evade both detectors — an existing test had directly
+  pinned the bug). Round 4 was clean. Total: ~23 real bugs found and fixed
+  across the round, on top of the critique's own 4 amendments.
+- **PR #61/#63**: a manual Cubic re-scan (triggered after a mid-review
+  force-push confused its incremental-review mode — had to be re-triggered
+  via a PR comment, twice, once per repo's own quirk) found the same
+  snapshot-var-leak bug independently in `harbor_adapter`'s `_pi_env`
+  that priority 8's implementation had already fixed in `tb_adapter`'s —
+  neither adapter explicitly cleared `LITTLE_CODER_INITIAL_SNAPSHOT`, so an
+  omitted key could inherit a stale value from an earlier trial in the same
+  worker process (`PiRpc` builds the child env as `dict(os.environ)`
+  updated with the adapter's own dict — an omitted key passes an inherited
+  one through untouched). Also found: Trigger D and Trigger A could queue
+  two different steers on the same turn (pi delivers every queued message,
+  never coalesces); Trigger C was missing the same baseline caveats and
+  restore-restraint warning Trigger A needed. One fix was applied to the
+  wrong branch initially (PR #63 instead of PR #61, where the finding
+  actually lived) — caught, the commit was moved to #61 via cherry-pick,
+  and #63 was re-rebased on top; this repeated several times as both
+  branches kept independently accumulating fixes, each requiring a fresh
+  rebase (once hitting a real merge conflict from priority 8's own
+  `_pi_env` signature change, resolved by hand).
+- A final `/code-comments` pass (3 parallel Fable agents, one per branch)
+  found 9 more real stale/overstated comments total (4 on #61, 2 on #62, 3
+  on #63) — all comments left behind by earlier fix rounds that no longer
+  described the final code accurately. Comment-only, no logic changes.
+
+**MERGED (2026-09-20), on explicit user "merge 61, then 63, then 62"
+instruction.** Order: #61 → #63 → #62, all via `gh pr merge --merge`. All
+three fully green and thread-clean at merge time.
+
 ## 5. Open loose ends
 
-- Priorities 7-12 in `PLAN.md` have not been started.
+- Priorities 11-12 in `PLAN.md` have not been started.
 - Re-run `benchmarks/syntax_error_report.py` on a fresh write-compressor trial
   to confirm the 24.5%/2026-09-19 evidence baseline for priority 6 still holds
-  post-#54-58 — still outstanding, needs a live harbor trial, not a code change.
+  post-#54-63 — still outstanding, needs a live harbor trial, not a code change.
 - The separate 8-issue plan from an earlier trajectory analysis (saved at
   `~/.claude/plans/calm-churning-wigderson.md`, not part of this `PLAN.md`'s
   ranked list) still has an open Phase 4 implementation plan (branches

@@ -1,6 +1,6 @@
 # Plan: second-round harness improvements (2026-09-19 trajectory analysis)
 
-Status: **priorities 1-6 merged (PRs #54-58, 2026-09-20); priorities 7-12 not yet
+Status: **priorities 1-10 merged (PRs #54-63, 2026-09-20); priorities 11-12 not yet
 started.** See `STATE.md` for how this fits into the overall project.
 
 ## Source
@@ -94,10 +94,10 @@ where the full rationale lives.
 | 4 | `#10` Don't truncate small (<4KB) tool outputs | Low–Med | **S** | Threshold tweak to an existing formatter; narrow but free — **merged, PR #55** |
 | 5 | `#3` Advertise the pristine initial-state snapshot to the agent | **High** | M | Would have caught overfull-hbox's corruption instantly; extends checkpoint/snapshot machinery already built (PR #29/#50/#51) — **merged, PR #57** |
 | 6 | *(carried over)* Pre-execution syntax diagnostics (LSP alternative) | **High** | M | Strongest evidence of anything remaining — measured, reproducing failure rate (not a single trajectory), generalizes to Aider Polyglot for free. **Merged, PR #58** (2026-09-20), after a second implementation round fixed 8 more Cubic findings (2 declined with evidence, 6 real) and a `/code-comments` pass found 4 more real comment issues. |
-| 7 | `#6` Baseline-grounded adversarial re-verification in "don't give up" nudges | Medium | S–M | Directive-text change to existing nudge extensions; pairs directly with #3/PR #57 (a real baseline now exists to verify against) |
-| 8 | `#5` Earlier/more frequent deadline-progress nudges (50%/75% checkpoints) | Med–High | M | Extends tb-finalize-guard triggers; needs a "does a runnable deliverable exist yet" heuristic |
-| 9 | `#4` Fuzzy/near-duplicate loop detection | Med–High | M | Extends quality-monitor's loop-breaker; similarity matching carries real false-positive risk, needs careful tuning |
-| 10 | `#8` Repeated-identical-failure-signature watchdog | Medium | M | New output-hashing state tracked across turns; distinct mechanism from #4 |
+| 7 | `#6` Baseline-grounded adversarial re-verification in "don't give up" nudges | Medium | S–M | **Merged, PR #61** (2026-09-20). Reworked Trigger A/C in tb-finalize-guard; demanded adversarial (not self-referential) re-verification, pointed at PR #57's real snapshot. |
+| 8 | `#5` Earlier/more frequent deadline-progress nudges (50%/75% checkpoints) | Med–High | M | **Merged, PR #63** (2026-09-20, stacked on #61). New "Trigger D": evidence-gated at 50%, unconditional at 75%. |
+| 9 | `#4` Fuzzy/near-duplicate loop detection | Med–High | M | **Merged, PR #62** (2026-09-20). Token-bigram Jaccard similarity over tool-call content, clustered across an 8-turn window. |
+| 10 | `#8` Repeated-identical-failure-signature watchdog | Medium | M | **Merged, PR #62** (2026-09-20, same PR as priority 9 — the two share a `quality-monitor` extension surface and a `similarity.ts` helper). Hash of a normalized output tail, Jaccard fallback for noisy traces. |
 | 11 | `#11` Adaptive thinking-budget continuation | Medium | **L** | Cuts both ways (this session saw both starvation and leaked-reasoning failure modes) — needs careful tuning and validation, real regression risk, continuation of PR #36 |
 | 12 | `#7` Surface stale background processes touching shared files | Low | M | Only 1 of 4 trajectories; needs bg-shell job-registry + file-path-tracking integration |
 
@@ -105,12 +105,23 @@ where the full rationale lives.
 resolved before this update — PR #53 is merged — and isn't part of this
 prioritization.
 
-**Reading the table**: priorities 1-6 are done (all merged 2026-09-20, PRs
-#54-58). 7 is the next tier — still high-leverage, lower effort, and unblocked
-(needs the baseline #3/PR #57 provides). 8-10 are real but generalized gaps,
-medium effort with more design judgment required. 11-12 are the
-highest-effort/highest-risk or lowest-impact items — 11 in particular should
-not be rushed given the direct tension in the evidence.
+**Reading the table**: priorities 1-10 are done (all merged 2026-09-20, PRs
+#54-63). 11-12 are what's left — the highest-effort/highest-risk or
+lowest-impact items. 11 in particular should not be rushed given the direct
+tension in the evidence (this session saw both thinking-budget starvation and
+leaked-reasoning failure modes).
+
+**Scope of the priorities 7-10 round**: went through Fable design → Fable
+adversarial critique → Opus implementation for two grouped tracks (7+8 shared
+the tb-finalize-guard file surface; 9+10 shared the quality-monitor file
+surface), each critique folding in several real amendments before
+implementation. Post-implementation review was unusually extensive — PR #62 in
+particular went through 4 rounds of Cubic findings (~23 real bugs total,
+including one where the detector was inert on the exact task type it was built
+for, and one where a passing result could reach the model mislabeled as a
+failure) before a final `/code-comments` pass. PR #61/#63 together fixed the
+same snapshot-env-leak bug independently in both TB adapters. Full detail in
+`STATE.md` section 4d.
 
 **Also merged alongside priority 6, not part of this ranked list** (discovered
 as drive-by fixes during the priority-6 round, not scored items): PR #59 fixed
@@ -210,11 +221,11 @@ undetected. See `STATE.md` section 4b for both.
    on a fresh write-compressor trial to confirm the 2026-09-19 24.5%
    evidence baseline still holds post-#54-58 — not done, needs a live harbor
    trial, not just a code change.
-3. Priority 7 is newly unblocked (PR #57 gives it a real baseline to verify
-   against) and is small — could go straight to implementation without a full
-   design pass, mirroring how PR #47-#52 were handled.
-4. Priorities 8-10 are candidates for the full design→critique→implement pipeline.
-5. Priority 11 should be scoped as a continuation of PR #36's adaptive
-   thinking-budget work, not a fresh design.
-6. Priority 12 is lowest priority — only 1 of 4 trajectories, buildable on the
-   existing bg-shell job registry whenever there's room for it.
+3. ~~Priorities 7-10~~ — **done**, merged as PRs #61 (priority 7), #63 (priority
+   8, stacked on #61), and #62 (priorities 9+10) on 2026-09-20. Full
+   design→critique→implement pipeline, two grouped design tracks. See
+   `STATE.md` section 4d for the round-by-round review history.
+4. Priority 11 should be scoped as a continuation of PR #36's adaptive
+   thinking-budget work, not a fresh design. Not started.
+5. Priority 12 is lowest priority — only 1 of 4 trajectories, buildable on the
+   existing bg-shell job registry whenever there's room for it. Not started.
