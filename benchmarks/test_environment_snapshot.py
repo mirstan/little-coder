@@ -225,3 +225,18 @@ def test_snapshot_records_error_for_malformed_model_string(tmp_path):
     snap = RC.capture_environment_snapshot("bare-model-id-no-slash")
     assert any(e["source"] == "model" for e in snap["errors"])
     assert snap["server_sampling"]["note"] == "not introspectable for this provider"
+
+
+def test_a_relative_agent_dir_naming_the_bench_dir_is_still_recognized(tmp_path, monkeypatch):
+    """The stale-latch guard compares resolved paths, not path text: a
+    relative PI_CODING_AGENT_DIR names the same directory but compares
+    unequal lexically, which would put the stale latch back into the
+    snapshot."""
+    bench = RC._BENCH_AGENT_DIR
+    bench.mkdir(parents=True, exist_ok=True)
+    _write_json(bench / "settings.json", {"defaultThinkingLevel": "off"})
+    monkeypatch.chdir(bench.parent)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", f"./{bench.name}")
+    out = RC._resolve_thinking(None)
+    assert out["pi_default_setting"] is None
+    assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL

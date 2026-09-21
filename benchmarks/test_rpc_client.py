@@ -32,6 +32,18 @@ def _skip_if_no_pi():
         pytest.skip(f"pi CLI not installed at {PI_BIN} — run `npm install`")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bench_agent_dir(tmp_path, monkeypatch):
+    """Keep constructing a PiRpc out of the checkout's own scratch agent dir.
+
+    _bench_agent_dir() mkdirs it and deletes its settings.json, so without
+    this a test run mutates whatever a real benchmark run left at
+    REPO_ROOT/.cache. Tests that pin the path override this with their own
+    setattr, which monkeypatch applies after the fixture's.
+    """
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", tmp_path / "bench-agent")
+
+
 def test_extension_enumeration_finds_scaffold():
     paths = _extension_paths()
     assert len(paths) > 0
@@ -264,3 +276,85 @@ def test_max_turns_unset_leaves_ambient_env_untouched(tmp_path, monkeypatch):
         assert _FakeProc.captured_env["LITTLE_CODER_MAX_TURNS"] == "40"
     finally:
         rpc.close(timeout=1)
+
+
+def test_a_scratch_dir_redirected_into_the_real_pi_config_is_refused(tmp_path, monkeypatch):
+    """mkdir(exist_ok=True) succeeds through a symlink, so a planted link
+    back to ~/.pi/agent would have the settings-reset delete the user's own
+    file and route every later latch through it. polyglot and gaia give the
+    model under test a host shell, so the link is plantable."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".pi" / "agent").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    victim = fake_home / ".pi" / "agent" / "settings.json"
+    victim.write_text('{"defaultThinkingLevel": "xhigh"}')
+
+    scratch = tmp_path / "repo" / ".cache" / "pi-bench-agent"
+    scratch.parent.mkdir(parents=True)
+    scratch.symlink_to(fake_home / ".pi" / "agent", target_is_directory=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+
+    with pytest.raises(RuntimeError, match="refusing to touch it"):
+        RC._bench_agent_dir()
+    assert victim.read_text() == '{"defaultThinkingLevel": "xhigh"}'
+
+
+def test_a_relocated_scratch_dir_outside_the_repo_is_still_allowed(tmp_path, monkeypatch):
+    """The guard names ~/.pi specifically rather than "outside the repo" --
+    symlinking .cache/ onto another disk is a legitimate thing to do."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".pi" / "agent").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    elsewhere = tmp_path / "big-disk" / "pi-bench-agent"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", elsewhere)
+    assert RC._bench_agent_dir() == str(elsewhere)
+
+
+def test_a_dangling_bin_symlink_is_repaired(tmp_path, monkeypatch):
+    """exists() follows symlinks, so a dead link reads as absent and
+    symlink_to then raises FileExistsError into the OSError handler --
+    leaving pi's Grep tool to re-download ripgrep every run, silently."""
+    fake_home = tmp_path / "home"
+    real_bin = fake_home / ".pi" / "agent" / "bin"
+    real_bin.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "bin").symlink_to(tmp_path / "gone", target_is_directory=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+
+    RC._bench_agent_dir()
+    assert (scratch / "bin").readlink() == real_bin
+
+
+def test_a_bin_symlink_pointing_somewhere_else_is_repointed(tmp_path, monkeypatch):
+    """A link to an attacker-chosen dir would otherwise persist and pi would
+    resolve rg from it."""
+    fake_home = tmp_path / "home"
+    real_bin = fake_home / ".pi" / "agent" / "bin"
+    real_bin.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    other = tmp_path / "other-bin"
+    other.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "bin").symlink_to(other, target_is_directory=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+
+    RC._bench_agent_dir()
+    assert (scratch / "bin").readlink() == real_bin
+
+
+def test_a_correct_bin_symlink_is_left_alone(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    real_bin = fake_home / ".pi" / "agent" / "bin"
+    real_bin.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "bin").symlink_to(real_bin, target_is_directory=True)
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", scratch)
+
+    RC._bench_agent_dir()
+    assert (scratch / "bin").readlink() == real_bin

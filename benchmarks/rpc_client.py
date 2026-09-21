@@ -100,6 +100,25 @@ def _bench_agent_dir() -> str:
     export PI_CODING_AGENT_DIR itself to opt out.
     """
     _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    # mkdir(exist_ok=True) succeeds on a symlink to a directory, so the
+    # delete below follows one wherever it points -- and pointing it back at
+    # ~/.pi/agent both destroys the user's settings.json and silently undoes
+    # the isolation, since every later latch then writes through the link.
+    # Worth guarding because polyglot and gaia hand the model under test an
+    # unsandboxed host shell, which is enough to plant it. resolve() catches
+    # a redirect at .cache/ as well as at the leaf.
+    # Only ~/.pi is refused, not everywhere outside the repo: relocating
+    # .cache/ to another disk is legitimate, and the scratch dir only ever
+    # holds files pi put there.
+    pi_home = (Path.home() / ".pi").resolve()
+    resolved = _BENCH_AGENT_DIR.resolve()
+    if resolved == pi_home or pi_home in resolved.parents:
+        raise RuntimeError(
+            f"benchmark agent dir {_BENCH_AGENT_DIR} resolves inside {pi_home} "
+            f"({resolved}) -- that is the config this isolation exists to "
+            f"protect, so refusing to touch it. Remove the redirect, or export "
+            f"PI_CODING_AGENT_DIR to manage the agent dir yourself."
+        )
     # Start each session from a known thinking level. thinking-budget's
     # latch calls pi.setThinkingLevel(), which settings-manager.js persists
     # to <agent dir>/settings.json under the GLOBAL scope -- so without this
@@ -117,9 +136,20 @@ def _bench_agent_dir() -> str:
     # the real bin dir, exactly as it would without this isolation.
     real_bin = Path.home() / ".pi" / "agent" / "bin"
     link = _BENCH_AGENT_DIR / "bin"
-    if real_bin.is_dir() and not link.exists():
+    if real_bin.is_dir():
         try:
-            link.symlink_to(real_bin, target_is_directory=True)
+            # readlink(), not exists(): exists() follows the link, so a
+            # dangling one reads as absent and symlink_to then raises
+            # FileExistsError into the handler below -- leaving the dead
+            # link in place forever, which is the failure this guards.
+            if not link.is_symlink():
+                stale = link.exists()
+            else:
+                stale = link.readlink() != real_bin
+            if stale:
+                link.unlink(missing_ok=True)
+            if not link.exists():
+                link.symlink_to(real_bin, target_is_directory=True)
         except OSError:
             pass
     return str(_BENCH_AGENT_DIR)
@@ -1596,8 +1626,10 @@ def _pi_global_settings_path() -> Path:
     (config.js::getAgentDir -> getSettingsPath), and PiRpc points every
     benchmark subprocess at _BENCH_AGENT_DIR -- so ~/.pi/agent/settings.json,
     which this provenance used to read, is a file pi no longer opens for
-    these runs. Mirrors PiRpc.__init__'s own rule: an already-exported
-    PI_CODING_AGENT_DIR wins, otherwise the scratch dir applies.
+    these runs. Follows PiRpc.__init__'s rule for the exported case: an
+    already-exported PI_CODING_AGENT_DIR wins, otherwise the scratch dir
+    applies. Only the exported case -- PiRpc also honours the var in a
+    caller's env= dict, which os.environ cannot see. No caller passes one.
 
     Not pi's whole picture -- settings-manager.js merges
     <cwd>/.pi/settings.json over this scope -- but no benchmark cwd ships a
@@ -1610,7 +1642,7 @@ def _pi_global_settings_path() -> Path:
 
 def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
     settings_path = _pi_global_settings_path()
-    if settings_path.parent == _BENCH_AGENT_DIR:
+    if settings_path.parent.resolve() == _BENCH_AGENT_DIR.resolve():
         # _bench_agent_dir() deletes this file on every PiRpc construction,
         # so anything on disk here is a prior run's thinking-budget latch
         # that pi will never read. Reporting it would just relocate the

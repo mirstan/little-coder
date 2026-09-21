@@ -1102,7 +1102,9 @@ def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
     ordered ahead of PiRpc so it survives a construction failure.
     """
     try:
-        state = rpc.get_state()
+        # Charged to the trial's wall-clock budget (anchored before PiRpc
+        # construction), so bounded well under get_state's 20s default.
+        state = rpc.get_state(timeout=5)
         level = state.get("thinkingLevel")
         if level:
             snapshot.setdefault("thinking", {})["confirmed_live"] = level
@@ -1127,6 +1129,7 @@ def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
         path.write_text(json.dumps(snapshot, indent=2, default=str))
     except Exception as e:
         logger.warning(f"LittleCoderAgent: environment snapshot rewrite failed: {e}")
+
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
@@ -2085,15 +2088,19 @@ class LittleCoderAgent(BaseAgent):
                     initial_snapshot=initial_snapshot,
                 ),
             )
-            if snapshot is not None and self.logs_dir:
-                await asyncio.to_thread(
-                    _confirm_live_thinking,
-                    rpc,
-                    snapshot,
-                    self.logs_dir / "environment_snapshot.json",
-                    self.logger,
-                )
             try:
+                # Inside this try, not between it and the PiRpc construction
+                # above: the `finally` below is the only thing that closes
+                # rpc, so an await in that gap leaks a pi subprocess when
+                # Harbor cancels a timed-out trial.
+                if snapshot is not None and self.logs_dir:
+                    await asyncio.to_thread(
+                        _confirm_live_thinking,
+                        rpc,
+                        snapshot,
+                        self.logs_dir / "environment_snapshot.json",
+                        self.logger,
+                    )
                 # Retried in place on a provider-error completion rather than
                 # called bare: a single errored completion used to end the
                 # whole trial with most of the wall clock unspent (measured
