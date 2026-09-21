@@ -1448,10 +1448,11 @@ DEFAULT_THINKING_LEVEL = "high"
 
 #: pi's own vocabulary, copied from its cli/args.js VALID_THINKING_LEVELS.
 #: Safe to duplicate because pi is vendored in this repo's node_modules, so
-#: the list and the pi that consumes it move together on every bump.
-PI_THINKING_LEVELS = frozenset(
-    ("off", "minimal", "low", "medium", "high", "xhigh", "max")
-)
+#: the list and the pi that consumes it move together on every bump --
+#: test_thinking_level_resolver.py checks this copy against that file.
+#: A tuple, not a set: ascending effort order is what --help and the
+#: warning below should show, and membership over seven items is free.
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 #: pi's compiled-in level when neither --thinking nor a defaultThinkingLevel
 #: setting supplies one (core/defaults.js::DEFAULT_THINKING_LEVEL).
@@ -1549,7 +1550,7 @@ def resolve_thinking_level(model: str, benchmark: Optional[str] = None) -> str:
     if level not in PI_THINKING_LEVELS:
         print(
             f"[rpc_client] settings.json thinking_level={level!r} is not one of "
-            f"{sorted(PI_THINKING_LEVELS)}; pi would silently ignore it. "
+            f"{list(PI_THINKING_LEVELS)}; pi would silently ignore it. "
             f"Using {DEFAULT_THINKING_LEVEL!r} instead.",
             file=sys.stderr,
         )

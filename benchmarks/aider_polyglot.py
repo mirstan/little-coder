@@ -32,7 +32,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rpc_client import PiRpc, PromptResult, capture_environment_snapshot  # noqa: E402
+from rpc_client import (  # noqa: E402
+    PI_BUILTIN_THINKING_LEVEL,
+    PI_THINKING_LEVELS,
+    PiRpc,
+    PromptResult,
+    capture_environment_snapshot,
+)
 
 BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
 REPO_ROOT = Path(__file__).parent.parent
@@ -955,12 +961,16 @@ def main():
                      help="Total attempts including the first; default 2 matches "
                           "the original hardcoded one-retry behavior")
     ap.add_argument("--thinking", default=None,
-                     choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                     choices=list(PI_THINKING_LEVELS),
                      help="--thinking level passed to the pi CLI. Unset means "
-                          "whatever pi itself resolves to with no flag -- its "
-                          "compiled default is 'medium', but a user- or "
-                          "machine-local ~/.pi/agent/settings.json can override "
-                          "that, so 'unset' is not a fixed, reproducible level.")
+                          "whatever pi itself resolves to with no flag, which "
+                          f"is now its compiled default {PI_BUILTIN_THINKING_LEVEL!r}: "
+                          "PiRpc points pi at an isolated agent dir and clears "
+                          "that dir's settings.json each session, so the "
+                          "machine's own ~/.pi/agent/settings.json no longer "
+                          "reaches it. Unset is therefore reproducible, but it "
+                          "is still not RECORDED as a scoring parameter the way "
+                          "an explicit level is -- prefer passing one.")
     ap.add_argument("--config-label", default=None,
                      help="Recorded in meta.config_label for result-file bookkeeping when the "
                           "same --agent/--model is run under different tuning configs (e.g. "
