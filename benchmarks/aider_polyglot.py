@@ -33,11 +33,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import (  # noqa: E402
-    PI_BUILTIN_THINKING_LEVEL,
     PI_THINKING_LEVELS,
     PiRpc,
     PromptResult,
     capture_environment_snapshot,
+    resolve_thinking_level,
 )
 
 BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
@@ -962,15 +962,13 @@ def main():
                           "the original hardcoded one-retry behavior")
     ap.add_argument("--thinking", default=None,
                      choices=list(PI_THINKING_LEVELS),
-                     help="--thinking level passed to the pi CLI. Unset means "
-                          "whatever pi itself resolves to with no flag, which "
-                          f"is now its compiled default {PI_BUILTIN_THINKING_LEVEL!r}: "
-                          "PiRpc points pi at an isolated agent dir and clears "
-                          "that dir's settings.json each session, so the "
-                          "machine's own ~/.pi/agent/settings.json no longer "
-                          "reaches it. Unset is therefore reproducible, but it "
-                          "is still not RECORDED as a scoring parameter the way "
-                          "an explicit level is -- prefer passing one.")
+                     help="--thinking level passed to the pi CLI. Unset resolves "
+                          "via resolve_thinking_level() -- the same "
+                          "model_profiles lookup harbor/tb/gaia use -- rather "
+                          "than pi's own compiled default, so an unset run is "
+                          "both reproducible and consistent with the rest of "
+                          "the harness. The resolved value IS what gets "
+                          "recorded as the scoring parameter.")
     ap.add_argument("--config-label", default=None,
                      help="Recorded in meta.config_label for result-file bookkeeping when the "
                           "same --agent/--model is run under different tuning configs (e.g. "
@@ -992,6 +990,14 @@ def main():
     if model is None:
         sys.exit("--model is required for --agent codex (e.g. --model gpt-5.1-codex-max)")
 
+    # codex has no thinking-level concept of its own; resolving one for it
+    # would record a pi model_profiles lookup against a codex model id,
+    # which would never match anything real. Leave it unset there, same as
+    # every other pi-only scoring field below (allowed_tools, env knobs).
+    thinking = args.thinking
+    if thinking is None and args.agent == "pi":
+        thinking = resolve_thinking_level(model, "aider_polyglot")
+
     results = _load_results() if args.resume else {"exercises": {}, "meta": {}}
     if args.config_label:
         results["meta"]["config_label"] = args.config_label
@@ -1001,12 +1007,12 @@ def main():
         sys.exit(f"No descriptor for language '{args.language}'. Supported: {list(LANG_DESCRIPTORS)}")
 
     params = _scoring_params(model, args.language, not args.no_retry, desc,
-                             max_attempts=args.max_attempts, thinking=args.thinking,
+                             max_attempts=args.max_attempts, thinking=thinking,
                              agent=args.agent)
     # Diagnostic only -- deliberately NOT part of _scoring_params/_param_mismatches,
     # same reasoning as config_label: this doesn't affect how an attempt runs,
     # so a --resume under a different sampling temperature isn't a mismatch.
-    env_snapshot = capture_environment_snapshot(model, cli_thinking=args.thinking, agent=args.agent)
+    env_snapshot = capture_environment_snapshot(model, cli_thinking=thinking, agent=args.agent)
     if args.resume:
         mismatches = _param_mismatches(results["meta"].get("scoring_params", {}), params)
         if mismatches and results["exercises"]:
@@ -1072,7 +1078,7 @@ def main():
                 verbose=args.verbose,
                 retry=not args.no_retry,
                 max_attempts=args.max_attempts,
-                thinking=args.thinking,
+                thinking=thinking,
                 agent=args.agent,
                 thinking_confirmation=thinking_confirmation,
             )
