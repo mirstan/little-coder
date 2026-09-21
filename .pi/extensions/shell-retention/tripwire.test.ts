@@ -199,6 +199,13 @@ describe("shell-retention tool_call tripwire (wired)", () => {
     // file without re-quoting the marker.
     expect(result.reason).toMatch(/line number/i);
     expect(result.reason).toMatch(/sed -i/i);
+    // `edit` matches on exact existing text, so removing the marker line with
+    // it means putting that line in old_string — blocked by this same guard.
+    // The reason has to say so, or it advises its way into the loop it warns of.
+    expect(result.reason).toContain("old_string");
+    // Every command the reason suggests must itself clear the guard.
+    expect(findMarkerEchoIds({ command: `grep -n 'sr-' f.c` })).toEqual([]);
+    expect(findMarkerEchoIds({ command: `sed -i '42d' f.c` })).toEqual([]);
     expect(ctx.notifies[0]).toMatch(/harness intervention:.*placeholder/i);
   });
 
