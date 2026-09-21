@@ -479,6 +479,12 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=self._max_turns,
+                # See harbor_adapter's identical kwarg for why this is safe
+                # to pass unconditionally (pi clamps it to "off" for
+                # non-reasoning models) and necessary (pi's reasoningEffort
+                # defaults to "off" otherwise, silently no-op'ing any
+                # thinkingFormat gated on it).
+                thinking="high",
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,
