@@ -1,5 +1,19 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { findMarkerEchoIds } from "./retention.ts";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import {
+  DEFAULT_CMD_KEEP,
+  DEFAULT_KEEP_RESULT_HEAD,
+  DEFAULT_KEEP_RESULT_TAIL,
+  DEFAULT_MIN_PAIR_BYTES,
+  DEFAULT_RETAIN_RAW,
+  DEFAULT_STALE_DISTANCE,
+  ENV_CMD_KEEP,
+  ENV_KEEP_RESULT_HEAD,
+  ENV_KEEP_RESULT_TAIL,
+  ENV_MIN_PAIR_BYTES,
+  ENV_RETAIN_RAW,
+  ENV_STALE_DISTANCE,
+  findMarkerEchoIds,
+} from "./retention.ts";
 import setupShellRetention from "./index.ts";
 
 // ── findMarkerEchoIds: pure extraction, liveness-agnostic ───────────────────
@@ -32,6 +46,19 @@ describe("findMarkerEchoIds", () => {
       expect(findMarkerEchoIds({ command: text })).toEqual([LIVE]);
     });
   }
+
+  // A longer hex run is a different token, not this id with noise after it:
+  // truncating it to its first 16 characters would hand the caller an id the
+  // text never carried, and blocking on that is a block of an innocent call.
+  it("ignores an id followed by more hex characters", () => {
+    expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}0` })).toEqual([]);
+    expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}deadbeef` })).toEqual([]);
+    expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}A` })).toEqual([]);
+  });
+
+  it("still extracts an id that ends the string, with nothing after it", () => {
+    expect(findMarkerEchoIds({ command: `ShellRecall id=${LIVE}` })).toEqual([LIVE]);
+  });
 
   it("returns [] for text with no marker-shaped substring", () => {
     const bigHeredoc = `cat > file.c <<'EOF'\n${"int x;\n".repeat(2000)}EOF\n`;
@@ -90,13 +117,48 @@ async function fireToolCall(handlers: Record<string, Array<(event: any, ctx: any
   return undefined;
 }
 
+// The wired tests drive the real `context` hook, which resolves every knob
+// from the environment, and `setupShellRetention` returns without registering
+// anything when retention is switched off. An ambient value for any of these
+// — a developer shell, a benchmark harness, CI — would break the fixture's
+// deliberately narrow margins (60 turns of traffic against a staleDistance of
+// 50) and surface as a misleading "expected the context hook to demote" error.
+// Pin them to the documented defaults for the duration, restore after.
+const PINNED_ENV: Record<string, string | undefined> = {
+  [ENV_STALE_DISTANCE]: String(DEFAULT_STALE_DISTANCE),
+  [ENV_RETAIN_RAW]: String(DEFAULT_RETAIN_RAW),
+  [ENV_MIN_PAIR_BYTES]: String(DEFAULT_MIN_PAIR_BYTES),
+  [ENV_KEEP_RESULT_HEAD]: String(DEFAULT_KEEP_RESULT_HEAD),
+  [ENV_KEEP_RESULT_TAIL]: String(DEFAULT_KEEP_RESULT_TAIL),
+  [ENV_CMD_KEEP]: String(DEFAULT_CMD_KEEP),
+  // Both live in index.ts and are read there, not via resolveOptions: the
+  // budget gates hostArchive.save (a refused save cancels the demotion), and
+  // the kill switch makes the extension register no hooks at all.
+  LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),
+  LITTLE_CODER_NO_SHELL_RETENTION: undefined,
+};
+
 describe("shell-retention tool_call tripwire (wired)", () => {
   let handlers: Record<string, Array<(event: any, ctx: any) => any>>;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const [name, value] of Object.entries(PINNED_ENV)) {
+      savedEnv[name] = process.env[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
 
   afterEach(async () => {
     // hostArchive is module-level singleton state in index.ts; session_shutdown
     // is its own cleanup hook, the same one a real session fires on exit.
     for (const h of handlers?.session_shutdown ?? []) await h({}, makeCtx());
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
 
   /** Demote a big stale pair through the real context hook to get a live id. */
@@ -172,6 +234,13 @@ describe("shell-retention tool_call tripwire (wired)", () => {
       toolName: "ShellSession",
       input: { command: `[... 1.6KB of command text demoted — ShellRecall id=${deadId} ...]` },
     };
+    const result = await fireToolCall(handlers, event, makeCtx());
+    expect(result).toBeUndefined();
+  });
+
+  it("does not block a live id that is merely the prefix of a longer hex run", async () => {
+    const id = await seedLiveId();
+    const event = { toolName: "ShellSession", input: { command: `echo ShellRecall id=${id}0` } };
     const result = await fireToolCall(handlers, event, makeCtx());
     expect(result).toBeUndefined();
   });

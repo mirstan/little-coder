@@ -336,7 +336,13 @@ const MARKER_ECHO_GATE = "ShellRecall id=sr-";
 // `--`/`-`/`...`). Matching more of the surrounding prose would only make
 // this stricter than MARKER_ECHO_GATE, opening a gap where the pre-gate
 // admits a call this regex then fails to catch.
-const MARKER_ECHO_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16})/g;
+//
+// The trailing lookahead is that byte-exactness enforced: without it a longer
+// hex run (`id=sr-<16 hex><more hex>`) still yields its first 16 characters,
+// and if those happen to name a live archive entry the guard blocks a call
+// that never carried that id. A real marker always ends the id on a space, so
+// requiring a non-hex boundary costs no genuine match.
+const MARKER_ECHO_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16})(?![0-9a-fA-F])/g;
 
 /**
  * All sr-… ids that appear, anywhere among `input`'s string leaves, in
