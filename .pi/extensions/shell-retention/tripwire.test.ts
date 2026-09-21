@@ -20,8 +20,7 @@ describe("findMarkerEchoIds", () => {
   });
 
   // A small local model reproducing the marker from its own context may not
-  // land the em dash byte-exact — and this repo's own log sanitization is
-  // already known to transliterate it. The id-phrase match doesn't care.
+  // land the em dash byte-exact. The id-phrase match doesn't care.
   for (const dash of ["--", "-", "...", "—"]) {
     it(`tolerates a "${dash}" dash variant in the command-infix phrasing`, () => {
       const text = `[... 1.6KB of command text demoted ${dash} ShellRecall id=${LIVE} ...]`;

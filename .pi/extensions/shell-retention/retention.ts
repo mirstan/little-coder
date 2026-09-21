@@ -329,7 +329,7 @@ function alreadyDemoted(p: Pair): boolean {
 const MARKER_ECHO_GATE = "ShellRecall id=sr-";
 
 // Anchored on the id phrase alone, not the "demoted — …" prose around it
-// (both CMD_DEMOTED_INFIX and RESULT_DEMOTED_PREFIX share this phrase). The
+// (both the command-infix and result-prefix marker lines carry it). The
 // id must be byte-exact anyway for the liveness check downstream to match
 // it, while the dash just before it is exactly the byte a model
 // paraphrasing its own context from memory is free to mangle (em dash vs
