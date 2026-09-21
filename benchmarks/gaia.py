@@ -196,8 +196,9 @@ def _run_task(
                 benchmark="gaia",
                 allowed_tools=ALLOWED_TOOLS,
                 session_id=f"gaia-{task_id[:10]}",
-                # Without an explicit level pi's reasoningEffort defaults to
-                # "off", silently disabling any thinkingFormat gated on it.
+                # Without an explicit level pi falls back to the machine-local
+                # defaultThinkingLevel; a machine set to "off" silently no-ops
+                # any thinkingFormat gated on reasoningEffort.
                 thinking=resolve_thinking_level(model, "gaia"),
                 env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
             ) as rpc:

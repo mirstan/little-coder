@@ -1417,7 +1417,8 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
 #: Applied when no matched profile names a thinking_level, and when the
 #: settings file is missing or malformed. "high" is what the harness
 #: hardcoded before thinking_level existed; a None here would send no
-#: --thinking flag at all, leaving pi's reasoningEffort at its "off" default.
+#: --thinking flag at all, leaving pi on the machine-local
+#: defaultThinkingLevel (built-in fallback "medium").
 DEFAULT_THINKING_LEVEL = "high"
 
 
@@ -1429,7 +1430,7 @@ def _load_little_coder_settings() -> dict:
     Python harness and that TS extension. The home-directory candidate stays
     the real ~/.pi/agent/settings.json even though PiRpc now points the
     subprocess elsewhere (see _bench_agent_dir): the TS side resolves it from
-    homedir(), not from PI_CODING_AGENT_DIR, so this matches what the
+    $HOME, not from PI_CODING_AGENT_DIR, so this matches what the
     extension actually reads.
     """
     for path in (_PI_PROJECT_SETTINGS_PATH, _PI_SETTINGS_PATH):
