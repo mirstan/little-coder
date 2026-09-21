@@ -98,18 +98,19 @@ where the full rationale lives.
 | 8 | `#5` Earlier/more frequent deadline-progress nudges (50%/75% checkpoints) | Med–High | M | **Merged, PR #63** (2026-09-20, stacked on #61). New "Trigger D": evidence-gated at 50%, unconditional at 75%. |
 | 9 | `#4` Fuzzy/near-duplicate loop detection | Med–High | M | **Merged, PR #62** (2026-09-20). Token-bigram Jaccard similarity over tool-call content, clustered across an 8-turn window. |
 | 10 | `#8` Repeated-identical-failure-signature watchdog | Medium | M | **Merged, PR #62** (2026-09-20, same PR as priority 9 — the two share a `quality-monitor` extension surface and a `similarity.ts` helper). Hash of a normalized output tail, Jaccard fallback for noisy traces. |
-| 11 | `#11` Adaptive thinking-budget continuation | Medium | **L** | Cuts both ways (this session saw both starvation and leaked-reasoning failure modes) — needs careful tuning and validation, real regression risk, continuation of PR #36 |
-| 12 | `#7` Surface stale background processes touching shared files | Low | M | Only 1 of 4 trajectories; needs bg-shell job-registry + file-path-tracking integration |
+| 11 | `#11` Adaptive thinking-budget continuation | Medium | **L** | **Already done — status corrected 2026-09-20.** This row was stale: PR #36 (`fix/adaptive-thinking-budget`, merged 2026-09-13) plus 7 follow-up hardening commits through 2026-09-14 fully implemented this — turn-boundary adaptive budget, a per-turn wall-clock guard positioned before the thinking-delta-only early-return, and the 300s HTTP-idle-timeout residual-risk note — all pre-dating this list's own 2026-09-19 draft. Verified directly against current `thinking-budget/index.ts`, not assumed from the PR title. |
+| 12 | `#7` Surface stale background processes touching shared files | Low | M | Only 1 of 4 trajectories; needs bg-shell job-registry + file-path-tracking integration. **Confirmed still open** (2026-09-20): no such feature exists in `.pi/extensions/bg-shell/`. The only genuinely unstarted item left across this whole list. |
 
 `#12` in the original "Ranked list" below (validates PR #53's value) was already
 resolved before this update — PR #53 is merged — and isn't part of this
 prioritization.
 
-**Reading the table**: priorities 1-10 are done (all merged 2026-09-20, PRs
-#54-63). 11-12 are what's left — the highest-effort/highest-risk or
-lowest-impact items. 11 in particular should not be rushed given the direct
-tension in the evidence (this session saw both thinking-budget starvation and
-leaked-reasoning failure modes).
+**Reading the table**: priorities 1-11 are done. 1-10 merged 2026-09-20 (PRs
+#54-63); 11 turned out to already be done via PR #36 and follow-ups from
+2026-09-12/13 — this list's own row for it was simply stale and is now
+corrected (see the table row and `STATE.md` section 6 for the full
+re-validation). **Priority 12 is the only genuinely unstarted item left on
+this entire list.**
 
 **Scope of the priorities 7-10 round**: went through Fable design → Fable
 adversarial critique → Opus implementation for two grouped tracks (7+8 shared

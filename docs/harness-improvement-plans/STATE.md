@@ -356,17 +356,45 @@ branch). Post-implementation review was unusually extensive:
 instruction.** Order: #61 → #63 → #62, all via `gh pr merge --merge`. All
 three fully green and thread-clean at merge time.
 
+## 6. Re-validation of the separate 8-issue plan (2026-09-20)
+
+`~/.claude/plans/calm-churning-wigderson.md` — a Phase 1-4 design for 8 items
+from an EARLIER trajectory analysis (5 Fable-5 subagents), distinct from this
+`PLAN.md`'s own 2026-09-19-dated ranked list. Earlier the same day, this plan
+was checked and reported as "never executed — no matching branches or PRs."
+**That check was wrong.** Re-checked properly this time (traced each item to
+actual current code, not just a branch-name grep) — all 8 items are done:
+
+| # | Item | PR | Merged | Notes |
+|---|---|---|---|---|
+| 1 | Retry on `stopReason=="error"` | (in `rpc_client.py`'s stop_reason machinery) | pre-09-19 | `result.stop_reason="error"` + `error_message`, provider-error vs. empty-completion distinguished |
+| 2 | Fix `[:400]` log-preview truncation | #55 | 2026-09-20 | Confirmed earlier same day |
+| 3 | tb-finalize-guard Trigger C | (bundled into tb-finalize-guard's history) | pre-09-19 | Exists verbatim: "dead run: errored or empty final message, any time" |
+| 4 | thinking-budget deadline/latency-adaptive | **#36** (`fix/adaptive-thinking-budget`) | 2026-09-13 | + 7 follow-up hardening commits through 09-14. Current code's residual-risk comment (300s HTTP idle timeout backstop) matches this plan's own critique amendment #4 almost verbatim. |
+| 5 | Checkpoint shell-write snapshot coverage | (bundled into checkpoint's history) | pre-09-19 | `SHELL_TOOLS`/`ShellSend` handled, same `cd`-tracking caveat this plan flagged |
+| 6 | Shell-contract-nudge (pkill/bg mitigation) | **#35** (`feat/shell-contract-nudge`) | 2026-09-13 | Literally the directory name this plan proposed, + a ReDoS fix and a rewrite since |
+| 7 | skill-inject temporal-research trigger | (bundled into skill-inject's history) | pre-09-19 | `TEMPORAL_TRIGGERS` exists, matches the design |
+| 8a | Error payload logging | (bundled into adapter history) | pre-09-19 | `errorMessage`/`auto_retry_start`/`auto_retry_end` handled in both adapters |
+| 8b | Dynamic `max_tokens` sizing | — | not done | Still deferred, per the plan's own recommendation (needs a vendor patch, no evidence justifies it) |
+
+All of it pre-dates this `PLAN.md`'s own 2026-09-19 draft date — meaning the
+2026-09-19 trajectory analysis that produced this `PLAN.md`'s ranked list ran
+without re-checking whether these 8 items were already addressed, and this
+`PLAN.md` in turn carried a stale "not started" status for priority 11
+(the same as item 4 here) all the way through 2026-09-20 until this
+re-validation caught it. **Lesson, worth remembering**: a "no matching
+branches" check is only as good as the exact names searched — `gh pr list
+--search <keyword>` and reading the actual current code both found what a
+`git branch` grep missed.
+
 ## 5. Open loose ends
 
-- Priorities 11-12 in `PLAN.md` have not been started.
+- Priority 12 in `PLAN.md` is the only genuinely unstarted item across both
+  this list and the calm-churning-wigderson.md plan (see section 6). Confirmed
+  no bg-shell "stale process surfacing" feature exists.
+- Item 8b from the calm-churning-wigderson.md plan (dynamic `max_tokens`
+  sizing) remains explicitly deferred, per that plan's own recommendation —
+  needs a vendor patch via `scripts/patch-pi.mjs`, no evidence justifies it.
 - Re-run `benchmarks/syntax_error_report.py` on a fresh write-compressor trial
   to confirm the 24.5%/2026-09-19 evidence baseline for priority 6 still holds
   post-#54-63 — still outstanding, needs a live harbor trial, not a code change.
-- The separate 8-issue plan from an earlier trajectory analysis (saved at
-  `~/.claude/plans/calm-churning-wigderson.md`, not part of this `PLAN.md`'s
-  ranked list) still has an open Phase 4 implementation plan (branches
-  A-F: error-stop-reason-retry, tb-guard-trigger-c, adaptive-thinking-budget,
-  checkpoint-shell-writes, temporal-research-trigger, shell-contract-nudge).
-  Checked 2026-09-20: no branches or merged PRs matching those names exist —
-  this plan was never executed. Distinct from priorities 7-12 above; needs its
-  own decision on whether it's still wanted before picking it back up.
