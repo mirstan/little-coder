@@ -200,7 +200,7 @@ describe("shipped models.json", () => {
     expect(lmstudio.models.find((m) => m.id === "local-model")).toBeDefined();
   });
 
-  it("still registers llamacpp and ollama alongside lmstudio", () => {
+  it("registers all shipped providers (llamacpp, lmstudio, mlx-serve, ollama, omlx)", () => {
     const result = loadProviders(pkgRoot, {});
     expect(Object.keys(result.providers).sort()).toEqual([
       "llamacpp",
