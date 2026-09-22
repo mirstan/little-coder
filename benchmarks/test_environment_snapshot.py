@@ -31,6 +31,12 @@ def _isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(RC, "_OMLX_SETTINGS", tmp_path / "omlx-settings.json")
     monkeypatch.setattr(RC, "_OMLX_MODEL_SETTINGS", tmp_path / "omlx-model-settings.json")
     monkeypatch.setattr(RC, "_VENDOR_PATCH_TARGET", tmp_path / "openai-completions.js")
+    # The real repo .cache/pi-bench-agent otherwise leaks in: _resolve_thinking
+    # resolves its settings path through this constant, so an unpatched one
+    # would make these assertions depend on what a local benchmark run left
+    # behind.
+    monkeypatch.setattr(RC, "_BENCH_AGENT_DIR", tmp_path / "bench-agent")
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     monkeypatch.delenv("LITTLE_CODER_MODELS_FILE", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -38,30 +44,68 @@ def _isolate_paths(tmp_path, monkeypatch):
 
 
 # ── thinking resolution ──────────────────────────────────────────────────
+#
+# These pin the settings file pi ITSELF reads (<agent dir>/settings.json),
+# not ~/.pi/agent/settings.json: PiRpc redirects PI_CODING_AGENT_DIR, so the
+# home-directory file is one pi never opens during a benchmark run.
+# _PI_SETTINGS_PATH still exists, but only for _load_little_coder_settings's
+# mirror of the TS extension, which really does resolve from $HOME.
 
-def test_thinking_cli_value_wins_over_settings_file(tmp_path):
-    _write_json(RC._PI_SETTINGS_PATH, {"defaultThinkingLevel": "high"})
+def test_thinking_cli_value_wins_over_agent_dir_settings(tmp_path, monkeypatch):
+    agent_dir = tmp_path / "exported-agent"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    _write_json(agent_dir / "settings.json", {"defaultThinkingLevel": "high"})
     out = RC._resolve_thinking("low")
     assert out == {
         "cli_value": "low", "pi_default_setting": "high",
+        "pi_default_setting_file": str(agent_dir / "settings.json"),
+        "pi_default_setting_source": "agent_dir",
         "resolved": "low", "source": "cli", "confirmed_live": None,
     }
 
 
-def test_thinking_falls_back_to_pi_settings_when_cli_unset(tmp_path):
-    _write_json(RC._PI_SETTINGS_PATH, {"defaultThinkingLevel": "high"})
+def test_thinking_falls_back_to_agent_dir_settings_when_cli_unset(tmp_path, monkeypatch):
+    agent_dir = tmp_path / "exported-agent"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    _write_json(agent_dir / "settings.json", {"defaultThinkingLevel": "high"})
     out = RC._resolve_thinking(None)
     assert out["resolved"] == "high"
     assert out["source"] == "pi_default_settings"
 
 
-def test_thinking_unresolved_when_both_absent(tmp_path):
+def test_thinking_home_settings_are_not_consulted(tmp_path, monkeypatch):
+    """The pre-isolation source must not leak back in. A machine whose
+    ~/.pi/agent/settings.json says "off" -- the exact config that motivated
+    the redirect -- must not have that reported as this run's level."""
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "exported-agent"))
+    _write_json(RC._PI_SETTINGS_PATH, {"defaultThinkingLevel": "off"})
     out = RC._resolve_thinking(None)
-    assert out["resolved"] is None
-    assert out["source"] == "unresolved"
-    # Must NOT fabricate pi's own compiled-in default ("medium") -- that
-    # would recreate the exact silent-divergence risk this exists to close.
     assert out["pi_default_setting"] is None
+    assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL
+
+
+def test_thinking_falls_back_to_pis_builtin_when_no_setting_applies(tmp_path):
+    out = RC._resolve_thinking(None)
+    # Not None/"unresolved": pi resolves this case itself, to its compiled-in
+    # "medium". Claiming ignorance let a run at "medium" be recorded as though
+    # the level were unknowable.
+    assert out["resolved"] == "medium" == RC.PI_BUILTIN_THINKING_LEVEL
+    assert out["source"] == "pi_builtin_default"
+    # Still distinguishable from a file that explicitly said "medium".
+    assert out["pi_default_setting"] is None
+
+
+def test_thinking_ignores_a_stale_latch_in_the_bench_agent_dir(tmp_path):
+    """thinking-budget's latch persists setThinkingLevel("off") into the
+    scratch dir. _bench_agent_dir() deletes that file on every PiRpc, so pi
+    never reads it -- and neither may the snapshot, whichever side of that
+    delete the snapshot happens to be built on."""
+    _write_json(RC._BENCH_AGENT_DIR / "settings.json", {"defaultThinkingLevel": "off"})
+    out = RC._resolve_thinking(None)
+    assert out["pi_default_setting"] is None
+    assert out["pi_default_setting_file"] is None
+    assert out["pi_default_setting_source"] == "bench_agent_dir_cleared"
+    assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL
 
 
 # ── max_tokens resolution ────────────────────────────────────────────────
@@ -184,3 +228,18 @@ def test_snapshot_records_error_for_malformed_model_string(tmp_path):
     snap = RC.capture_environment_snapshot("bare-model-id-no-slash")
     assert any(e["source"] == "model" for e in snap["errors"])
     assert snap["server_sampling"]["note"] == "not introspectable for this provider"
+
+
+def test_a_relative_agent_dir_is_reported_as_unresolvable(tmp_path, monkeypatch):
+    """pi resolves a relative PI_CODING_AGENT_DIR against the CHILD's cwd,
+    which PiRpc sets per caller, so this process cannot know which file that
+    is. Naming one resolved against the harness's own cwd would be a guess
+    presented as provenance."""
+    monkeypatch.chdir(tmp_path)
+    _write_json(tmp_path / "rel-agent" / "settings.json", {"defaultThinkingLevel": "off"})
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "./rel-agent")
+    out = RC._resolve_thinking(None)
+    assert out["pi_default_setting"] is None
+    assert out["pi_default_setting_file"] is None
+    assert out["pi_default_setting_source"] == "relative_agent_dir"
+    assert out["resolved"] == RC.PI_BUILTIN_THINKING_LEVEL

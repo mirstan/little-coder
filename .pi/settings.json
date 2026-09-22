@@ -9,6 +9,7 @@
     "default_model_profile": {
       "max_tokens": 4096,
       "thinking_budget": 4096,
+      "thinking_level": "high",
       "skill_token_budget": 300,
       "knowledge_token_budget": 200,
       "system_prompt_budget": 0,

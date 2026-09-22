@@ -794,7 +794,8 @@ def test_environment_snapshot_records_the_probe_result_even_when_empty():
     info = lca._fallback_timeout_info()
     for toolchain in (["python3"], None):
         snapshot = lca._build_environment_snapshot(
-            "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+            "llamacpp/x", max_turns=0, thinking_level="high",
+            ambient_max_turns_env=None,
             timeout_info=info, toolchain=toolchain,
             toolchain_probe_status="probe ran, raw output: 'python3 '",
         )
@@ -805,7 +806,8 @@ def test_environment_snapshot_records_the_probe_result_even_when_empty():
     # And the None/None case (probe never even attempted a status) still
     # serializes cleanly rather than raising.
     snapshot = lca._build_environment_snapshot(
-        "llamacpp/x", max_turns=0, ambient_max_turns_env=None,
+        "llamacpp/x", max_turns=0, thinking_level="high",
+        ambient_max_turns_env=None,
         timeout_info=info, toolchain=None, toolchain_probe_status=None,
     )
     assert snapshot["toolchain_probe"] is None

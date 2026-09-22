@@ -43,7 +43,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rpc_client import PiRpc, capture_environment_snapshot  # noqa: E402
+from rpc_client import (  # noqa: E402
+    PiRpc,
+    capture_environment_snapshot,
+    resolve_thinking_level,
+)
 from gaia_scorer import score, extract_final_answer  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -192,6 +196,10 @@ def _run_task(
                 benchmark="gaia",
                 allowed_tools=ALLOWED_TOOLS,
                 session_id=f"gaia-{task_id[:10]}",
+                # Without an explicit level pi falls back to the machine-local
+                # defaultThinkingLevel; a machine set to "off" silently no-ops
+                # any thinkingFormat gated on reasoningEffort.
+                thinking=resolve_thinking_level(model, "gaia"),
                 env={"LITTLE_CODER_PERMISSION_MODE": "accept-all"},
             ) as rpc:
                 result = rpc.prompt_and_collect(prompt, timeout=timeout)
@@ -311,9 +319,9 @@ def main():
         "started_at": datetime.datetime.now().isoformat(),
         "task_ids": [r["task_id"] for r in records],
         "allowed_tools": ALLOWED_TOOLS,
-        # gaia.py has no --thinking flag today, so this only resolves the
-        # machine-local default; see capture_environment_snapshot's docstring.
-        "environment_snapshot": capture_environment_snapshot(args.model),
+        "environment_snapshot": capture_environment_snapshot(
+            args.model, cli_thinking=resolve_thinking_level(args.model, "gaia")
+        ),
     }
     # Don't overwrite a manifest from an earlier resume run — append a
     # restart entry instead so we have full provenance.

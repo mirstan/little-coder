@@ -104,6 +104,7 @@ from rpc_client import (  # noqa: E402
     capture_environment_snapshot,
     preview_tool_result,
     prompt_with_error_retry,
+    resolve_thinking_level,
 )
 
 
@@ -1047,6 +1048,7 @@ def _build_environment_snapshot(
     model: str,
     *,
     max_turns: int,
+    thinking_level: str,
     ambient_max_turns_env: str | None,
     timeout_info: dict,
     toolchain: list[str] | None = None,
@@ -1055,8 +1057,8 @@ def _build_environment_snapshot(
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
     introspection, plus the config values this adapter itself resolved --
-    the active turn cap, the ambient env var seen at process entry, this
-    process's own code identity, and the FULL timeout-provenance dict from
+    the active turn cap, the resolved thinking level, the ambient env var
+    seen at process entry, this process's own code identity, and the FULL timeout-provenance dict from
     _resolve_trial_timeout_info() (not just the effective float) so a
     reader can tell exactly which task.toml/cache-layout produced it.
 
@@ -1064,7 +1066,7 @@ def _build_environment_snapshot(
     PiRpc/environment. Never raises on its own logic; capture_environment_
     snapshot() already guarantees no-raise for its half.
     """
-    snapshot = capture_environment_snapshot(model)
+    snapshot = capture_environment_snapshot(model, cli_thinking=thinking_level)
     snapshot["max_turns"] = max_turns
     snapshot["ambient_max_turns_env"] = ambient_max_turns_env
     snapshot["little_coder_version"] = _AGENT_VERSION
@@ -1080,6 +1082,60 @@ def _build_environment_snapshot(
     snapshot["toolchain_probe"] = toolchain
     snapshot["toolchain_probe_status"] = toolchain_probe_status
     return snapshot
+
+
+def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
+    """Backfill thinking.confirmed_live from pi's own resolved session state,
+    then rewrite `path`.
+
+    The rest of the snapshot records what this adapter REQUESTED. pi does not
+    necessarily honour it: clampThinkingLevel degrades any level to "off" for
+    a model registered with reasoning=false, so a non-reasoning model can run
+    with no thinking at all under a snapshot that says "high". Rather than
+    re-deriving that clamp in Python -- a second copy of pi's rules, free to
+    drift -- ask pi, exactly as aider_polyglot.py does.
+
+    Best-effort in every direction: a failed probe is recorded in the
+    snapshot's own `errors` (silence would be indistinguishable from "pi
+    agreed") and never propagates, because provenance must not fail a trial.
+    Rewrites rather than deferring the first write, which is deliberately
+    ordered ahead of PiRpc so it survives a construction failure.
+    """
+    try:
+        # Charged to the trial's wall-clock budget (anchored before PiRpc
+        # construction), so bounded well under get_state's 20s default.
+        state = rpc.get_state(timeout=5)
+        level = state.get("thinkingLevel")
+        if level:
+            snapshot.setdefault("thinking", {})["confirmed_live"] = level
+            if level != snapshot.get("thinking", {}).get("resolved"):
+                logger.warning(
+                    "LittleCoderAgent: pi resolved thinkingLevel="
+                    f"{level!r}, not the requested "
+                    f"{snapshot['thinking'].get('resolved')!r} "
+                    "(expected for a model registered with reasoning=false)"
+                )
+        else:
+            snapshot.setdefault("errors", []).append({
+                "source": "confirmed_thinking",
+                "error": f"get_state succeeded but returned no thinkingLevel: {state!r}",
+            })
+    except Exception as exc:
+        snapshot.setdefault("errors", []).append({
+            "source": "confirmed_thinking",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    try:
+        # Temp file + os.replace, not write_text: write_text truncates first,
+        # so a trial killed mid-rewrite would replace a complete snapshot
+        # with unparseable JSON -- losing the toolchain probe and timeout
+        # provenance too, not just the field being added.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2, default=str))
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"LittleCoderAgent: environment snapshot rewrite failed: {e}")
+
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
@@ -1727,8 +1783,10 @@ class LittleCoderAgent(BaseAgent):
         # Throttled so a fast-streaming turn doesn't turn this into a flush
         # storm.
         HEARTBEAT_INTERVAL_SEC = 30.0
-        heartbeat_last_ts = 0.0
-        heartbeat_turn_start_ts = 0.0
+        # Seeded to "now", not 0.0: a zero start makes the very first delta
+        # satisfy the throttle and emit a "0s elapsed" line every turn.
+        heartbeat_last_ts = time.time()
+        heartbeat_turn_start_ts = heartbeat_last_ts
         heartbeat_delta_chars = 0
 
         def on_event(ev: dict) -> None:
@@ -1741,7 +1799,10 @@ class LittleCoderAgent(BaseAgent):
                 delta_type = delta.get("type")
                 if delta_type == "text_delta":
                     pending_text.append(delta.get("delta", ""))
-                if delta_type in ("text_delta", "thinking_delta"):
+                # toolcall_delta too: a long shell command or heredoc
+                # streams entirely as tool-call arguments, and that is the
+                # dominant shape of a Terminal-Bench turn.
+                if delta_type in ("text_delta", "thinking_delta", "toolcall_delta"):
                     heartbeat_delta_chars += len(delta.get("delta", ""))
                     now = time.time()
                     if now - heartbeat_last_ts >= HEARTBEAT_INTERVAL_SEC:
@@ -1812,7 +1873,7 @@ class LittleCoderAgent(BaseAgent):
             elif t == "agent_start":
                 turn_counter += 1
                 heartbeat_turn_start_ts = time.time()
-                heartbeat_last_ts = 0.0
+                heartbeat_last_ts = heartbeat_turn_start_ts
                 heartbeat_delta_chars = 0
                 live_log_fh.write(f"=== turn {turn_counter} start ===\n")
                 live_log_fh.flush()
@@ -1878,9 +1939,13 @@ class LittleCoderAgent(BaseAgent):
         # can never diverge.
         max_turns = 0
         ambient_max_turns_env = os.environ.get("LITTLE_CODER_MAX_TURNS")
+        # Hoisted for the same reason as max_turns: the log line, the
+        # environment snapshot and the PiRpc kwarg must all read one value.
+        thinking_level = resolve_thinking_level(model, "terminal_bench")
         self.logger.info(
             "LittleCoderAgent: config provenance "
             f"max_turns={max_turns} "
+            f"thinking_level={thinking_level} "
             f"ambient_LITTLE_CODER_MAX_TURNS={ambient_max_turns_env!r} "
             f"code_sha={_CODE_SHA} "
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
@@ -1906,11 +1971,16 @@ class LittleCoderAgent(BaseAgent):
         # it (and the config-provenance log line) land even if PiRpc itself
         # fails to construct (e.g. PI_BIN missing) -- exactly the
         # diagnostics that failure needs most.
+        # Kept in scope past the write so the post-PiRpc confirmation below
+        # can amend and rewrite it; None means "never successfully built",
+        # which that step treats as nothing to confirm.
+        snapshot: dict | None = None
         if self.logs_dir:
             try:
                 snapshot = _build_environment_snapshot(
                     model,
                     max_turns=max_turns,
+                    thinking_level=thinking_level,
                     ambient_max_turns_env=ambient_max_turns_env,
                     timeout_info=timeout_info,
                     toolchain=toolchain.tools,
@@ -1920,6 +1990,7 @@ class LittleCoderAgent(BaseAgent):
                     json.dumps(snapshot, indent=2, default=str)
                 )
             except Exception as e:
+                snapshot = None
                 self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
 
         # Start-of-trial snapshot of the task's pre-existing /app files.
@@ -2008,15 +2079,14 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=max_turns,
-                # Every configured model_profiles entry has a nonzero
-                # thinking_budget, i.e. wants reasoning on; pi's own
-                # clampThinkingLevel degrades this to "off" for models with
-                # reasoning=false, so this is safe to pass unconditionally.
-                # Without it, pi falls back to the machine-local
-                # defaultThinkingLevel setting (pi's built-in fallback is
-                # "medium"); a machine set to "off" silently no-ops any
-                # thinkingFormat gated on reasoningEffort (e.g. "qwen").
-                thinking="high",
+                # pi's own clampThinkingLevel degrades this to "off" for
+                # models with reasoning=false, so it is safe to pass
+                # unconditionally. Without it, pi falls back to the
+                # machine-local defaultThinkingLevel setting (pi's built-in
+                # fallback is "medium"); a machine set to "off" silently
+                # no-ops any thinkingFormat gated on reasoningEffort (e.g.
+                # "qwen").
+                thinking=thinking_level,
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,
@@ -2025,6 +2095,18 @@ class LittleCoderAgent(BaseAgent):
                 ),
             )
             try:
+                # Inside this try, not between it and the PiRpc construction
+                # above: the `finally` below is the only thing that closes
+                # rpc, so an await in that gap leaks a pi subprocess when
+                # Harbor cancels a timed-out trial.
+                if snapshot is not None and self.logs_dir:
+                    await asyncio.to_thread(
+                        _confirm_live_thinking,
+                        rpc,
+                        snapshot,
+                        self.logs_dir / "environment_snapshot.json",
+                        self.logger,
+                    )
                 # Retried in place on a provider-error completion rather than
                 # called bare: a single errored completion used to end the
                 # whole trial with most of the wall clock unspent (measured

@@ -35,6 +35,7 @@ TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 # (not inlined) so tests can monkeypatch each one independently, matching how
 # REPO_ROOT/PI_BIN are already overridden in tests.
 _PI_SETTINGS_PATH = Path.home() / ".pi" / "agent" / "settings.json"
+_PI_PROJECT_SETTINGS_PATH = REPO_ROOT / ".pi" / "settings.json"
 _LC_MODELS_SHIPPED_DEFAULT = REPO_ROOT / "models.json"
 _OMLX_SETTINGS = Path.home() / ".omlx" / "settings.json"
 _OMLX_MODEL_SETTINGS = Path.home() / ".omlx" / "model_settings.json"
@@ -62,6 +63,107 @@ def _extension_paths() -> list[str]:
         if child.is_dir() and (child / "index.ts").exists():
             paths.append(str(child / "index.ts"))
     return paths
+
+
+#: Scratch agent dir for benchmark pi subprocesses. Repo-scoped rather than a
+#: per-process temp dir so the bin/ symlink and whatever a run wrote survive
+#: for post-mortem, and so two checkouts never share one.
+_BENCH_AGENT_DIR = REPO_ROOT / ".cache" / "pi-bench-agent"
+
+
+def _bench_agent_dir() -> str:
+    """Prepare and return the PI_CODING_AGENT_DIR every benchmark pi gets.
+
+    thinking-budget's latches call pi.setThinkingLevel() mid-trial, which
+    pi writes straight through to <agent dir>/settings.json. At the default
+    agent dir that file is the user's own interactive
+    ~/.pi/agent/settings.json, whose defaultThinkingLevel a benchmark run
+    was observed silently overwriting.
+
+    This redirects EVERYTHING pi derives from getAgentDir() (config.js),
+    not just settings.json: auth.json, pi's own models.json/models-store.json,
+    bin/, tools/, sessions/. pi recreates what it needs, so the practical
+    effect is that a benchmark pi starts from an empty agent config.
+
+    That is harmless for these runs, but for a narrower reason than it may
+    look. Auth IS redirected -- pi writes a fresh empty auth.json here -- and
+    the local providers these benchmarks drive simply don't use it: their key
+    comes from a *_API_KEY env var (set in PiRpc.__init__) or from
+    little-coder's own models.json, a DIFFERENT file that resolves from
+    ~/.config/little-coder (see _resolve_little_coder_models_file) and is
+    unaffected by the agent dir. Likewise pi's own agent-dir models.json is
+    redirected, but llamacpp/omlx/mlx-serve register through this repo's
+    extensions rather than that file.
+
+    A hosted-provider run (OAuth in ~/.pi/agent/auth.json) would NOT survive
+    this redirect. No benchmark drives one today; one that did would have to
+    export PI_CODING_AGENT_DIR itself to opt out.
+    """
+    # Ahead of the mkdir, which is itself one of the mutations being guarded:
+    # mkdir(parents=True) through a symlinked .cache/ would create the leaf
+    # inside ~/.pi before any later check could object. resolve() follows a
+    # redirect at .cache/ as well as at the leaf, and tolerates the leaf not
+    # existing yet.
+    #
+    # The hazard: mkdir(exist_ok=True) succeeds on a symlink to a directory,
+    # so the delete below follows one wherever it points -- and pointing it
+    # back at ~/.pi/agent both destroys the user's settings.json and silently
+    # undoes the isolation, since every later latch writes through the link.
+    # Worth guarding because polyglot and gaia hand the model under test an
+    # unsandboxed host shell, which is enough to plant it.
+    #
+    # Only ~/.pi is refused, not everywhere outside the repo: relocating
+    # .cache/ to another disk is legitimate, and the scratch dir only ever
+    # holds files pi put there.
+    pi_home = (Path.home() / ".pi").resolve()
+    resolved = _BENCH_AGENT_DIR.resolve()
+    if resolved == pi_home or pi_home in resolved.parents:
+        raise RuntimeError(
+            f"benchmark agent dir {_BENCH_AGENT_DIR} resolves inside {pi_home} "
+            f"({resolved}) -- that is the config this isolation exists to "
+            f"protect, so refusing to touch it. Remove the redirect, or export "
+            f"PI_CODING_AGENT_DIR to manage the agent dir yourself."
+        )
+    _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    # Start each session from a known thinking level. thinking-budget's
+    # latch calls pi.setThinkingLevel(), which settings-manager.js persists
+    # to <agent dir>/settings.json under the GLOBAL scope -- so without this
+    # a run that latched to "off" would leave that behind as the startup
+    # default of every later run sharing this dir. Only pi itself ever
+    # writes this file, so nothing hand-authored is lost; bin/ and auth.json
+    # are deliberately kept (see above).
+    #
+    # Assumes one pi at a time per checkout, which every harness satisfies
+    # today (the pilots pin --n-concurrent 1). Raising that would need a
+    # per-session dir instead: a second trial's delete lands between a
+    # running trial's latch write and a third pi's startup read.
+    try:
+        (_BENCH_AGENT_DIR / "settings.json").unlink()
+    except OSError:
+        pass
+    # pi's Grep tool calls ensureTool("rg"), which downloads ripgrep from
+    # GitHub when <agent dir>/bin has no copy -- a mid-trial download, or a
+    # dead Grep tool offline. A download pi does still perform then lands in
+    # the real bin dir, exactly as it would without this isolation.
+    real_bin = Path.home() / ".pi" / "agent" / "bin"
+    link = _BENCH_AGENT_DIR / "bin"
+    if real_bin.is_dir():
+        try:
+            # readlink(), not exists(): exists() follows the link, so a
+            # dangling one reads as absent and symlink_to then raises
+            # FileExistsError into the handler below -- leaving the dead
+            # link in place forever, which is the failure this guards.
+            if not link.is_symlink():
+                stale = link.exists()
+            else:
+                stale = link.readlink() != real_bin
+            if stale:
+                link.unlink(missing_ok=True)
+            if not link.exists():
+                link.symlink_to(real_bin, target_is_directory=True)
+        except OSError:
+            pass
+    return str(_BENCH_AGENT_DIR)
 
 
 class PiProcessExited(RuntimeError):
@@ -158,6 +260,9 @@ class PiRpc:
         # Required api-key envs (pi requires SOMETHING even for local providers)
         full_env.setdefault("LLAMACPP_API_KEY", "noop")
         full_env.setdefault("OLLAMA_API_KEY", "noop")
+        # Not setdefault: an exported value must also skip the mkdir.
+        if "PI_CODING_AGENT_DIR" not in full_env:
+            full_env["PI_CODING_AGENT_DIR"] = _bench_agent_dir()
         if benchmark:
             full_env["LITTLE_CODER_BENCHMARK"] = benchmark
         if allowed_tools:
@@ -1374,6 +1479,126 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
     return Path.home() / ".config" / "little-coder" / "models.json", "home_default"
 
 
+#: Applied when no matched profile names a thinking_level, and when the
+#: settings file is missing or malformed. "high" is what the harness
+#: hardcoded before thinking_level existed; a None here would send no
+#: --thinking flag at all, leaving pi on whatever defaultThinkingLevel its
+#: agent dir supplies -- under PiRpc's isolation, none, so pi's built-in
+#: PI_BUILTIN_THINKING_LEVEL.
+DEFAULT_THINKING_LEVEL = "high"
+
+#: pi's own vocabulary, copied from its cli/args.js VALID_THINKING_LEVELS.
+#: Safe to duplicate because pi is vendored in this repo's node_modules, so
+#: the list and the pi that consumes it move together on every bump --
+#: test_thinking_level_resolver.py checks this copy against that file.
+#: A tuple, not a set: ascending effort order is what --help and the
+#: warning below should show, and membership over seven items is free.
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+#: pi's compiled-in level when neither --thinking nor a defaultThinkingLevel
+#: setting supplies one (core/defaults.js::DEFAULT_THINKING_LEVEL).
+PI_BUILTIN_THINKING_LEVEL = "medium"
+
+
+def _load_little_coder_settings() -> dict:
+    """The `little_coder` block, from the first settings file that has one.
+
+    Mirrors .pi/extensions/benchmark-profiles/index.ts::loadSettings() --
+    kept in sync by hand, there is no shared source of truth between this
+    Python harness and that TS extension. The home-directory candidate stays
+    the real ~/.pi/agent/settings.json even though PiRpc now points the
+    subprocess elsewhere (see _bench_agent_dir): the TS side resolves it from
+    $HOME, not from PI_CODING_AGENT_DIR, so this matches what the
+    extension actually reads.
+    """
+    for path in (_PI_PROJECT_SETTINGS_PATH, _PI_SETTINGS_PATH):
+        data = _read_json(path)
+        if data is None:
+            continue
+        little_coder = data.get("little_coder")
+        if isinstance(little_coder, dict):
+            return little_coder
+    return {}
+
+
+def _norm_key(s: str) -> str:
+    """Port of benchmark-profiles/index.ts::normKey(). Its `/:/g` regex is a
+    plain str.replace here -- identical for a single literal character, and
+    with no `re` dependency."""
+    return s.replace(":", "-")
+
+
+def _resolve_profile_from(
+    settings: dict,
+    provider_slash_model: str,
+    bench: Optional[str] = None,
+) -> dict:
+    """Port of benchmark-profiles/index.ts::resolveProfileFrom() -- kept in
+    sync by hand; benchmarks/test_thinking_level_resolver.py pins the two to
+    the same cases. Exact key match, then separator-insensitive prefix match,
+    then default_model_profile, then benchmark_overrides[bench] layered on.
+
+    Note the fallback is whole-profile, not per-field: a profile that matches
+    but omits a field does NOT inherit that field from default_model_profile.
+    """
+    profiles = _as_dict(settings.get("model_profiles"))
+    target = _norm_key(provider_slash_model)
+
+    base = profiles.get(provider_slash_model)
+    if not isinstance(base, dict):
+        base = None
+        for pattern, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            normalized = _norm_key(pattern)
+            if target == normalized or target.startswith(normalized):
+                base = profile
+                break
+    if base is None:
+        base = _as_dict(settings.get("default_model_profile"))
+
+    resolved = {k: v for k, v in base.items() if k != "benchmark_overrides"}
+    overrides = _as_dict(base.get("benchmark_overrides"))
+    if bench and isinstance(overrides.get(bench), dict):
+        resolved.update(overrides[bench])
+    return resolved
+
+
+def resolve_thinking_level(model: str, benchmark: Optional[str] = None) -> str:
+    """The `--thinking` level for a `provider/model`, from settings.json's
+    little_coder.model_profiles (see _resolve_profile_from for the lookup).
+
+    Orthogonal to thinking_budget: the level is a construction-time
+    instruction for how hard to think, the budget a runtime token cap the
+    thinking-budget extension enforces. Where they conflict the level wins --
+    an explicit thinking_level "off" means thinking is off no matter what
+    budget the same profile carries, since there is then nothing to cap.
+
+    Values outside pi's own vocabulary (PI_THINKING_LEVELS) fall back to
+    DEFAULT_THINKING_LEVEL with a warning rather than being passed through.
+    Passing them through would be silently lossy, not permissive: pi's
+    cli/args.js demotes an unrecognized --thinking to a *warning diagnostic*
+    and drops the flag entirely, so pi would quietly run at its own default
+    while the environment snapshot recorded the typo as `source: "cli"`.
+    settings.json's thinking_level is not schema-validated, so a typo there
+    is the realistic way this happens.
+    """
+    level = _resolve_profile_from(
+        _load_little_coder_settings(), model, benchmark
+    ).get("thinking_level")
+    if not isinstance(level, str) or not level:
+        return DEFAULT_THINKING_LEVEL
+    if level not in PI_THINKING_LEVELS:
+        print(
+            f"[rpc_client] settings.json thinking_level={level!r} is not one of "
+            f"{list(PI_THINKING_LEVELS)}; pi would silently ignore it. "
+            f"Using {DEFAULT_THINKING_LEVEL!r} instead.",
+            file=sys.stderr,
+        )
+        return DEFAULT_THINKING_LEVEL
+    return level
+
+
 def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     """maxTokens resolution: the user-override file wins if it defines this
     model; otherwise fall back to the shipped default at REPO_ROOT/models.json
@@ -1405,18 +1630,72 @@ def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     return out
 
 
+def _pi_global_settings_path() -> tuple[Optional[Path], str]:
+    """The settings.json pi will read as its GLOBAL scope, and its path.
+
+    pi derives it from PI_CODING_AGENT_DIR, not from $HOME
+    (config.js::getAgentDir -> getSettingsPath), and PiRpc points every
+    benchmark subprocess at _BENCH_AGENT_DIR -- so ~/.pi/agent/settings.json,
+    which this provenance used to read, is a file pi no longer opens for
+    these runs.
+
+    A None path means "pi will read no global settings", for one of two
+    reasons named by the returned string:
+
+    bench_agent_dir_cleared -- no exported var, so PiRpc supplies the scratch
+    dir and clears its settings.json on every construction. Anything on disk
+    there is a prior run's thinking-budget latch that pi never sees, and the
+    snapshot can be built either side of that delete (harbor writes it before
+    PiRpc, polyglot before the run loop), so ignoring it is the only
+    ordering-independent answer.
+
+    relative_agent_dir -- an exported but relative PI_CODING_AGENT_DIR. pi
+    resolves it against the CHILD's cwd, which PiRpc sets per caller (the
+    per-exercise work dir for polyglot), so this process cannot say which
+    file that is. Reporting a guess resolved against the harness's own cwd
+    would name a file pi may never open.
+
+    Only the exported case is followed: PiRpc also honours the var from a
+    caller's env= dict, which os.environ cannot see. No caller passes one.
+
+    Not pi's whole picture -- settings-manager.js merges
+    <cwd>/.pi/settings.json over this scope -- but no benchmark cwd ships a
+    defaultThinkingLevel, so this is the only scope that can supply one.
+    """
+    env = os.environ.get("PI_CODING_AGENT_DIR")
+    if not env:
+        return None, "bench_agent_dir_cleared"
+    base = Path(env).expanduser()
+    if not base.is_absolute():
+        return None, "relative_agent_dir"
+    return base / "settings.json", "agent_dir"
+
+
 def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
-    settings = _read_json(_PI_SETTINGS_PATH)
-    pi_default = settings.get("defaultThinkingLevel") if settings else None
+    settings_path, path_status = _pi_global_settings_path()
+    if settings_path is None:
+        pi_default = None
+    else:
+        settings = _read_json(settings_path)
+        pi_default = settings.get("defaultThinkingLevel") if settings else None
     if cli_thinking:
         resolved, source = cli_thinking, "cli"
     elif pi_default:
         resolved, source = pi_default, "pi_default_settings"
     else:
-        resolved, source = None, "unresolved"
+        # Not "unresolved": pi does resolve this case, to its own compiled-in
+        # level. Recording None here claimed ignorance about a value that is
+        # in fact knowable, which is how a benchmark ran at "medium" while
+        # its snapshot said nothing at all.
+        resolved, source = PI_BUILTIN_THINKING_LEVEL, "pi_builtin_default"
     return {
         "cli_value": cli_thinking,
         "pi_default_setting": pi_default,
+        # Which file the pi_default_setting above was read from -- the agent
+        # dir moves, so the value alone is ambiguous. None when pi will read
+        # no global settings at all; path_status says which case that is.
+        "pi_default_setting_file": str(settings_path) if settings_path else None,
+        "pi_default_setting_source": path_status,
         "resolved": resolved,
         "source": source,
         # Filled in later by the caller once a live PiRpc session exists and
@@ -1457,8 +1736,9 @@ def _capture_omlx_sampling(model_id: str, errors: list[dict]) -> dict:
 
 def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None, agent: str = "pi") -> dict:
     """Best-effort snapshot of config that affects generation but isn't visible
-    to the harness's own CLI args: the machine-local default thinking level
-    pi falls back to when --thinking is unset, the model's maxTokens, the
+    to the harness's own CLI args: the default thinking level pi falls back
+    to when --thinking is unset (from whichever agent dir this run points pi
+    at -- see _pi_global_settings_path), the model's maxTokens, the
     model server's sampling params (temperature/top_p/top_k/repetition_penalty
     -- omlx only for now; rapid-mlx's sampling flags are CLI-launch-time only
     with no queryable file, so that provider degrades to a note rather than a
@@ -1501,6 +1781,8 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
     except Exception as exc:
         errors.append({"source": "thinking", "error": f"{type(exc).__name__}: {exc}"})
         thinking = {"cli_value": cli_thinking, "pi_default_setting": None,
+                    "pi_default_setting_file": None,
+                    "pi_default_setting_source": "error",
                     "resolved": None, "source": "error", "confirmed_live": None}
     try:
         max_tokens = _find_model_max_tokens(provider, model_id)

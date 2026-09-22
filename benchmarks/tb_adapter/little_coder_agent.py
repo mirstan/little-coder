@@ -26,6 +26,7 @@ from rpc_client import (  # noqa: E402
     PiRpc,
     preview_tool_result,
     prompt_with_error_retry,
+    resolve_thinking_level,
 )
 
 
@@ -485,7 +486,7 @@ class LittleCoderAgent(BaseAgent):
                 # back to the machine-local defaultThinkingLevel, which can
                 # silently no-op any thinkingFormat gated on
                 # reasoningEffort).
-                thinking="high",
+                thinking=resolve_thinking_level(self._model, "terminal_bench"),
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,
