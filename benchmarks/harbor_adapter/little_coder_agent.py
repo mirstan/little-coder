@@ -1717,16 +1717,42 @@ class LittleCoderAgent(BaseAgent):
         # only line a reader should treat as "the trial's turn is actually
         # done".
         turn_counter = 0
+        # Heartbeat state for long single generations. message_update deltas
+        # (including thinking_delta, which is otherwise never logged at all)
+        # arrive continuously while a turn streams, but nothing was written
+        # to live_log_fh between turn/tool-call boundaries -- a turn with a
+        # large thinking budget can legitimately stream for over an hour
+        # with zero bytes hitting disk, making a live generation
+        # indistinguishable from a hung one to anyone tailing this file.
+        # Throttled so a fast-streaming turn doesn't turn this into a flush
+        # storm.
+        HEARTBEAT_INTERVAL_SEC = 30.0
+        heartbeat_last_ts = 0.0
+        heartbeat_turn_start_ts = 0.0
+        heartbeat_delta_chars = 0
 
         def on_event(ev: dict) -> None:
-            nonlocal turn_counter
+            nonlocal turn_counter, heartbeat_last_ts, heartbeat_turn_start_ts, heartbeat_delta_chars
             if live_log_fh is None:
                 return
             t = ev.get("type")
             if t == "message_update":
                 delta = ev.get("assistantMessageEvent", {})
-                if delta.get("type") == "text_delta":
+                delta_type = delta.get("type")
+                if delta_type == "text_delta":
                     pending_text.append(delta.get("delta", ""))
+                if delta_type in ("text_delta", "thinking_delta"):
+                    heartbeat_delta_chars += len(delta.get("delta", ""))
+                    now = time.time()
+                    if now - heartbeat_last_ts >= HEARTBEAT_INTERVAL_SEC:
+                        heartbeat_last_ts = now
+                        elapsed = now - heartbeat_turn_start_ts
+                        live_log_fh.write(
+                            f"... turn {turn_counter} still generating "
+                            f"({elapsed:.0f}s elapsed, ~{heartbeat_delta_chars} "
+                            f"chars streamed so far) ...\n"
+                        )
+                        live_log_fh.flush()
                 return
             if t == "tool_execution_start":
                 if pending_text:
@@ -1785,6 +1811,9 @@ class LittleCoderAgent(BaseAgent):
                 live_log_fh.flush()
             elif t == "agent_start":
                 turn_counter += 1
+                heartbeat_turn_start_ts = time.time()
+                heartbeat_last_ts = 0.0
+                heartbeat_delta_chars = 0
                 live_log_fh.write(f"=== turn {turn_counter} start ===\n")
                 live_log_fh.flush()
             elif t == "agent_end":
@@ -1979,6 +2008,15 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=max_turns,
+                # Every configured model_profiles entry has a nonzero
+                # thinking_budget, i.e. wants reasoning on; pi's own
+                # clampThinkingLevel degrades this to "off" for models with
+                # reasoning=false, so this is safe to pass unconditionally.
+                # Without it, pi falls back to the machine-local
+                # defaultThinkingLevel setting (pi's built-in fallback is
+                # "medium"); a machine set to "off" silently no-ops any
+                # thinkingFormat gated on reasoningEffort (e.g. "qwen").
+                thinking="high",
                 tb_shell_handler=tb_shell_handler,
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,

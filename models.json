@@ -1,6 +1,27 @@
 {
   "default": "omlx/tiel-coder-oq6e-fp16",
   "providers": {
+    "mlx-serve": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:11234/v1",
+      "apiKey": "IGNORED",
+      "models": [
+        {
+          "id": "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+          "name": "Qwen3.8-27B-MLX-Serve-4bit (mlx-serve, --pld --kv-quant 4 --ctx-size 131072)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 80000,
+          "compat": {
+            "thinkingFormat": "qwen",
+            "supportsReasoningEffort": true,
+            "supportsDeveloperRole": false
+          },
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    },
     "llamacpp": {
       "api": "openai-completions",
       "baseUrl": "http://127.0.0.1:8888/v1",

@@ -85,6 +85,11 @@
         "skill_token_budget": 300,
         "knowledge_token_budget": 200
       },
+      "mlx-serve/ddalcu/Qwen3.8-27B-MLX-Serve-4bit": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
+      },
       "rapidmlx/tiel-coder-oq4e": {
         "thinking_budget": 32768,
         "skill_token_budget": 300,
