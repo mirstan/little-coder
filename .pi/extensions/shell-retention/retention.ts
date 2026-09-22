@@ -316,6 +316,58 @@ function alreadyDemoted(p: Pair): boolean {
   return cmdMatch !== null && cmdMatch[1] === ownId;
 }
 
+// ── Marker-echo tripwire (index.ts's tool_call hook) ────────────────────────
+//
+// A model can copy a demoted placeholder verbatim into a NEW tool call (e.g.
+// reconstructing a file from "what I remember writing"), baking the
+// placeholder text into real output. That's a different job from
+// alreadyDemoted above (this extension's own command/result text vs.
+// arbitrary tool-call input), so it gets its own, more tolerant pattern.
+//
+// Per-leaf pre-gate: marker-free strings (the vast majority) never reach the
+// regex below.
+const MARKER_ECHO_GATE = "ShellRecall id=sr-";
+
+// Anchored on the id phrase alone, not the "demoted — …" prose around it
+// (both the command-infix and result-prefix marker lines carry it). The
+// id must be byte-exact anyway for the liveness check downstream to match
+// it, while the dash just before it is exactly the byte a model
+// paraphrasing its own context from memory is free to mangle (em dash vs
+// `--`/`-`/`...`). Matching more of the surrounding prose would only make
+// this stricter than MARKER_ECHO_GATE, opening a gap where the pre-gate
+// admits a call this regex then fails to catch.
+//
+// The lookahead is that byte-exactness enforced. Without it a longer hex run
+// still yields its first 16 characters, and if those name a live entry the
+// guard blocks a call that never carried that id. Both marker shapes put a
+// space right after the id, so the boundary costs no genuine match.
+const MARKER_ECHO_ID_RE = /ShellRecall id=(sr-[0-9a-f]{16})(?![0-9a-fA-F])/g;
+
+/**
+ * All sr-… ids that appear, anywhere among `input`'s string leaves, in
+ * demotion-marker shape. Doesn't check liveness — the caller cross-checks
+ * against the archive, so a marker-shaped id naming nothing there (a fixture's,
+ * or one left in a file by an earlier session) doesn't trip the guard.
+ */
+export function findMarkerEchoIds(input: unknown): string[] {
+  const ids = new Set<string>();
+  const stack: unknown[] = [input];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === "string") {
+      if (!v.includes(MARKER_ECHO_GATE)) continue;
+      MARKER_ECHO_ID_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = MARKER_ECHO_ID_RE.exec(v)) !== null) ids.add(m[1]);
+    } else if (Array.isArray(v)) {
+      stack.push(...v);
+    } else if (v !== null && typeof v === "object") {
+      stack.push(...Object.values(v as Record<string, unknown>));
+    }
+  }
+  return [...ids];
+}
+
 /**
  * Replace stale, oversized shell pairs with archived placeholders.
  *
