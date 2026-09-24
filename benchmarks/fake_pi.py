@@ -108,6 +108,52 @@ def main():
         sys.stderr.flush()
         os._exit(3)
 
+    if mode in ("compact_ok", "compact_fails"):
+        # Answers compact requests without ever being prompted: the
+        # compaction round-trip is an RPC pair, not a turn.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            line = sys.stdin.readline()
+            if not line:
+                return  # EOF -- caller closed stdin
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if req.get("type") != "compact":
+                if req.get("id"):
+                    emit({"type": "response", "id": req.get("id"), "success": True,
+                          "data": {}})
+                continue
+            if mode == "compact_ok":
+                emit({"type": "response", "id": req.get("id"), "command": "compact",
+                      "success": True,
+                      "data": {"summary": "so far...", "firstKeptEntryId": "entry-9",
+                               "tokensBefore": 230000, "estimatedTokensAfter": 40000}})
+            else:
+                emit({"type": "response", "id": req.get("id"), "command": "compact",
+                      "success": False, "error": "Already compacted"})
+        return
+
+    if mode in ("always_busy", "rejects_prompt"):
+        # always_busy is pi mid-run (the real failure's shape: a compaction
+        # that outlasts every readiness attempt); rejects_prompt is any
+        # other rejection, which must NOT read as recoverable.
+        error = (
+            "Agent is already processing. Specify streamingBehavior "
+            "('steer' or 'followUp') to queue the message."
+            if mode == "always_busy" else "No model selected"
+        )
+        while True:
+            req = read_prompt()
+            if req is None:
+                return
+            emit({"type": "response", "id": req.get("id"), "success": False,
+                  "error": error})
+
     msg = read_prompt()
     if msg is None:
         return

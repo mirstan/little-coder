@@ -4,9 +4,12 @@ These cover the JSONL event loop, which the existing tests cannot: they spawn a
 real pi and skip when node_modules/.bin/pi is absent. EOF/deadline/crash need a
 process that exits on cue.
 """
+import json
 import os
 import sys
+import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -603,3 +606,140 @@ def test_close_silent_when_reader_threads_finish_in_time(capsys):
 
     err = capsys.readouterr().err
     assert "WARNING" not in err
+
+
+# ── a pi that stays busy, and the compaction RPC pair ────────────────────
+
+
+@pytest.fixture
+def _no_readiness_backoff(monkeypatch):
+    """Collapse prompt_and_collect's 2/4/6/8s readiness backoff.
+
+    Those are real sleeps inside the send loop, not injectable ones, so a
+    test that exhausts all five attempts would otherwise spend 20 seconds
+    proving a control-flow branch. Nothing else in the client sleeps -- the
+    drains and response waits all block on the condition variable.
+    """
+    monkeypatch.setattr(rpc_client.time, "sleep", lambda *_a, **_k: None)
+
+
+def test_a_sustained_busy_pi_raises_the_typed_error(fake_pi, tmp_path,
+                                                    _no_readiness_backoff):
+    """The real TB2.0 train-fasttext failure: pi was mid-compaction for far
+    longer than the five readiness attempts cover. The typed error is what
+    lets prompt_with_error_retry tell "wait and try again" apart from the
+    rejections that are genuinely terminal."""
+    with fake_pi("always_busy", tmp_path) as rpc:
+        with pytest.raises(rpc_client.PiBusyError) as excinfo:
+            rpc.prompt_and_collect("go", timeout=30)
+    assert "already processing" in str(excinfo.value).lower()
+
+
+def test_every_other_rejection_stays_a_plain_runtime_error(fake_pi, tmp_path,
+                                                           _no_readiness_backoff):
+    """Widening the typed error would make genuinely unrecoverable
+    rejections look like something waiting could fix."""
+    with fake_pi("rejects_prompt", tmp_path) as rpc:
+        with pytest.raises(RuntimeError) as excinfo:
+            rpc.prompt_and_collect("go", timeout=30)
+    assert not isinstance(excinfo.value, rpc_client.PiBusyError)
+    assert "No model selected" in str(excinfo.value)
+
+
+def test_a_busy_rejection_is_not_retried_more_than_five_times(fake_pi, tmp_path,
+                                                              _no_readiness_backoff):
+    """Bounded inside the send loop, so the outer retry policy is the only
+    thing that decides how long a trial keeps waiting on a busy pi."""
+    sent = []
+    with fake_pi("always_busy", tmp_path) as rpc:
+        original = rpc._send
+        rpc._send = lambda obj: (sent.append(obj), original(obj))[1]
+        with pytest.raises(rpc_client.PiBusyError):
+            rpc.prompt_and_collect("go", timeout=30)
+    assert sum(o.get("type") == "prompt" for o in sent) == 5
+
+
+def test_compact_round_trips_and_returns_pis_own_payload(fake_pi, tmp_path):
+    with fake_pi("compact_ok", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        data = rpc.await_compact(rid, timeout=20)
+    assert data["tokensBefore"] == 230000
+    assert data["estimatedTokensAfter"] == 40000
+
+
+def test_request_compact_does_not_wait_for_the_response(fake_pi, tmp_path):
+    """It is fired from inside an on_event callback, which runs on the
+    draining thread -- blocking there stalls event demultiplexing and the
+    tb_shell proxy with it."""
+    with fake_pi("compact_ok", tmp_path) as rpc:
+        started = time.time()
+        rid = rpc.request_compact()
+        assert time.time() - started < 1.0
+        assert rpc.await_compact(rid, timeout=20)["summary"] == "so far..."
+
+
+def test_a_refused_compaction_surfaces_pis_own_error_text(fake_pi, tmp_path):
+    """pi has several refusal reasons and picks its own wording; matching on
+    the strings here would go stale the next time it rephrases one."""
+    with fake_pi("compact_fails", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        with pytest.raises(RuntimeError, match="Already compacted"):
+            rpc.await_compact(rid, timeout=20)
+
+
+def test_await_compact_times_out_rather_than_blocking_forever(fake_pi, tmp_path):
+    with fake_pi("clean", tmp_path) as rpc:
+        with pytest.raises(TimeoutError):
+            rpc.await_compact("never-sent", timeout=0.2)
+
+
+# ── the stdin send lock ──────────────────────────────────────────────────
+
+
+class _RecordingStdin:
+    closed = False
+
+    def __init__(self):
+        self.writes = []
+        self.flushes = 0
+
+    def write(self, text):
+        self.writes.append(text)
+
+    def flush(self):
+        self.flushes += 1
+
+
+def test_a_single_send_still_writes_one_flushed_line():
+    """Smoke test for the lock added around the write: _send is called from
+    the reader thread as well as the caller's, and serializing it must not
+    change what a plain single-threaded send puts on the wire."""
+    rpc = object.__new__(PiRpc)
+    rpc._send_lock = threading.Lock()
+    rpc._proc = types.SimpleNamespace(stdin=_RecordingStdin())
+
+    rpc._send({"id": "r1", "type": "get_state"})
+
+    assert rpc._proc.stdin.writes == ['{"id": "r1", "type": "get_state"}\n']
+    assert rpc._proc.stdin.flushes == 1
+
+
+def test_concurrent_sends_each_write_one_whole_line():
+    """The corruption the lock prevents: two threads interleaving a write
+    and its flush leaves pi a line it cannot resync from."""
+    rpc = object.__new__(PiRpc)
+    rpc._send_lock = threading.Lock()
+    rpc._proc = types.SimpleNamespace(stdin=_RecordingStdin())
+
+    threads = [
+        threading.Thread(target=rpc._send, args=({"id": f"r{i}", "type": "ping"},))
+        for i in range(24)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    writes = rpc._proc.stdin.writes
+    assert len(writes) == 24
+    assert {json.loads(w)["id"] for w in writes} == {f"r{i}" for i in range(24)}

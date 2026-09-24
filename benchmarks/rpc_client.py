@@ -170,6 +170,17 @@ class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
 
 
+class PiBusyError(RuntimeError):
+    """pi refused the prompt as "already processing" on every readiness attempt.
+
+    Distinct from the generic RuntimeError every OTHER rejection reason still
+    raises, because this one is recoverable by waiting: the session is alive
+    and holding a transcript worth continuing, it is just mid-run (a long
+    compaction summarization, most often). prompt_with_error_retry treats it
+    as retryable for exactly that reason.
+    """
+
+
 @dataclass
 class PromptResult:
     """Outcome of a single prompt_and_collect() call."""
@@ -186,6 +197,15 @@ class PromptResult:
     #: provider error or came back empty -- see error_message), "deadline"
     #: (budget expired), or "process_exit" (pi died mid-run). Callers must not
     #: infer this from elapsed time.
+    #:
+    #: prompt_with_mid_run_compaction adds a fifth value, "compacted", which
+    #: prompt_and_collect itself never produces: an "agent_end" it relabelled
+    #: because that end was pi unwinding the run for a compaction the harness
+    #: asked for, not the agent finishing. It is an intermediate label -- a
+    #: cycle carrying it is normally followed by another -- so a caller of
+    #: that helper sees it as the FINAL stop_reason only when a brake
+    #: (compaction cap, budget floor, dead pi) stopped the loop right after
+    #: one, which is itself the accurate account of how such a trial ended.
     #:
     #: "error" is a refinement of "agent_end", not of the other two:
     #: "deadline"/"process_exit" always win over it, because those describe
@@ -318,6 +338,8 @@ class PiRpc:
         self._event_q: list[dict] = []
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
+        # Not _cv's lock: a blocked write would stall event demultiplexing.
+        self._send_lock = threading.Lock()
         self._closed = False
         #: Set once pi's stdout reaches EOF, i.e. the process is going away.
         self._eof = False
@@ -427,11 +449,25 @@ class PiRpc:
 
     # ── Send / recv ──────────────────────────────────────────────────────
     def _send(self, obj: dict):
+        """Write one JSONL request to pi's stdin.
+
+        Called from two threads -- the reader thread answering an
+        `extension_ui_request`, and the caller thread issuing prompts /
+        get_state / compact -- so the write and its flush are serialized.
+        Interleaved, they produce a line pi answers with a parse error and
+        discards, which for a request awaited by id is not a visible failure
+        but a wait that only ends at its timeout. Before mid-generation
+        sends became routine (prompt_with_error_retry's idle-wait retry
+        path, prompt_with_mid_run_compaction's compact request) this needed
+        two threads to collide by accident; now it is an expected pairing.
+        """
         if self._proc.stdin is None or self._proc.stdin.closed:
             return
+        payload = json.dumps(obj) + "\n"
         try:
-            self._proc.stdin.write(json.dumps(obj) + "\n")
-            self._proc.stdin.flush()
+            with self._send_lock:
+                self._proc.stdin.write(payload)
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError):
             pass
 
@@ -712,9 +748,18 @@ class PiRpc:
             if resp.get("success"):
                 break
             err = str(resp.get("error", ""))
-            if "already processing" in err.lower() and readiness_attempt < 4:
-                time.sleep(2 * (readiness_attempt + 1))
-                continue
+            if "already processing" in err.lower():
+                if readiness_attempt < 4:
+                    time.sleep(2 * (readiness_attempt + 1))
+                    continue
+                # Typed only for THIS rejection reason. Every other one stays
+                # a generic RuntimeError, which prompt_with_error_retry
+                # treats as terminal -- widening the type would make
+                # genuinely unrecoverable rejections look retryable.
+                raise PiBusyError(
+                    f"pi stayed busy across {readiness_attempt + 1} readiness "
+                    f"attempts: {resp.get('error')}"
+                )
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
 
         # Trim any event still queued from before THIS response was recorded
@@ -1011,6 +1056,40 @@ class PiRpc:
             raise RuntimeError(f"pi rejected get_state: {resp.get('error')}")
         return resp.get("data", {})
 
+    def request_compact(self) -> str:
+        """Ask pi to compact the session now; return the request id.
+
+        Deliberately does NOT wait for the response. The only useful moment
+        to fire this is from inside an `on_event` callback, which runs on the
+        draining thread (see _drain_events_until) -- blocking there stalls
+        event demultiplexing and the tb_shell proxy with it, and the response
+        cannot arrive until pi has finished summarizing anyway. Pair it with
+        await_compact() once the aborted run has unwound.
+
+        pi's own `session.compact()` aborts the active run before it starts
+        summarizing, so the prompt_and_collect this is fired from will end
+        with an `agent_end` that means "we interrupted it", not "the agent
+        finished".
+        """
+        rid = str(uuid.uuid4())
+        self._send({"id": rid, "type": "compact"})
+        return rid
+
+    def await_compact(self, rid: str, timeout: float = 600) -> dict:
+        """Collect the response to a request_compact(), or raise.
+
+        Raises RuntimeError carrying pi's own error text on a failed
+        compaction (it has several: an already-compacted branch, a session
+        too small to compact, an extension cancelling it), TimeoutError if
+        the response does not arrive in `timeout`, and PiProcessExited if pi
+        went away first. Returns pi's CompactionResult payload; callers
+        mostly want `estimatedTokensAfter`, which pi marks optional.
+        """
+        resp = self._await_response(rid, timeout=timeout)
+        if not resp.get("success"):
+            raise RuntimeError(f"pi rejected compact: {resp.get('error')}")
+        return resp.get("data", {})
+
     def session_stats(self, timeout: float = 10) -> Optional[dict]:
         """Query pi's own cumulative token/cost accounting for this session.
 
@@ -1150,6 +1229,72 @@ ERROR_RETRY_PROMPT = (
     "complete — please continue working on it. If the task is actually "
     "already complete and verified, say so explicitly and stop."
 )
+#: How often wait_for_pi_idle re-reads pi's own state.
+PI_IDLE_POLL_SEC = 10.0
+#: Flat stuckness guard on top of the deadline bound: a pi wedged in
+#: `isCompacting` forever would otherwise burn the entire remaining trial
+#: budget waiting, and attempting the prompt anyway is strictly better than
+#: not attempting it at all.
+PI_IDLE_WAIT_CAP_SEC = 1800.0
+
+
+def wait_for_pi_idle(
+    rpc: PiRpc,
+    deadline: float,
+    *,
+    min_remaining_sec: float = ERROR_RETRY_MIN_BUDGET_SEC,
+    poll_sec: float = PI_IDLE_POLL_SEC,
+    cap_sec: float = PI_IDLE_WAIT_CAP_SEC,
+    now: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Poll pi's own state until it is neither streaming nor compacting.
+
+    Motivation, measured: the real TB2.0 `train-fasttext` failure was not the
+    context overflow itself but what came after -- the error retry landed in
+    a sustained "Agent is already processing" window (pi was mid-compaction,
+    which can run for many minutes on a 260k transcript) and exhausted its
+    five readiness attempts inside the first ~30 seconds of it. Waiting for
+    pi's own idle signal before re-prompting turns that into a recovery.
+
+    Returns True only when pi was actually observed idle. Every other
+    outcome -- the cap, the deadline, a state read that never succeeded --
+    returns False, and the caller is expected to attempt the prompt ANYWAY:
+    a stale or wrong idle reading must never by itself end a recoverable
+    trial, and the send loop's own readiness retry is the backstop if the
+    read was wrong. False on a dead pi too, where the caller's own liveness
+    checks are the right authority.
+
+    `now`/`sleep` are injected so tests can drive the whole wait without
+    spending real seconds, matching prompt_with_error_retry.
+    """
+    wait_until = min(now() + cap_sec, deadline - min_remaining_sec)
+    unreadable_logged = False
+    while True:
+        if not rpc.is_alive():
+            return False
+        try:
+            state = rpc.get_state()
+        except PiProcessExited:
+            return False
+        except Exception as exc:
+            # An unreadable state is "not idle yet": a pi too busy to
+            # answer get_state is the case this wait exists for.
+            if log is not None and not unreadable_logged:
+                log(f"could not read pi state while waiting for idle: {exc}")
+                unreadable_logged = True
+            state = None
+        if isinstance(state, dict) and not (
+            state.get("isStreaming") or state.get("isCompacting")
+        ):
+            return True
+        remaining = wait_until - now()
+        if remaining <= 0:
+            if log is not None:
+                log("pi never went idle within the wait bound; prompting anyway")
+            return False
+        sleep(min(poll_sec, remaining))
 
 
 @dataclass
@@ -1169,11 +1314,17 @@ class ErrorRetryOutcome:
     #: record n_error_retries > 0 with no trace of what it recovered from.
     error_message: str = ""
     #: "TypeName: message" when a RETRY raised and was turned into the merged
-    #: result instead of propagating, "" otherwise. Separate from
+    #: result instead of propagating -- including a PiBusyError the loop then
+    #: recovered from, which is retained the way `error_message` is. ""
+    #: otherwise. Separate from
     #: `error_message`, which is a provider verdict: this one is a harness
     #: fault (a rejected prompt, a dead pipe) that the caller would otherwise
     #: have seen as a raised exception and now cannot see at all.
     retry_exception: str = ""
+    #: Mid-run compactions prompt_with_mid_run_compaction deliberately
+    #: triggered. Always 0 out of prompt_with_error_retry, which has no
+    #: compaction mechanism of its own.
+    n_deliberate_compactions: int = 0
 
 
 def _merged_result(acc: PromptResult, latest: PromptResult) -> PromptResult:
@@ -1258,6 +1409,17 @@ def prompt_with_error_retry(
     left pi dead -- as a "process_exit" stop_reason rather than a retryable
     "error".
 
+    A `PiBusyError` out of a retry is the one exception type handled rather
+    than merged-and-returned. It means the session is alive and worth
+    continuing but was mid-run when the send landed -- the shape of the real
+    TB2.0 `train-fasttext` failure, where the retry hit a multi-minute
+    compaction window and the blanket handler then ended the trial on the
+    first of its two available retries. It re-enters the loop through the
+    same `wait_for_pi_idle` preamble every retry uses, still bounded by
+    `max_attempts` and the budget/liveness brakes, but outside
+    `identical_error_limit`: a busy rejection carries no error text to
+    compare and resolves by waiting, not by giving up.
+
     `sleep`/`now` are injected purely so tests can drive the whole policy
     without spending real seconds.
     """
@@ -1271,6 +1433,10 @@ def prompt_with_error_retry(
     attempts = 0
     n_retries = 0
     last_error = ""
+    # Retained across a recovery for the same reason last_error is: a trial
+    # that spent attempts on a busy pi and then succeeded would otherwise
+    # leave no trace of what it recovered from.
+    busy_exception = ""
     identical_streak = 0
     attempt_message = message
     merged: Optional[PromptResult] = None
@@ -1281,11 +1447,47 @@ def prompt_with_error_retry(
 
     while True:
         attempts += 1
+        if attempts > 1:
+            # pi can still be mid-compaction from the attempt that just
+            # failed, and a send into that window is what PiBusyError
+            # reports. attempt_timeout is recomputed AFTER the wait, which
+            # can itself spend up to PI_IDLE_WAIT_CAP_SEC.
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
+            attempt_timeout = max(0.0, deadline - now())
         if attempts == 1:
             result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
         else:
             try:
                 result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
+            except PiBusyError as exc:
+                # Before the blanket handler below on purpose: that one ends
+                # the loop after a single retry, which is exactly how the
+                # real failure wasted the rest of its budget. A busy
+                # rejection carries no error text, so it deliberately does
+                # NOT feed identical_streak -- there is nothing to compare,
+                # and counting it would fast-fail the loop on a condition
+                # that resolves by waiting.
+                detail = f"{type(exc).__name__}: {exc}"
+                busy_exception = detail
+                _log(f"attempt {attempts}/{max_attempts} rejected: {exc}")
+                if attempts >= max_attempts:
+                    _log(f"not retrying: {max_attempts} attempts already used")
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                if (deadline - now()) < min_remaining_sec:
+                    _log(
+                        f"not retrying: only {deadline - now():.0f}s of budget "
+                        f"is left, below the {min_remaining_sec:.0f}s floor"
+                    )
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                if not rpc.is_alive():
+                    _log("not retrying: pi process is gone")
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                n_retries += 1
+                _log(f"retry {n_retries} after waiting for pi to go idle")
+                continue
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
                 _log(
@@ -1313,7 +1515,7 @@ def prompt_with_error_retry(
                 return ErrorRetryOutcome(merged, n_retries, last_error, detail)
         merged = result if merged is None else _merged_result(merged, result)
         if result.stop_reason != "error":
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         err = result.error_message or "provider error"
         identical_streak = identical_streak + 1 if err == last_error else 1
@@ -1325,13 +1527,13 @@ def prompt_with_error_retry(
 
         if attempts >= max_attempts:
             _log(f"not retrying: {max_attempts} attempts already used")
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
         if identical_streak >= identical_error_limit:
             _log(
                 f"not retrying: {identical_streak} consecutive attempts failed "
                 f"with the identical error, treating it as non-retryable"
             )
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         backoff = backoff_sec[min(n_retries, len(backoff_sec) - 1)] if backoff_sec else 0.0
         remaining_after_backoff = (deadline - now()) - backoff
@@ -1341,14 +1543,14 @@ def prompt_with_error_retry(
                 f"left after a {backoff:.0f}s backoff, below the "
                 f"{min_remaining_sec:.0f}s floor"
             )
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         if not rpc.is_alive():
             # pi can exit between attempts, once the derivation that would
             # have said "process_exit" has already run on this result.
             # Prompting anyway raises PiProcessExited out of the trial.
             _log("not retrying: pi process is gone")
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         sleep(backoff)
         n_retries += 1
@@ -1357,6 +1559,321 @@ def prompt_with_error_retry(
         _log(
             f"retry {n_retries} on the same session with "
             f"{attempt_timeout:.0f}s of remaining budget"
+        )
+
+
+# ── Deliberate mid-run compaction ───────────────────────────────────────────
+
+#: Context-token estimate at which the harness asks pi to compact. Below the
+#: 262 144-token window the real TB2.0 `train-fasttext` trial overflowed, with
+#: enough slack for the turn already in flight to land.
+COMPACT_TRIGGER_TOKENS = 220_000
+#: A compaction that freed less than this much is not worth repeating: the
+#: transcript is dominated by whatever compaction cannot summarize away, so
+#: the next trigger would just spend another summarization on nothing.
+COMPACT_REGAIN_MIN_TOKENS = 30_000
+#: Hard cap on deliberate compactions per trial, so the outer loop is bounded
+#: independently of whether the anti-thrash check ever fires.
+MAX_DELIBERATE_COMPACTIONS = 5
+#: Same shape and escape hatch as ERROR_RETRY_PROMPT, for the same reason:
+#: the nudge has to be able to lose against an agent that genuinely finished.
+COMPACTION_CONTINUE_PROMPT = (
+    "Your session context was compacted to free space, which interrupted "
+    "what you were doing. The task is not complete — please continue from "
+    "where you left off. If the task is actually already complete and "
+    "verified, say so explicitly and stop."
+)
+
+
+def _turn_context_tokens(event: dict) -> Optional[int]:
+    """Context-token estimate carried by one `turn_end` event, or None.
+
+    input + cacheRead + cacheWrite is the prompt pi actually sent, and
+    output is what the turn added to it, so their sum approximates the
+    context the NEXT turn will carry. Parsed exactly as prompt_and_collect's
+    own usage aggregation does -- same defensive .get/isinstance handling,
+    because this is untrusted wire data from a pi build we don't control and
+    a malformed field here must not crash a trial over token accounting.
+    """
+    message = event.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    for src in ("input", "output", "cacheRead", "cacheWrite"):
+        val = usage.get(src, 0)
+        if isinstance(val, (int, float)):
+            total += val
+    return int(total)
+
+
+class _CompactionTrigger:
+    """A caller's `on_event`, wrapped to watch context growth on `turn_end`.
+
+    Disarmed rather than deleted when there is nothing to watch against (no
+    `context_window`) or when compaction has proved unhelpful: the wrapper
+    stays in the callback chain either way, so the caller's own on_event
+    keeps firing and only the compaction mechanism goes inert.
+    """
+
+    def __init__(
+        self,
+        rpc: PiRpc,
+        on_event: Optional[Callable[[dict], None]],
+        context_window: Optional[float],
+        *,
+        trigger_tokens: float = COMPACT_TRIGGER_TOKENS,
+        log: Optional[Callable[[str], None]] = None,
+    ):
+        self._rpc = rpc
+        self._inner = on_event
+        self._log = log
+        # A fraction of the window as well as the flat trigger, so a model
+        # with a smaller window still compacts before it overflows.
+        self.threshold: Optional[int] = (
+            min(int(trigger_tokens), int(0.84 * context_window))
+            if context_window
+            else None
+        )
+        self._armed = self.threshold is not None
+        self.pending_rid: Optional[str] = None
+        self.last_tokens: Optional[int] = None
+
+    def __call__(self, event: dict) -> None:
+        # The caller's logging runs first and unguarded: an exception out of
+        # it must keep behaving exactly as it did before this wrapper existed.
+        if self._inner is not None:
+            self._inner(event)
+        if event.get("type") != "turn_end":
+            return
+        tokens = _turn_context_tokens(event)
+        if tokens is None:
+            return
+        self.last_tokens = tokens
+        if not self._armed or self.pending_rid is not None:
+            return
+        if tokens < self.threshold:
+            return
+        try:
+            self.pending_rid = self._rpc.request_compact()
+        except Exception as exc:
+            # A failed request must not propagate: this runs inside
+            # _drain_events_until, where a raising callback discards the
+            # whole in-flight batch of events.
+            self._armed = False
+            if self._log is not None:
+                self._log(f"could not request compaction: {exc}")
+            return
+        # Disarmed until the request resolves, never re-checked per turn:
+        # two concurrent compact requests would have pi abort the run it
+        # started for the first one.
+        self._armed = False
+        if self._log is not None:
+            self._log(
+                f"requested compaction at ~{tokens} context tokens "
+                f"(threshold {self.threshold})"
+            )
+
+    def take_pending(self) -> Optional[str]:
+        """Hand back the outstanding compact request id, clearing it."""
+        rid, self.pending_rid = self.pending_rid, None
+        return rid
+
+    def rearm(self) -> None:
+        if self.threshold is not None:
+            self._armed = True
+
+    def disarm(self) -> None:
+        self._armed = False
+
+
+def prompt_with_mid_run_compaction(
+    rpc: PiRpc,
+    message: str,
+    timeout: float,
+    on_event: Optional[Callable[[dict], None]] = None,
+    *,
+    deadline: Optional[float] = None,
+    context_window: Optional[float] = None,
+    continue_message: str = COMPACTION_CONTINUE_PROMPT,
+    trigger_tokens: float = COMPACT_TRIGGER_TOKENS,
+    regain_min_tokens: float = COMPACT_REGAIN_MIN_TOKENS,
+    max_compactions: int = MAX_DELIBERATE_COMPACTIONS,
+    retry_message: str = ERROR_RETRY_PROMPT,
+    max_attempts: int = ERROR_RETRY_MAX_ATTEMPTS,
+    backoff_sec: tuple = ERROR_RETRY_BACKOFF_SEC,
+    min_remaining_sec: float = ERROR_RETRY_MIN_BUDGET_SEC,
+    identical_error_limit: int = ERROR_RETRY_IDENTICAL_LIMIT,
+    log: Optional[Callable[[str], None]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> ErrorRetryOutcome:
+    """prompt_with_error_retry(), plus compaction the harness triggers itself.
+
+    Motivation, measured: a TB2.0 `train-fasttext` trial ran 244 turns over
+    ~11 hours and then died of context overflow -- omlx refused a 264 975-token
+    prompt against a 262 144-token window. pi's own auto-compaction would
+    have prevented it, but it only checks at agent-run BOUNDARIES, and a
+    Harbor trial is structurally ONE agent run: no boundary ever occurs, so
+    the check never ran until the overflow had already forced one.
+
+    This helper supplies the boundary. It watches `turn_end` usage as the
+    events stream past, and when the context estimate crosses
+    `min(trigger_tokens, 0.84 * context_window)` it issues pi's `compact`
+    command mid-run. pi's `session.compact()` aborts the active run itself,
+    so the inner prompt_with_error_retry returns with an `agent_end` that is
+    really "we interrupted it" -- relabelled to "compacted" -- and this loop
+    re-prompts the same session with `continue_message` once the compaction
+    has finished.
+
+    A NEW outer loop, not a change to prompt_with_error_retry: that helper is
+    called as a black box, once per cycle, with the same absolute `deadline`
+    every time and whatever budget is left as its `timeout`. Its own retry
+    policy, brakes and merge semantics are untouched, so the two fixes can
+    fail independently -- with `context_window=None` (the adapter's probe
+    failed, or the model declares no window) the trigger never arms and this
+    degrades to exactly prompt_with_error_retry.
+
+    Four brakes end the loop: `max_compactions`, the `min_remaining_sec`
+    budget floor, a dead pi, and the anti-thrash check -- a compaction whose
+    `estimatedTokensAfter` shows less than `regain_min_tokens` of headroom
+    regained disarms the trigger for the rest of the trial rather than
+    spending another summarization proving the same thing. A compaction that
+    fails outright (pi reports "Already compacted" / "Nothing to compact" /
+    a cancelling extension, or never answers) disarms it too, but still gets
+    its continuation prompt: the run was aborted by `compact()` before any
+    of those failures could happen, so the session is sitting idle mid-task
+    either way.
+
+    A stop_reason other than `agent_end` coming back from a cycle that had a
+    compaction pending is left alone and ends the loop: "deadline",
+    "process_exit" and an exhausted "error" are terminal conditions of their
+    own, unrelated to the abort we asked for.
+    """
+    if deadline is None:
+        deadline = now() + timeout
+
+    def _log(text: str) -> None:
+        if log is not None:
+            log(text)
+
+    trigger = _CompactionTrigger(
+        rpc, on_event, context_window, trigger_tokens=trigger_tokens, log=log
+    )
+    if trigger.threshold is None:
+        _log("mid-run compaction disabled: no context window to trigger against")
+
+    merged: Optional[PromptResult] = None
+    n_error_retries = 0
+    last_error = ""
+    retry_exception = ""
+    n_compactions = 0
+    cycle_message = message
+    cycle_timeout = min(timeout, max(0.0, deadline - now()))
+
+    while True:
+        outcome = prompt_with_error_retry(
+            rpc,
+            cycle_message,
+            cycle_timeout,
+            trigger,
+            deadline=deadline,
+            retry_message=retry_message,
+            max_attempts=max_attempts,
+            backoff_sec=backoff_sec,
+            min_remaining_sec=min_remaining_sec,
+            identical_error_limit=identical_error_limit,
+            log=log,
+            sleep=sleep,
+            now=now,
+        )
+        # Summed / last-non-empty across cycles for the same reason
+        # prompt_with_error_retry keeps them across its own attempts: a
+        # later cycle recovering must not erase what the earlier ones cost.
+        n_error_retries += outcome.n_error_retries
+        last_error = outcome.error_message or last_error
+        retry_exception = outcome.retry_exception or retry_exception
+
+        result = outcome.result
+        rid = trigger.take_pending()
+        if rid is None:
+            merged = result if merged is None else _merged_result(merged, result)
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        n_compactions += 1
+        if result.stop_reason == "agent_end":
+            result = replace(result, stop_reason="compacted")
+        merged = result if merged is None else _merged_result(merged, result)
+        if result.stop_reason != "compacted":
+            _log(
+                f"compaction requested, but the run ended as "
+                f"{result.stop_reason!r} -- not continuing"
+            )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        # Awaiting the response is load-bearing, not a courtesy: pi's
+        # session.prompt() refuses a message only while `isStreaming`, never
+        # while `isCompacting`, so a continuation sent before the summary
+        # lands is accepted and races pi rebuilding the transcript under it.
+        try:
+            data = rpc.await_compact(
+                rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
+            )
+        except Exception as exc:
+            trigger.disarm()
+            _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
+            # Our await gave up, which does not mean pi's compaction did.
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
+        else:
+            after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
+            regained_enough = (
+                isinstance(after, (int, float))
+                and after <= trigger_tokens - regain_min_tokens
+            )
+            if regained_enough:
+                trigger.rearm()
+                _log(f"compaction left ~{int(after)} context tokens")
+            else:
+                # Also the branch an absent estimatedTokensAfter (pi marks it
+                # optional) takes: unmeasurable headroom is not evidence of
+                # headroom.
+                trigger.disarm()
+                _log(
+                    f"compaction regained too little headroom "
+                    f"(estimatedTokensAfter={after!r}); not compacting again"
+                )
+
+        if n_compactions >= max_compactions:
+            _log(f"not continuing: {max_compactions} deliberate compactions used")
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+        if (deadline - now()) < min_remaining_sec:
+            _log(
+                f"not continuing after compaction: only {deadline - now():.0f}s "
+                f"of budget is left, below the {min_remaining_sec:.0f}s floor"
+            )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+        if not rpc.is_alive():
+            _log("not continuing after compaction: pi process is gone")
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        cycle_message = continue_message
+        cycle_timeout = max(0.0, deadline - now())
+        _log(
+            f"continuing after compaction {n_compactions} with "
+            f"{cycle_timeout:.0f}s of remaining budget"
         )
 
 
