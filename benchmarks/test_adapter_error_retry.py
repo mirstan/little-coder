@@ -603,6 +603,10 @@ class _CycleRpc:
     is what lets the compaction trigger fire from inside a cycle. Compact
     round-trips are scripted separately: each await_compact() consumes one
     entry, returning a dict or raising an Exception.
+
+    A cycle entry that is itself an Exception is raised instead of replayed,
+    the way _StubRpc does it -- that is how a prompt rejected outright (a
+    busy pi) is expressed, since it produces no events and no result.
     """
 
     def __init__(self, cycles, clock=None, compact_results=(), alive=True):
@@ -617,7 +621,10 @@ class _CycleRpc:
     def prompt_and_collect(self, message, timeout=900, on_event=None):
         self.calls.append((message, timeout))
         assert self._cycles, "prompt_and_collect called more often than scripted"
-        events, result = self._cycles.pop(0)
+        nxt = self._cycles.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        events, result = nxt
         for ev in events:
             if on_event is not None:
                 on_event(ev)
@@ -778,6 +785,74 @@ def test_a_missing_estimate_is_treated_as_too_little_regained():
     )
     _run_compaction(rpc, clock)
     assert len(rpc.compact_requests) == 1
+
+
+def test_the_regain_floor_stays_satisfiable_on_a_small_window():
+    """The floor is clamped to half the threshold, so it can always be met.
+
+    A flat 30k floor measured against a 32 768-token model's 27 525 threshold
+    asks for a negative context, so EVERY compaction reads as having regained
+    too little and the trigger goes inert after firing once -- on six of the
+    nine models in models.json, and on precisely the ones that overflow
+    soonest. Here the compaction frees 93% of the window; it has to re-arm.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(30_000)], _ok()), ([_turn(30_000)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"tokensBefore": 30_000, "estimatedTokensAfter": 2_000},
+                         {"tokensBefore": 30_000, "estimatedTokensAfter": 2_000}],
+    )
+    _run_compaction(rpc, clock, context_window=32_768)
+    assert len(rpc.compact_requests) == 2, "the second crossing must re-trigger"
+
+
+def test_a_big_window_keeps_the_flat_regain_floor():
+    """The clamp binds only below ~71k; the tuned big-window bound is the
+    flat 30k, and a compaction that left 215k of a 220k threshold still has
+    to disarm."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 215_000}],
+    )
+    _run_compaction(rpc, clock, context_window=262_144)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_a_busy_continuation_keeps_the_cycles_already_completed():
+    """prompt_with_error_retry leaves its first attempt unguarded on purpose,
+    but every post-compaction continuation is also an "attempt 1".
+
+    A busy pi there used to raise straight out of the helper, ending the
+    trial and discarding the compacted cycle's own text, tool calls and
+    tokens -- the blanket-handler failure this whole helper exists to stop.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], PromptResult(stop_reason="agent_end",
+                                         assistant_text="work done")),
+         rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts")],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert "work done" in outcome.result.assistant_text, "the cycle's work survives"
+    assert outcome.n_deliberate_compactions == 1
+    assert "PiBusyError" in outcome.retry_exception
+
+
+def test_a_busy_first_prompt_still_propagates_through_the_wrapper():
+    """The trial's own first prompt keeps the bare prompt_and_collect
+    contract: the wrapper must not swallow what a direct call would raise."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts")],
+        clock,
+    )
+    with pytest.raises(rpc_client.PiBusyError):
+        _run_compaction(rpc, clock)
 
 
 def test_the_deliberate_compaction_cap_is_enforced():
@@ -945,10 +1020,13 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     source = path.read_text()
     # Name, not call site: the Harbor adapter hands it to asyncio.to_thread
     # rather than calling it directly.
-    # The wrapper, not the helper underneath it: an adapter that called
-    # prompt_with_error_retry directly would still retry provider errors but
-    # would never compact, which is the failure this wiring exists to stop.
     assert "prompt_with_mid_run_compaction" in source
+    # And the wrapper INSTEAD of the helper underneath it, not alongside it:
+    # an adapter reverting to prompt_with_error_retry would still retry
+    # provider errors and still keep `rpc.prompt_and_collect(` absent, so
+    # every other assertion here would pass while the trial silently lost
+    # the compaction boundary this wiring exists to supply.
+    assert "prompt_with_error_retry" not in source
     assert "rpc.prompt_and_collect(" not in source, "should go through the retry helper"
     assert "n_error_retries" in source
     assert "n_deliberate_compactions" in source

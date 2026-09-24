@@ -1571,7 +1571,19 @@ COMPACT_TRIGGER_TOKENS = 220_000
 #: A compaction that freed less than this much is not worth repeating: the
 #: transcript is dominated by whatever compaction cannot summarize away, so
 #: the next trigger would just spend another summarization on nothing.
+#: Clamped against the threshold it is measured from -- see
+#: COMPACT_REGAIN_MAX_FRACTION.
 COMPACT_REGAIN_MIN_TOKENS = 30_000
+#: Ceiling on the regain floor, as a fraction of the threshold that fired.
+#: Without it the flat floor above is unsatisfiable on a small window: a
+#: 32 768-token model triggers at 27 525, so demanding 30 000 tokens of
+#: headroom below that asks for a negative context. Six of the nine models
+#: in models.json declare exactly 32 768, and every one of them would have
+#: compacted once per trial and then gone inert -- on precisely the models
+#: that overflow soonest. Half the threshold is the weaker demand that
+#: remains satisfiable at every window, and it binds only below ~71k, so
+#: the tuned behaviour of the big windows is untouched.
+COMPACT_REGAIN_MAX_FRACTION = 0.5
 #: Hard cap on deliberate compactions per trial, so the outer loop is bounded
 #: independently of whether the anti-thrash check ever fires.
 MAX_DELIBERATE_COMPACTIONS = 5
@@ -1780,21 +1792,56 @@ def prompt_with_mid_run_compaction(
     cycle_timeout = min(timeout, max(0.0, deadline - now()))
 
     while True:
-        outcome = prompt_with_error_retry(
-            rpc,
-            cycle_message,
-            cycle_timeout,
-            trigger,
-            deadline=deadline,
-            retry_message=retry_message,
-            max_attempts=max_attempts,
-            backoff_sec=backoff_sec,
-            min_remaining_sec=min_remaining_sec,
-            identical_error_limit=identical_error_limit,
-            log=log,
-            sleep=sleep,
-            now=now,
-        )
+        try:
+            outcome = prompt_with_error_retry(
+                rpc,
+                cycle_message,
+                cycle_timeout,
+                trigger,
+                deadline=deadline,
+                retry_message=retry_message,
+                max_attempts=max_attempts,
+                backoff_sec=backoff_sec,
+                min_remaining_sec=min_remaining_sec,
+                identical_error_limit=identical_error_limit,
+                log=log,
+                sleep=sleep,
+                now=now,
+            )
+        except PiBusyError as exc:
+            # prompt_with_error_retry leaves its own first attempt outside
+            # its try deliberately, so that wrapping a call site in it cannot
+            # swallow what a bare prompt_and_collect would have raised. That
+            # is right for the trial's FIRST prompt and wrong for every
+            # continuation after it: this loop calls the helper once per
+            # cycle, so a post-compaction continuation is an "attempt 1" too,
+            # and a busy pi there ended the trial AND discarded every cycle
+            # already completed -- the exact blanket-handler failure this
+            # helper exists to stop, and a direct contradiction of
+            # wait_for_pi_idle's promise that a wrong idle reading never by
+            # itself ends a recoverable trial.
+            #
+            # `merged is None` is precisely "no cycle has completed yet",
+            # i.e. this IS the trial's first prompt, so it still propagates.
+            if merged is None:
+                raise
+            detail = f"{type(exc).__name__}: {exc}"
+            _log(
+                f"continuation after compaction {n_compactions} was rejected "
+                f"as busy: {exc}"
+            )
+            # Unconditionally, for the same reason prompt_with_error_retry
+            # prints its swallowed exceptions: `log` defaults to None, and
+            # this path turns a raised failure into an ordinary return.
+            print(
+                f"WARNING: continuation after compaction {n_compactions} "
+                f"raised {detail}; returning the {n_compactions} completed "
+                f"compaction cycle(s) instead",
+                file=sys.stderr,
+            )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, detail, n_compactions
+            )
         # Summed / last-non-empty across cycles for the same reason
         # prompt_with_error_retry keeps them across its own attempts: a
         # later cycle recovering must not erase what the earlier ones cost.
@@ -1849,10 +1896,14 @@ def prompt_with_mid_run_compaction(
             # flat 220k -- enough to re-arm and compact again one turn
             # later, spending every remaining compaction the cap allows on
             # summarizations that free nothing.
+            regain_floor = min(
+                regain_min_tokens,
+                COMPACT_REGAIN_MAX_FRACTION * (trigger.threshold or 0),
+            )
             regained_enough = (
                 isinstance(after, (int, float))
                 and trigger.threshold is not None
-                and after <= trigger.threshold - regain_min_tokens
+                and after <= trigger.threshold - regain_floor
             )
             if regained_enough:
                 trigger.rearm()

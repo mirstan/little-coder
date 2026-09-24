@@ -2210,7 +2210,7 @@ class LittleCoderAgent(BaseAgent):
                     "n_error_retries": retry_outcome.n_error_retries,
                     "error_message": retry_outcome.error_message,
                     # A retry that raised is turned into a normal return by
-                    # prompt_with_error_retry, so this field is the only place
+                    # the retry helper, so this field is the only place
                     # a harness fault reaches result.json at all.
                     "retry_exception": retry_outcome.retry_exception,
                     "n_tool_calls": len(result.tool_calls),
