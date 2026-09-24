@@ -1637,7 +1637,6 @@ class _CompactionTrigger:
         )
         self._armed = self.threshold is not None
         self.pending_rid: Optional[str] = None
-        self.last_tokens: Optional[int] = None
 
     def __call__(self, event: dict) -> None:
         # The caller's logging runs first and unguarded: an exception out of
@@ -1649,7 +1648,6 @@ class _CompactionTrigger:
         tokens = _turn_context_tokens(event)
         if tokens is None:
             return
-        self.last_tokens = tokens
         if not self._armed or self.pending_rid is not None:
             return
         if tokens < self.threshold:
@@ -1833,9 +1831,18 @@ def prompt_with_mid_run_compaction(
             )
         else:
             after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
+            # Measured against the threshold that actually fired, not the
+            # flat trigger: on a window smaller than trigger_tokens the two
+            # differ, and a bound that never fires cannot say whether this
+            # compaction bought anything. A 100k-window model triggers at
+            # 84k, so a drop to 83k reads as 137k of headroom against the
+            # flat 220k -- enough to re-arm and compact again one turn
+            # later, spending every remaining compaction the cap allows on
+            # summarizations that free nothing.
             regained_enough = (
                 isinstance(after, (int, float))
-                and after <= trigger_tokens - regain_min_tokens
+                and trigger.threshold is not None
+                and after <= trigger.threshold - regain_min_tokens
             )
             if regained_enough:
                 trigger.rearm()

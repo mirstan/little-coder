@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rpc_client import (  # noqa: E402
     PiRpc,
     preview_tool_result,
-    prompt_with_error_retry,
     prompt_with_mid_run_compaction,
     resolve_thinking_level,
 )

@@ -659,6 +659,30 @@ def test_a_busy_rejection_is_not_retried_more_than_five_times(fake_pi, tmp_path,
     assert sum(o.get("type") == "prompt" for o in sent) == 5
 
 
+def test_wait_for_pi_idle_reads_the_busy_state_instead_of_timing_out(
+        fake_pi, tmp_path):
+    """The wait is only a recovery if it can SEE the busy state.
+
+    A pi that answers prompts but not get_state would have every poll spend
+    the full 20s response timeout, so the wait would burn its whole bound
+    proving nothing -- indistinguishable, from the outside, from one that
+    polled correctly and never went idle. The elapsed bound is what tells
+    the two apart.
+    """
+    lines = []
+    with fake_pi("always_busy", tmp_path) as rpc:
+        started = time.time()
+        went_idle = rpc_client.wait_for_pi_idle(
+            rpc, deadline=time.monotonic() + 3600,
+            cap_sec=0.5, poll_sec=0.05, log=lines.append,
+        )
+        elapsed = time.time() - started
+
+    assert went_idle is False, "a pi that never leaves isStreaming never goes idle"
+    assert elapsed < 5.0, f"polled state was not read; took {elapsed:.1f}s"
+    assert not any("could not read pi state" in line for line in lines)
+
+
 def test_compact_round_trips_and_returns_pis_own_payload(fake_pi, tmp_path):
     with fake_pi("compact_ok", tmp_path) as rpc:
         rid = rpc.request_compact()
@@ -697,17 +721,32 @@ def test_await_compact_times_out_rather_than_blocking_forever(fake_pi, tmp_path)
 
 
 class _RecordingStdin:
+    """A stdin whose write is deliberately NOT atomic.
+
+    `list.append` of a whole payload is atomic under the GIL, so a recorder
+    built that way makes the concurrency test below pass whether or not
+    _send serializes anything -- it can never observe the interleaving it
+    claims to rule out. Appending a character at a time and yielding between
+    them reproduces what an unserialized `write(); flush()` pair actually
+    does to a real pipe: `flush()` snapshots whatever is in the buffer, so
+    an unlocked writer lands a half-written line.
+    """
     closed = False
 
     def __init__(self):
+        self._buf = []
         self.writes = []
         self.flushes = 0
 
     def write(self, text):
-        self.writes.append(text)
+        for ch in text:
+            self._buf.append(ch)
+            time.sleep(0)  # yield, so the interleaving is not GIL-hidden
 
     def flush(self):
         self.flushes += 1
+        self.writes.append("".join(self._buf))
+        self._buf.clear()
 
 
 def test_a_single_send_still_writes_one_flushed_line():
@@ -726,7 +765,11 @@ def test_a_single_send_still_writes_one_flushed_line():
 
 def test_concurrent_sends_each_write_one_whole_line():
     """The corruption the lock prevents: two threads interleaving a write
-    and its flush leaves pi a line it cannot resync from."""
+    and its flush leaves pi a line it cannot resync from.
+
+    Fails without `_send_lock` -- see _RecordingStdin, which is built so it
+    can.
+    """
     rpc = object.__new__(PiRpc)
     rpc._send_lock = threading.Lock()
     rpc._proc = types.SimpleNamespace(stdin=_RecordingStdin())

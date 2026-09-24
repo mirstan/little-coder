@@ -733,6 +733,25 @@ def test_a_compaction_that_regained_too_little_disarms_the_trigger():
     assert outcome.n_deliberate_compactions == 1
 
 
+def test_the_regain_floor_follows_the_smaller_window_too():
+    """The threshold moves with the window, so the regain check has to.
+
+    Measured against the flat 220k trigger, a 100k-window trial that
+    compacted 84k down to 83k would read as having regained 137k, re-arm,
+    and compact again on the very next turn -- a summarization per turn for
+    the rest of the trial.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(90_000)], _ok()), ([_turn(95_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 83_000}],
+    )
+    outcome = _run_compaction(rpc, clock, context_window=100_000)
+    assert len(rpc.compact_requests) == 1, "the second crossing must not re-trigger"
+    assert outcome.n_deliberate_compactions == 1
+
+
 def test_a_missing_estimate_is_treated_as_too_little_regained():
     """pi marks estimatedTokensAfter optional; unmeasurable headroom is not
     evidence of headroom."""
@@ -911,7 +930,9 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     source = path.read_text()
     # Name, not call site: the Harbor adapter hands it to asyncio.to_thread
     # rather than calling it directly.
-    assert "prompt_with_error_retry" in source
+    # The wrapper, not the helper underneath it: an adapter that called
+    # prompt_with_error_retry directly would still retry provider errors but
+    # would never compact, which is the failure this wiring exists to stop.
     assert "prompt_with_mid_run_compaction" in source
     assert "rpc.prompt_and_collect(" not in source, "should go through the retry helper"
     assert "n_error_retries" in source

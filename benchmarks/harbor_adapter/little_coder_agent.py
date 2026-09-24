@@ -103,7 +103,6 @@ from rpc_client import (  # noqa: E402
     PiRpc,
     capture_environment_snapshot,
     preview_tool_result,
-    prompt_with_error_retry,
     prompt_with_mid_run_compaction,
     resolve_thinking_level,
 )
@@ -2024,8 +2023,8 @@ class LittleCoderAgent(BaseAgent):
         # Composed here rather than right after the probe above:
         # _initial_snapshot_advertisement derives from the initial-state
         # snapshot's outcome, so composition has to wait for it -- and
-        # `prompt` isn't read until prompt_with_error_retry far below, so
-        # waiting costs nothing.
+        # `prompt` isn't read until prompt_with_mid_run_compaction far
+        # below, so waiting costs nothing.
         prompt = _compose_prompt(
             prompt_prefix,
             prompt_task_block,
