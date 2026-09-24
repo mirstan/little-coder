@@ -609,11 +609,16 @@ class _CycleRpc:
     busy pi) is expressed, since it produces no events and no result.
     """
 
-    def __init__(self, cycles, clock=None, compact_results=(), alive=True):
+    def __init__(self, cycles, clock=None, compact_results=(), alive=True,
+                 die_on_prompt=False):
         self._cycles = list(cycles)
         self._clock = clock
         self._compact_results = list(compact_results)
         self.alive = alive
+        #: Flip `alive` false as a scripted exception is raised, i.e. pi died
+        #: producing it -- the liveness brake ahead of the continuation
+        #: prompt cannot see that, since it runs before the prompt.
+        self._die_on_prompt = die_on_prompt
         self.calls = []            # [(message, timeout)]
         self.compact_requests = []
         self.awaited = []
@@ -623,6 +628,8 @@ class _CycleRpc:
         assert self._cycles, "prompt_and_collect called more often than scripted"
         nxt = self._cycles.pop(0)
         if isinstance(nxt, Exception):
+            if self._die_on_prompt:
+                self.alive = False
             raise nxt
         events, result = nxt
         for ev in events:
@@ -677,7 +684,7 @@ def test_no_context_window_leaves_the_trigger_permanently_disarmed():
     assert outcome.n_deliberate_compactions == 0
 
 
-@pytest.mark.parametrize("window", ["262144", 0, -1, True])
+@pytest.mark.parametrize("window", ["262144", 0, -1, True, 1])
 def test_a_malformed_context_window_disarms_rather_than_raising(window):
     """contextWindow is wire data from a pi build we don't control.
 
@@ -821,38 +828,75 @@ def test_a_big_window_keeps_the_flat_regain_floor():
     assert len(rpc.compact_requests) == 1
 
 
-def test_a_busy_continuation_keeps_the_cycles_already_completed():
+#: Every way a wedged-mid-compaction continuation actually presents. Only
+#: the typed one comes from pi answering "already processing"; a pi too busy
+#: to answer at all times the response out instead, and one that died
+#: summarizing raises PiProcessExited. prompt_and_collect's readiness loop
+#: retries on the explicit response alone, so the other three never reach it.
+_CONTINUATION_FAILURES = [
+    rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts"),
+    TimeoutError("pi did not respond to request r1 within 30s"),
+    rpc_client.PiProcessExited("pi exited before acknowledging request r1"),
+    RuntimeError("pi rejected prompt: No model selected"),
+]
+
+
+@pytest.mark.parametrize("failure", _CONTINUATION_FAILURES,
+                         ids=lambda e: type(e).__name__)
+def test_a_failed_continuation_keeps_the_cycles_already_completed(failure):
     """prompt_with_error_retry leaves its first attempt unguarded on purpose,
     but every post-compaction continuation is also an "attempt 1".
 
-    A busy pi there used to raise straight out of the helper, ending the
+    Anything raised there used to go straight out of the helper, ending the
     trial and discarding the compacted cycle's own text, tool calls and
     tokens -- the blanket-handler failure this whole helper exists to stop.
+    Ending the loop and throwing away what was already earned are separate
+    questions, and the inner helper already answers the second one this way
+    for its own retries.
     """
     clock = _Clock()
     rpc = _CycleRpc(
         [([_turn(230_000)], PromptResult(stop_reason="agent_end",
                                          assistant_text="work done")),
-         rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts")],
+         failure],
         clock,
         compact_results=[{"estimatedTokensAfter": 20_000}],
     )
     outcome = _run_compaction(rpc, clock, timeout=36_000.0)
     assert "work done" in outcome.result.assistant_text, "the cycle's work survives"
     assert outcome.n_deliberate_compactions == 1
-    assert "PiBusyError" in outcome.retry_exception
+    assert type(failure).__name__ in outcome.retry_exception
 
 
-def test_a_busy_first_prompt_still_propagates_through_the_wrapper():
+@pytest.mark.parametrize("failure", _CONTINUATION_FAILURES,
+                         ids=lambda e: type(e).__name__)
+def test_a_failed_first_prompt_still_propagates_through_the_wrapper(failure):
     """The trial's own first prompt keeps the bare prompt_and_collect
-    contract: the wrapper must not swallow what a direct call would raise."""
+    contract: the wrapper must not swallow what a direct call would raise.
+    `merged is None` is exactly that case, which is what carries it."""
+    clock = _Clock()
+    rpc = _CycleRpc([failure], clock)
+    with pytest.raises(type(failure)):
+        _run_compaction(rpc, clock)
+
+
+def test_a_continuation_that_left_pi_dead_reports_process_exit():
+    """Otherwise the outcome reports "compacted" -- or a retryable "error" --
+    for a session that is provably gone, the same contradiction
+    prompt_with_error_retry re-checks liveness to avoid."""
     clock = _Clock()
     rpc = _CycleRpc(
-        [rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts")],
+        [([_turn(230_000)], PromptResult(stop_reason="agent_end",
+                                         assistant_text="work done")),
+         rpc_client.PiProcessExited("pi exited while summarizing")],
         clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        die_on_prompt=True,
     )
-    with pytest.raises(rpc_client.PiBusyError):
-        _run_compaction(rpc, clock)
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.result.stop_reason == "process_exit"
+    assert outcome.result.error_message == ""
+    assert "work done" in outcome.result.assistant_text
 
 
 def test_the_deliberate_compaction_cap_is_enforced():

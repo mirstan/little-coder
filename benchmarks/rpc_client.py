@@ -1315,8 +1315,9 @@ class ErrorRetryOutcome:
     error_message: str = ""
     #: "TypeName: message" when a RETRY raised and was turned into the merged
     #: result instead of propagating -- including a PiBusyError the loop then
-    #: recovered from, which is retained the way `error_message` is. ""
-    #: otherwise. Separate from
+    #: recovered from, which is retained the way `error_message` is, and
+    #: including an exception out of one of prompt_with_mid_run_compaction's
+    #: continuation cycles. "" otherwise. Separate from
     #: `error_message`, which is a provider verdict: this one is a harness
     #: fault (a rejected prompt, a dead pipe) that the caller would otherwise
     #: have seen as a raised exception and now cannot see at all.
@@ -1650,13 +1651,18 @@ class _CompactionTrigger:
         # trial. A non-positive window is malformed the same way: it would
         # put the threshold at or below zero, firing a compaction on the
         # first turn_end that carried any usage at all.
-        self.threshold: Optional[int] = (
+        threshold = (
             min(int(trigger_tokens), int(0.84 * context_window))
             if isinstance(context_window, (int, float))
             and not isinstance(context_window, bool)
             and context_window > 0
             else None
         )
+        # Validated on the COMPUTED threshold rather than the input, so the
+        # check means what the note above says: int(0.84 * w) truncates to 0
+        # for any window under 1.19, which would otherwise arm the trigger at
+        # zero and fire it on the first turn_end carrying any usage at all.
+        self.threshold: Optional[int] = threshold if threshold else None
         self._armed = self.threshold is not None
         self.pending_rid: Optional[str] = None
 
@@ -1769,6 +1775,11 @@ def prompt_with_mid_run_compaction(
     compaction pending is left alone and ends the loop: "deadline",
     "process_exit" and an exhausted "error" are terminal conditions of their
     own, unrelated to the abort we asked for.
+
+    An exception out of a CONTINUATION cycle ends the loop too, but returns
+    the cycles already completed rather than propagating -- see the handler
+    for why that does not weaken prompt_with_error_retry's rule about its own
+    first attempt, which still applies to the trial's first prompt here.
     """
     if deadline is None:
         deadline = now() + timeout
@@ -1808,28 +1819,43 @@ def prompt_with_mid_run_compaction(
                 sleep=sleep,
                 now=now,
             )
-        except PiBusyError as exc:
+        except Exception as exc:
             # prompt_with_error_retry leaves its own first attempt outside
             # its try deliberately, so that wrapping a call site in it cannot
             # swallow what a bare prompt_and_collect would have raised. That
             # is right for the trial's FIRST prompt and wrong for every
             # continuation after it: this loop calls the helper once per
             # cycle, so a post-compaction continuation is an "attempt 1" too,
-            # and a busy pi there ended the trial AND discarded every cycle
-            # already completed -- the exact blanket-handler failure this
-            # helper exists to stop, and a direct contradiction of
-            # wait_for_pi_idle's promise that a wrong idle reading never by
-            # itself ends a recoverable trial.
+            # and anything raised there ended the trial AND discarded every
+            # cycle already completed.
             #
             # `merged is None` is precisely "no cycle has completed yet",
-            # i.e. this IS the trial's first prompt, so it still propagates.
+            # i.e. this IS the trial's first prompt, so it still propagates
+            # and the bare-prompt_and_collect contract is untouched.
+            #
+            # EVERY exception, not just the typed busy one. A pi wedged in a
+            # long summarization does not reliably answer "already
+            # processing" at all, and prompt_and_collect's readiness loop
+            # retries only on that explicit response -- so a pi too busy to
+            # send one raises TimeoutError out of _await_response instead,
+            # and a pi that died summarizing raises PiProcessExited, which
+            # prompt_and_collect's own docstring records ending a Harbor
+            # trial before its metadata was ever written. Those are the same
+            # wedged continuation in different clothes. The inner helper
+            # already answered this question the same way for its own
+            # retries, so catching less here would only mean one rejection
+            # preserves the trial's work on an inner retry and destroys it on
+            # a continuation cycle, decided by nothing but which side of a
+            # try the call happens to sit on. Ending the loop and discarding
+            # what was already earned are separate questions.
+            #
+            # Exception, never BaseException: harbor runs this inside
+            # asyncio.to_thread and cancels on trial timeout, and
+            # CancelledError is a BaseException.
             if merged is None:
                 raise
             detail = f"{type(exc).__name__}: {exc}"
-            _log(
-                f"continuation after compaction {n_compactions} was rejected "
-                f"as busy: {exc}"
-            )
+            _log(f"continuation after compaction {n_compactions} raised {detail}")
             # Unconditionally, for the same reason prompt_with_error_retry
             # prints its swallowed exceptions: `log` defaults to None, and
             # this path turns a raised failure into an ordinary return.
@@ -1839,6 +1865,15 @@ def prompt_with_mid_run_compaction(
                 f"compaction cycle(s) instead",
                 file=sys.stderr,
             )
+            if not rpc.is_alive():
+                # Same recheck prompt_with_error_retry does on the same kind
+                # of path: the accumulated verdict would otherwise report
+                # "compacted" -- or a retryable "error" -- for a session that
+                # is provably gone. `replace`, not mutation: `merged` can
+                # still be a cycle's own object.
+                merged = replace(
+                    merged, stop_reason="process_exit", error_message=""
+                )
             return ErrorRetryOutcome(
                 merged, n_error_retries, last_error, detail, n_compactions
             )
