@@ -1630,9 +1630,19 @@ class _CompactionTrigger:
         self._log = log
         # A fraction of the window as well as the flat trigger, so a model
         # with a smaller window still compacts before it overflows.
+        #
+        # Type-checked, not just truth-checked, for the reason
+        # _turn_context_tokens spells out: contextWindow is wire data from a
+        # pi build we don't control, and a malformed one must disarm the
+        # mechanism the way a missing one does -- never raise out of a
+        # trial. A non-positive window is malformed the same way: it would
+        # put the threshold at or below zero, firing a compaction on the
+        # first turn_end that carried any usage at all.
         self.threshold: Optional[int] = (
             min(int(trigger_tokens), int(0.84 * context_window))
-            if context_window
+            if isinstance(context_window, (int, float))
+            and not isinstance(context_window, bool)
+            and context_window > 0
             else None
         )
         self._armed = self.threshold is not None

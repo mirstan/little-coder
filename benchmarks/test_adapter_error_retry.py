@@ -670,6 +670,21 @@ def test_no_context_window_leaves_the_trigger_permanently_disarmed():
     assert outcome.n_deliberate_compactions == 0
 
 
+@pytest.mark.parametrize("window", ["262144", 0, -1, True])
+def test_a_malformed_context_window_disarms_rather_than_raising(window):
+    """contextWindow is wire data from a pi build we don't control.
+
+    The probe that reads it is best-effort precisely so a bad answer costs
+    the compaction mechanism and nothing else; a TypeError here would
+    instead end the trial before the first prompt was ever sent.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(500_000)], _ok())], clock)
+    outcome = _run_compaction(rpc, clock, context_window=window)
+    assert rpc.compact_requests == []
+    assert outcome.n_deliberate_compactions == 0
+
+
 def test_crossing_the_threshold_compacts_and_continues_the_same_session():
     """The whole point: the run pi aborted for the compaction is relabelled
     rather than reported as the agent finishing, and the trial continues."""
