@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import setupSkillInject, {
   looksLikeResearchTask,
   looksLikeTemporalTask,
+  looksLikeGpt2CheckpointTask,
   shouldInjectResearchDirective,
   shouldInjectTemporalDirective,
+  shouldInjectGpt2CheckpointDirective,
 } from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
 
@@ -632,6 +634,95 @@ describe("temporal directive triggers on phrasing that names a PAST state", () =
 
     const second = await handler(turn("what was the leaderboard as of March 2024?"), ctx);
     expect(second).toBeUndefined();
+  });
+});
+
+// gpt2-codegolf benchmark task shape: small models reliably converge on the
+// wrong belief that a raw TF1 checkpoint dump stores its tensors in creation
+// order with wte first. The real order is sorted by variable name, wte last.
+// The directive corrects that specific wrong prior.
+describe("gpt2-checkpoint directive triggers on GPT-2 + raw-TF-checkpoint phrasing", () => {
+  // The real gpt2-codegolf instruction.md text, verified byte-for-byte
+  // against the task package.
+  const REAL_PROMPT =
+    "I have downloaded the gpt-2 weights stored as a TF .ckpt. Write me a " +
+    "dependency-free C file that samples from the model with arg-max " +
+    "sampling. Call your program /app/gpt2.c, I will compile with gcc -O3 " +
+    "-lm. It should read the .ckpt and the .bpe file. Your c program must " +
+    'be <5000 bytes. I will run it /app/a.out gpt2-124M.ckpt vocab.bpe ' +
+    '"[input string here]" and you should continue the output under ' +
+    "whatever GPT-2 would print for the next 20 tokens.";
+
+  it("fires on the real task prompt, paraphrases, and the exact shard filename", () => {
+    expect(looksLikeGpt2CheckpointTask(REAL_PROMPT)).toBe(true);
+    expect(
+      looksLikeGpt2CheckpointTask(
+        "the gpt-2 model's weights are stored in a TensorFlow .ckpt file",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikeGpt2CheckpointTask(
+        "parse gpt2's tensorflow checkpoint at .ckpt and continue generation",
+      ),
+    ).toBe(true);
+    // Exact raw-shard filename is an unambiguous TF signal on its own, no
+    // "TF"/"tensorflow" wording needed alongside it -- but GPT-2 still has
+    // to be named for the directive's advice to be on-topic.
+    expect(
+      looksLikeGpt2CheckpointTask(
+        "load gpt2-124M.data-00000-of-00001 and continue the text",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not fire for GPT-2 mentions with no checkpoint-format language, or the PyTorch Lightning .ckpt false positive", () => {
+    expect(looksLikeGpt2CheckpointTask("explain how GPT-2's attention mechanism works")).toBe(
+      false,
+    );
+    expect(looksLikeGpt2CheckpointTask("write a poem in the style of GPT-2")).toBe(false);
+    // PyTorch Lightning's .ckpt format is fully self-describing -- the
+    // directive's "no header, sorted-by-name" advice would be wrong here.
+    // No TF/tensorflow co-signal and no raw shard filename, so must not fire.
+    expect(
+      looksLikeGpt2CheckpointTask("fine-tune gpt2 and load the .ckpt file to resume training"),
+    ).toBe(false);
+    expect(looksLikeGpt2CheckpointTask("")).toBe(false);
+  });
+
+  it("does not inject the directive when no shell tool is available, even though the trigger matches", async () => {
+    const readOnly = new Set(["read", "edit"]);
+    expect(shouldInjectGpt2CheckpointDirective(REAL_PROMPT, readOnly)).toBe(false);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn(REAL_PROMPT);
+    event.systemPromptOptions.littleCoder.allowedTools = ["read", "edit"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+  });
+
+  it("injects the corrected general-principle directive when a shell tool is available", async () => {
+    const shellOnly = new Set(["ShellSession", "ShellSessionCwd", "ShellSessionReset"]);
+    expect(shouldInjectGpt2CheckpointDirective(REAL_PROMPT, shellOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn(REAL_PROMPT);
+    event.systemPromptOptions.littleCoder.allowedTools = [
+      "ShellSession",
+      "ShellSessionCwd",
+      "ShellSessionReset",
+    ];
+    const result = await handler(event, ctx);
+    const content: string = result?.message?.content ?? "";
+
+    expect(content).toContain("## TF checkpoint format note");
+    expect(content).toContain("SORTED VARIABLE-NAME");
+    // Scope stays fixed to the corrected general principle -- the specific
+    // layer ordering, the h10-quirk, and the ln_f/wpe/wte placement are
+    // deliberately withheld; the model must still derive and verify those.
+    expect(content).not.toContain("h10");
+    expect(content).not.toContain("wpe");
+    expect(content).not.toContain("wte");
   });
 });
 
