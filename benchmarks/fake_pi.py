@@ -60,6 +60,15 @@ def emit_text(delta):
 
 
 def read_prompt():
+    """Wait for the next prompt, answering get_state as idle meanwhile.
+
+    Answered rather than dropped because this is exactly the window
+    wait_for_pi_idle polls in, and a dropped request does not read as
+    "unknown" -- it reads as a pi too busy to answer, so each poll spends
+    its full 20s response timeout until the whole wait bound is gone.
+    Leaving it unanswered turned a one-second retry test into a
+    nine-minute one. A fake sitting here IS idle, so that is what it says.
+    """
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -68,15 +77,20 @@ def read_prompt():
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if msg.get("type") == "get_state":
+            emit({"type": "response", "id": msg.get("id"),
+                  "command": "get_state", "success": True,
+                  "data": {"isStreaming": False, "isCompacting": False}})
+            continue
         if msg.get("type") == "prompt":
             return msg
     return None
 
 
 def serve_requests(timeout=30):
-    """After the canned prompt sequence, keep servicing requests -- currently
-    just get_session_stats -- until stdin closes (the caller's rpc.close())
-    or `timeout` elapses. Replaces a blind time.sleep(): a real pi process
+    """After the canned prompt sequence, keep servicing requests --
+    get_session_stats and get_state -- until stdin closes (the caller's
+    rpc.close()) or `timeout` elapses. Replaces a blind time.sleep(): a real pi process
     sits idle between prompts and would answer get_session_stats the same
     way, so this lets hermetic tests exercise PiRpc.session_stats() the same
     as they exercise prompt_and_collect()."""
@@ -92,7 +106,11 @@ def serve_requests(timeout=30):
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if msg.get("type") == "get_session_stats":
+        if msg.get("type") == "get_state":
+            emit({"type": "response", "id": msg.get("id"),
+                  "command": "get_state", "success": True,
+                  "data": {"isStreaming": False, "isCompacting": False}})
+        elif msg.get("type") == "get_session_stats":
             emit({"type": "response", "id": msg.get("id"), "command": "get_session_stats",
                   "success": True, "data": SESSION_STATS_DATA})
         elif msg.get("id"):
@@ -107,6 +125,75 @@ def main():
         sys.stderr.write("fake_pi: dying before ack\n")
         sys.stderr.flush()
         os._exit(3)
+
+    if mode in ("compact_ok", "compact_fails"):
+        # Answers compact requests without ever being prompted: the
+        # compaction round-trip is an RPC pair, not a turn.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            line = sys.stdin.readline()
+            if not line:
+                return  # EOF -- caller closed stdin
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if req.get("type") != "compact":
+                if req.get("id"):
+                    emit({"type": "response", "id": req.get("id"), "success": True,
+                          "data": {}})
+                continue
+            if mode == "compact_ok":
+                emit({"type": "response", "id": req.get("id"), "command": "compact",
+                      "success": True,
+                      "data": {"summary": "so far...", "firstKeptEntryId": "entry-9",
+                               "tokensBefore": 230000, "estimatedTokensAfter": 40000}})
+            else:
+                emit({"type": "response", "id": req.get("id"), "command": "compact",
+                      "success": False, "error": "Already compacted"})
+        return
+
+    if mode in ("always_busy", "rejects_prompt"):
+        # always_busy is pi mid-run (the real failure's shape: a compaction
+        # that outlasts every readiness attempt); rejects_prompt is any
+        # other rejection, which must NOT read as recoverable.
+        error = (
+            "Agent is already processing. Specify streamingBehavior "
+            "('steer' or 'followUp') to queue the message."
+            if mode == "always_busy" else "No model selected"
+        )
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                return  # EOF -- caller closed stdin
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if req.get("type") == "get_state":
+                # Answered rather than dropped: wait_for_pi_idle polls this
+                # while a prompt is being refused, and a fixture that stayed
+                # silent would have it spend a full get_state timeout per
+                # poll instead of ever observing the busy state it exists to
+                # wait out.
+                emit({"type": "response", "id": req.get("id"),
+                      "command": "get_state", "success": True,
+                      "data": {"isStreaming": mode == "always_busy",
+                               "isCompacting": False}})
+                continue
+            if req.get("type") != "prompt":
+                if req.get("id"):
+                    emit({"type": "response", "id": req.get("id"),
+                          "success": True, "data": {}})
+                continue
+            emit({"type": "response", "id": req.get("id"), "success": False,
+                  "error": error})
 
     msg = read_prompt()
     if msg is None:

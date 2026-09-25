@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rpc_client import (  # noqa: E402
     PiRpc,
     preview_tool_result,
-    prompt_with_error_retry,
+    prompt_with_mid_run_compaction,
     resolve_thinking_level,
 )
 
@@ -493,15 +493,29 @@ class LittleCoderAgent(BaseAgent):
                     deadline_epoch_ms=deadline_epoch_ms,
                 ),
             ) as rpc:
+                # Best-effort, exactly as in harbor_adapter: a failed probe
+                # leaves this None, which disarms mid-run compaction and
+                # leaves the error-retry recovery under it untouched.
+                context_window = None
+                try:
+                    context_window = (
+                        rpc.get_state().get("model") or {}
+                    ).get("contextWindow")
+                except Exception as e:
+                    log_line(f"context-window probe failed (non-fatal): {e}")
+
                 # Retried in place on a provider-error completion -- one
                 # errored completion otherwise ends the whole trial with most
-                # of the budget unspent. See prompt_with_error_retry.
-                retry_outcome = prompt_with_error_retry(
+                # of the budget unspent -- and wrapped in the compaction
+                # boundary a single-agent-run trial never reaches on its own.
+                # See prompt_with_mid_run_compaction.
+                retry_outcome = prompt_with_mid_run_compaction(
                     rpc,
                     prompt,
                     DEFAULT_PROMPT_TIMEOUT_SEC,
                     on_event,
                     deadline=prompt_deadline,
+                    context_window=context_window,
                     log=log_line,
                 )
                 result = retry_outcome.result
@@ -519,6 +533,10 @@ class LittleCoderAgent(BaseAgent):
                         log_fh.write(
                             f"=== retry raised (not propagated): "
                             f"{retry_outcome.retry_exception} ===\n")
+                    if retry_outcome.n_deliberate_compactions:
+                        log_fh.write(
+                            f"=== deliberate compactions: "
+                            f"{retry_outcome.n_deliberate_compactions} ===\n")
                     log_fh.write(f"=== assistant text ===\n{text_out}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")

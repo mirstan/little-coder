@@ -103,7 +103,7 @@ from rpc_client import (  # noqa: E402
     PiRpc,
     capture_environment_snapshot,
     preview_tool_result,
-    prompt_with_error_retry,
+    prompt_with_mid_run_compaction,
     resolve_thinking_level,
 )
 
@@ -2023,8 +2023,8 @@ class LittleCoderAgent(BaseAgent):
         # Composed here rather than right after the probe above:
         # _initial_snapshot_advertisement derives from the initial-state
         # snapshot's outcome, so composition has to wait for it -- and
-        # `prompt` isn't read until prompt_with_error_retry far below, so
-        # waiting costs nothing.
+        # `prompt` isn't read until prompt_with_mid_run_compaction far
+        # below, so waiting costs nothing.
         prompt = _compose_prompt(
             prompt_prefix,
             prompt_task_block,
@@ -2107,18 +2107,35 @@ class LittleCoderAgent(BaseAgent):
                         self.logs_dir / "environment_snapshot.json",
                         self.logger,
                     )
+                # Best-effort: a probe that fails leaves context_window None,
+                # which disarms mid-run compaction without touching the
+                # error-retry recovery underneath it.
+                context_window = None
+                try:
+                    state = await asyncio.to_thread(rpc.get_state)
+                    context_window = (state.get("model") or {}).get("contextWindow")
+                except Exception as e:
+                    self.logger.info(
+                        f"LittleCoderAgent: context-window probe failed (non-fatal): {e}"
+                    )
+
                 # Retried in place on a provider-error completion rather than
                 # called bare: a single errored completion used to end the
                 # whole trial with most of the wall clock unspent (measured
                 # at 62-81% unused across three of five failed TB2.1 trials).
-                # Same rpc, same session -- see prompt_with_error_retry.
+                # The outer wrapper adds the compaction boundary a Harbor
+                # trial structurally never reaches on its own -- one agent
+                # run for the whole trial, so pi's auto-compaction check at
+                # run boundaries never fires until an overflow forces one.
+                # Same rpc, same session -- see prompt_with_mid_run_compaction.
                 retry_outcome = await asyncio.to_thread(
-                    prompt_with_error_retry,
+                    prompt_with_mid_run_compaction,
                     rpc,
                     prompt,
                     effective_timeout_sec,
                     on_event,
                     deadline=prompt_deadline,
+                    context_window=context_window,
                     log=self.logger.warning,
                 )
                 result = retry_outcome.result
@@ -2136,6 +2153,11 @@ class LittleCoderAgent(BaseAgent):
                         log_fh.write(
                             f"=== retry raised (not propagated): "
                             f"{retry_outcome.retry_exception} ===\n"
+                        )
+                    if retry_outcome.n_deliberate_compactions:
+                        log_fh.write(
+                            f"=== deliberate compactions: "
+                            f"{retry_outcome.n_deliberate_compactions} ===\n"
                         )
                     log_fh.write(f"=== assistant text ===\n{result.assistant_text}\n\n")
                     for tc in result.tool_calls:
@@ -2188,12 +2210,15 @@ class LittleCoderAgent(BaseAgent):
                     "n_error_retries": retry_outcome.n_error_retries,
                     "error_message": retry_outcome.error_message,
                     # A retry that raised is turned into a normal return by
-                    # prompt_with_error_retry, so this field is the only place
+                    # the retry helper, so this field is the only place
                     # a harness fault reaches result.json at all.
                     "retry_exception": retry_outcome.retry_exception,
                     "n_tool_calls": len(result.tool_calls),
                     "n_turns": result.turn_count,
+                    # Every compaction pi reported, deliberate ones included;
+                    # the field below is the harness-triggered subset.
                     "n_compactions": result.compaction_events,
+                    "n_deliberate_compactions": retry_outcome.n_deliberate_compactions,
                     "n_notifications": len(rpc.notifications()) if hasattr(rpc, "notifications") else 0,
                     "little_coder_version": self.version(),
                     # Read from the trial's own config.json -- the pilot's

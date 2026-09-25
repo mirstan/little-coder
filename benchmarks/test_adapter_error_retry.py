@@ -7,10 +7,15 @@ seconds. test_rpc_terminal.py covers the same loop against a real fake-pi
 subprocess; this file covers the policy's edges, which a scripted subprocess
 cannot express cheaply.
 
-The adapters' own two-line wiring (call the helper, copy n_error_retries /
-error_message into the metadata they already build) is guarded textually at
-the bottom, because importing either adapter module needs a benchmark harness
-package that isn't installed alongside these tests.
+The same file also covers prompt_with_mid_run_compaction, the outer loop
+that calls that policy once per compaction cycle -- driven the same way,
+against a stub that replays scripted events so the trigger can fire.
+
+The adapters' own wiring (call the helpers, copy n_error_retries /
+error_message / n_deliberate_compactions into the metadata they already
+build) is guarded textually at the bottom, because importing either adapter
+module needs a benchmark harness package that isn't installed alongside
+these tests.
 """
 import os
 import sys
@@ -20,7 +25,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
-from rpc_client import ERROR_RETRY_PROMPT, PromptResult, prompt_with_error_retry  # noqa: E402
+from rpc_client import (  # noqa: E402
+    COMPACTION_CONTINUE_PROMPT,
+    ERROR_RETRY_PROMPT,
+    PromptResult,
+    prompt_with_error_retry,
+    prompt_with_mid_run_compaction,
+)
 
 
 class _Clock:
@@ -44,14 +55,23 @@ class _StubRpc:
     rather than vacuous. A scripted entry that is an Exception is raised
     instead of returned, and `alive` is what the helper's pre-retry
     liveness check sees.
+
+    `busy_polls` scripts the pre-retry idle wait: that many get_state reads
+    report pi still streaming before one reports it idle. The default 0
+    keeps every pre-existing test's wait a single no-op read, so their
+    budget assertions still measure only the attempts and backoffs.
     """
 
-    def __init__(self, results, clock=None, consume_sec=0.0, alive=True):
+    def __init__(self, results, clock=None, consume_sec=0.0, alive=True,
+                 busy_polls=0, state_error=None):
         self._results = list(results)
         self._clock = clock
         self._consume_sec = consume_sec
         self.alive = alive
+        self._busy_polls = busy_polls
+        self._state_error = state_error
         self.calls = []  # [(message, timeout)]
+        self.state_calls = 0
 
     def prompt_and_collect(self, message, timeout=900, on_event=None):
         self.calls.append((message, timeout))
@@ -65,6 +85,13 @@ class _StubRpc:
 
     def is_alive(self):
         return self.alive
+
+    def get_state(self):
+        self.state_calls += 1
+        if self._state_error is not None:
+            raise self._state_error
+        busy = self.state_calls <= self._busy_polls
+        return {"isStreaming": busy, "isCompacting": False}
 
 
 def _err(message="upstream 500"):
@@ -408,6 +435,615 @@ def test_works_without_a_log_callback():
     assert _run(rpc, clock).n_error_retries == 1
 
 
+# ── a pi that stayed busy ────────────────────────────────────────────────
+
+
+def _busy(message="pi stayed busy across 5 readiness attempts"):
+    return rpc_client.PiBusyError(message)
+
+
+def test_a_busy_rejection_is_retried_rather_than_ending_the_trial():
+    """The shape of the real TB2.0 train-fasttext failure: the retry landed
+    while pi was mid-compaction, and the blanket exception handler then
+    ended the trial on the first of its two available retries."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), _busy(), _ok()], clock)
+    outcome = _run(rpc, clock)
+    assert len(rpc.calls) == 3
+    assert rpc.calls[2][0] == ERROR_RETRY_PROMPT
+    assert outcome.result.stop_reason == "agent_end"
+
+
+def test_a_recovered_busy_rejection_is_still_recorded():
+    """Same reason the recovered provider error is: a trial that spent an
+    attempt on a busy pi and then succeeded would otherwise leave no trace."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), _busy("mid-compaction"), _ok()], clock)
+    outcome = _run(rpc, clock)
+    assert "PiBusyError" in outcome.retry_exception
+    assert "mid-compaction" in outcome.retry_exception
+    assert outcome.error_message == "upstream 500", "the provider error is untouched"
+
+
+def test_a_busy_rejected_attempt_still_counts_toward_the_cap():
+    """Retrying a busy pi is bounded by exactly the same max_attempts as
+    retrying an errored one -- an unbounded wait-and-resend loop is a worse
+    failure than ending the trial."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), _busy(), _busy()], clock)
+    outcome = _run(rpc, clock)
+    assert len(rpc.calls) == 3
+    assert "PiBusyError" in outcome.retry_exception
+
+
+def test_a_busy_rejection_does_not_feed_the_identical_error_streak():
+    """A busy rejection has no provider error text to compare, and resolves
+    by waiting rather than by giving up -- folding it into the streak would
+    fast-fail the loop on the one condition retrying actually fixes."""
+    clock = _Clock()
+    rpc = _StubRpc([_err("same"), _busy(), _busy(), _ok()], clock)
+    outcome = _run(rpc, clock, max_attempts=4)
+    assert len(rpc.calls) == 4
+    assert outcome.result.stop_reason == "agent_end"
+
+
+def test_a_busy_rejection_still_respects_the_budget_floor():
+    clock = _Clock()
+    lines = []
+    # Two attempts at 1790s each plus the 5s backoff leaves 15s, under the
+    # floor -- and the busy branch has to check it for itself, since it
+    # never reaches the loop's own pre-backoff check.
+    rpc = _StubRpc([_err(), _busy()], clock, consume_sec=1790.0)
+    outcome = _run(rpc, clock, log=lines.append)
+    assert len(rpc.calls) == 2
+    assert "below the 60s floor" in "\n".join(lines)
+    assert "PiBusyError" in outcome.retry_exception
+
+
+def test_a_busy_rejection_from_the_first_attempt_still_propagates():
+    """The first attempt's exceptions are the caller's, same as any other
+    type -- only a RETRY is turned into a merged return."""
+    clock = _Clock()
+    rpc = _StubRpc([_busy()], clock)
+    with pytest.raises(rpc_client.PiBusyError):
+        _run(rpc, clock)
+
+
+# ── waiting for pi to go idle ────────────────────────────────────────────
+
+
+def test_a_retry_waits_for_pi_to_go_idle_before_re_prompting():
+    """Re-sending into a compaction window is what produced the busy
+    rejection in the first place; the wait is what makes the retry land."""
+    clock = _Clock()
+    rpc = _StubRpc([_err(), _ok()], clock, busy_polls=3)
+    _run(rpc, clock)
+    # The 5s backoff plus three 10s polls before the fourth read saw idle.
+    assert rpc.calls[1][1] == pytest.approx(3600.0 - 5.0 - 30.0)
+
+
+def test_the_idle_wait_stops_at_the_budget_floor_not_only_the_flat_cap():
+    """Waiting is only worth doing while there is still a trial left to
+    spend the budget on."""
+    clock = _Clock()
+    rpc = _StubRpc([], clock, busy_polls=10_000)
+    start = clock.now()
+    idle = rpc_client.wait_for_pi_idle(
+        rpc, deadline=clock.now() + 300.0, now=clock.now, sleep=clock.sleep
+    )
+    assert idle is False
+    # 300s of budget minus the 60s floor, far short of the 1800s cap.
+    assert clock.now() - start == pytest.approx(240.0)
+
+
+def test_the_idle_wait_gives_up_at_the_flat_cap_rather_than_hanging():
+    """A pi wedged in isCompacting against a long deadline would otherwise
+    burn the whole remaining budget on a wait that never ends."""
+    clock = _Clock()
+    rpc = _StubRpc([], clock, busy_polls=10_000)
+    start = clock.now()
+    idle = rpc_client.wait_for_pi_idle(
+        rpc, deadline=clock.now() + 100_000.0, now=clock.now, sleep=clock.sleep
+    )
+    assert idle is False
+    assert clock.now() - start == pytest.approx(rpc_client.PI_IDLE_WAIT_CAP_SEC)
+
+
+def test_an_idle_pi_is_not_waited_on_at_all():
+    clock = _Clock()
+    rpc = _StubRpc([], clock)
+    start = clock.now()
+    assert rpc_client.wait_for_pi_idle(
+        rpc, deadline=clock.now() + 3600.0, now=clock.now, sleep=clock.sleep
+    ) is True
+    assert clock.now() == start
+
+
+def test_an_unreadable_state_keeps_waiting_rather_than_giving_up():
+    """A state read that times out most often means pi is busy enough not to
+    answer it; treating "unknown" as "idle" would send straight back into
+    the window the wait exists to avoid."""
+    clock = _Clock()
+    lines = []
+    rpc = _StubRpc([], clock, state_error=TimeoutError("no response"))
+    idle = rpc_client.wait_for_pi_idle(
+        rpc, deadline=clock.now() + 300.0, now=clock.now, sleep=clock.sleep,
+        log=lines.append,
+    )
+    assert idle is False
+    assert clock.now() - 1000.0 == pytest.approx(240.0)
+    assert sum("could not read pi state" in line for line in lines) == 1, \
+        "the unreadable state should be logged once, not once per poll"
+
+
+def test_a_dead_pi_is_not_waited_on():
+    clock = _Clock()
+    rpc = _StubRpc([], clock, alive=False, busy_polls=10_000)
+    start = clock.now()
+    assert rpc_client.wait_for_pi_idle(
+        rpc, deadline=clock.now() + 3600.0, now=clock.now, sleep=clock.sleep
+    ) is False
+    assert clock.now() == start
+
+
+# ── deliberate mid-run compaction ────────────────────────────────────────
+
+
+def _turn(tokens):
+    """A turn_end carrying `tokens` of context, in pi's own usage shape."""
+    return {"type": "turn_end", "message": {"usage": {
+        "input": tokens, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+    }}}
+
+
+class _CycleRpc:
+    """Replays (events, result) pairs, one pair per prompt_and_collect.
+
+    The events are handed to `on_event` exactly as the real drain does, which
+    is what lets the compaction trigger fire from inside a cycle. Compact
+    round-trips are scripted separately: each await_compact() consumes one
+    entry, returning a dict or raising an Exception.
+
+    A cycle entry that is itself an Exception is raised instead of replayed,
+    the way _StubRpc does it -- that is how a prompt rejected outright (a
+    busy pi) is expressed, since it produces no events and no result.
+    """
+
+    def __init__(self, cycles, clock=None, compact_results=(), alive=True,
+                 die_on_prompt=False):
+        self._cycles = list(cycles)
+        self._clock = clock
+        self._compact_results = list(compact_results)
+        self.alive = alive
+        #: Flip `alive` false as a scripted exception is raised, i.e. pi died
+        #: producing it -- the liveness brake ahead of the continuation
+        #: prompt cannot see that, since it runs before the prompt.
+        self._die_on_prompt = die_on_prompt
+        self.calls = []            # [(message, timeout)]
+        self.compact_requests = []
+        self.awaited = []
+
+    def prompt_and_collect(self, message, timeout=900, on_event=None):
+        self.calls.append((message, timeout))
+        assert self._cycles, "prompt_and_collect called more often than scripted"
+        nxt = self._cycles.pop(0)
+        if isinstance(nxt, Exception):
+            if self._die_on_prompt:
+                self.alive = False
+            raise nxt
+        events, result = nxt
+        for ev in events:
+            if on_event is not None:
+                on_event(ev)
+        return result
+
+    def is_alive(self):
+        return self.alive
+
+    def get_state(self):
+        return {"isStreaming": False, "isCompacting": False}
+
+    def request_compact(self):
+        rid = f"compact-{len(self.compact_requests)}"
+        self.compact_requests.append(rid)
+        return rid
+
+    def await_compact(self, rid, timeout=600):
+        self.awaited.append(rid)
+        assert self._compact_results, "await_compact called more often than scripted"
+        nxt = self._compact_results.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def _run_compaction(rpc, clock, timeout=3600.0, context_window=262_144, **kw):
+    return prompt_with_mid_run_compaction(
+        rpc, "original prompt", timeout,
+        context_window=context_window, sleep=clock.sleep, now=clock.now, **kw,
+    )
+
+
+def test_a_quiet_run_never_compacts_and_reads_as_a_bare_retry():
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(10_000)], _ok())], clock)
+    outcome = _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []
+    assert len(rpc.calls) == 1
+    assert outcome.n_deliberate_compactions == 0
+    assert outcome.result.stop_reason == "agent_end"
+
+
+def test_no_context_window_leaves_the_trigger_permanently_disarmed():
+    """The adapter's probe is best-effort, so "we don't know the window" has
+    to degrade to plain prompt_with_error_retry rather than guessing one."""
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(500_000)], _ok())], clock)
+    outcome = _run_compaction(rpc, clock, context_window=None)
+    assert rpc.compact_requests == []
+    assert outcome.n_deliberate_compactions == 0
+
+
+@pytest.mark.parametrize("window", ["262144", 0, -1, True, 1])
+def test_a_malformed_context_window_disarms_rather_than_raising(window):
+    """contextWindow is wire data from a pi build we don't control.
+
+    The probe that reads it is best-effort precisely so a bad answer costs
+    the compaction mechanism and nothing else; a TypeError here would
+    instead end the trial before the first prompt was ever sent.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(500_000)], _ok())], clock)
+    outcome = _run_compaction(rpc, clock, context_window=window)
+    assert rpc.compact_requests == []
+    assert outcome.n_deliberate_compactions == 0
+
+
+def test_crossing_the_threshold_compacts_and_continues_the_same_session():
+    """The whole point: the run pi aborted for the compaction is relabelled
+    rather than reported as the agent finishing, and the trial continues."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(60_000)], PromptResult(stop_reason="agent_end",
+                                        assistant_text="finished"))],
+        clock,
+        compact_results=[{"tokensBefore": 230_000, "estimatedTokensAfter": 60_000}],
+    )
+    outcome = _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+    assert rpc.awaited == rpc.compact_requests, "the compact response is awaited"
+    assert len(rpc.calls) == 2
+    assert rpc.calls[1][0] == COMPACTION_CONTINUE_PROMPT
+    assert outcome.n_deliberate_compactions == 1
+    # The LAST cycle's real verdict, not the intermediate "compacted" label.
+    assert outcome.result.stop_reason == "agent_end"
+    assert "finished" in outcome.result.assistant_text
+
+
+def test_the_threshold_follows_a_smaller_context_window():
+    """min(flat trigger, 84% of the window): a model with a window under the
+    flat trigger would otherwise never compact before overflowing."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(90_000)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock, context_window=100_000)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_only_one_compact_request_is_in_flight_at_a_time():
+    """A second request would have pi abort the run it started for the
+    first."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000), _turn(240_000), _turn(250_000)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_a_compaction_that_regained_too_little_disarms_the_trigger():
+    """Compacting again would spend another summarization proving the same
+    thing: whatever fills the transcript is not what compaction removes."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 215_000}],
+    )
+    outcome = _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1, "the second crossing must not re-trigger"
+    assert len(rpc.calls) == 2
+    assert outcome.n_deliberate_compactions == 1
+
+
+def test_the_regain_floor_follows_the_smaller_window_too():
+    """The threshold moves with the window, so the regain check has to.
+
+    Measured against the flat 220k trigger, a 100k-window trial that
+    compacted 84k down to 83k would read as having regained 137k, re-arm,
+    and compact again on the very next turn -- a summarization per turn for
+    the rest of the trial.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(90_000)], _ok()), ([_turn(95_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 83_000}],
+    )
+    outcome = _run_compaction(rpc, clock, context_window=100_000)
+    assert len(rpc.compact_requests) == 1, "the second crossing must not re-trigger"
+    assert outcome.n_deliberate_compactions == 1
+
+
+def test_a_missing_estimate_is_treated_as_too_little_regained():
+    """pi marks estimatedTokensAfter optional; unmeasurable headroom is not
+    evidence of headroom."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
+        clock,
+        compact_results=[{"tokensBefore": 230_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_the_regain_floor_stays_satisfiable_on_a_small_window():
+    """The floor is clamped to half the threshold, so it can always be met.
+
+    A flat 30k floor measured against a 32 768-token model's 27 525 threshold
+    asks for a negative context, so EVERY compaction reads as having regained
+    too little and the trigger goes inert after firing once -- on six of the
+    nine models in models.json, and on precisely the ones that overflow
+    soonest. Here the compaction frees 93% of the window; it has to re-arm.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(30_000)], _ok()), ([_turn(30_000)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"tokensBefore": 30_000, "estimatedTokensAfter": 2_000},
+                         {"tokensBefore": 30_000, "estimatedTokensAfter": 2_000}],
+    )
+    _run_compaction(rpc, clock, context_window=32_768)
+    assert len(rpc.compact_requests) == 2, "the second crossing must re-trigger"
+
+
+def test_a_big_window_keeps_the_flat_regain_floor():
+    """The clamp binds only below ~71k; the tuned big-window bound is the
+    flat 30k, and a compaction that left 215k of a 220k threshold still has
+    to disarm."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 215_000}],
+    )
+    _run_compaction(rpc, clock, context_window=262_144)
+    assert len(rpc.compact_requests) == 1
+
+
+#: Every way a wedged-mid-compaction continuation actually presents. Only
+#: the typed one comes from pi answering "already processing"; a pi too busy
+#: to answer at all times the response out instead, and one that died
+#: summarizing raises PiProcessExited. prompt_and_collect's readiness loop
+#: retries on the explicit response alone, so the other three never reach it.
+_CONTINUATION_FAILURES = [
+    rpc_client.PiBusyError("pi stayed busy across 5 readiness attempts"),
+    TimeoutError("pi did not respond to request r1 within 30s"),
+    rpc_client.PiProcessExited("pi exited before acknowledging request r1"),
+    RuntimeError("pi rejected prompt: No model selected"),
+]
+
+
+@pytest.mark.parametrize("failure", _CONTINUATION_FAILURES,
+                         ids=lambda e: type(e).__name__)
+def test_a_failed_continuation_keeps_the_cycles_already_completed(failure):
+    """prompt_with_error_retry leaves its first attempt unguarded on purpose,
+    but every post-compaction continuation is also an "attempt 1".
+
+    Anything raised there used to go straight out of the helper, ending the
+    trial and discarding the compacted cycle's own text, tool calls and
+    tokens -- the blanket-handler failure this whole helper exists to stop.
+    Ending the loop and throwing away what was already earned are separate
+    questions, and the inner helper already answers the second one this way
+    for its own retries.
+    """
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], PromptResult(stop_reason="agent_end",
+                                         assistant_text="work done")),
+         failure],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert "work done" in outcome.result.assistant_text, "the cycle's work survives"
+    assert outcome.n_deliberate_compactions == 1
+    assert type(failure).__name__ in outcome.retry_exception
+
+
+@pytest.mark.parametrize("failure", _CONTINUATION_FAILURES,
+                         ids=lambda e: type(e).__name__)
+def test_a_failed_first_prompt_still_propagates_through_the_wrapper(failure):
+    """The trial's own first prompt keeps the bare prompt_and_collect
+    contract: the wrapper must not swallow what a direct call would raise.
+    `merged is None` is exactly that case, which is what carries it."""
+    clock = _Clock()
+    rpc = _CycleRpc([failure], clock)
+    with pytest.raises(type(failure)):
+        _run_compaction(rpc, clock)
+
+
+def test_a_continuation_that_left_pi_dead_reports_process_exit():
+    """Otherwise the outcome reports "compacted" -- or a retryable "error" --
+    for a session that is provably gone, the same contradiction
+    prompt_with_error_retry re-checks liveness to avoid."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], PromptResult(stop_reason="agent_end",
+                                         assistant_text="work done")),
+         rpc_client.PiProcessExited("pi exited while summarizing")],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        die_on_prompt=True,
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.result.stop_reason == "process_exit"
+    assert outcome.result.error_message == ""
+    assert "work done" in outcome.result.assistant_text
+
+
+def test_the_deliberate_compaction_cap_is_enforced():
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())] * 3,
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}] * 3,
+    )
+    lines = []
+    outcome = _run_compaction(rpc, clock, max_compactions=2, log=lines.append)
+    assert len(rpc.compact_requests) == 2
+    assert len(rpc.calls) == 2
+    assert outcome.n_deliberate_compactions == 2
+    assert "2 deliberate compactions used" in "\n".join(lines)
+
+
+@pytest.mark.parametrize("failure", [
+    TimeoutError("compact never answered"),
+    RuntimeError("pi rejected compact: Nothing to compact (session too small)"),
+])
+def test_a_failed_compaction_still_gets_its_continuation(failure):
+    """session.compact() aborts the active run BEFORE any of these failures
+    can happen, so the session is sitting idle mid-task either way -- ending
+    the trial here would throw away the budget the abort just freed."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[failure],
+    )
+    outcome = _run_compaction(rpc, clock)
+    assert len(rpc.calls) == 2
+    assert rpc.calls[1][0] == COMPACTION_CONTINUE_PROMPT
+    assert outcome.result.stop_reason == "agent_end"
+    assert outcome.n_deliberate_compactions == 1
+
+
+def test_a_failed_compaction_disarms_further_attempts():
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
+        clock,
+        compact_results=[RuntimeError("pi rejected compact: Already compacted")],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+@pytest.mark.parametrize("stop_reason", ["deadline", "process_exit", "error"])
+def test_a_genuinely_terminal_cycle_is_not_continued(stop_reason):
+    """"compacted" is only ever an agent_end we relabelled. These three are
+    terminal conditions of their own and have nothing to do with the abort
+    we asked for, so the loop must not paper over them with a continuation."""
+    clock = _Clock()
+    # Repeated because "error" is the one value the INNER loop retries on its
+    # own; it exhausts its own brakes first and only then hands the verdict
+    # out here, which is the case this is about.
+    cycle = ([_turn(230_000)], PromptResult(stop_reason=stop_reason,
+                                            error_message="upstream 500"))
+    rpc = _CycleRpc([cycle] * 3, clock)
+    outcome = _run_compaction(rpc, clock)
+    assert rpc.awaited == [], "no point awaiting a compaction nothing will use"
+    assert COMPACTION_CONTINUE_PROMPT not in [c[0] for c in rpc.calls]
+    assert outcome.result.stop_reason == stop_reason
+
+
+def test_results_are_merged_across_compaction_cycles():
+    """A cycle the harness cut short still spent the trial's tokens and
+    wrote the trial's files."""
+    clock = _Clock()
+    first = PromptResult(
+        stop_reason="agent_end", turn_count=2, tool_calls=[{"name": "read"}],
+        assistant_text="before",
+        usage={"input": 100, "output": 10, "cache_read": 0, "cache_write": 0,
+               "cost": 0.5},
+    )
+    second = PromptResult(
+        stop_reason="agent_end", turn_count=3, tool_calls=[{"name": "write"}],
+        assistant_text="after",
+        usage={"input": 40, "output": 5, "cache_read": 0, "cache_write": 0,
+               "cost": 0.25},
+    )
+    rpc = _CycleRpc(
+        [([_turn(230_000)], first), ([], second)],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    merged = _run_compaction(rpc, clock).result
+    assert merged.turn_count == 5
+    assert [t["name"] for t in merged.tool_calls] == ["read", "write"]
+    assert merged.usage["input"] == 140
+    assert merged.assistant_text == "before\nafter"
+
+
+def test_error_retries_are_summed_across_cycles():
+    """Each cycle runs its own inner retry loop; reporting only the last
+    one's count would understate what the trial actually spent."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _err("upstream 500")), ([_turn(1_000)], _ok()),
+         ([], _err("upstream 503")), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    outcome = _run_compaction(rpc, clock)
+    assert outcome.n_error_retries == 2
+    assert outcome.error_message == "upstream 503"
+
+
+def test_the_continuation_prompt_leaves_a_finished_agent_an_exit():
+    """Same escape hatch ERROR_RETRY_PROMPT carries, for the same reason:
+    the nudge has to be able to lose."""
+    assert "already complete" in COMPACTION_CONTINUE_PROMPT
+    assert "stop" in COMPACTION_CONTINUE_PROMPT
+
+
+def test_a_dead_pi_is_not_continued_after_a_compaction():
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        alive=False,
+    )
+    lines = []
+    outcome = _run_compaction(rpc, clock, log=lines.append)
+    assert len(rpc.calls) == 1
+    assert "pi process is gone" in "\n".join(lines)
+    assert outcome.n_deliberate_compactions == 1
+
+
+def test_a_spent_budget_is_not_continued_after_a_compaction():
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    lines = []
+    outcome = _run_compaction(rpc, clock, timeout=30.0, log=lines.append)
+    assert len(rpc.calls) == 1
+    assert "below the 60s floor" in "\n".join(lines)
+    assert outcome.result.stop_reason == "compacted"
+
+
 # ── adapter wiring ───────────────────────────────────────────────────────
 
 _ADAPTERS = [
@@ -428,8 +1064,15 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     source = path.read_text()
     # Name, not call site: the Harbor adapter hands it to asyncio.to_thread
     # rather than calling it directly.
-    assert "prompt_with_error_retry" in source
+    assert "prompt_with_mid_run_compaction" in source
+    # And the wrapper INSTEAD of the helper underneath it, not alongside it:
+    # an adapter reverting to prompt_with_error_retry would still retry
+    # provider errors and still keep `rpc.prompt_and_collect(` absent, so
+    # every other assertion here would pass while the trial silently lost
+    # the compaction boundary this wiring exists to supply.
+    assert "prompt_with_error_retry" not in source
     assert "rpc.prompt_and_collect(" not in source, "should go through the retry helper"
     assert "n_error_retries" in source
+    assert "n_deliberate_compactions" in source
     assert "preview_tool_result(" in source
     assert "[:400]" not in source, "raw slice should be gone from the log previews"
