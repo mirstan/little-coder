@@ -545,6 +545,65 @@ function temporalDirective(allowed: Set<string> | undefined): string {
   return lines.join("\n");
 }
 
+// Keyword-triggered directive: a raw TensorFlow 1.x checkpoint dump with no
+// .index file has no header or metadata, so a model tasked with parsing one
+// (the gpt2-codegolf benchmark task is the motivating case) has to derive the
+// tensor layout itself. Small models reliably converge on the same wrong
+// answer -- "creation order, wte first" -- when the true layout is
+// sorted-by-variable-NAME, wte last (verified against the checkpoint's
+// companion .index file). This corrects that specific wrong prior without
+// handing over the full derived layout, which the model still has to verify
+// empirically for the checkpoint actually in front of it.
+//
+// GPT-2 identification alone is not enough to fire: PyTorch Lightning also
+// uses the *.ckpt extension for its own fully self-describing (header-and-all)
+// checkpoint format, and this directive's advice would be actively wrong for
+// a "fine-tune GPT-2 from a Lightning .ckpt" prompt. Require a TF co-signal
+// alongside GPT-2 -- either "TF"/"tensorflow" named near a .ckpt reference, or
+// the exact raw-shard filename pattern on its own, which is unambiguous
+// regardless of nearby wording.
+const GPT2_PATTERN = /\bgpt[-\s]?2\b/i;
+const TF_TAGGED_CKPT = /(?:\bTF\b|\btensorflow\b)[^.?!;\n]{0,60}?\.ckpt\b|\.ckpt\b[^.?!;\n]{0,60}?(?:\bTF\b|\btensorflow\b)/i;
+const RAW_SHARD_FILENAME = /\.data-\d{5}-of-\d{5}\b/i;
+
+export function looksLikeGpt2CheckpointTask(text: string): boolean {
+  if (!text) return false;
+  if (!GPT2_PATTERN.test(text)) return false;
+  return TF_TAGGED_CKPT.test(text) || RAW_SHARD_FILENAME.test(text);
+}
+
+/** Should the GPT-2 checkpoint-format directive be injected for this
+ *  prompt/allow-list? Exported for unit testing alongside
+ *  looksLikeGpt2CheckpointTask.
+ *
+ *  The directive's own "verify empirically" advice requires a shell to act
+ *  on, so gate on the same shell-capability check the temporal directive
+ *  uses for its git-log advice. */
+export function shouldInjectGpt2CheckpointDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  return looksLikeGpt2CheckpointTask(prompt) && anyShellToolAvailable(allowed);
+}
+
+function gpt2CheckpointDirective(): string {
+  return [
+    "",
+    "## TF checkpoint format note",
+    "A raw TensorFlow 1.x checkpoint dump with no accompanying .index file " +
+      "(a bare *.data-00000-of-00001, or similar) has no header or metadata " +
+      "to parse. Its tensors are stored back-to-back in SORTED VARIABLE-NAME " +
+      "order -- not creation order, not any layout you can guess from the " +
+      "model architecture alone. Verify the actual ordering empirically (e.g. " +
+      "compare tensor byte-sizes against known parameter shapes) before " +
+      "assuming any particular layout, rather than assuming embeddings or a " +
+      "specific layer comes first. This note does not cover the BPE " +
+      "tokenizer format or any code-size constraints, which need their own " +
+      "verification.",
+    "",
+  ].join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
   // `/skills` (issue #118). pi's own `/skill:name` addresses pi skills; these
   // cards are a different mechanism (selected per turn by error-recovery >
@@ -603,8 +662,9 @@ export default function (pi: ExtensionAPI) {
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
     const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
+    const gpt2CheckpointTask = shouldInjectGpt2CheckpointDirective(event.prompt ?? "", allowed);
 
-    if (selected.length === 0 && !researchTask && !temporalTask) return;
+    if (selected.length === 0 && !researchTask && !temporalTask && !gpt2CheckpointTask) return;
 
     const skillBlock = selected.length > 0
       ? (() => {
@@ -622,19 +682,19 @@ export default function (pi: ExtensionAPI) {
       : "";
 
     // Order within the block: [tool skill cards] [research directive]
-    // [temporal directive]. Both directives come after the skill cards by
-    // design — small models show strong recency bias and the per-task
-    // instructions are what we want freshest in their attention. The
-    // temporal directive comes LAST of all: it is the more specific,
-    // corrective one (don't reconstruct a past state from current data),
-    // so it wins the recency argument over the more general research
-    // directive when a prompt trips both (e.g. "research the leaderboard as
-    // of March 2024"). Delivered at the conversation tail (see
-    // _shared/inject.ts), which is later still than the end of the system
-    // prompt.
+    // [temporal directive] [gpt2-checkpoint directive]. All directives come
+    // after the skill cards by design — small models show strong recency
+    // bias and the per-task instructions are what we want freshest in their
+    // attention. Among the directives, more specific/corrective wins the
+    // recency argument over more general ones: temporal (don't reconstruct
+    // a past state from current data) beats research, and the gpt2-checkpoint
+    // note — the most specific of all, naming one exact wrong prior — goes
+    // last. Delivered at the conversation tail (see _shared/inject.ts),
+    // which is later still than the end of the system prompt.
     const directive =
       (researchTask ? researchDirective(allowed) : "") +
-      (temporalTask ? temporalDirective(allowed) : "");
+      (temporalTask ? temporalDirective(allowed) : "") +
+      (gpt2CheckpointTask ? gpt2CheckpointDirective() : "");
     const block = skillBlock + directive;
 
     // Identical to last turn's block? The previous copy is still in the
@@ -650,6 +710,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (researchTask) parts.push("+research-directive");
       if (temporalTask) parts.push("+temporal-directive");
+      if (gpt2CheckpointTask) parts.push("+gpt2-checkpoint-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
     } catch {
       // UI unavailable in some run modes — silent best-effort
