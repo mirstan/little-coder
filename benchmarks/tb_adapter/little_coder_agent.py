@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import uuid
 import base64
 from pathlib import Path
@@ -21,25 +22,132 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 
 # benchmarks/ isn't a package; make imports work when TB points at this file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rpc_client import PiRpc  # noqa: E402
+from rpc_client import (  # noqa: E402
+    PiRpc,
+    preview_tool_result,
+    prompt_with_mid_run_compaction,
+    resolve_thinking_level,
+)
 
 
-DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
+DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset", "ShellRecall"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
+#: Wall-clock budget for the single prompt this adapter issues. TB 1.0 gives
+#: the agent no per-task budget to read (unlike Harbor, which the sibling
+#: adapter resolves a real per-task timeout from), so this stays the flat
+#: value it has always been -- but it is now named and shared, because the
+#: deadline pi is told about, the prompt timeout, and the error-retry budget
+#: all have to be the same number or the three disagree about when time is up.
+DEFAULT_PROMPT_TIMEOUT_SEC = 3600.0
 
 
 # ── tmux command execution (matches shell_session.py::_exec_tmux) ──────────
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_LINES = 200
+# Tiny relative to the byte caps below, which still catch anything past this
+# that's actually large.
+SMALL_OUTPUT_FLOOR_BYTES = 4 * 1024
+
+# Byte caps, which the line cap alone cannot enforce: one 1MB line is one
+# "line", so output with no newline in it used to reach the model whole and
+# blow the context window. Pane capture wraps at terminal width, which likely
+# defuses that here, but the cap is kept identical across adapters -- the
+# format contract between them is the point. Head/tail split mirrors the 2:1
+# line ratio below.
+MAX_BODY_HEAD_BYTES = 32 * 1024
+MAX_BODY_TAIL_BYTES = 16 * 1024
+# Pre-dedup gate: bounds the cost of split/dedup, which otherwise walk the
+# whole output before any truncation runs.
+MAX_RAW_HEAD_BYTES = 256 * 1024
+MAX_RAW_TAIL_BYTES = 128 * 1024
+
+
+# The output-caps and minimal-image sentences below are kept in sync by hand
+# with the harbor adapter's _HARD_LIMITS_PARAGRAPH (same enforcement on both
+# backends -- ANSI_RE/MAX_LINES/MAX_BODY_*_BYTES above are separately
+# duplicated constants with the same values as harbor's), the same way
+# _format_output is duplicated across the two adapters rather than shared.
+# test_format_output.py pins that shared substring across both paragraphs.
+#
+# The timeout sentence is NOT kept in sync, and never should be: neither
+# backend kills an overrun command (_TmuxShellProxy.run only passes the
+# timeout to tmux's send_keys(block=True) and sends no C-c; harbor's
+# timeout terminates just the host-side docker-exec client -- reproduced
+# against a live container, the in-container command survived it), but what
+# the model then sees differs. Harbor discards the timed-out call's output
+# outright, while this pane keeps collecting it, so overrun output can
+# interleave with, or show up ahead of, a later command's own.
+_HARD_LIMITS_PARAGRAPH = (
+    "Hard limits of this environment: each ShellSession call has a "
+    "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts); a command that runs past its "
+    "timeout keeps running in the background rather than being "
+    "killed — its output so far is shown, and it may keep writing "
+    "output that interleaves with, or shows up ahead of, a "
+    "subsequent command's own output. Output is capped at 200 "
+    "lines / ~48KB per call. The container image is minimal: check which "
+    "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+    "designing an approach around one."
+)
 
 
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
 
+def _format_size(n: int) -> str:
+    """Human-readable byte count, matching pi's own truncation markers."""
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
+def _cap_bytes_head_tail(s: str, head_bytes: int, tail_bytes: int) -> tuple[str, int]:
+    """Keep the first `head_bytes` and last `tail_bytes` of `s`, joined by a
+    marker. Returns (text, dropped_bytes).
+
+    Cuts prefer a line boundary but must never require one -- the case this
+    exists for is output with no newline in it at all. Byte-identical to the
+    TypeScript capBytesHeadTail in .pi/extensions/shell-session/helpers.ts;
+    test_format_output.py pins a shared multi-byte vector across the two.
+    """
+    buf = s.encode("utf-8")
+    if len(buf) <= head_bytes + tail_bytes:
+        return s, 0
+
+    # Last newline in the head window, so the kept head is as long as the
+    # budget allows; the first newline would legally cut at byte 10 of 32K.
+    head_end = buf.rfind(b"\n", 0, head_bytes)
+    if head_end < 0:
+        head_end = head_bytes
+        # Back off continuation bytes, keeping the shorter valid prefix.
+        while head_end > 0 and buf[head_end] & 0xC0 == 0x80:
+            head_end -= 1
+
+    tail_start = buf.find(b"\n", len(buf) - tail_bytes)
+    if tail_start >= 0:
+        tail_start += 1
+    else:
+        tail_start = len(buf) - tail_bytes
+        # Mirror image of the head side: skip *forward* off a continuation
+        # byte. decode(errors="ignore") is not equivalent here -- it drops a
+        # phantom partial character instead of skipping to the next real one.
+        while tail_start < len(buf) and buf[tail_start] & 0xC0 == 0x80:
+            tail_start += 1
+
+    dropped = tail_start - head_end
+    head = buf[:head_end].decode("utf-8")
+    tail = buf[tail_start:].decode("utf-8")
+    return f"{head}\n  [... {_format_size(dropped)} truncated ...]\n{tail}", dropped
+
+
 def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note: str) -> str:
     cleaned = _strip_ansi(raw).replace("\r", "")
-    lines = cleaned.split("\n")
+    raw_bytes = len(cleaned.encode("utf-8"))
+    pre_capped, pre_dropped = _cap_bytes_head_tail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES)
+    lines = pre_capped.split("\n")
     # dedup
     deduped = []
     last, dup = None, 0
@@ -56,20 +164,77 @@ def _format_output(raw: str, code: int, cwd: str, timed_out: bool, backend_note:
         deduped.append(f"  [... {dup} duplicate line(s) collapsed ...]")
     # truncate
     truncated = False
-    if len(deduped) > MAX_LINES:
+    if len(deduped) > MAX_LINES and len("\n".join(deduped).encode("utf-8")) > SMALL_OUTPUT_FLOOR_BYTES:
         head = MAX_LINES // 2
         tail = MAX_LINES // 4
         skipped = len(deduped) - head - tail
         deduped = deduped[:head] + [f"  [... {skipped} lines truncated ...]"] + deduped[-tail:]
         truncated = True
-    body = "\n".join(deduped)
+    body, post_dropped = _cap_bytes_head_tail(
+        "\n".join(deduped), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES
+    )
+    byte_capped = pre_dropped > 0 or post_dropped > 0
+    # No "Full output:" line here, unlike the local subprocess backend: the
+    # command ran inside the container, so any host path we wrote would be one
+    # the model cannot read.
     bits = [f"exit={code}", f"cwd={cwd}", f"timed_out={'true' if timed_out else 'false'}"]
-    if truncated:
+    if truncated or byte_capped:
         bits.append("output_truncated=true")
+        # Only alongside output_truncated: untruncated output is its own raw
+        # size, and the existing footer shape stays byte-identical for normal
+        # results.
+        bits.append(f"raw_bytes={raw_bytes}")
     if backend_note:
         bits.append(backend_note)
     footer = "[" + " ".join(bits) + "]"
     return f"{body}\n{footer}" if body else footer
+
+
+# This branch fires whenever no sentinel is found in the pane within the
+# {N}s budget -- which is not only the "command is still running" case.
+# send_keys/capture_pane exceptions are swallowed above (see run()), so this
+# also fires when send_keys failed immediately for a non-timeout reason, or
+# when capture_pane raised (pane == "" -> no output to show at all).
+_TMUX_TIMEOUT_WARNING = (
+    "WARNING: no completion sentinel was seen for this command within its {N}s timeout. "
+    "It may be STILL RUNNING in the terminal session, it may have failed to start, or its "
+    "pane output may not have been captured -- any output shown above is only what could "
+    "be read, and any file it was writing may be incomplete. Check on it (e.g. capture "
+    "the pane again, or ps) before trusting its output or files."
+)
+
+
+def _pi_env(*, budget_start_epoch_ms: int, deadline_epoch_ms: int) -> dict[str, str]:
+    """The env pi's extensions are handed for this trial. Pure/module-level so
+    its contents are assertable without standing up a whole run, mirroring the
+    harbor adapter's own _pi_env -- the two must publish the same timing vars
+    or an extension would behave differently on TB1.0 than on TB2.x for no
+    reason a reader could find.
+
+    Unattended permission mode, same as the harbor/gaia/aider_polyglot
+    adapters (see harbor_adapter/little_coder_agent.py's own _pi_env for the
+    fuller rationale): there is no human present to grant a permission-gate
+    prompt, and its "auto" default's SAFE_PREFIXES whitelist is necessarily
+    incomplete (e.g. it covers `which`/`type`/`printenv` but not `command`,
+    which this adapter's own hard-limits paragraph tells the model to run as
+    its very first probe). Whitelisting one command at a time is whack-a-mole;
+    every other TB agent already runs with unrestricted tool access here.
+
+    LITTLE_CODER_INITIAL_SNAPSHOT is set to empty, not omitted: this adapter
+    stages no start-of-trial copy, and PiRpc's child env starts as a copy of
+    this process's own os.environ (full_env = dict(os.environ), updated with
+    this dict) -- an omitted key does not clear one already present there,
+    e.g. leaked from a prior harbor trial run in the same process/shell.
+    Empty clobbers it either way; initialSnapshotOutcome() on the TS side
+    treats anything but "succeeded"/"partial" as no snapshot. See the harbor
+    adapter's _pi_env, which sets the real classified value instead.
+    """
+    return {
+        "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+        "LITTLE_CODER_BUDGET_START_EPOCH_MS": str(budget_start_epoch_ms),
+        "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+        "LITTLE_CODER_INITIAL_SNAPSHOT": "",
+    }
 
 
 class _TmuxShellProxy:
@@ -139,7 +304,8 @@ class _TmuxShellProxy:
         marker = pane.rfind(sentinel + ":")
         if marker < 0:
             body = pane[prev_cursor:] if prev_cursor <= len(pane) else ""
-            return _format_output(body.strip(), -1, "?", True, "backend=tmux-proxy")
+            warning = _TMUX_TIMEOUT_WARNING.format(N=timeout)
+            return _format_output(f"{body.strip()}\n{warning}".strip(), -1, "?", True, "backend=tmux-proxy")
 
         tail = pane[marker + len(sentinel) + 1:]
         parts = tail.split(":", 1)
@@ -246,9 +412,64 @@ class LittleCoderAgent(BaseAgent):
             "You are running as root in the container; /app is writable.\n"
             "File tools like Read/Write/Edit are NOT available — use shell commands "
             "(cat, sed -i, heredoc 'cat > file <<EOF') through ShellSession instead.\n\n"
+            + _HARD_LIMITS_PARAGRAPH + "\n\n"
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
+
+        def on_event(ev: dict) -> None:
+            """Provider-error breadcrumbs only.
+
+            Deliberately not a full live trajectory log (that's the Harbor
+            adapter's job): the one thing this log could never explain before
+            was why a session stopped early, so error/auto-retry events are
+            written as they happen, ahead of the summary block below.
+            """
+            if log_fh is None:
+                return
+            t = ev.get("type")
+            if t == "turn_end":
+                msg = ev.get("message")
+                if isinstance(msg, dict) and (
+                    msg.get("errorMessage") or msg.get("stopReason") == "error"
+                ):
+                    log_fh.write(
+                        f"=== turn error (stopReason={msg.get('stopReason')}): "
+                        f"{msg.get('errorMessage') or '(no errorMessage)'} ===\n"
+                    )
+                    log_fh.flush()
+            elif t == "auto_retry_start":
+                log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')}/"
+                    f"{ev.get('maxAttempts')} in {ev.get('delayMs')}ms: "
+                    f"{ev.get('errorMessage', '')} ===\n"
+                )
+                log_fh.flush()
+            elif t == "auto_retry_end":
+                log_fh.write(
+                    f"=== pi auto-retry {ev.get('attempt')} finished "
+                    f"success={ev.get('success')} {ev.get('finalError', '')} ===\n"
+                )
+                log_fh.flush()
+
+        def log_line(text: str) -> None:
+            """Retry-loop progress, flushed so a `tail -f` shows a stalled
+            trial waiting out a backoff rather than appearing hung."""
+            if log_fh is None:
+                return
+            log_fh.write(f"=== {text} ===\n")
+            log_fh.flush()
+
+        # Given to pi as an absolute wall-clock interval (finalize-warn
+        # reads its far end through `_shared/deadline.ts`; tb-finalize-guard
+        # reads both ends, through that and `_shared/budget-progress.ts`;
+        # both extensions' wall-clock triggers silently no-op without these
+        # vars), and tracked in parallel on the monotonic clock for the
+        # error-retry budget. All from the same constant, taken at the same
+        # instant.
+        budget_start_epoch_ms = int(time.time() * 1000)
+        deadline_epoch_ms = budget_start_epoch_ms + int(DEFAULT_PROMPT_TIMEOUT_SEC * 1000)
+        prompt_deadline = time.monotonic() + DEFAULT_PROMPT_TIMEOUT_SEC
 
         try:
             with PiRpc(
@@ -259,17 +480,69 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=self._max_turns,
+                # See harbor_adapter's identical kwarg for why this is safe
+                # to pass unconditionally (pi clamps it to "off" for
+                # non-reasoning models) and necessary (otherwise pi falls
+                # back to the machine-local defaultThinkingLevel, which can
+                # silently no-op any thinkingFormat gated on
+                # reasoningEffort).
+                thinking=resolve_thinking_level(self._model, "terminal_bench"),
                 tb_shell_handler=tb_shell_handler,
+                env=_pi_env(
+                    budget_start_epoch_ms=budget_start_epoch_ms,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                ),
             ) as rpc:
-                result = rpc.prompt_and_collect(prompt, timeout=3600)
+                # Best-effort, exactly as in harbor_adapter: a failed probe
+                # leaves this None, which disarms mid-run compaction and
+                # leaves the error-retry recovery under it untouched.
+                context_window = None
+                try:
+                    context_window = (
+                        rpc.get_state().get("model") or {}
+                    ).get("contextWindow")
+                except Exception as e:
+                    log_line(f"context-window probe failed (non-fatal): {e}")
+
+                # Retried in place on a provider-error completion -- one
+                # errored completion otherwise ends the whole trial with most
+                # of the budget unspent -- and wrapped in the compaction
+                # boundary a single-agent-run trial never reaches on its own.
+                # See prompt_with_mid_run_compaction.
+                retry_outcome = prompt_with_mid_run_compaction(
+                    rpc,
+                    prompt,
+                    DEFAULT_PROMPT_TIMEOUT_SEC,
+                    on_event,
+                    deadline=prompt_deadline,
+                    context_window=context_window,
+                    log=log_line,
+                )
+                result = retry_outcome.result
                 text_out = result.assistant_text
                 turns = result.turn_count
                 if log_fh:
+                    # Distinguishes a crashed pi from a model that simply ran
+                    # long; both used to look identical in this log.
+                    log_fh.write(
+                        f"=== stop_reason: {getattr(result, 'stop_reason', 'unknown')} ===\n")
+                    log_fh.write(
+                        f"=== error retries: {retry_outcome.n_error_retries} "
+                        f"(last error: {retry_outcome.error_message}) ===\n")
+                    if retry_outcome.retry_exception:
+                        log_fh.write(
+                            f"=== retry raised (not propagated): "
+                            f"{retry_outcome.retry_exception} ===\n")
+                    if retry_outcome.n_deliberate_compactions:
+                        log_fh.write(
+                            f"=== deliberate compactions: "
+                            f"{retry_outcome.n_deliberate_compactions} ===\n")
                     log_fh.write(f"=== assistant text ===\n{text_out}\n\n")
                     for tc in result.tool_calls:
                         log_fh.write(f">> {tc['name']}({tc.get('args', {})})\n")
-                        preview = (tc.get("result_text", "") or "")[:400]
-                        log_fh.write(f"<< {preview}\n")
+                        log_fh.write(
+                            f"<< {preview_tool_result(tc.get('result_text', '') or '')}\n"
+                        )
                     # Extension notifications: per-turn evidence of
                     # skill-inject / knowledge-inject / thinking-budget /
                     # quality-monitor / turn-cap firing. Structured as one
