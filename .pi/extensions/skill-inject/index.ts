@@ -35,6 +35,21 @@ let lastFailedTool: string | null = null;
 // every automatic signal. Cleared by `/skills off` (issue #118).
 let pinnedSkill: string | null = null;
 
+// Once a turn's prompt correctly identifies one of these single-task-recurring
+// directives, latch that identification for the rest of the session. The raw
+// predicates (looksLikeGpt2CheckpointTask / looksLikeRamanFittingTask) are pure
+// functions of the CURRENT turn's prompt only, but a mid-trial compaction's
+// continuation prompt is a generic "please continue" message that will never
+// itself contain the original task-triggering language -- without a latch, the
+// directive silently stops firing for the remainder of a long trial the moment
+// it compacts, which is exactly the scenario the compaction-continuation fix
+// in this PR exists for. Sourced from a real trial's task prompt only, on the
+// same first-turn basis the harness already uses to send the actual task
+// instructions -- these are not derived from later, potentially adversarial,
+// tool output.
+let sawGpt2CheckpointTask = false;
+let sawRamanFittingTask = false;
+
 // ── Intent keywords → likely tools ──────────────────────────────────────
 const INTENT_MAP: Record<string, string[]> = {
   read: ["read"], show: ["read"], view: ["read"], cat: ["read"],
@@ -690,7 +705,16 @@ export default function (pi: ExtensionAPI) {
   // resume logic (index.ts:331-338) which gates on `ctx.mode`/`willRetry`
   // because *that* side effect (queuing a continuation prompt) would be
   // wrong to duplicate. Worst case here is one redundant re-send of a block
-  // that was already about to be re-selected anyway.
+  // that was already about to be re-selected anyway -- and for the
+  // gpt2-checkpoint/raman-fitting directives specifically, "about to be
+  // re-selected" is true only because that identification is latched
+  // (sawGpt2CheckpointTask / sawRamanFittingTask, declared above) for the
+  // rest of the session once made. This reset does not by itself regenerate
+  // a directive: it only lets an already-current block back through the
+  // dedupe once the model's live context can no longer be assumed to hold
+  // the last copy. The latch is what keeps the directive wanting to fire
+  // every turn; the reset is what lets that resend actually happen
+  // post-compaction.
   pi.on("session_compact", async () => {
     shouldInject.reset();
   });
@@ -737,8 +761,15 @@ export default function (pi: ExtensionAPI) {
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
     const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
-    const gpt2CheckpointTask = shouldInjectGpt2CheckpointDirective(event.prompt ?? "", allowed);
-    const ramanFittingTask = shouldInjectRamanFittingDirective(event.prompt ?? "", allowed);
+    // Latched, not the raw per-turn result -- see sawGpt2CheckpointTask /
+    // sawRamanFittingTask above. Once either has been true on any turn this
+    // session, it stays true for every turn after, including a generic
+    // post-compaction continuation prompt that matches neither predicate on
+    // its own.
+    sawGpt2CheckpointTask ||= shouldInjectGpt2CheckpointDirective(event.prompt ?? "", allowed);
+    sawRamanFittingTask ||= shouldInjectRamanFittingDirective(event.prompt ?? "", allowed);
+    const gpt2CheckpointTask = sawGpt2CheckpointTask;
+    const ramanFittingTask = sawRamanFittingTask;
 
     if (
       selected.length === 0 &&

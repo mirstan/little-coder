@@ -829,6 +829,102 @@ describe("raman-fitting directive triggers on Raman + graphene/named-band phrasi
   });
 });
 
+// The looksLike*/shouldInject* predicates are pure functions of the CURRENT
+// turn's prompt only -- nothing persisted the ORIGINAL task-triggering
+// prompt text across turns. A mid-trial compaction's continuation prompt is
+// a generic "please continue" message (verified against
+// benchmarks/rpc_client.py's own COMPACTION_CONTINUE_PROMPT below) that
+// contains none of the gpt2/raman trigger language, so without a latch that
+// remembers a positive identification once made, the directive silently
+// stops firing for the rest of a long trial the moment it compacts -- even
+// though iteration 1's session_compact/reset() fix lets an identical block
+// back through the dedupe. These tests pin that the identification itself
+// now survives across turns, and that a session which never trips either
+// predicate still never gets either directive (the latch must not become an
+// always-on switch).
+describe("gpt2-checkpoint/raman-fitting identification latches across turns", () => {
+  const SHELL_ONLY = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"];
+
+  // Mirrors benchmarks/rpc_client.py's COMPACTION_CONTINUE_PROMPT verbatim --
+  // no "Raman"/graphene/band language and no GPT-2/.ckpt language.
+  const GENERIC_CONTINUATION_PROMPT =
+    "Your session context was compacted to free space, which interrupted " +
+    "what you were doing. The task is not complete — please continue from " +
+    "where you left off. If the task is actually already complete and " +
+    "verified, say so explicitly and stop.";
+
+  const RAMAN_PROMPT =
+    "You are given the output file of a Raman Setup. We used it to measure " +
+    "some graphene sample.\n" +
+    'Fit the G and 2D Peak of the spectrum and return the x0, gamma, ' +
+    'amplitude and offset of the peaks and write them to a file called ' +
+    '"/app/results.json".';
+
+  const GPT2_PROMPT =
+    "I have downloaded the gpt-2 weights stored as a TF .ckpt. Write me a " +
+    "dependency-free C file that samples from the model with arg-max " +
+    "sampling. Call your program /app/gpt2.c, I will compile with gcc -O3 " +
+    "-lm. It should read the .ckpt and the .bpe file. Your c program must " +
+    'be <5000 bytes. I will run it /app/a.out gpt2-124M.ckpt vocab.bpe ' +
+    '"[input string here]" and you should continue the output under ' +
+    "whatever GPT-2 would print for the next 20 tokens.";
+
+  // The latch is module-level state (like recentToolCalls/lastFailedTool
+  // above), so each test drives a freshly imported copy rather than leaking
+  // a latched identification into its neighbours.
+  async function freshHandlers(): Promise<Record<string, Handler>> {
+    vi.resetModules();
+    const mod = await import("./index.ts");
+    return handlersFor(mod.default);
+  }
+
+  function shellOnlyTurn(prompt: string) {
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = SHELL_ONLY;
+    return event;
+  }
+
+  it("keeps injecting the raman-fitting directive on a later, generic continuation turn once turn 1 identified the task", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(shellOnlyTurn(RAMAN_PROMPT), ctx);
+    expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+
+    // Mid-run compaction: the dedupe is reset (iteration 1's fix) but the
+    // raw per-turn predicate would evaluate false on this turn's own prompt.
+    await h.session_compact({}, ctx);
+
+    const third = await h.before_agent_start(shellOnlyTurn(GENERIC_CONTINUATION_PROMPT), ctx);
+    expect(third?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+  });
+
+  it("gives the gpt2-checkpoint identification the identical latch treatment", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(shellOnlyTurn(GPT2_PROMPT), ctx);
+    expect(first?.message?.content ?? "").toContain("## TF checkpoint format note");
+
+    await h.session_compact({}, ctx);
+
+    const third = await h.before_agent_start(shellOnlyTurn(GENERIC_CONTINUATION_PROMPT), ctx);
+    expect(third?.message?.content ?? "").toContain("## TF checkpoint format note");
+  });
+
+  it("never injects either directive for a session that never trips either predicate on any turn", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(shellOnlyTurn("edit the parser to fix the bug"), ctx);
+    expect(first?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+    expect(first?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+
+    await h.session_compact({}, ctx);
+
+    const second = await h.before_agent_start(shellOnlyTurn(GENERIC_CONTINUATION_PROMPT), ctx);
+    expect(second?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+    expect(second?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+  });
+});
+
 describe("knowledge-inject still injects after the #73 conversion", () => {
   // Scoring is word=1.0 / phrase=2.0 against MIN_SCORE_THRESHOLD=2.0, so the
   // prompt needs one phrase keyword or two single-word ones from a shipped
