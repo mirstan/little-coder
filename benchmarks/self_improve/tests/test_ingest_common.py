@@ -365,3 +365,76 @@ def test_summarize_for_reflection_prioritizes_error_tool_calls():
 
 def test_summarize_for_reflection_handles_empty_input():
     assert summarize_for_reflection(assistant_text="", tool_calls=[], cap=8_000) == ""
+
+
+# ── content hashes (skill-inject-hashes / knowledge-inject-hashes) ─────────
+# The emitters keep their `+N [...]` line byte-identical and send the hashes
+# on a SECOND notify line, so the usage regex must keep ignoring it and
+# merge_component_usage attaches the hashes only when present.
+
+
+def test_parse_notification_line_ignores_the_hashes_line():
+    """The hashes line is a sidecar, not a usage event: counting it would
+    double every invocation_count."""
+    assert parse_notification_line('[info] skill-inject-hashes: {"bash":"0123456789ab"}') == []
+    assert parse_notification_line('[info] knowledge-inject-hashes: {"DP":"0123456789ab"}') == []
+
+
+def test_merge_component_usage_attaches_content_hashes_when_present():
+    lines = [
+        '[info] skill-inject: +2 ["bash","read"]',
+        '[info] skill-inject-hashes: {"bash":"aaaaaaaaaaaa","read":"bbbbbbbbbbbb"}',
+        '[info] skill-inject: +1 ["bash"]',
+        '[info] skill-inject-hashes: {"bash":"cccccccccccc"}',
+    ]
+    merged = {u.pred_name: u for u in merge_component_usage(lines)}
+    assert merged["skills_tools_bash"].invocation_count == 2
+    # Same card, two different renderings (e.g. gated lines stripped): both
+    # hashes kept, deduped and sorted so the record is deterministic.
+    assert merged["skills_tools_bash"].content_hashes == ["aaaaaaaaaaaa", "cccccccccccc"]
+    assert merged["skills_tools_read"].content_hashes == ["bbbbbbbbbbbb"]
+
+
+def test_merge_component_usage_resolves_knowledge_hashes_via_topic_index():
+    index = {_index_key("knowledge-inject", "Error handling, retries"): "skills_knowledge_retries"}
+    lines = [
+        '[info] knowledge-inject: +1 ["Error handling, retries"]',
+        '[info] knowledge-inject-hashes: {"Error handling, retries":"dddddddddddd"}',
+    ]
+    merged = merge_component_usage(lines, knowledge_topic_index=index)
+    assert merged == [
+        ComponentUsage(
+            pred_name="skills_knowledge_retries",
+            invocation_count=1,
+            content_hashes=["dddddddddddd"],
+        )
+    ]
+
+
+def test_merge_component_usage_old_format_has_no_hashes():
+    merged = merge_component_usage(["[info] skill-inject: +1 [bash]"])
+    assert merged == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]
+    assert merged[0].content_hashes == []
+
+
+def test_merge_component_usage_never_creates_a_record_from_a_hashes_line_alone():
+    """A hashes line whose names never appeared in a usage line (an unresolved
+    knowledge topic the usage line dropped, or a truncated log) must not
+    invent a phantom component record."""
+    lines = [
+        '[info] knowledge-inject: +1 ["Unknown topic"]',
+        '[info] knowledge-inject-hashes: {"Unknown topic":"eeeeeeeeeeee"}',
+        '[info] skill-inject-hashes: {"orphan":"ffffffffffff"}',
+    ]
+    assert merge_component_usage(lines, knowledge_topic_index={}) == []
+
+
+def test_merge_component_usage_tolerates_a_malformed_hashes_line():
+    lines = [
+        "[info] skill-inject: +1 [bash]",
+        "[info] skill-inject-hashes: {not json",
+        '[info] skill-inject-hashes: ["a list", "not a map"]',
+        '[info] skill-inject-hashes: {"bash": 7}',
+    ]
+    merged = merge_component_usage(lines)
+    assert merged == [ComponentUsage(pred_name="skills_tools_bash", invocation_count=1)]

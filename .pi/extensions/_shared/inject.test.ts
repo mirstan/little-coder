@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { injectMode, injectionResult, makeDedupe } from "./inject.ts";
+import { contentHash, injectMode, injectionResult, makeDedupe } from "./inject.ts";
 
 const messageMode = {} as NodeJS.ProcessEnv;
 const systemMode = { LITTLE_CODER_INJECT_MODE: "system" } as NodeJS.ProcessEnv;
@@ -60,5 +60,16 @@ describe("makeDedupe", () => {
     const knowledge = makeDedupe(messageMode);
     expect(skills("A")).toBe(true);
     expect(knowledge("A")).toBe(true); // not shadowed by skill-inject's state
+  });
+});
+
+describe("contentHash", () => {
+  it("is the first 12 hex chars of the text's sha256", () => {
+    // FIPS 180-2 test vector: sha256("abc") = ba7816bf8f01cfea...
+    expect(contentHash("abc")).toBe("ba7816bf8f01");
+  });
+
+  it("changes when a single byte of the body changes", () => {
+    expect(contentHash("use bash\n")).not.toBe(contentHash("use bash"));
   });
 });

@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseSkillFile } from "./frontmatter.ts";
-import { injectionResult, makeDedupe } from "../_shared/inject.ts";
+import { contentHash, injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
 import { SHELL_TOOLS } from "../_shared/shell-write.ts";
 
@@ -717,6 +717,16 @@ export default function (pi: ExtensionAPI) {
       if (temporalTask) parts.push("+temporal-directive");
       if (gpt2CheckpointTask) parts.push("+gpt2-checkpoint-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
+      if (selected.length > 0) {
+        // Content hashes on a separate line, so the usage line above stays
+        // byte-identical for every existing reader (ingest regex, tb_status.sh,
+        // gaia_status.sh). Hashed over the body exactly as buildBlock renders
+        // it: the gated-line stripping changes the text the model sees.
+        const hashes = Object.fromEntries(
+          selected.map((s) => [s.targetTool, contentHash(stripGatedLines(s.body, allowed))]),
+        );
+        ctx.ui.notify(`skill-inject-hashes: ${JSON.stringify(hashes)}`, "info");
+      }
     } catch {
       // UI unavailable in some run modes — silent best-effort
     }

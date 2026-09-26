@@ -26,6 +26,8 @@
 // `LITTLE_CODER_INJECT_MODE=system` restores the old system-prompt behavior,
 // which is what the whitepaper scaffold reproduction was measured against.
 
+import { createHash } from "node:crypto";
+
 export type InjectMode = "message" | "system";
 
 /** Shape of what a `before_agent_start` handler may return. */
@@ -84,4 +86,14 @@ export function makeDedupe(env: NodeJS.ProcessEnv = process.env): (block: string
     last = block;
     return true;
   };
+}
+
+/**
+ * Short content id for one injected body: the first 12 hex chars of its
+ * sha256. skill-inject and knowledge-inject report it per selected entry on a
+ * `<source>-hashes:` notify line, so the self-improve ingest can tell which
+ * VERSION of a card a trajectory actually saw, not just its name.
+ */
+export function contentHash(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 12);
 }

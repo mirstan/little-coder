@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseSkillFile } from "../skill-inject/frontmatter.ts";
-import { injectionResult, makeDedupe } from "../_shared/inject.ts";
+import { contentHash, injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
 
 // ── Knowledge-entry registry ────────────────────────────────────────────
@@ -164,6 +164,10 @@ export default function (pi: ExtensionAPI) {
         `knowledge-inject: +${selected.length} ${JSON.stringify(selected.map((e) => e.topic))}`,
         "info",
       );
+      // Per-entry content hashes on their own line so the one above stays
+      // byte-identical for existing readers; see skill-inject's twin.
+      const hashes = Object.fromEntries(selected.map((e) => [e.topic, contentHash(e.body)]));
+      ctx.ui.notify(`knowledge-inject-hashes: ${JSON.stringify(hashes)}`, "info");
     } catch {
       // best-effort
     }

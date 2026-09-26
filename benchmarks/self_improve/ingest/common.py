@@ -8,6 +8,10 @@ not be re-derived from guesswork -- see TDD_SPEC.md §0 for the confirmed
 source references:
   .pi/extensions/skill-inject/index.ts        'skill-inject: +N ["tool1","tool2"]'
   .pi/extensions/knowledge-inject/index.ts    'knowledge-inject: +N ["topic1","topic2"]'
+Newer emitters follow each of those with a sidecar line carrying a
+sha256[:12] of every injected body, keyed by the same names:
+  'skill-inject-hashes: {"tool1":"<hash>",...}'
+  'knowledge-inject-hashes: {"topic1":"<hash>",...}'
 
 The bracketed payload is a JSON array of strings. Historical trajectory data
 predates that and carries a bare comma-joined list instead, ambiguous
@@ -37,6 +41,15 @@ logger = logging.getLogger(__name__)
 _NOTIF_RE = re.compile(
     r"^\[(?P<level>\w+)\]\s+(?P<source>skill-inject|knowledge-inject):"
     r"\s+(?:\+\d+\s+(?P<payload>\[.*\]))?"
+)
+
+# Sidecar line each emitter sends right after its usage line:
+# `<source>-hashes: {"<name>": "<sha256[:12] of the injected body>", ...}`.
+# A separate line (not an extension of the usage line) so every older reader
+# of the usage line -- _NOTIF_RE above, tb_status.sh, gaia_status.sh -- sees
+# it byte-identical and ignores this one.
+_HASHES_RE = re.compile(
+    r"^\[\w+\]\s+(?P<source>skill-inject|knowledge-inject)-hashes:\s+(?P<payload>\{.*\})\s*$"
 )
 
 
@@ -217,24 +230,63 @@ def parse_notification_line(
     return usages
 
 
+def _parse_hashes_line(
+    line: str, knowledge_topic_index: dict[str, str] | None = None
+) -> list[tuple[str, str]]:
+    """(pred_name, hash) pairs from one `<source>-hashes:` sidecar line; []
+    for any other or malformed line. Names resolve by the same rules as
+    parse_notification_line, minus its warnings: the paired usage line has
+    already warned about the same names."""
+    m = _HASHES_RE.match(line)
+    if not m:
+        return []
+    try:
+        parsed = json.loads(m.group("payload"))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    source = m.group("source")
+    index = knowledge_topic_index or {}
+    pairs = []
+    for name, digest in parsed.items():
+        if not isinstance(digest, str) or not digest:
+            continue
+        pred_name = index.get(_index_key(source, name))
+        if pred_name is None:
+            if source != "skill-inject":
+                continue
+            pred_name = f"skills_tools_{name}"
+        pairs.append((pred_name, digest))
+    return pairs
+
+
 def merge_component_usage(
     lines: list[str],
     follows_error: bool = False,
     knowledge_topic_index: dict[str, str] | None = None,
 ) -> list[ComponentUsage]:
     """Parse every line and aggregate by pred_name: sum invocation_count,
-    OR was_error_context across contributing lines."""
+    OR was_error_context across contributing lines, and union the content
+    hashes from any `-hashes:` sidecar lines (absent in older data)."""
     counts: dict[str, int] = {}
     error_flags: dict[str, bool] = {}
+    hashes: dict[str, set[str]] = {}
     for line in lines:
+        for pred_name, digest in _parse_hashes_line(line, knowledge_topic_index):
+            hashes.setdefault(pred_name, set()).add(digest)
         for usage in parse_notification_line(line, knowledge_topic_index):
             counts[usage.pred_name] = counts.get(usage.pred_name, 0) + usage.invocation_count
             error_flags[usage.pred_name] = error_flags.get(usage.pred_name, False) or follows_error
+    # Hashes attach only to components a usage line counted, so a sidecar
+    # alone (truncated log, or a knowledge topic the usage line dropped as
+    # unresolvable) can never invent a record.
     return [
         ComponentUsage(
             pred_name=name,
             invocation_count=count,
             was_error_context=error_flags[name],
+            content_hashes=sorted(hashes.get(name, ())),
         )
         for name, count in counts.items()
     ]

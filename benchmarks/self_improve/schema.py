@@ -10,6 +10,10 @@ class ComponentUsage(BaseModel):
     pred_name: str
     invocation_count: int = Field(default=0, ge=0)
     was_error_context: bool = False
+    # sha256[:12] of each distinct body text actually injected for this
+    # component (from the `<source>-hashes:` notify sidecar line). Empty for
+    # trajectories recorded before the emitters sent hashes.
+    content_hashes: list[str] = Field(default_factory=list)
 
 
 class NormalizedTrajectory(BaseModel):

@@ -11,6 +11,7 @@ import setupSkillInject, {
   shouldInjectGpt2CheckpointDirective,
 } from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
+import { contentHash } from "../_shared/inject.ts";
 
 // End-to-end check of the #73 conversion: drive the real `before_agent_start`
 // handlers of both injectors, against the real skills/ files, and assert the
@@ -42,6 +43,47 @@ function handlersFor(setup: (pi: any) => void): Record<string, Handler> {
 }
 
 const ctx = { ui: { notify: () => {} } };
+
+/** A ctx whose notify calls are kept, for asserting on the harness-facing lines. */
+function recordingCtx() {
+  const messages: string[] = [];
+  return { ctx: { ui: { notify: (m: string) => { messages.push(m); } } }, messages };
+}
+
+/**
+ * The usage line must stay byte-compatible with the ingest parser
+ * (`<source>: +N [json names]`), and the hashes ride on a second line keyed by
+ * exactly those names. Returns the names.
+ */
+function expectUsageThenHashes(messages: string[], source: string): string[] {
+  expect(messages).toHaveLength(2);
+  const usage = messages[0].match(new RegExp(`^${source}: \\+(\\d+) (\\[.*\\])$`));
+  expect(usage, messages[0]).not.toBeNull();
+  const names: string[] = JSON.parse(usage![2]);
+  expect(names).toHaveLength(Number(usage![1]));
+
+  const prefix = `${source}-hashes: `;
+  expect(messages[1].startsWith(prefix), messages[1]).toBe(true);
+  const hashes = JSON.parse(messages[1].slice(prefix.length));
+  expect(Object.keys(hashes)).toEqual(names);
+  for (const h of Object.values(hashes)) expect(h).toMatch(/^[0-9a-f]{12}$/);
+  return names;
+}
+
+/**
+ * Both injectors render each entry as `\n### <name>\n<body>\n`, back to back.
+ * Pulls one body back out; the entry must be followed by another entry or by
+ * the end of the block (i.e. no directive appended after it).
+ */
+function entryBodyFromBlock(block: string, name: string): string {
+  const marker = `\n### ${name}\n`;
+  const start = block.indexOf(marker);
+  expect(start, `no "### ${name}" section in the block`).toBeGreaterThanOrEqual(0);
+  const bodyStart = start + marker.length;
+  // The next entry's marker begins with the body's own trailing "\n".
+  const next = block.indexOf("\n\n### ", bodyStart);
+  return next === -1 ? block.slice(bodyStart, -1) : block.slice(bodyStart, next);
+}
 
 /** A turn event with the little-coder budgets the extensions expect. */
 function turn(prompt: string, systemPrompt = "BASE SYSTEM PROMPT") {
@@ -81,6 +123,35 @@ describe("skill-inject still injects after the #73 conversion", () => {
 
     expect(result?.message.content).toContain('"name": "bash"');
     expect(result.message.content).not.toContain('"name": "Bash"');
+  });
+
+  it("keeps its usage notify line and follows it with a content-hash sidecar", async () => {
+    const { ctx: rec, messages } = recordingCtx();
+    // No research/temporal/gpt2 trigger words, so the block is cards only.
+    const result = await handlerFor(setupSkillInject)(turn("edit the parser to fix the bug"), rec);
+
+    const tools = expectUsageThenHashes(messages, "skill-inject");
+    expect(tools.length).toBeGreaterThan(0);
+    // Hash of the card body as actually injected (after gated-line stripping).
+    const hashes = JSON.parse(messages[1].slice("skill-inject-hashes: ".length));
+    for (const tool of tools) {
+      expect(hashes[tool]).toBe(contentHash(entryBodyFromBlock(result.message.content, tool)));
+    }
+
+    // Same selection from a second handler instance -> same hashes (ingest
+    // compares them across runs).
+    const again = recordingCtx();
+    await handlerFor(setupSkillInject)(turn("edit the parser to fix the bug"), again.ctx);
+    expect(again.messages).toEqual(messages);
+  });
+
+  it("sends no hashes line when only a directive fired", async () => {
+    const { ctx: rec, messages } = recordingCtx();
+    const event = turn("research the history of the transistor online");
+    // No skill budget -> no cards, but research directive still gated on tools.
+    event.systemPromptOptions.littleCoder.skillTokenBudget = 1;
+    await handlerFor(setupSkillInject)(event, rec);
+    expect(messages).toEqual(["skill-inject: +research-directive"]);
   });
 
   // The half of the pi 0.83 rename nobody reported. The registry is keyed by
@@ -746,6 +817,21 @@ describe("knowledge-inject still injects after the #73 conversion", () => {
     expect(result.message.display).toBe(false);
     expect(result.message.content).toContain("## Algorithm Reference");
     expect(result.systemPrompt).toBeUndefined();
+  });
+
+  it("keeps its usage notify line and follows it with a content-hash sidecar", async () => {
+    const { ctx: rec, messages } = recordingCtx();
+    const result = await handlerFor(setupKnowledgeInject)(turn(PROMPT), rec);
+
+    expect(result, "no knowledge entry scored above threshold").toBeDefined();
+    const topics = expectUsageThenHashes(messages, "knowledge-inject");
+    // Each hash is of the exact entry body injected, which buildBlock renders
+    // as `### <topic>\n<body>\n` inside the block.
+    const hashes = JSON.parse(messages[1].slice("knowledge-inject-hashes: ".length));
+    for (const topic of topics) {
+      const body = entryBodyFromBlock(result.message.content, topic);
+      expect(hashes[topic]).toBe(contentHash(body));
+    }
   });
 
   it("falls back to the system prompt under LITTLE_CODER_INJECT_MODE=system", async () => {
