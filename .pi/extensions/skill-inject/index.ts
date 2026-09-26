@@ -680,6 +680,21 @@ export default function (pi: ExtensionAPI) {
 
   const shouldInject = makeDedupe();
 
+  // Mid-run compaction (session_compact) rebuilds/summarizes the model's
+  // live conversation and can drop the block shouldInject last accepted out
+  // of it (issue: dedupe outlives the hidden message after compaction).
+  // shouldInject has no way to know that on its own -- it only compares
+  // against its own closure state -- so reset it here whenever pi reports a
+  // compaction, unconditionally: resetting a dedupe flag is harmless even
+  // when the compaction was TUI-triggered, unlike context-watchdog's own
+  // resume logic (index.ts:331-338) which gates on `ctx.mode`/`willRetry`
+  // because *that* side effect (queuing a continuation prompt) would be
+  // wrong to duplicate. Worst case here is one redundant re-send of a block
+  // that was already about to be re-selected anyway.
+  pi.on("session_compact", async () => {
+    shouldInject.reset();
+  });
+
   // Track tool usage across the whole session so recency + error-recovery
   // state is available on the next before_agent_start.
   pi.on("tool_result", async (event) => {

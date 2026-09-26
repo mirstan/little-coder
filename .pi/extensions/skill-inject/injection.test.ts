@@ -165,6 +165,36 @@ describe("skill-inject still injects after the #73 conversion", () => {
     expect(second).toBeUndefined();
   });
 
+  // Mid-run compaction can drop the previously-injected block out of the
+  // model's actual live conversation (session_compact rebuilds/summarizes
+  // history), while skill-inject's own dedupe still remembers it as "last
+  // sent" and would otherwise wrongly suppress an identical re-send forever.
+  // skill-inject must register a session_compact handler that resets that
+  // dedupe state, so the next before_agent_start re-injects even a
+  // textually-identical block.
+  it("re-injects an identical block after a session_compact event fires", async () => {
+    const handlers = handlersFor(setupSkillInject);
+    expect(handlers.before_agent_start).toBeDefined();
+    expect(handlers.session_compact).toBeDefined();
+
+    const first = await handlers.before_agent_start(turn("edit the parser"), ctx);
+    expect(first?.message).toBeDefined();
+
+    // Without compaction, the regression case still holds: an identical
+    // block on the very next turn is suppressed.
+    const second = await handlers.before_agent_start(turn("edit the parser"), ctx);
+    expect(second).toBeUndefined();
+
+    // session_compact fires (mirroring context-watchdog's registration
+    // shape) -- the model's live context may no longer contain the block.
+    await handlers.session_compact({}, ctx);
+
+    // The next turn producing the identical block must be sent again.
+    const third = await handlers.before_agent_start(turn("edit the parser"), ctx);
+    expect(third?.message).toBeDefined();
+    expect(third.message.content).toBe(first.message.content);
+  });
+
   it("falls back to the system prompt under LITTLE_CODER_INJECT_MODE=system", async () => {
     process.env.LITTLE_CODER_INJECT_MODE = "system";
     const handler = handlerFor(setupSkillInject);
