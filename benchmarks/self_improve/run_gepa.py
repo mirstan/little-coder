@@ -49,7 +49,12 @@ from benchmarks.self_improve.live_budget import (
     render_estimate,
 )
 from benchmarks.self_improve.live_cache import LiveResultCache
-from benchmarks.self_improve.live_eval import PolyglotLiveRunner, _attempt_timeout_s, _sanitize_candidate
+from benchmarks.self_improve.live_eval import (
+    LiveEvalHarnessError,
+    PolyglotLiveRunner,
+    _attempt_timeout_s,
+    _sanitize_candidate,
+)
 from benchmarks.self_improve.polyglot_adapter import PolyglotGEPAAdapter
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 from benchmarks.self_improve.spend_log import SpendLog
@@ -433,6 +438,16 @@ def _run_live(args: argparse.Namespace) -> int:
                 )
                 spend_log.run_end(reason="budget_backstop", error=str(e))
                 return 3
+            except LiveEvalHarnessError as e:
+                # run_batch() refuses to score a persistent harness failure
+                # (see LiveEvalHarnessError) -- same partial persistence as
+                # the budget backstop above, distinct reason and exit code.
+                print(f"\nHarness error, stopping baseline: {e}", file=sys.stderr)
+                (out_dir / "seed_baseline.json").write_text(
+                    json.dumps({r.task_id: r.to_dict() for r in results}, indent=2, default=str)
+                )
+                spend_log.run_end(reason="harness_error", error=str(e))
+                return 4
             print("\n=== Baseline results ===")
             (out_dir / "seed_baseline.json").write_text(
                 json.dumps({r.task_id: r.to_dict() for r in results}, indent=2, default=str)
@@ -492,7 +507,12 @@ def _run_live(args: argparse.Namespace) -> int:
                 reflection_minibatch_size=args.reflection_minibatch_size,
                 module_selector=args.module_selector,
                 use_merge=False,
+                # Skip reflection when the parent already scored perfect on
+                # every sampled exercise -- nothing to improve, and the child
+                # minibatch would be pure spend. GEPA compares per exercise
+                # (all(s >= perfect_score)); 1.0 is pass on attempt 1.
                 skip_perfect_score=args.skip_perfect_score,
+                perfect_score=1.0,
                 cache_evaluation=True,
                 track_best_outputs=True,
                 display_progress_bar=False,
@@ -557,7 +577,9 @@ def main() -> int:
                           "to spend reflection LM budget.")
     ap.add_argument("--reflection-minibatch-size", type=int, default=2)
     ap.add_argument("--module-selector", choices=["round_robin", "all"], default="round_robin")
-    ap.add_argument("--skip-perfect-score", action="store_true")
+    ap.add_argument("--skip-perfect-score", action=argparse.BooleanOptionalAction, default=True,
+                     help="Skip reflection on a minibatch the parent already solved perfectly "
+                          "(default on; --no-skip-perfect-score to disable).")
 
     ap.add_argument("--live-cache-dir", default=None)
     ap.add_argument("--no-live-cache", action="store_true")

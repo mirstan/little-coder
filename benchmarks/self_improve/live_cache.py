@@ -1,4 +1,11 @@
-"""On-disk memo: (candidate, run_config, exercise_id) -> live run result.
+"""On-disk memo: (candidate, run_config, exercise_id, sample_index) -> live
+run result.
+
+Callers must pass the SANITIZED candidate (live_eval._sanitize_candidate) --
+the text that actually gets materialized and run -- not GEPA's raw proposal:
+two proposals differing only by a re-emitted frontmatter block execute
+byte-identical files and must share one entry. (Sanitizing can't happen in
+here: live_eval imports this module.)
 
 Investigated whether GEPA's own EvaluationCache (gepa/core/state.py, enabled
 via gepa.optimize(cache_evaluation=True)) makes this unnecessary. Verified
@@ -53,14 +60,18 @@ class LiveResultCache:
     def __init__(self, root: Path):
         self.root = Path(root)
 
-    def _path_for(self, cand_hash: str, cfg_hash: str, exercise_id: str) -> Path:
+    def _path_for(self, cand_hash: str, cfg_hash: str, exercise_id: str, sample_index: int = 0) -> Path:
         safe_exercise = exercise_id.replace("/", "__")
-        return self.root / cfg_hash[:12] / cand_hash[:16] / f"{safe_exercise}.json"
+        # Sample 0 keeps the pre-sample_index filename so an existing memo
+        # (for any candidate with no frontmatter to sanitize away) stays warm.
+        suffix = "" if sample_index == 0 else f".sample{int(sample_index)}"
+        return self.root / cfg_hash[:12] / cand_hash[:16] / f"{safe_exercise}{suffix}.json"
 
     def get(
         self, candidate: Mapping[str, str], run_config: Mapping[str, Any], exercise_id: str,
+        sample_index: int = 0,
     ) -> dict | None:
-        path = self._path_for(candidate_hash(candidate), run_config_hash(run_config), exercise_id)
+        path = self._path_for(candidate_hash(candidate), run_config_hash(run_config), exercise_id, sample_index)
         if not path.exists():
             return None
         try:
@@ -77,11 +88,11 @@ class LiveResultCache:
 
     def put(
         self, candidate: Mapping[str, str], run_config: Mapping[str, Any],
-        exercise_id: str, result: Mapping[str, Any],
+        exercise_id: str, result: Mapping[str, Any], sample_index: int = 0,
     ) -> None:
         if result.get("status") in ENVIRONMENTAL_STATUSES:
             return
-        path = self._path_for(candidate_hash(candidate), run_config_hash(run_config), exercise_id)
+        path = self._path_for(candidate_hash(candidate), run_config_hash(run_config), exercise_id, sample_index)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
         tmp.write_text(json.dumps(dict(result), indent=2))

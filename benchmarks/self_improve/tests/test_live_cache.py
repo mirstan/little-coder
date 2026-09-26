@@ -130,3 +130,25 @@ def test_exercise_id_with_slash_does_not_create_nested_directories(tmp_path):
     cache.put(candidate, run_config, "python/wordy", {"status": "pass_1", "score": 1.0})
     cand_dir = cache._path_for(candidate_hash(candidate), run_config_hash(run_config), "python/wordy").parent
     assert list(cand_dir.iterdir()) == [cand_dir / "python__wordy.json"]
+
+
+def test_sample_index_distinguishes_cache_keys(tmp_path):
+    """k repeated samples of one (candidate, exercise) are distinct outcomes
+    of a stochastic agent -- one sample must never be served back as another."""
+    cache = LiveResultCache(tmp_path)
+    candidate = {"agents_md": "text"}
+    run_config = {"model": "m1"}
+    cache.put(candidate, run_config, "python/wordy", {"status": "pass_1", "score": 1.0}, sample_index=0)
+    cache.put(candidate, run_config, "python/wordy", {"status": "fail", "score": 0.0}, sample_index=1)
+    assert cache.get(candidate, run_config, "python/wordy", sample_index=0)["status"] == "pass_1"
+    assert cache.get(candidate, run_config, "python/wordy", sample_index=1)["status"] == "fail"
+    assert cache.get(candidate, run_config, "python/wordy", sample_index=2) is None
+
+
+def test_sample_index_zero_is_the_default(tmp_path):
+    cache = LiveResultCache(tmp_path)
+    candidate = {"agents_md": "text"}
+    run_config = {"model": "m1"}
+    cache.put(candidate, run_config, "python/wordy", {"status": "pass_1", "score": 1.0})
+    assert cache.get(candidate, run_config, "python/wordy", sample_index=0) == {"status": "pass_1", "score": 1.0}
+    assert cache.get(candidate, run_config, "python/wordy", sample_index=1) is None

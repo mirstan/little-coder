@@ -465,3 +465,72 @@ def test_spend_log_zeroes_duration_for_a_cache_hit(source_repo, fake_practice, t
     assert len(exercise_records) == 2
     assert all(r["memo_hit"] is True for r in exercise_records)
     assert all(r["duration_s"] == 0.0 for r in exercise_records)
+
+
+@pytest.mark.parametrize("extra_flags,expected_skip", [([], True), (["--no-skip-perfect-score"], False)])
+def test_optimize_skips_perfect_scores_by_default_and_passes_perfect_score(
+    source_repo, fake_practice, tmp_path, monkeypatch, extra_flags, expected_skip,
+):
+    """Without skip_perfect_score, GEPA pays for reflection plus a child
+    minibatch on a parent that already solved every sampled exercise --
+    nothing to improve. perfect_score=1.0 is the per-exercise max (pass on
+    attempt 1); GEPA compares each minibatch score against it."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+    captured = {}
+
+    def fake_optimize(**kwargs):
+        captured.update(kwargs)
+        return type("Result", (), {"best_candidate": dict(kwargs["seed_candidate"])})()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--reflection-minibatch-size", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--reflection-model", "reflection/fake", "--confirm-real-run",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--yes", *extra_flags,
+    ])
+    assert code == 0
+    assert captured["skip_perfect_score"] is expected_skip
+    assert captured["perfect_score"] == 1.0
+
+
+def test_baseline_only_persists_partial_results_on_a_persistent_harness_error(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """run_batch() now raises LiveEvalHarnessError instead of returning a
+    0.0 harness_error result -- baseline mode must still write what DID run
+    rather than crash and lose it."""
+    from benchmarks.self_improve.live_eval import LiveEvalHarnessError, LiveRunResult, PolyglotLiveRunner
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+
+    def fake_run_batch(self, candidate, specs, *, sample_index=0):
+        (spec,) = specs
+        if spec.exercise == "acronym":
+            raise LiveEvalHarnessError("results file missing")
+        return [LiveRunResult(task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
+                              status="pass_1", score=1.0, success=True)]
+
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", fake_run_batch)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
+    ])
+    assert code == 4
+    seed_baseline = json.loads((out_dir / "seed_baseline.json").read_text())
+    assert list(seed_baseline) == ["python/wordy"]
+    records = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()]
+    assert records[-1].get("reason") == "harness_error"

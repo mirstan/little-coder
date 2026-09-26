@@ -638,3 +638,99 @@ def test_attempt_timeout_default_from_source_warns_on_non_utf8_file(tmp_path, ca
 
     assert value == _ATTEMPT_TIMEOUT_S_HARDCODED_FALLBACK
     assert "could not read" in caplog.text
+
+
+def test_cache_is_keyed_on_the_sanitized_candidate(runner_factory, tmp_path, monkeypatch):
+    """materialize() writes _sanitize_candidate(candidate), so two
+    candidates differing only by a re-emitted frontmatter block run
+    byte-identical files -- keying on the raw text paid twice for one outcome."""
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    cache = LiveResultCache(tmp_path / "cache")
+    with_frontmatter = {"skills_tools_bash": "---\nname: bash\n---\nSame guidance.\n"}
+    plain = {"skills_tools_bash": "Same guidance.\n"}
+
+    for runner in runner_factory(cache=cache):
+        first = runner.run_batch(with_frontmatter, [ExerciseSpec("wordy")])
+
+    for runner in runner_factory(cache=cache):
+        def _must_not_run(*a, **kw):
+            raise AssertionError("the sanitized-equal candidate should have been a cache hit")
+        monkeypatch.setattr(runner, "_run_one_uncached", _must_not_run)
+        second = runner.run_batch(plain, [ExerciseSpec("wordy")])
+
+    assert first[0].from_cache is False
+    assert second[0].from_cache is True
+
+
+def test_run_batch_sample_index_selects_a_distinct_cache_entry(runner_factory, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    cache = LiveResultCache(tmp_path / "cache")
+    candidate = {"skills_tools_bash": "Some guidance.\n"}
+
+    for runner in runner_factory(cache=cache):
+        runner.run_batch(candidate, [ExerciseSpec("wordy")])
+        calls = []
+        real = runner._run_one_uncached
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: calls.append(spec) or real(spec))
+        again_default = runner.run_batch(candidate, [ExerciseSpec("wordy")])
+        other_sample = runner.run_batch(candidate, [ExerciseSpec("wordy")], sample_index=1)
+
+    assert again_default[0].from_cache is True
+    assert other_sample[0].from_cache is False
+    assert len(calls) == 1
+
+
+def _canned(spec, status, score=0.0, error=None):
+    return live_eval.LiveRunResult(
+        task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
+        status=status, score=score, success=score > 0, error=error,
+    )
+
+
+def test_harness_error_is_retried_in_place_and_never_cached(runner_factory, tmp_path, monkeypatch):
+    cache = LiveResultCache(tmp_path / "cache")
+    candidate = {"agents_md": "text"}
+    outcomes = iter(["harness_error", "pass_1"])
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        def _next(spec):
+            status = next(outcomes)
+            return _canned(spec, status, score=1.0 if status == "pass_1" else 0.0, error="boom")
+        monkeypatch.setattr(runner, "_run_one_uncached", _next)
+        results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
+        run_config = runner.run_config
+
+    assert [r.status for r in results] == ["pass_1"]
+    # Both genuine runs reach the audit trail; only the real outcome is scored.
+    assert [r.status for r in seen] == ["harness_error", "pass_1"]
+    cached = cache.get(live_eval._sanitize_candidate(candidate), run_config, "python/wordy")
+    assert cached["status"] == "pass_1"
+
+
+def test_persistent_harness_error_raises_instead_of_scoring_zero(runner_factory, tmp_path, monkeypatch):
+    """A harness failure says nothing about the candidate: scoring it 0.0
+    would poison GEPA's search, and EvaluationBatch.scores must stay
+    index-aligned, so it can't simply be dropped either."""
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "harness_error", error="results file missing"))
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="results file missing"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert len(seen) == 1 + live_eval.HARNESS_ERROR_RETRIES
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+def test_harness_error_retries_count_against_the_live_budget(runner_factory, monkeypatch):
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
+
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=2)
+    for runner in runner_factory(budget=budget):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "harness_error"))
+        with pytest.raises(LiveEvalBudgetExceeded):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])

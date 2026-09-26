@@ -125,6 +125,30 @@ def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
     return value
 
 
+#: In-place retries for an exercise whose run came back "harness_error"
+#: before PolyglotLiveRunner.run_batch() gives up and raises
+#: LiveEvalHarnessError. Each retry is a real run, charged to LiveBudget.
+HARNESS_ERROR_RETRIES = 2
+
+
+class LiveEvalHarnessError(RuntimeError):
+    """Raised by PolyglotLiveRunner.run_batch() when an exercise still comes
+    back "harness_error" after HARNESS_ERROR_RETRIES in-place retries.
+
+    A harness failure (missing/malformed results file, outer subprocess
+    timeout) says nothing about the candidate, so scoring it 0.0 would
+    poison the search -- and EvaluationBatch.scores must stay index-aligned
+    with the batch, so the exercise can't simply be dropped either. Mirrors
+    live_budget.LiveEvalBudgetExceeded: raise rather than fabricate a score.
+    Callers of gepa.optimize()/run_batch() (run_gepa.py) are expected to
+    catch it alongside LiveEvalBudgetExceeded and persist partial results.
+    Carries the last failing result as `.result`."""
+
+    def __init__(self, message: str, result: "LiveRunResult | None" = None):
+        super().__init__(message)
+        self.result = result
+
+
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
@@ -365,7 +389,13 @@ class PolyglotLiveRunner:
         candidate's (sanitized) text into place, verifying nothing else in
         the tree changed."""
         self.worktree.reset()
-        sanitized = _sanitize_candidate(candidate)
+        return self._write_sanitized(_sanitize_candidate(candidate))
+
+    def _write_sanitized(self, sanitized: Mapping[str, str]) -> list[Path]:
+        """materialize() minus the reset and the sanitize step --
+        _sanitize_candidate strips only ONE leading block, so it must not be
+        re-applied to text that is already sanitized (run_batch() sanitizes
+        once and uses that same dict for both the cache key and the write)."""
         mapping = yaml.safe_load(Path(self.components_yaml).read_text()) or {}
         unmapped = sorted(set(sanitized) - set(mapping))
         if unmapped:
@@ -387,19 +417,32 @@ class PolyglotLiveRunner:
         self.worktree.assert_only_expected_dirty(changed)
         return changed
 
-    def run_batch(self, candidate: Mapping[str, str], specs: Sequence[ExerciseSpec]) -> list[LiveRunResult]:
+    def run_batch(
+        self, candidate: Mapping[str, str], specs: Sequence[ExerciseSpec], *, sample_index: int = 0,
+    ) -> list[LiveRunResult]:
         """Cache-first, materialize-once: checks the on-disk memo for every
         requested exercise before touching the worktree at all; only if
         there's at least one miss does it reset+write the candidate, then
         runs each missed exercise. Returns results in the SAME order as
         `specs` (a hard requirement for the GEPA adapter built on top of
         this -- EvaluationBatch.scores must align index-for-index with the
-        batch)."""
+        batch).
+
+        The memo is keyed on the SANITIZED candidate, i.e. exactly what gets
+        written, plus `sample_index` (which of k repeated samples this is).
+
+        A "harness_error" run is retried in place up to HARNESS_ERROR_RETRIES
+        times and then raises LiveEvalHarnessError -- it is never returned as
+        a scored result and never cached."""
         run_config = self.run_config
+        sanitized = _sanitize_candidate(candidate)
         results: dict[str, LiveRunResult] = {}
         misses: list[ExerciseSpec] = []
         for spec in specs:
-            cached = self.cache.get(candidate, run_config, spec.task_id) if self.cache else None
+            cached = (
+                self.cache.get(sanitized, run_config, spec.task_id, sample_index=sample_index)
+                if self.cache else None
+            )
             if cached is not None:
                 result = LiveRunResult.from_dict(cached)
                 result.from_cache = True
@@ -410,25 +453,41 @@ class PolyglotLiveRunner:
                 misses.append(spec)
 
         if misses:
-            self.materialize(candidate)
+            self.worktree.reset()
+            self._write_sanitized(sanitized)
             for spec in misses:
-                if self.budget is not None:
-                    self.budget.check_before_exercise(spec.task_id)  # raises rather than faking a score
-                result = self._run_one_uncached(spec)
-                if self.budget is not None:
-                    self.budget.record_live_run()
+                for _try in range(1 + HARNESS_ERROR_RETRIES):
+                    if self.budget is not None:
+                        self.budget.check_before_exercise(spec.task_id)  # raises rather than faking a score
+                    result = self._run_one_uncached(spec)
+                    if self.budget is not None:
+                        self.budget.record_live_run()
+                    # Emitted here, per-run, rather than after the whole batch
+                    # returns -- a later exercise in this same batch raising
+                    # (e.g. the budget backstop above) must not erase the audit
+                    # trail for exercises that already genuinely ran. Fired for
+                    # a harness_error run too: it genuinely ran and spent
+                    # budget, even though it is never scored. Fired BEFORE
+                    # cache.put(): if the memo write itself raises (disk I/O),
+                    # the audit record for an exercise that DID genuinely run
+                    # must not be lost along with it.
+                    if self.on_result is not None:
+                        self.on_result(result)
+                    if result.status != "harness_error":
+                        break
+                    logger.warning(
+                        "live_eval: %s hit harness_error (try %d/%d): %s",
+                        spec.task_id, _try + 1, 1 + HARNESS_ERROR_RETRIES, result.error,
+                    )
+                else:
+                    raise LiveEvalHarnessError(
+                        f"{spec.task_id!r} still hit harness_error after {HARNESS_ERROR_RETRIES} "
+                        f"retries -- refusing to score a harness failure: {result.error}",
+                        result=result,
+                    )
                 results[spec.task_id] = result
-                # Emitted here, per-result, rather than after the whole batch
-                # returns -- a later exercise in this same batch raising
-                # (e.g. the budget backstop above) must not erase the audit
-                # trail for exercises that already genuinely ran. Fired
-                # BEFORE cache.put(): if the memo write itself raises (disk
-                # I/O), the audit record for an exercise that DID genuinely
-                # run must not be lost along with it.
-                if self.on_result is not None:
-                    self.on_result(result)
                 if self.cache is not None:
-                    self.cache.put(candidate, run_config, spec.task_id, result.to_dict())
+                    self.cache.put(sanitized, run_config, spec.task_id, result.to_dict(), sample_index=sample_index)
 
         return [results[spec.task_id] for spec in specs]
 
