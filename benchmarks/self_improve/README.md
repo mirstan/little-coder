@@ -96,8 +96,10 @@ python -m benchmarks.self_improve.run_gepa ... \
 ### Real (costs money AND real compute): two independent gates
 
 ```bash
-export REFLECTION_LM_API_KEY=<your key>   # separate from any key used by the model under test
-python -m benchmarks.self_improve.run_gepa \
+# Use a distinct, spend-capped key. Either put REFLECTION_LM_API_KEY=<your key>
+# in benchmarks/self_improve/.env, or set it for this one command as below
+# rather than exporting it into the shell.
+REFLECTION_LM_API_KEY=<your key> python -m benchmarks.self_improve.run_gepa \
   --components-config benchmarks/self_improve/config/components_bash_only.yaml \
   --repo-root <path> --benchmark-root <path> \
   --model <model under test> --confirm-live-rollouts --max-metric-calls <N> \
@@ -113,6 +115,28 @@ redundant safety, not a bug to work around:
    `--max-metric-calls` (real coding-agent runs against real exercises — real
    compute AND real wall-clock time, not just API dollars; never use GEPA's own
    `auto=` presets here — confirmed to wildly over-provision).
+
+`REFLECTION_LM_API_KEY`, however it was set, and every variable defined in
+`benchmarks/self_improve/.env` are orchestrator-only: `run_gepa` removes them
+from the environment of the agent-under-test, its bash tool, and the
+exercise test runs. The startup banner lists the withheld names (never their
+values). Put the model-under-test's provider key in your shell or pi's
+config, not in this `.env`. A run knob the agent reads itself
+(`ATTEMPT_TIMEOUT_S`, `CODEX_TIMEOUT_S`, or any `LITTLE_CODER_*` / `PI_*`
+name) is refused if it appears in the `.env`, because the orchestrator and
+the agent would otherwise run with different values: export it in your shell
+instead.
+
+This scrub stops *accidental* exposure: an `env` or `printenv`, or an error
+dump, ending up in transcripts, run logs, cached results or the reflection
+dataset. It does not contain a hostile agent. The agent runs as your user
+with unrestricted bash and no filesystem sandbox, so it can still read the
+`.env` file on disk, read the orchestrator's launch environment (`ps eww
+<pid>` on macOS; the scratch worktree's marker file records that pid), or
+plant git hooks in the shared `.git` that later run inside the orchestrator's
+own git calls. Use a separate, spend-limited key for reflection, and don't
+export it in shells where you run other harnesses (harbor, tb, or
+`aider_polyglot.py` directly), which do not remove it.
 
 `$SELF_IMPROVE_NO_LIVE_ROLLOUTS=1` refuses regardless of flags — a hard,
 machine-level deny for a shared host. A graceful stop is available mid-run via

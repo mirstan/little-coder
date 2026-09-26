@@ -1,10 +1,20 @@
 import copy
 import importlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
-import pytest
+# Runs before any test module imports run_gepa, whose import loads
+# $SELF_IMPROVE_DOTENV. Assigned outright, not setdefault: an exported
+# SELF_IMPROVE_DOTENV (possibly the real benchmarks/self_improve/.env, which
+# can hold a real key) must not reach the test process or the subprocesses it
+# spawns. os.devnull parses as an empty .env. LITELLM_MODE=PRODUCTION stops
+# litellm's own import-time load_dotenv().
+os.environ["SELF_IMPROVE_DOTENV"] = os.devnull
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+
+import pytest  # noqa: E402
 
 # benchmarks/self_improve is an opt-in subsystem with its own pyproject.toml,
 # deliberately outside the dependency-free benchmarks/*.py scripts' footprint

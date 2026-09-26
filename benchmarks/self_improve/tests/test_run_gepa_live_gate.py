@@ -870,3 +870,94 @@ def test_refuses_a_leftover_nested_gepa_stop_file(source_repo, fake_practice, tm
     assert calls == []
     assert (out_dir / "gepa" / "gepa.stop").exists()
     assert not (out_dir / "manifest.yaml").exists()
+
+
+def _env_dumping_pi(tmp_path: Path) -> Path:
+    """A pi stand-in that records its own environment, then becomes fake_pi.
+    A /bin/sh wrapper avoids a long `#!<venv python>` shebang."""
+    import shlex
+    dumper = tmp_path / "dump_env.py"
+    dumper.write_text(
+        "import json, os\n"
+        "d = os.environ['PI_ENV_DUMP_DIR']\n"
+        "with open(os.path.join(d, f'{os.getppid()}.json'), 'w') as fh:\n"
+        "    json.dump(dict(os.environ), fh)\n"
+    )
+    wrapper = tmp_path / "pi-env-dump"
+    py = shlex.quote(sys.executable)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"{py} {shlex.quote(str(dumper))} || exit 1\n"
+        f"exec {py} {shlex.quote(str(FAKE_PI))} \"$@\"\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_baseline_run_withholds_orchestrator_only_env_from_the_agent(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """The reflection LM key and every .env name reach neither pi nor pi's
+    bash, while the model-under-test's own key does; the orchestrator's own
+    environment keeps the reflection key."""
+    import os
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "sk-sentinel-reflection")
+    monkeypatch.setenv("SOME_DOTENV_SECRET", "dotenv-sentinel")
+    monkeypatch.setenv("OMLX_API_KEY", "model-sentinel")
+    dump_dir = tmp_path / "env_dumps"
+    dump_dir.mkdir()
+    monkeypatch.setenv("PI_ENV_DUMP_DIR", str(dump_dir))
+    monkeypatch.setattr(run_gepa, "_DOTENV_KEYS", frozenset({REFLECTION_LM_API_KEY_ENV, "SOME_DOTENV_SECRET"}))
+
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(tmp_path / "run_out"), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(_env_dumping_pi(tmp_path)), "--baseline-only", "--yes", "--no-live-cache",
+    ])
+    assert code == 0
+    dumps = [json.loads(p.read_text()) for p in dump_dir.glob("*.json")]
+    assert dumps, "pi was never spawned, so nothing was checked"
+    for p in dump_dir.glob("*.json"):
+        p.unlink()  # each dump holds the developer's whole environment
+    # Assertions compare names only, so a failure never prints env values.
+    for env in dumps:
+        leaked = [n for n in (REFLECTION_LM_API_KEY_ENV, "SOME_DOTENV_SECRET", "SELF_IMPROVE_DOTENV") if n in env]
+        assert leaked == []
+        sentinel_hits = sorted(k for k, v in env.items() if v in ("sk-sentinel-reflection", "dotenv-sentinel"))
+        assert sentinel_hits == []
+        assert env.get("OMLX_API_KEY") == "model-sentinel"
+        assert "LLAMACPP_API_KEY" in sorted(env)
+    assert os.environ[REFLECTION_LM_API_KEY_ENV] == "sk-sentinel-reflection"
+    assert os.environ["SOME_DOTENV_SECRET"] == "dotenv-sentinel"
+
+
+def test_a_shared_knob_in_dotenv_refuses_before_any_worktree_or_prompt(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setattr(run_gepa, "_DOTENV_KEYS", frozenset({"ATTEMPT_TIMEOUT_S"}))
+    monkeypatch.setattr("builtins.input", lambda *_: pytest.fail("prompted despite the refusal"))
+    scratch_dir = tmp_path / "scratch"
+
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(tmp_path / "run_out"), "--scratch-dir", str(scratch_dir),
+        "--pi-bin", str(FAKE_PI), "--baseline-only",
+    ])
+    assert code == 1
+    assert ("ATTEMPT_TIMEOUT_S is set in benchmarks/self_improve/.env, which is orchestrator-only; "
+            "export it in your shell instead.") in capsys.readouterr().err
+    assert not scratch_dir.exists()
+    assert "gepa-scratch" not in subprocess.run(
+        ["git", "worktree", "list"], cwd=source_repo, capture_output=True, text=True, check=True,
+    ).stdout

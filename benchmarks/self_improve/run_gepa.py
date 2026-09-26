@@ -29,18 +29,26 @@ no longer touches.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-from dotenv import load_dotenv
+# litellm (imported lazily by gepa on the first reflection call) runs its own
+# load_dotenv() on import while LITELLM_MODE is DEV, its default. That would
+# load a .env this module never parsed, whose names _DOTENV_KEYS could not
+# withhold from the agent. Set before any import can pull litellm in.
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+
+import yaml  # noqa: E402
+from dotenv import dotenv_values, load_dotenv  # noqa: E402
 
 from benchmarks.self_improve.components import load_component_token_costs, load_components
 from benchmarks.self_improve.exercises import discover_exercises, practice_dir, split_three_way, split_train_val
@@ -61,10 +69,12 @@ from benchmarks.self_improve.live_eval import (
 )
 from benchmarks.self_improve.manifest import Manifest
 from benchmarks.self_improve.polyglot_adapter import PolyglotGEPAAdapter
-from benchmarks.self_improve.scratch_worktree import scratch_worktree
-from benchmarks.self_improve.spend_log import SpendLog
-
-REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
+from benchmarks.self_improve.scratch_worktree import (  # noqa: E402
+    ALWAYS_ORCHESTRATOR_ONLY_ENV,
+    REFLECTION_LM_API_KEY_ENV,  # also re-exported from here
+    scratch_worktree,
+)
+from benchmarks.self_improve.spend_log import SpendLog  # noqa: E402
 #: Hard machine-level deny, checked before every other gate -- lets a shared
 #: box refuse live rollouts no matter what command gets pasted into it.
 NO_LIVE_ROLLOUTS_ENV = "SELF_IMPROVE_NO_LIVE_ROLLOUTS"
@@ -73,7 +83,42 @@ _ZERO_USAGE = {"input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0}
 
 # SELF_IMPROVE_DOTENV exists so a test never touches the real .env
 # (test_run_gepa_dotenv.py).
-load_dotenv(Path(os.environ.get("SELF_IMPROVE_DOTENV", str(Path(__file__).parent / ".env"))))
+_DOTENV_PATH = Path(os.environ.get("SELF_IMPROVE_DOTENV", str(Path(__file__).parent / ".env")))
+# Read once, so the names withheld from the agent are exactly the names that
+# were loaded. load_dotenv() on the text keeps its own semantics (override=
+# False, interpolation, PYTHON_DOTENV_DISABLED); the readability test mirrors
+# python-dotenv's own, so a missing file loads nothing and a FIFO still loads.
+_readable = os.path.isfile(_DOTENV_PATH) or (
+    os.path.exists(_DOTENV_PATH) and stat.S_ISFIFO(os.stat(_DOTENV_PATH).st_mode)
+)
+_DOTENV_TEXT = _DOTENV_PATH.read_text(encoding="utf-8") if _readable else ""
+load_dotenv(stream=io.StringIO(_DOTENV_TEXT))
+#: Every name defined in the .env: the agent-under-test never sees any of them.
+_DOTENV_KEYS = frozenset(dotenv_values(stream=io.StringIO(_DOTENV_TEXT), interpolate=False))
+del _readable, _DOTENV_TEXT
+
+#: Names the agent-under-test's process tree reads itself. One of these in
+#: the .env would reach the orchestrator but be withheld from the agent, so
+#: the two would run with different values; _dotenv_refusals() refuses it.
+#: POLYGLOT_* is not listed: live_eval sets the ones the child reads.
+_CHILD_ENV_NAMES = frozenset({"ATTEMPT_TIMEOUT_S", "CODEX_TIMEOUT_S"})
+_CHILD_ENV_PREFIXES = ("LITTLE_CODER_", "PI_")
+
+
+def _orchestrator_only_env_names() -> frozenset[str]:
+    """Names ScratchWorktree.env() withholds from the agent-under-test.
+    Reads _DOTENV_KEYS at call time so a test can replace it."""
+    return _DOTENV_KEYS | ALWAYS_ORCHESTRATOR_ONLY_ENV
+
+
+def _dotenv_refusals() -> list[str]:
+    """One refusal per .env name that the agent-under-test also reads."""
+    return [
+        f"{name} is set in benchmarks/self_improve/.env, which is orchestrator-only; "
+        "export it in your shell instead."
+        for name in sorted(_DOTENV_KEYS)
+        if name in _CHILD_ENV_NAMES or name.startswith(_CHILD_ENV_PREFIXES)
+    ]
 
 
 def _check_gates(args: argparse.Namespace) -> list[str]:
@@ -300,7 +345,7 @@ def _run_live(args: argparse.Namespace) -> int:
     # it exists precisely to let a human decide whether to authorize the
     # spend gates below, so it must not itself be blocked by them.
     if not args.estimate_only:
-        gate_errors = _check_gates(args)
+        gate_errors = _check_gates(args) + [f"Refusing to run: {m}" for m in _dotenv_refusals()]
         if gate_errors:
             for msg in gate_errors:
                 print(msg, file=sys.stderr)
@@ -379,6 +424,7 @@ def _run_live(args: argparse.Namespace) -> int:
     stop_file = out_dir / "gepa.stop"
     print(f"\n  Run dir       : {out_dir}")
     print(f"  Graceful stop : touch {stop_file}")
+    print(f"  Withheld from the agent's env : {', '.join(sorted(_orchestrator_only_env_names()))}")
 
     prior = _prior_run_artifacts(out_dir)
     if args.estimate_only:
@@ -469,6 +515,7 @@ def _run_live(args: argparse.Namespace) -> int:
             parent_dir=Path(args.scratch_dir) if args.scratch_dir else None,
             pi_bin=Path(args.pi_bin) if args.pi_bin else None,
             keep=args.keep_scratch,
+            orchestrator_only_env=_orchestrator_only_env_names(),
         ) as wt,
     ):
         spend_log.run_start(argv=sys.argv, exercises=[s.task_id for s in specs])

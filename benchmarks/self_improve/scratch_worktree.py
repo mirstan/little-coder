@@ -37,7 +37,17 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Iterable, Iterator, Mapping
+
+#: The reflection LM's key. Defined here rather than in run_gepa (which
+#: re-exports it) so ALWAYS_ORCHESTRATOR_ONLY_ENV below is built from the
+#: same name the orchestrator reads.
+REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
+
+#: Removed from every environment ScratchWorktree.env() builds, whatever the
+#: caller passes as orchestrator_only_env. SELF_IMPROVE_DOTENV is included
+#: because it tells the agent where the secrets file is.
+ALWAYS_ORCHESTRATOR_ONLY_ENV = frozenset({REFLECTION_LM_API_KEY_ENV, "SELF_IMPROVE_DOTENV"})
 
 #: Written into every scratch worktree's root immediately after creation.
 #: gepa_scratch_gc.py refuses to remove anything lacking this marker.
@@ -133,12 +143,21 @@ class ScratchWorktree:
     source_repo_root: Path
     base_commit: str
     pi_bin: Path
+    #: Names withheld from env() on top of ALWAYS_ORCHESTRATOR_ONLY_ENV.
+    orchestrator_only_env: frozenset[str] = frozenset()
 
     def env(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
-        """Environment for a subprocess run inside this worktree: the base
-        environment (defaults to the real os.environ) plus the resolved pi
-        binary override."""
-        merged = dict(base if base is not None else os.environ)
+        """Environment for a subprocess run inside this worktree: a copy of
+        the base environment (defaults to the real os.environ) minus every
+        orchestrator-only name, plus the resolved pi binary override.
+
+        Everything the agent-under-test runs (pi, its bash tool, the
+        exercise's tests) inherits this environment, so the reflection LM's
+        key and the other orchestrator-only names are removed here. Neither
+        `base` nor os.environ is modified. The override is set after the
+        removal, so naming it orchestrator-only cannot drop it."""
+        withheld = ALWAYS_ORCHESTRATOR_ONLY_ENV | self.orchestrator_only_env
+        merged = {k: v for k, v in (base if base is not None else os.environ).items() if k not in withheld}
         merged["LITTLE_CODER_PI_BIN_OVERRIDE"] = str(self.pi_bin)
         return merged
 
@@ -244,6 +263,7 @@ def scratch_worktree(
     parent_dir: Path | None = None,
     pi_bin: Path | None = None,
     keep: bool = False,
+    orchestrator_only_env: Iterable[str] = (),
 ) -> Iterator[ScratchWorktree]:
     """Create a disposable `git worktree add --detach` checkout of
     source_repo_root, pinned at `commit` (resolved to a concrete sha once,
@@ -253,6 +273,9 @@ def scratch_worktree(
     fails) unless `keep=True`, in which case the path is left on disk and
     logged for post-mortem -- `__exit__`-equivalent cleanup here never masks
     an exception raised inside the `with` block.
+
+    `orchestrator_only_env` names variables ScratchWorktree.env() withholds
+    from the agent-under-test, in addition to ALWAYS_ORCHESTRATOR_ONLY_ENV.
     """
     source_repo_root = Path(source_repo_root).resolve()
     prune_stale(source_repo_root)
@@ -294,6 +317,7 @@ def scratch_worktree(
     worktree = ScratchWorktree(
         path=scratch_path, source_repo_root=source_repo_root,
         base_commit=base_commit, pi_bin=resolved_pi_bin,
+        orchestrator_only_env=frozenset(orchestrator_only_env),
     )
 
     try:

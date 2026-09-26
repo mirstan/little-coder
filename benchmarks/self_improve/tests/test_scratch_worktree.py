@@ -305,3 +305,49 @@ def test_prune_stale_deregisters_a_manually_deleted_worktree(source_repo, tmp_pa
     assert str(scratch_path) in _worktree_list(source_repo)
     prune_stale(source_repo)
     assert str(scratch_path) not in _worktree_list(source_repo)
+
+
+_ENV_BASE = {
+    "REFLECTION_LM_API_KEY": "sk-sentinel",
+    "SELF_IMPROVE_DOTENV": "/x/.env",
+    "OMLX_API_KEY": "model-sentinel",
+    "PATH": "/usr/bin",
+}
+
+
+def test_env_always_withholds_the_reflection_key_and_dotenv_path(source_repo, tmp_path):
+    """The agent-under-test's environment is built here, so the reflection
+    LM key must be stripped even when the caller names nothing to withhold."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        env = wt.env(dict(_ENV_BASE))
+    assert "REFLECTION_LM_API_KEY" not in env
+    assert "SELF_IMPROVE_DOTENV" not in env
+    assert env["OMLX_API_KEY"] == "model-sentinel"
+    assert env["PATH"] == "/usr/bin"
+    assert env["LITTLE_CODER_PI_BIN_OVERRIDE"] == str((tmp_path / "pi").resolve())
+
+
+def test_env_withholds_the_names_passed_as_orchestrator_only(source_repo, tmp_path):
+    base = {**_ENV_BASE, "OTHER_SECRET": "other-sentinel"}
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi",
+                          orchestrator_only_env={"OTHER_SECRET"}) as wt:
+        env = wt.env(base)
+    assert "OTHER_SECRET" not in env
+    assert env["OMLX_API_KEY"] == "model-sentinel"
+    assert base["OTHER_SECRET"] == "other-sentinel"  # the caller's mapping is not mutated
+
+
+def test_env_still_sets_the_pi_bin_override_when_it_is_named_orchestrator_only(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi",
+                          orchestrator_only_env={"LITTLE_CODER_PI_BIN_OVERRIDE"}) as wt:
+        env = wt.env(dict(_ENV_BASE))
+    assert env["LITTLE_CODER_PI_BIN_OVERRIDE"] == str((tmp_path / "pi").resolve())
+
+
+def test_env_from_os_environ_strips_the_key_without_touching_os_environ(source_repo, tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("REFLECTION_LM_API_KEY", "sk-sentinel")
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        env = wt.env()
+    assert "REFLECTION_LM_API_KEY" not in sorted(env)  # names only: env holds real values
+    assert os.environ["REFLECTION_LM_API_KEY"] == "sk-sentinel"
