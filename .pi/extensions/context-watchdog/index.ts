@@ -330,11 +330,17 @@ export default function (pi: ExtensionAPI) {
   // right seam.
   pi.on("session_compact", async (event, ctx) => {
     // The TUI resumes from its own compaction callback; queueing here too would
-    // send the model two continuations for one compaction. RPC mode drives its
-    // own continuation after a deliberate compaction it requested itself
-    // (little-coder's benchmark harness is RPC mode's sole consumer) -- queueing
-    // here too races that continuation with this extension's own resume turn.
-    if (canCompactMidRun(ctx.mode) || ctx.mode === "rpc") return;
+    // send the model two continuations for one compaction. Only the harness's
+    // own deliberate, manually-requested RPC compaction drives its own
+    // continuation (little-coder's benchmark harness, via
+    // prompt_with_mid_run_compaction in the harbor/TB adapters specifically --
+    // NOT every RPC caller: benchmarks/gaia.py and aider_polyglot.py issue a
+    // bare prompt with no continuation loop). Pi's own automatic
+    // threshold/overflow compactions reach RPC mode too via _checkCompaction,
+    // and those still need this resume -- nothing else drives them -- so the
+    // skip must key on event.reason, not ctx.mode alone.
+    if (canCompactMidRun(ctx.mode)) return;
+    if (ctx.mode === "rpc" && (event as { reason?: string }).reason === "manual") return;
     // Overflow recovery already returns true and retries the aborted turn by
     // itself. A queued message on top of that re-runs work pi is re-running.
     if ((event as { willRetry?: boolean }).willRetry) return;
