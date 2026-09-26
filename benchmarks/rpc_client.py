@@ -1916,11 +1916,6 @@ def prompt_with_mid_run_compaction(
         except Exception as exc:
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
-            # Our await gave up, which does not mean pi's compaction did.
-            wait_for_pi_idle(
-                rpc, deadline, min_remaining_sec=min_remaining_sec,
-                now=now, sleep=sleep, log=log,
-            )
         else:
             after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
             # Measured against the threshold that actually fired, not the
@@ -1971,6 +1966,19 @@ def prompt_with_mid_run_compaction(
             return ErrorRetryOutcome(
                 merged, n_error_retries, last_error, retry_exception, n_compactions
             )
+
+        # Unconditional, regardless of why await_compact succeeded or failed
+        # above: pi's own isStreaming can still be true right after a
+        # compaction settles (e.g. a resume turn some other extension fired
+        # in-process), and the continuation below is a brand-new call whose
+        # attempt 1 never goes through prompt_with_error_retry's own
+        # attempts>1 wait. Return value is deliberately ignored -- a stale or
+        # wrong idle reading must never by itself end a recoverable trial;
+        # the continuation is sent regardless of what this returns.
+        wait_for_pi_idle(
+            rpc, deadline, min_remaining_sec=min_remaining_sec,
+            now=now, sleep=sleep, log=log,
+        )
 
         cycle_message = continue_message
         cycle_timeout = max(0.0, deadline - now())

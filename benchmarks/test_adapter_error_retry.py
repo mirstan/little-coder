@@ -28,6 +28,7 @@ import rpc_client  # noqa: E402
 from rpc_client import (  # noqa: E402
     COMPACTION_CONTINUE_PROMPT,
     ERROR_RETRY_PROMPT,
+    PiBusyError,
     PromptResult,
     prompt_with_error_retry,
     prompt_with_mid_run_compaction,
@@ -610,7 +611,7 @@ class _CycleRpc:
     """
 
     def __init__(self, cycles, clock=None, compact_results=(), alive=True,
-                 die_on_prompt=False):
+                 die_on_prompt=False, busy_for_sec_after_compact=0.0):
         self._cycles = list(cycles)
         self._clock = clock
         self._compact_results = list(compact_results)
@@ -619,12 +620,25 @@ class _CycleRpc:
         #: producing it -- the liveness brake ahead of the continuation
         #: prompt cannot see that, since it runs before the prompt.
         self._die_on_prompt = die_on_prompt
+        #: Models the residual isStreaming window a successful await_compact
+        #: can still leave behind (compaction-continuation-idle-wait-gap.md):
+        #: armed on a *successful* await_compact, not at construction, so it
+        #: cannot fire before the trial's own first prompt.
+        self._busy_for_sec_after_compact = busy_for_sec_after_compact
+        self._busy_until = None
         self.calls = []            # [(message, timeout)]
         self.compact_requests = []
         self.awaited = []
+        self.state_calls = 0
 
     def prompt_and_collect(self, message, timeout=900, on_event=None):
         self.calls.append((message, timeout))
+        if self._busy_until is not None and self._clock.now() < self._busy_until:
+            raise PiBusyError(
+                "pi stayed busy across 5 readiness attempts: "
+                "Agent is already processing. Specify streamingBehavior "
+                "('steer' or 'followUp') to queue the message."
+            )
         assert self._cycles, "prompt_and_collect called more often than scripted"
         nxt = self._cycles.pop(0)
         if isinstance(nxt, Exception):
@@ -641,7 +655,9 @@ class _CycleRpc:
         return self.alive
 
     def get_state(self):
-        return {"isStreaming": False, "isCompacting": False}
+        self.state_calls += 1
+        busy = self._busy_until is not None and self._clock.now() < self._busy_until
+        return {"isStreaming": busy, "isCompacting": False}
 
     def request_compact(self):
         rid = f"compact-{len(self.compact_requests)}"
@@ -654,6 +670,8 @@ class _CycleRpc:
         nxt = self._compact_results.pop(0)
         if isinstance(nxt, Exception):
             raise nxt
+        if self._busy_for_sec_after_compact:
+            self._busy_until = self._clock.now() + self._busy_for_sec_after_compact
         return nxt
 
 
@@ -934,6 +952,56 @@ def test_a_failed_compaction_still_gets_its_continuation(failure):
     assert rpc.calls[1][0] == COMPACTION_CONTINUE_PROMPT
     assert outcome.result.stop_reason == "agent_end"
     assert outcome.n_deliberate_compactions == 1
+
+
+def test_continuation_gives_up_gracefully_if_pi_stays_busy_past_the_wait_bound():
+    """Regression pin for compaction-continuation-idle-wait-gap.md, both
+    before and after the fix -- it pins an observable shape, not the bug
+    itself. Pre-fix, this demonstrates the bug directly: the continuation's
+    first send hits a residual isStreaming window and gives up without ever
+    waiting it out (n_error_retries stays 0 -- the tell that the busy
+    rejection hit attempt 1 of a brand-new call, never a retry). Post-fix,
+    with a busy duration chosen to exceed even wait_for_pi_idle's own
+    PI_IDLE_WAIT_CAP_SEC (1800s) by a wide margin, it instead demonstrates a
+    different, still-useful property: even when the busy window outlasts the
+    wait itself, the trial still ends gracefully with stop_reason=compacted
+    rather than crashing."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        busy_for_sec_after_compact=100_000,
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.n_deliberate_compactions == 1
+    assert outcome.result.stop_reason == "compacted"
+    assert "PiBusyError" in outcome.retry_exception
+
+
+def test_continuation_waits_for_pi_to_go_idle_after_a_compaction():
+    """The fix under test: the continuation is a brand-new
+    prompt_with_error_retry call, so its attempt 1 never goes through that
+    helper's own attempts>1 wait -- prompt_with_mid_run_compaction must hoist
+    its own wait_for_pi_idle call after a successful await_compact. Before
+    the fix this fails: the continuation's first send hits the busy stub
+    immediately, get_state is never consulted, clock.now() never advances
+    past busy_until, and prompt_and_collect keeps raising PiBusyError. After
+    the fix, wait_for_pi_idle's poll-and-sleep loop advances the clock via
+    clock.sleep past busy_until, get_state reports idle, and the
+    continuation proceeds against the second scripted cycle."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        busy_for_sec_after_compact=30.0,
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.result.stop_reason == "agent_end"
+    assert "finished" in outcome.result.assistant_text
+    assert rpc.state_calls > 0
 
 
 def test_a_failed_compaction_disarms_further_attempts():

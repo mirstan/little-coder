@@ -330,8 +330,11 @@ export default function (pi: ExtensionAPI) {
   // right seam.
   pi.on("session_compact", async (event, ctx) => {
     // The TUI resumes from its own compaction callback; queueing here too would
-    // send the model two continuations for one compaction.
-    if (canCompactMidRun(ctx.mode)) return;
+    // send the model two continuations for one compaction. RPC mode drives its
+    // own continuation after a deliberate compaction it requested itself
+    // (little-coder's benchmark harness is RPC mode's sole consumer) -- queueing
+    // here too races that continuation with this extension's own resume turn.
+    if (canCompactMidRun(ctx.mode) || ctx.mode === "rpc") return;
     // Overflow recovery already returns true and retries the aborted turn by
     // itself. A queued message on top of that re-runs work pi is re-running.
     if ((event as { willRetry?: boolean }).willRetry) return;
