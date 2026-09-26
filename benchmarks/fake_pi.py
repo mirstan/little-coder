@@ -28,7 +28,10 @@ SESSION_STATS_DATA = {
 
 # Fixed per-turn usage stamped onto turn_end's message.usage -- small, made
 # up numbers, just enough for tests to assert prompt_and_collect() sums them
-# correctly across one or more turns.
+# correctly across one or more turns. The *solve* modes behind the live-eval
+# e2e tests carry it too (with no stopReason, so outcome classification is
+# unchanged), so usage can be followed through the results JSON,
+# LiveRunResult and spend_log.
 TURN_USAGE = {"input": 100, "output": 20, "cacheRead": 10, "cacheWrite": 0,
               "cost": {"input": 0.0008, "output": 0.0002, "cacheRead": 0,
                         "cacheWrite": 0, "total": 0.001}}
@@ -455,7 +458,7 @@ def main():
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
         _write_solution_files()
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -475,7 +478,7 @@ def main():
         else:
             with open(state_file, "w") as fh:
                 fh.write("attempt-1-done\n")
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -497,7 +500,7 @@ def main():
         else:
             with open(state_file, "w") as fh:
                 fh.write("attempt-1-done\n")
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -512,7 +515,7 @@ def main():
             fh.write(open(system_prompt_path).read() if system_prompt_path else "")
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -529,7 +532,7 @@ def main():
         emit({"type": "agent_start"})
         if token in prompt_text:
             _write_solution_files()
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -600,7 +603,7 @@ def main():
               "result": {"content": [{"type": "text", "text": "chmod: run.sh: Permission denied"}]},
               "isError": True})
         _write_solution_files()
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return
@@ -615,7 +618,7 @@ def main():
         emit({"type": "compaction_end"})
         emit({"type": "compaction_end"})
         _write_solution_files()
-        emit({"type": "turn_end"})
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
         return

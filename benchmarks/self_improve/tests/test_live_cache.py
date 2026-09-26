@@ -152,3 +152,19 @@ def test_sample_index_zero_is_the_default(tmp_path):
     cache.put(candidate, run_config, "python/wordy", {"status": "pass_1", "score": 1.0})
     assert cache.get(candidate, run_config, "python/wordy", sample_index=0) == {"status": "pass_1", "score": 1.0}
     assert cache.get(candidate, run_config, "python/wordy", sample_index=1) is None
+
+
+def test_live_run_result_from_an_old_cache_entry_has_no_usage():
+    """Entries memoized before usage was recorded must still load."""
+    from benchmarks.self_improve.live_eval import LiveRunResult
+    old = {"task_id": "polyglot/python/wordy", "exercise": "wordy", "language": "python",
+           "status": "pass_1", "score": 1.0, "success": True}
+    assert LiveRunResult.from_dict(old).usage is None
+
+
+def test_live_run_result_usage_round_trips_through_to_dict():
+    from benchmarks.self_improve.live_eval import LiveRunResult
+    usage = {"input_tokens": 110, "cache_read_tokens": 10, "output_tokens": 20}
+    r = LiveRunResult(task_id="t", exercise="wordy", language="python", status="pass_1",
+                      score=1.0, success=True, usage=usage)
+    assert LiveRunResult.from_dict(r.to_dict()).usage == usage

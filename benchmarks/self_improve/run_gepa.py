@@ -64,6 +64,7 @@ REFLECTION_LM_API_KEY_ENV = "REFLECTION_LM_API_KEY"
 #: box refuse live rollouts no matter what command gets pasted into it.
 NO_LIVE_ROLLOUTS_ENV = "SELF_IMPROVE_NO_LIVE_ROLLOUTS"
 DEFAULT_BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
+_ZERO_USAGE = {"input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0}
 
 # SELF_IMPROVE_DOTENV exists so a test never touches the real .env
 # (test_run_gepa_dotenv.py).
@@ -403,9 +404,12 @@ def _run_live(args: argparse.Namespace) -> int:
             # hit logs duration_s=0.0 (not the original run's elapsed_s):
             # SpendLog.summarize()'s total_wall_s would otherwise double-count
             # the same real wall-clock time every time that result is reused.
+            # Tokens are spend too, so a hit zeroes usage the same way (the
+            # memoized LiveRunResult still carries the original numbers).
             on_result=lambda r: spend_log.exercise(
                 exercise_id=r.task_id, status=r.status, score=r.score,
                 memo_hit=r.from_cache, duration_s=0.0 if r.from_cache else r.elapsed_s,
+                usage=_ZERO_USAGE if r.from_cache else r.usage,
             ),
         )
 

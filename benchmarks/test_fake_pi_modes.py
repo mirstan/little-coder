@@ -163,3 +163,13 @@ def test_non_text_deltas_are_bounded_during_collection(fake_pi, tmp_path, monkey
     # Rolling tail: the TRUE end of the stream survives too, not just
     # whatever was most recent at the moment the head filled up.
     assert r.non_text_deltas[-1]["delta"] == f"chunk {count - 1}"
+
+
+def test_solve_from_env_reports_turn_usage(fake_pi, tmp_path, monkeypatch):
+    """The live-eval e2e tests run through this mode, so it must carry
+    usage for the results JSON -> LiveRunResult -> spend_log plumbing to be
+    testable at all."""
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"solution.py": _b64("x = 1\n")}))
+    with fake_pi("solve_from_env", tmp_path) as rpc:
+        r = rpc.prompt_and_collect("go", timeout=30)
+    assert (r.usage["input"], r.usage["cache_read"], r.usage["output"]) == (100, 10, 20)

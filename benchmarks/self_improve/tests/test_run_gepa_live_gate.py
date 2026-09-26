@@ -465,6 +465,13 @@ def test_spend_log_zeroes_duration_for_a_cache_hit(source_repo, fake_practice, t
     assert len(exercise_records) == 2
     assert all(r["memo_hit"] is True for r in exercise_records)
     assert all(r["duration_s"] == 0.0 for r in exercise_records)
+    # Tokens are spend too: a hit zeroes them just like duration_s. The
+    # first run's records carry the real numbers.
+    assert all(r["usage"] == {"input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0}
+               for r in exercise_records)
+    expected_usage = {"input_tokens": 110, "cache_read_tokens": 10, "output_tokens": 20}
+    first_run = [json.loads(line) for line in (out_dir_1 / "spend_log.jsonl").read_text().splitlines()]
+    assert [r["usage"] for r in first_run if r.get("event") == "exercise"] == [expected_usage] * 2
 
 
 @pytest.mark.parametrize("extra_flags,expected_skip", [([], True), (["--no-skip-perfect-score"], False)])

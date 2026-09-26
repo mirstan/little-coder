@@ -246,6 +246,13 @@ class LiveRunResult:
     summarized_transcript: str = ""
     diff_summary: str = ""
     notifications: list = field(default_factory=list)
+    #: {input_tokens, cache_read_tokens, output_tokens} summed across every
+    #: attempt, from aider_polyglot.py's per-exercise "usage" (input_tokens
+    #: includes the cached part -- see its _usage_tokens). An output only:
+    #: never part of run_config or the cache key. None means "not recorded"
+    #: (a results file or memo entry from before usage was carried, or a
+    #: harness_error with no results), distinct from a genuine zero.
+    usage: dict | None = None
     error: str | None = None
     from_cache: bool = False
     exit_code: int | None = None
@@ -663,6 +670,14 @@ class PolyglotLiveRunner:
                 self_reported_lessons.append(clipped)
                 remaining -= len(clipped)
 
+        usage = None
+        raw_usage = record.get("usage")
+        if isinstance(raw_usage, dict):
+            usage = {
+                key: int(val) if isinstance(val := raw_usage.get(key, 0), (int, float)) else 0
+                for key in ("input_tokens", "cache_read_tokens", "output_tokens")
+            }
+
         ex_log_dir = log_root / "pi" / spec.language / spec.exercise
         test_output_tail = ""
         final_output = ex_log_dir / "final_output.txt"
@@ -716,7 +731,7 @@ class PolyglotLiveRunner:
             self_reported_lessons=self_reported_lessons,
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
             reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
-            diff_summary=diff_summary, notifications=notifications,
+            diff_summary=diff_summary, notifications=notifications, usage=usage,
             **base_kwargs,
         )
 

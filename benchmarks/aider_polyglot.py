@@ -622,6 +622,33 @@ def _attempt_outcome(result) -> str:
     return "completed"
 
 
+def _usage_tokens(result) -> dict:
+    """One attempt's token usage as {input_tokens, cache_read_tokens,
+    output_tokens}.
+
+    input_tokens is the whole prompt pi sent -- uncached input + cache read
+    + cache write -- the same convention as the Harbor adapter's
+    n_input_tokens, so cache_read_tokens / input_tokens is the prefix-cache
+    hit ratio. pi's own `input` counts only the uncached part. Sourced from
+    PromptResult.usage (summed turn_end usage); a result without one (codex,
+    test fakes) reports zeros rather than failing the exercise over token
+    accounting.
+    """
+    usage = getattr(result, "usage", None)
+    if not isinstance(usage, dict):
+        usage = {}
+
+    def _n(key):
+        val = usage.get(key, 0)
+        return int(val) if isinstance(val, (int, float)) else 0
+
+    return {
+        "input_tokens": _n("input") + _n("cache_read") + _n("cache_write"),
+        "cache_read_tokens": _n("cache_read"),
+        "output_tokens": _n("output"),
+    }
+
+
 def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> str:
     """Precedence for the recorded status. Pure, so it can be table-tested.
 
@@ -896,6 +923,7 @@ def _run_exercise(
         stop_reasons: list[str] = []
         turn_total = 0
         compaction_total = 0
+        attempt_usage: list[dict] = []
         lessons: list[str] = []
         current_prompt = prompt
         codex_session_id = None
@@ -973,6 +1001,7 @@ def _run_exercise(
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
             compaction_total += getattr(r, "compaction_events", 0) or 0
+            attempt_usage.append(_usage_tokens(r))
             # Only an attempt whose prompt actually asked for one can have a
             # LESSON: line, and the ask lives in the retry prompt built at the
             # Gated on i > 1 explicitly, not just by where the retry prompt
@@ -1079,6 +1108,11 @@ def _run_exercise(
             "turn_count": turn_total,
             "compaction_total": compaction_total,
             "lessons": lessons,
+            "attempt_usage": attempt_usage,
+            "usage": {
+                key: sum(u[key] for u in attempt_usage)
+                for key in ("input_tokens", "cache_read_tokens", "output_tokens")
+            },
         }
         return record
 

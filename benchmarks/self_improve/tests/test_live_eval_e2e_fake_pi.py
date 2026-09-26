@@ -203,6 +203,30 @@ def test_pipeline_scores_a_second_attempt_pass_as_partial_credit(runner_factory,
     assert results[0].score == 0.7
 
 
+
+# fake_pi.py's TURN_USAGE (input 100 + cacheRead 10 + cacheWrite 0, output
+# 20), one turn per attempt.
+_ONE_ATTEMPT_USAGE = {"input_tokens": 110, "cache_read_tokens": 10, "output_tokens": 20}
+
+
+def test_token_usage_reaches_the_live_run_result(runner_factory, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    assert results[0].usage == _ONE_ATTEMPT_USAGE
+
+
+def test_token_usage_is_summed_across_attempts(runner_factory, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "noop_then_solve")
+    monkeypatch.setenv("FAKE_PI_STATE_FILE", str(tmp_path / "attempt_state.txt"))
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    for runner in runner_factory():
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    assert results[0].status == "pass_2"
+    assert results[0].usage == {k: 2 * v for k, v in _ONE_ATTEMPT_USAGE.items()}
+
+
 def test_self_reported_lesson_is_captured_end_to_end(runner_factory, tmp_path, monkeypatch):
     """Real gap this closes: the retry loop fed the next attempt raw test
     output but never solicited or captured an explicit self-reflection --
@@ -287,6 +311,8 @@ def test_cache_hit_skips_the_subprocess_entirely(runner_factory, tmp_path, monke
     assert second[0].from_cache is True
     assert second[0].status == first[0].status
     assert second[0].score == first[0].score
+    # usage is an output, memoized with the rest of the result.
+    assert second[0].usage == first[0].usage == _ONE_ATTEMPT_USAGE
 
 
 def test_materialize_raises_when_candidate_has_a_component_not_in_components_yaml(runner_factory):
