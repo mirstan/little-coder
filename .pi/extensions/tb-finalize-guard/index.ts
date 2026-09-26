@@ -19,7 +19,7 @@ import {
   type InitialSnapshotOutcome,
 } from "../_shared/snapshot-paths.ts";
 import { inTbMode, tbProxyRun, tbSessionId, type ProxyUiCtx } from "../_shared/tb-proxy.ts";
-import { CHECK_TIMEOUT_SEC, footerExit, footerTimedOut } from "../syntax-check/helpers.ts";
+import { CHECK_TIMEOUT_SEC, footerExit, footerTimedOut, shellQuote } from "../syntax-check/helpers.ts";
 import { splitFooter } from "../truncated-view/truncation.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with four independent
@@ -100,13 +100,14 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 //
 // Compliance is judged via _shared/shell-write.ts's `detectDeliverableWrites`
 // — a tb-finalize-guard-only superset of `detectWriteTargets` that also
-// recognizes `cp`/`mv`/`install`, `sed -i`, and a compiler's `-o` flag as
-// evidence of a write, not just shell redirection (`detectWriteTargets`
-// itself stays redirect-only because write-guard and permission-gate also
-// consume it, and both deliberately treat `cp`/`mv`/`sed -i` as safe,
-// non-write commands — see that function's own comment). Extended with
-// `isScratchPath` so a write that only ever lands in /tmp does not count as
-// having saved the real deliverable.
+// recognizes `cp`/`mv`/`install`, `sed -i`, a compiler's `-o` flag, and an
+// inline-code interpreter's (`python3`/`python`/`ruby`/`node`, via `-c`/`-e`)
+// `open(path, 'w'/'a')` call as evidence of a write, not just shell
+// redirection (`detectWriteTargets` itself stays redirect-only because
+// write-guard and permission-gate also consume it, and both deliberately
+// treat `cp`/`mv`/`sed -i` as safe, non-write commands — see that function's
+// own comment). Extended with `isScratchPath` so a write that only ever
+// lands in /tmp does not count as having saved the real deliverable.
 //
 // A turn's evidence-of-work also includes `ShellSend` (writing to an
 // already-running interactive job's stdin) even though it is deliberately
@@ -231,17 +232,30 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // deadlineForRun's own once-per-run resolution. Both regexes are
 // false-negative-biased by design: if either fails to find a single
 // confident match, this trigger stays permanently inert for the run rather
-// than guessing. A guard armed with the wrong path or the wrong limit is
-// worse than one that never fires -- it would tell the model to golf a file
-// that isn't the deliverable, or accept a size that isn't the real cap.
+// than guessing. For the byte limit, "a single confident match" also folds
+// in ambiguity: a prompt stating two DIFFERENT sizes (see `parseByteLimit`'s
+// own doc comment) is treated the same as no match at all, rather than
+// resolved to whichever the regex happens to reach first. A guard armed with
+// the wrong path or the wrong limit is worse than one that never fires -- it
+// would tell the model to golf a file that isn't the deliverable, or accept
+// a size that isn't the real cap.
 //
 // Getting the real byte count reuses syntax-check's own solution to the
 // adjacent problem of reaching a file that lives in the TB container: the
 // `__LC_TB_SHELL__` proxy channel (`_shared/tb-proxy.ts`), which pi's host
 // process can use to run a command inside the container and read back its
 // output. A `wc -c` over that channel is a real count, not an inference from
-// command text. This only runs on a turn whose commands actually touched the
-// parsed deliverable path -- a turn doing unrelated work pays nothing.
+// command text; the path is shell-quoted (`checkDeliverableSize` reuses
+// syntax-check's own `shellQuote`) before it is interpolated into that
+// command, since it comes from task-author prose the container shell must
+// not be allowed to interpret. The per-turn check
+// (`maybeCheckDeliverableSize`) only runs on a turn whose commands actually
+// touched the parsed deliverable path -- a turn doing unrelated work pays
+// nothing -- with one exception: `maybeCheckDeliverableSizeAtEnd` always
+// re-checks once at `agent_end`, regardless of what (if anything) the run's
+// own last turn touched, so a deliverable that regressed over budget
+// earlier and was then only compiled/run -- or never touched again -- for
+// the rest of the run still gets a corrective nudge before the trial ends.
 //
 // The over-budget count is session- rather than run-scoped: it tracks a
 // property of the whole trial's deliverable, so a mid-run compaction
@@ -281,6 +295,7 @@ const MAX_TRIGGER_C_FIRES = 2; // per session
 
 const SIZE_CHECK_TIMEOUT_SEC = CHECK_TIMEOUT_SEC; // same budget syntax-check gives its own container checks
 const OVER_BUDGET_CHECKS_BEFORE_NUDGE = 3; // consecutive over-budget checks -- avoids spamming mid-golf
+const MAX_TRIGGER_E_END_FIRES = 2; // per session -- mirrors MAX_TRIGGER_C_FIRES
 
 // ---- Trigger A state (session-scoped fire count; run-scoped turn/cap bookkeeping) ----
 let triggerAFireCount = 0;
@@ -340,6 +355,11 @@ let deliverablePathForRun: string | undefined;
 // limit.
 let lastKnownSize: number | undefined;
 let consecutiveOverBudgetChecks = 0;
+// Session-scoped fire count for the agent_end end-of-run check, like Trigger
+// C's own fire count -- `agent_end` can recur across a trial (each
+// mid-run-compaction continuation ends its own run segment there), so this
+// bounds how many end-of-run nudges one trial can receive.
+let triggerEEndFireCount = 0;
 
 function isTerminalBench(): boolean {
   return process.env.LITTLE_CODER_BENCHMARK === "terminal_bench";
@@ -431,43 +451,115 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // behind a `\b` -- `<` is itself a non-word character, so `\b<` can never
 // fire next to the space that almost always precedes it in prose.
 //
-// "less than" is excluded when preceded by "no"/"not" -- "no less than N
-// bytes" states a FLOOR, and reading it as this trigger's ceiling would arm
-// the guard backwards (steering the model to shrink a file that has no
-// upper limit at all). The other alternatives don't have a floor-shaped
-// negation in ordinary prose, so only this one needs the guard.
+// "less than" is excluded when preceded by "no"/"not", optionally with an
+// intervening "be" -- "no less than N bytes" AND "must not be less than N
+// bytes" both state a FLOOR, and reading either as this trigger's ceiling
+// would arm the guard backwards (steering the model to shrink a file that
+// has no upper limit at all). Confirmed regression: a lookbehind that only
+// inspected the single token immediately before "less" caught "no less
+// than"/"not less than" but not "not BE less than" -- the token directly
+// before "less" there is "be", not "not"/"no" -- so "must not be less than
+// 5000 bytes" used to parse as a 5000-byte ceiling. The other alternatives
+// don't have a floor-shaped negation in ordinary prose, so only this one
+// needs the guard.
 const BYTE_LIMIT_RE =
-  /(?:\b(?:under|below|(?<!no\s)(?<!not\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+  /(?:\b(?:under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
 
 // An absolute path stated near an instruction verb, e.g. "Call your program
 // /app/gpt2.c".
 const DELIVERABLE_PATH_RE =
   /\b(?:call\s+your\s+\w+|save\s+(?:it|your\s+\w+)\s+(?:as|to)|write\s+(?:it|your\s+\w+)\s+to|program\s+(?:at|to))\s+(\/\S+)/i;
 
+// A per-item quantifier opening the SAME sentence as a byte-limit match --
+// "each record must be 64 bytes" states a per-record size, not the
+// deliverable's own. Anchored to the sentence's own start (see
+// `byteLimitCandidates` below), not merely present somewhere in it, so an
+// unrelated "each"/"every"/"per" elsewhere in the prompt can't disqualify an
+// otherwise-clean match.
+const PER_ITEM_QUALIFIER_RE = /^\s*(?:each|every|per)\b/i;
+
+// A byte-limit match immediately followed (within the same sentence) by "of
+// output" states a runtime-output-size constraint, not the deliverable
+// file's own size on disk -- confirmed regression: "prints at most 100 bytes
+// of output" used to resolve to 100 as the deliverable's limit.
+const OUTPUT_QUALIFIER_RE = /^\s*(?:of|in)\s+(?:its\s+|the\s+)?output\b/i;
+
+/** The nearest sentence boundary (`.` or `;`) around index `at`, or the string's own edges. */
+function sentenceBounds(prompt: string, at: number): { start: number; end: number } {
+  let start = 0;
+  for (let i = at - 1; i >= 0; i--) {
+    if (prompt[i] === "." || prompt[i] === ";") {
+      start = i + 1;
+      break;
+    }
+  }
+  let end = prompt.length;
+  for (let i = at; i < prompt.length; i++) {
+    if (prompt[i] === "." || prompt[i] === ";") {
+      end = i;
+      break;
+    }
+  }
+  return { start, end };
+}
+
+/**
+ * Every BYTE_LIMIT_RE match in `prompt`, each normalized to bytes and flagged
+ * `disqualified` when its own sentence's context (see the two RE's above)
+ * marks it as being about something other than the deliverable's own size.
+ * Matches a fresh global clone of BYTE_LIMIT_RE rather than mutating the
+ * shared const -- BYTE_LIMIT_RE itself stays a plain non-global pattern for
+ * every other caller.
+ */
+function byteLimitCandidates(prompt: string): { value: number; disqualified: boolean }[] {
+  const re = new RegExp(BYTE_LIMIT_RE.source, BYTE_LIMIT_RE.flags + "g");
+  const out: { value: number; disqualified: boolean }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(prompt))) {
+    const unit = m[2].toLowerCase();
+    const value = unit.startsWith("k") ? Number(m[1]) * 1024 : Number(m[1]);
+    const { start, end } = sentenceBounds(prompt, m.index);
+    const before = prompt.slice(start, m.index);
+    const after = prompt.slice(m.index + m[0].length, end);
+    const disqualified = PER_ITEM_QUALIFIER_RE.test(before) || OUTPUT_QUALIFIER_RE.test(after);
+    out.push({ value, disqualified });
+    if (re.lastIndex === m.index) re.lastIndex++; // guard against a zero-length match looping forever
+  }
+  return out;
+}
+
 /**
  * The byte limit stated in the prompt, normalized to bytes (kb/kilobytes
- * x1024). Undefined when the pattern doesn't match at all. First-match, not
- * ambiguity-checked: a prompt stating two DIFFERENT size constraints (e.g. a
- * per-record size alongside the deliverable's own limit) resolves to
- * whichever the regex reaches first, not a detected conflict -- narrow
- * enough that no task in the current suite exercises it. Exported for the
- * smoke test against the real gpt2-codegolf prompt.
+ * x1024). Undefined when no confident candidate remains: the pattern doesn't
+ * match at all, every match is disqualified by its own sentence's context
+ * (see `byteLimitCandidates`), or more than one DISTINCT value survives
+ * disqualification -- a genuine ambiguity between two different stated sizes
+ * is left unresolved rather than guessed at (the same false-negative bias
+ * the module header describes), not silently resolved to whichever the
+ * regex reaches first. Confirmed regression this replaces: "each record must
+ * be 64 bytes; the program must be under 5000 bytes" used to return 64 (the
+ * unrelated per-record constraint). Exported for the smoke test against the
+ * real gpt2-codegolf prompt.
  */
 export function parseByteLimit(prompt: string): number | undefined {
-  const m = BYTE_LIMIT_RE.exec(prompt);
-  if (!m) return undefined;
-  const value = Number(m[1]);
-  const unit = m[2].toLowerCase();
-  return unit.startsWith("k") ? value * 1024 : value;
+  const candidates = byteLimitCandidates(prompt).filter((c) => !c.disqualified);
+  if (candidates.length === 0) return undefined;
+  const distinctValues = new Set(candidates.map((c) => c.value));
+  if (distinctValues.size > 1) return undefined;
+  return candidates[0].value;
 }
 
 /**
  * The deliverable's absolute path stated in the prompt. Undefined when the
- * pattern doesn't match at all -- first-match, same caveat as
- * `parseByteLimit` above. Trailing sentence punctuation (a comma or period
- * immediately after the path, as in "Call your program /app/gpt2.c, I will
- * compile...") is stripped -- `\S+` has no way to distinguish it from a path
- * character, and no real deliverable path ends in one.
+ * pattern doesn't match at all -- first-match, and unlike `parseByteLimit`
+ * above (which is now ambiguity-checked, see there), this parser has no
+ * equivalent disambiguation: a prompt with two candidate paths still
+ * resolves to whichever DELIVERABLE_PATH_RE reaches first. Narrow enough
+ * that no task in the current suite exercises it. Trailing sentence
+ * punctuation (a comma or period immediately after the path, as in "Call
+ * your program /app/gpt2.c, I will compile...") is stripped -- `\S+` has no
+ * way to distinguish it from a path character, and no real deliverable path
+ * ends in one.
  */
 export function parseDeliverablePath(prompt: string): string | undefined {
   const m = DELIVERABLE_PATH_RE.exec(prompt);
@@ -483,6 +575,7 @@ export default function (pi: ExtensionAPI) {
     deliverableWriteEverSeen = false;
     lastKnownSize = undefined;
     consecutiveOverBudgetChecks = 0;
+    triggerEEndFireCount = 0;
     byteLimitForRun = undefined;
     deliverablePathForRun = undefined;
   });
@@ -557,6 +650,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event, ctx) => {
     if (!isTerminalBench()) return;
     maybeFireTriggerC(pi, ctx);
+    await maybeCheckDeliverableSizeAtEnd(pi, ctx);
   });
 }
 
@@ -941,12 +1035,18 @@ function maybeFireTriggerD(pi: ExtensionAPI, ctx: any): void {
  * mode -- not in TB mode, a proxy error, a timeout, a non-zero exit, a
  * non-numeric response -- returns null rather than fabricating a size,
  * matching syntax-check's own "every failure mode is silence" discipline.
+ *
+ * `path` is shell-quoted (reusing syntax-check's own `shellQuote`) before
+ * interpolation -- it comes from `DELIVERABLE_PATH_RE`'s capture over
+ * task-author prose, untrusted as far as the container shell run by
+ * `tbProxyRun` is concerned, and interpolating it bare would let shell
+ * metacharacters in that prose inject a second command into the container.
  */
 async function checkDeliverableSize(ctx: ProxyUiCtx, path: string): Promise<number | null> {
   if (!inTbMode()) return null;
   let text: string | null;
   try {
-    text = await tbProxyRun(ctx, `wc -c ${path}`, SIZE_CHECK_TIMEOUT_SEC, tbSessionId());
+    text = await tbProxyRun(ctx, `wc -c ${shellQuote(path)}`, SIZE_CHECK_TIMEOUT_SEC, tbSessionId());
   } catch {
     return null;
   }
@@ -968,7 +1068,10 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
     if (size === null) return;
     lastKnownSize = size;
 
-    if (size <= byteLimitForRun) {
+    // Strict "<N bytes", not "<=N": a file of exactly the stated limit is
+    // still over budget. Confirmed regression this replaces: `<= ` treated
+    // an exactly-N-byte file as compliant.
+    if (size < byteLimitForRun) {
       consecutiveOverBudgetChecks = 0;
       return;
     }
@@ -1013,6 +1116,58 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
         (nearDeadline
           ? " — near deadline, telling the model to save its best version."
           : " — telling the model to keep golfing."),
+    );
+  })();
+}
+
+/**
+ * The end-of-run counterpart to `maybeCheckDeliverableSize`: an unconditional
+ * re-check at `agent_end`, independent of whether the run's own last turn(s)
+ * wrote the deliverable at all. Confirmed gap this closes: the only
+ * per-turn check is gated on `writesDeliverablePath` finding evidence THAT
+ * turn, so a deliverable that regressed over budget on an earlier turn and
+ * was then only compiled/run (or never touched again) for the rest of the
+ * run reached the run's end with a known-over-budget file on disk and zero
+ * corrective steer -- the exact motivating failure shape from the real
+ * gpt2-codegolf trial this guard was built for.
+ *
+ * A SEPARATE check from `maybeCheckDeliverableSize`'s own
+ * OVER_BUDGET_CHECKS_BEFORE_NUDGE-gated escalation, not a replacement for
+ * it: this fires on the first over-budget observation it makes (there is no
+ * later turn at `agent_end` for a cooldown to wait out), and its own fire
+ * count (`triggerEEndFireCount`/`MAX_TRIGGER_E_END_FIRES`) is independent of
+ * `consecutiveOverBudgetChecks`.
+ */
+function maybeCheckDeliverableSizeAtEnd(pi: ExtensionAPI, ctx: any): Promise<void> {
+  return (async () => {
+    if (deliverablePathForRun === undefined || byteLimitForRun === undefined) return;
+    if (triggerEEndFireCount >= MAX_TRIGGER_E_END_FIRES) return;
+
+    const size = await checkDeliverableSize(ctx as ProxyUiCtx, deliverablePathForRun);
+    if (size === null) return;
+    lastKnownSize = size;
+    if (size < byteLimitForRun) return; // compliant -- nothing to say
+
+    const overBy = size - byteLimitForRun;
+    const nearDeadline =
+      armed || finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun });
+    const msg = nearDeadline
+      ? resolveFinalizeMessage("terminal_bench")
+      : buildTriggerEMessage(overBy, byteLimitForRun);
+
+    try {
+      pi.sendUserMessage(msg, { deliverAs: "steer" });
+    } catch {
+      // Don't burn the fire count for a nudge that was never actually
+      // delivered — mirrors every other trigger's ordering.
+      return;
+    }
+    triggerEEndFireCount++;
+    harnessIntervention(
+      ctx,
+      `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
+        `${byteLimitForRun}-byte limit at run end with no write this run to have caught it — ` +
+        "telling the model to fix it before the trial ends.",
     );
   })();
 }

