@@ -1803,6 +1803,12 @@ def prompt_with_mid_run_compaction(
     last_error = ""
     retry_exception = ""
     n_compactions = 0
+    # Consecutive busy-rejections the `except PiBusyError` branch below has
+    # seen for the CURRENT compaction cycle, bounding that branch's own
+    # retry-in-place the same way `attempts` bounds prompt_with_error_retry's
+    # -- reset to 0 the moment a cycle actually completes (see below), so an
+    # unrelated earlier busy episode can never carry over into a later one.
+    consecutive_busy_retries = 0
     cycle_message = message
     cycle_timeout = min(timeout, max(0.0, deadline - now()))
 
@@ -1834,12 +1840,22 @@ def prompt_with_mid_run_compaction(
             # the same rejection falls straight through to the blanket
             # `except Exception` below and ends the trial instead of
             # retrying. Bounded by the same is_alive()/min_remaining_sec
-            # brakes the rest of this loop already uses -- no new cap needed,
-            # since each PiBusyError already cost its own ~20s readiness loop
-            # inside prompt_and_collect before it could even be raised.
+            # brakes the rest of this loop already uses, AND by
+            # `consecutive_busy_retries`/`max_attempts` below: every retry
+            # re-enters wait_for_pi_idle, capped at PI_IDLE_WAIT_CAP_SEC
+            # (1800s) per call, not the ~20s readiness floor a single
+            # PiBusyError already cost inside prompt_and_collect -- so a
+            # genuinely wedged (not merely stale-idle) pi would otherwise
+            # burn remaining_budget / 1800s full-length waits before the
+            # budget floor ever caught it. `max_attempts` is reused
+            # deliberately for a second purpose here (bounding busy-retries,
+            # not just prompt_with_error_retry's own provider-error
+            # retries), the same count bound the sibling helper already
+            # applies to its own PiBusyError handler.
             if merged is None:
                 raise
             detail = f"{type(exc).__name__}: {exc}"
+            consecutive_busy_retries += 1
             _log(
                 f"continuation after compaction {n_compactions} hit a busy "
                 f"pi ({detail}); waiting for it to go idle and retrying"
@@ -1848,6 +1864,16 @@ def prompt_with_mid_run_compaction(
                 merged = replace(
                     merged, stop_reason="process_exit", error_message=""
                 )
+                return ErrorRetryOutcome(
+                    merged, n_error_retries, last_error, detail, n_compactions
+                )
+            if consecutive_busy_retries >= max_attempts:
+                _log(
+                    f"not retrying the continuation: {consecutive_busy_retries} "
+                    f"consecutive busy rejections reached the {max_attempts} "
+                    f"attempt bound"
+                )
+                merged = replace(merged, stop_reason="compacted")
                 return ErrorRetryOutcome(
                     merged, n_error_retries, last_error, detail, n_compactions
                 )
@@ -1874,6 +1900,14 @@ def prompt_with_mid_run_compaction(
                 rpc, deadline, min_remaining_sec=min_remaining_sec,
                 now=now, sleep=sleep, log=log,
             )
+            # Recorded here too, not only on the two give-up paths above: a
+            # busy rejection the loop then recovers from -- this retry
+            # succeeding -- must leave the same trace
+            # ErrorRetryOutcome.retry_exception's own docstring promises for
+            # prompt_with_error_retry's identical case, not read back as a
+            # trial that never hit one at all.
+            retry_exception = detail
+            n_error_retries += 1
             cycle_timeout = max(0.0, deadline - now())
             continue
         except Exception as exc:
@@ -1935,6 +1969,12 @@ def prompt_with_mid_run_compaction(
             return ErrorRetryOutcome(
                 merged, n_error_retries, last_error, detail, n_compactions
             )
+        # A cycle that reaches here completed without raising PiBusyError --
+        # whether it goes on to another compaction or returns normally below
+        # -- so the current busy streak is over; a later stale-idle read
+        # must start counting fresh, not inherit an unrelated earlier
+        # episode's near-miss.
+        consecutive_busy_retries = 0
         # Summed / last-non-empty across cycles for the same reason
         # prompt_with_error_retry keeps them across its own attempts: a
         # later cycle recovering must not erase what the earlier ones cost.
