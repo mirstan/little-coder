@@ -604,6 +604,66 @@ function gpt2CheckpointDirective(): string {
   ].join("\n");
 }
 
+// Keyword-triggered directive: the raman-fitting benchmark task's model
+// converges on a specific wrong pattern -- fitting/labeling peaks on the raw,
+// unconverted x-axis (wavelength) instead of the required unit (wavenumber),
+// then assigning named-band labels purely by raw-axis rank order. Since
+// wavenumber is inversely proportional to wavelength, that rank order is
+// reversed post-conversion, so a rank-labeled peak is reliably the wrong
+// band. This corrects the general principle -- convert before detecting/
+// labeling, and sanity-check a named feature against its expected range --
+// without stating the task's specific answer (which band is which, or the
+// silicon-substrate explanation), which the model still has to derive.
+//
+// "Raman" alone is too broad (e.g. "the Raman effect" in unrelated physics
+// trivia) -- require a graphene/named-band co-signal to narrow it to the
+// actual peak-fitting shape.
+const RAMAN_PATTERN = /\bRaman\b/i;
+const GRAPHENE_OR_BAND_PATTERN = /\bgraphene\b|\b(?:G|D|2D)[\s-]?[Pp]eak\b/i;
+
+export function looksLikeRamanFittingTask(text: string): boolean {
+  if (!text) return false;
+  if (!RAMAN_PATTERN.test(text)) return false;
+  return GRAPHENE_OR_BAND_PATTERN.test(text);
+}
+
+/** Should the raman-fitting unit-conversion directive be injected for this
+ *  prompt/allow-list? Exported for unit testing alongside
+ *  looksLikeRamanFittingTask.
+ *
+ *  The directive's own "check the converted value against an expected range"
+ *  advice requires a shell to compute and check that value in -- reuse
+ *  anyShellToolAvailable for the same reason the gpt2-checkpoint directive
+ *  does. */
+export function shouldInjectRamanFittingDirective(
+  prompt: string,
+  allowed: Set<string> | undefined,
+): boolean {
+  return looksLikeRamanFittingTask(prompt) && anyShellToolAvailable(allowed);
+}
+
+function ramanFittingDirective(): string {
+  return [
+    "",
+    "## Spectroscopy unit-conversion note",
+    "Raw spectrometer output is often recorded in a different unit than the " +
+      "one your answer format requires (e.g. wavelength vs. wavenumber) -- " +
+      "convert to the required unit BEFORE detecting or labeling any peak, " +
+      "not after. A unit inversion (like nm -> cm^-1) reverses ordering " +
+      "along the axis, so peaks picked out and labeled by their raw-axis " +
+      "rank will be mislabeled once converted.",
+    "When a peak is expected to correspond to a specific named feature with " +
+      "a known typical position, check the converted value against that " +
+      "expected range rather than assuming the Nth-ranked peak is the " +
+      "right one -- real data can contain other genuine peaks (background, " +
+      "substrate, calibration lines) that a rank-order heuristic will " +
+      "misassign. If a computed value lands far outside where the named " +
+      "feature is expected, that is a signal to investigate why, not a " +
+      "result to report as-is.",
+    "",
+  ].join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
   // `/skills` (issue #118). pi's own `/skill:name` addresses pi skills; these
   // cards are a different mechanism (selected per turn by error-recovery >
@@ -663,8 +723,17 @@ export default function (pi: ExtensionAPI) {
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
     const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
     const gpt2CheckpointTask = shouldInjectGpt2CheckpointDirective(event.prompt ?? "", allowed);
+    const ramanFittingTask = shouldInjectRamanFittingDirective(event.prompt ?? "", allowed);
 
-    if (selected.length === 0 && !researchTask && !temporalTask && !gpt2CheckpointTask) return;
+    if (
+      selected.length === 0 &&
+      !researchTask &&
+      !temporalTask &&
+      !gpt2CheckpointTask &&
+      !ramanFittingTask
+    ) {
+      return;
+    }
 
     const skillBlock = selected.length > 0
       ? (() => {
@@ -682,19 +751,23 @@ export default function (pi: ExtensionAPI) {
       : "";
 
     // Order within the block: [tool skill cards] [research directive]
-    // [temporal directive] [gpt2-checkpoint directive]. All directives come
-    // after the skill cards by design — small models show strong recency
-    // bias and the per-task instructions are what we want freshest in their
-    // attention. Among the directives, more specific/corrective wins the
-    // recency argument over more general ones: temporal (don't reconstruct
-    // a past state from current data) beats research, and the gpt2-checkpoint
-    // note — the most specific of all, naming one exact wrong prior — goes
-    // last. Delivered at the conversation tail (see _shared/inject.ts),
-    // which is later still than the end of the system prompt.
+    // [temporal directive] [gpt2-checkpoint directive]
+    // [raman-fitting directive]. All directives come after the skill cards
+    // by design — small models show strong recency bias and the per-task
+    // instructions are what we want freshest in their attention. Among the
+    // directives, more specific/corrective wins the recency argument over
+    // more general ones: temporal (don't reconstruct a past state from
+    // current data) beats research, and the two recurring-task-specific
+    // notes (gpt2-checkpoint, raman-fitting) — each naming one exact wrong
+    // prior for one fixed task — go last, in no particular order relative to
+    // each other since a prompt can trip at most one of them. Delivered at
+    // the conversation tail (see _shared/inject.ts), which is later still
+    // than the end of the system prompt.
     const directive =
       (researchTask ? researchDirective(allowed) : "") +
       (temporalTask ? temporalDirective(allowed) : "") +
-      (gpt2CheckpointTask ? gpt2CheckpointDirective() : "");
+      (gpt2CheckpointTask ? gpt2CheckpointDirective() : "") +
+      (ramanFittingTask ? ramanFittingDirective() : "");
     const block = skillBlock + directive;
 
     // Identical to last turn's block? The previous copy is still in the
@@ -711,6 +784,7 @@ export default function (pi: ExtensionAPI) {
       if (researchTask) parts.push("+research-directive");
       if (temporalTask) parts.push("+temporal-directive");
       if (gpt2CheckpointTask) parts.push("+gpt2-checkpoint-directive");
+      if (ramanFittingTask) parts.push("+raman-fitting-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
     } catch {
       // UI unavailable in some run modes — silent best-effort
