@@ -51,9 +51,9 @@ describe("knowledge directory loads from repo", () => {
   const kDir = join(here, "..", "..", "..", "skills", "knowledge");
   const pDir = join(here, "..", "..", "..", "skills", "protocols");
 
-  it("knowledge dir has 13 files", () => {
+  it("knowledge dir has 14 files", () => {
     expect(existsSync(kDir)).toBe(true);
-    expect(readdirSync(kDir).filter((f) => f.endsWith(".md")).length).toBe(13);
+    expect(readdirSync(kDir).filter((f) => f.endsWith(".md")).length).toBe(14);
   });
 
   it("protocols dir has 3 files", () => {
@@ -74,5 +74,48 @@ describe("knowledge directory loads from repo", () => {
   it("workspace_docs declares requires_tools", () => {
     const parsed = parseSkillFile(readFileSync(join(kDir, "workspace_docs.md"), "utf-8"));
     expect(parsed!.frontmatter.requires_tools).toEqual(["read", "glob"]);
+  });
+});
+
+// Motivating trial: train-fasttext__yewN65G (benchmarks/harbor_runs/
+// 2026-09-24__21-02-23/) scored reward 0.0 at 0.617 accuracy vs a 0.62
+// threshold, inside the model's own measured ~0.019 CV/holdout spread.
+// This entry is scoped to the general train-to-threshold shape, not
+// fastText specifically -- these tests exercise the REAL frontmatter
+// keywords against the REAL scorer, not a hand-copied keyword list.
+describe("stochastic-training-variance entry", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const kDir = join(here, "..", "..", "..", "skills", "knowledge");
+  const parsed = parseSkillFile(
+    readFileSync(join(kDir, "stochastic_training_variance.md"), "utf-8"),
+  );
+  const keywords = parsed!.frontmatter.keywords as string[];
+
+  it("fires on the real train-fasttext instruction text", () => {
+    const prompt =
+      "Please train a fasttext model on the yelp data in the data/ folder. " +
+      "The final model size needs to be less than 150MB but get at least " +
+      "0.62 accuracy on a private test set that comes from the same yelp " +
+      "review distribution. The model should be saved as /app/model.bin";
+    expect(scoreEntry(prompt, entry(keywords))).toBeGreaterThanOrEqual(MIN_SCORE_THRESHOLD);
+  });
+
+  it("fires on a different train-to-threshold prompt that never mentions fastText", () => {
+    // Proves this is a general train-to-threshold entry, not a fastText-only
+    // trigger with extra words attached.
+    const prompt = "train an XGBoost classifier to reach at least 0.85 F1 on the validation set";
+    expect(scoreEntry(prompt, entry(keywords))).toBeGreaterThanOrEqual(MIN_SCORE_THRESHOLD);
+  });
+
+  it("does not fire on unrelated coding prompts with no training/threshold shape", () => {
+    const gpt2Codegolf =
+      "I have downloaded the gpt-2 weights stored as a TF .ckpt. Write me a " +
+      "dependency-free C file that samples from the model with arg-max " +
+      "sampling. Call your program /app/gpt2.c, I will compile with gcc -O3 " +
+      "-lm. It should read the .ckpt and the .bpe file. Your c program must " +
+      'be <5000 bytes. I will run it /app/a.out gpt2-124M.ckpt vocab.bpe ' +
+      '"[input string here]" and you should continue the output under ' +
+      "whatever GPT-2 would print for the next 20 tokens.";
+    expect(scoreEntry(gpt2Codegolf, entry(keywords))).toBeLessThan(MIN_SCORE_THRESHOLD);
   });
 });
