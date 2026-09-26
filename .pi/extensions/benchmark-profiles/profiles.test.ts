@@ -56,12 +56,16 @@ describe("benchmark-profiles resolution against real settings.json", () => {
     expect(p.max_turns).toBeUndefined();
   });
 
-  it("every shipped per-model profile carries the 4096 budget, except the fixed omlx/rapidmlx real-budget profiles", () => {
-    // omlx/tiel-coder-oq4e and rapidmlx/tiel-coder-oq4e carry a real 32768 budget;
-    // without it they fall through to default_model_profile's 4096 default, which
-    // unconditionally shadows LITTLE_CODER_THINKING_BUDGET. Every other shipped
-    // profile is unaffected.
-    const REAL_BUDGET_PROFILES = new Set(["omlx/tiel-coder-oq4e", "rapidmlx/tiel-coder-oq4e"]);
+  it("every shipped per-model profile carries the 4096 budget, except the fixed real-budget profiles", () => {
+    // These carry a real 32768 budget; without it they fall through to
+    // default_model_profile's 4096 default, which unconditionally shadows
+    // LITTLE_CODER_THINKING_BUDGET. Every other shipped profile is unaffected.
+    const REAL_BUDGET_PROFILES = new Set([
+      "omlx/tiel-coder-oq4e",
+      "omlx/tiel-coder-oq6e-fp16",
+      "rapidmlx/tiel-coder-oq4e",
+      "mlx-serve/ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+    ]);
     for (const key of Object.keys(settings.model_profiles)) {
       const expected = REAL_BUDGET_PROFILES.has(key) ? 32768 : 4096;
       expect(resolveProfileFrom(settings, key).thinking_budget, key).toBe(expected);
@@ -148,6 +152,17 @@ describe("before_agent_start publishes a model-window contextLimit", () => {
   it("falls back to 32768 when the model reports no usable window", () => {
     const lc = fireWith({ provider: "llamacpp", id: "qwen3.6-35b-a3b", contextWindow: 0 });
     expect(lc.contextLimit).toBe(32768);
+  });
+
+  it("republishes thinking_level, which only default_model_profile declares today", () => {
+    // Observability only -- rpc_client.py::resolve_thinking_level is what
+    // actually applies the level, via pi's --thinking flag at launch. The
+    // undefined below is the whole-profile fallback showing through: a
+    // profile that matches does not inherit default_model_profile's fields.
+    const matched = fireWith({ provider: "llamacpp", id: "qwen3.6-35b-a3b", contextWindow: 131072 });
+    expect(matched.thinkingLevel).toBeUndefined();
+    const unmatched = fireWith({ provider: "nope", id: "nope", contextWindow: 131072 });
+    expect(unmatched.thinkingLevel).toBe("high");
   });
 
   it("an explicit gaia override still wins over the live window", () => {

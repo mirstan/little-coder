@@ -39,7 +39,7 @@ def test_footer_survives_a_long_body():
     assert len(text) > 400
     out = preview_tool_result(text)
     assert out.endswith(FOOTER)
-    assert "truncated" in out
+    assert "omitted from this log preview" in out
 
 
 def test_stays_within_the_budget():
@@ -61,7 +61,10 @@ def test_elision_marker_reports_how_much_was_dropped():
     body = _long_body()
     out = preview_tool_result(_formatted(body))
     kept = out.split("\n… [+")[0]
-    assert f"[+{len(body) - len(kept)} chars truncated]" in out
+    assert (
+        f"[+{len(body) - len(kept)} chars omitted from this log preview; "
+        "the model received the full output]" in out
+    )
 
 
 def test_output_without_a_footer_is_handled():
@@ -70,7 +73,7 @@ def test_output_without_a_footer_is_handled():
     text = "word " * 300
     out = preview_tool_result(text)
     assert len(out) <= 400
-    assert "truncated" in out
+    assert "omitted from this log preview" in out
     kept = out.split("\n… [+")[0]
     assert text.startswith(kept)
     assert not kept.endswith(" "), "cut should land before the trailing space"
@@ -90,7 +93,7 @@ def test_footer_is_preserved_even_when_it_eats_the_whole_budget():
     text = _formatted("some body text that will not survive", footer)
     out = preview_tool_result(text)
     assert out.endswith(footer)
-    assert "truncated" in out
+    assert "omitted from this log preview" in out
     assert not out.startswith("\n")
 
 
@@ -117,7 +120,7 @@ def test_unbroken_token_wider_than_the_budget_still_keeps_the_footer():
     text = _formatted("x" * 2000)
     out = preview_tool_result(text)
     assert out.endswith(FOOTER)
-    assert "truncated" in out
+    assert "omitted from this log preview" in out
 
 
 def test_a_footer_only_result_over_the_limit_is_kept_whole():

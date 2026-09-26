@@ -12,6 +12,8 @@
 // This dir has no `index.ts` on purpose — the launcher's extension discovery
 // requires one, so `_shared` is skipped and stays a plain library.
 
+// 5, not fewer: the nudge needs several turns of real headroom for the
+// model to act on it, not just one before the cap aborts the run.
 export const WARN_REMAINING = 5; // turns
 export const WARN_REMAINING_MS = 10 * 60 * 1000; // wall-clock headroom before deadline
 
@@ -44,4 +46,31 @@ export function finalizeWarnWouldFire({
   const timeTrigger = deadlineForRun > 0 && remainingMs <= WARN_REMAINING_MS;
 
   return turnTrigger || timeTrigger;
+}
+
+export interface FinalizeWarnTurnWindowArgs {
+  /** 1-indexed turn count within the current agent run. */
+  turnsThisRun: number;
+  /** Turn cap for the current run; 0 (or any non-positive value) = no cap. */
+  capForRun: number;
+}
+
+/**
+ * True on every turn from the one `finalizeWarnWouldFire`'s turn trigger
+ * fires on through the cap itself — the level-triggered form of that edge.
+ *
+ * The edge form exists because its callers latch on it. A caller with no
+ * latch to consult asks a different question ("is the endgame already
+ * underway?", not "did it begin this turn?") and gets a wrong answer from
+ * the edge on every turn but one: tb-finalize-guard's Trigger D cannot
+ * reuse Trigger B's `armed` latch, which stops re-latching once Trigger B
+ * has fired.
+ *
+ * The wall-clock half needs no counterpart — it is already level-triggered.
+ */
+export function finalizeWarnTurnWindowOpen({
+  turnsThisRun,
+  capForRun,
+}: FinalizeWarnTurnWindowArgs): boolean {
+  return capForRun > WARN_REMAINING && turnsThisRun > capForRun - WARN_REMAINING;
 }

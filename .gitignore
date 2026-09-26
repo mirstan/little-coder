@@ -53,3 +53,6 @@ benchmarks/self_improve/build/
 # Committed real-data test fixture -- overrides the blanket *.log rule above,
 # which otherwise silently drops this file from the repo.
 !benchmarks/self_improve/tests/fixtures/**/*.log
+
+# Scratch pi agent dir for benchmark subprocesses (rpc_client._BENCH_AGENT_DIR)
+/.cache/

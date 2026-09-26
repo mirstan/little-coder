@@ -53,6 +53,7 @@ TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 # (not inlined) so tests can monkeypatch each one independently, matching how
 # REPO_ROOT/PI_BIN are already overridden in tests.
 _PI_SETTINGS_PATH = Path.home() / ".pi" / "agent" / "settings.json"
+_PI_PROJECT_SETTINGS_PATH = REPO_ROOT / ".pi" / "settings.json"
 _LC_MODELS_SHIPPED_DEFAULT = REPO_ROOT / "models.json"
 _OMLX_SETTINGS = Path.home() / ".omlx" / "settings.json"
 _OMLX_MODEL_SETTINGS = Path.home() / ".omlx" / "model_settings.json"
@@ -127,6 +128,107 @@ def _build_system_prompt() -> Path:
     return generated
 
 
+#: Scratch agent dir for benchmark pi subprocesses. Repo-scoped rather than a
+#: per-process temp dir so the bin/ symlink and whatever a run wrote survive
+#: for post-mortem, and so two checkouts never share one.
+_BENCH_AGENT_DIR = REPO_ROOT / ".cache" / "pi-bench-agent"
+
+
+def _bench_agent_dir() -> str:
+    """Prepare and return the PI_CODING_AGENT_DIR every benchmark pi gets.
+
+    thinking-budget's latches call pi.setThinkingLevel() mid-trial, which
+    pi writes straight through to <agent dir>/settings.json. At the default
+    agent dir that file is the user's own interactive
+    ~/.pi/agent/settings.json, whose defaultThinkingLevel a benchmark run
+    was observed silently overwriting.
+
+    This redirects EVERYTHING pi derives from getAgentDir() (config.js),
+    not just settings.json: auth.json, pi's own models.json/models-store.json,
+    bin/, tools/, sessions/. pi recreates what it needs, so the practical
+    effect is that a benchmark pi starts from an empty agent config.
+
+    That is harmless for these runs, but for a narrower reason than it may
+    look. Auth IS redirected -- pi writes a fresh empty auth.json here -- and
+    the local providers these benchmarks drive simply don't use it: their key
+    comes from a *_API_KEY env var (set in PiRpc.__init__) or from
+    little-coder's own models.json, a DIFFERENT file that resolves from
+    ~/.config/little-coder (see _resolve_little_coder_models_file) and is
+    unaffected by the agent dir. Likewise pi's own agent-dir models.json is
+    redirected, but llamacpp/omlx/mlx-serve register through this repo's
+    extensions rather than that file.
+
+    A hosted-provider run (OAuth in ~/.pi/agent/auth.json) would NOT survive
+    this redirect. No benchmark drives one today; one that did would have to
+    export PI_CODING_AGENT_DIR itself to opt out.
+    """
+    # Ahead of the mkdir, which is itself one of the mutations being guarded:
+    # mkdir(parents=True) through a symlinked .cache/ would create the leaf
+    # inside ~/.pi before any later check could object. resolve() follows a
+    # redirect at .cache/ as well as at the leaf, and tolerates the leaf not
+    # existing yet.
+    #
+    # The hazard: mkdir(exist_ok=True) succeeds on a symlink to a directory,
+    # so the delete below follows one wherever it points -- and pointing it
+    # back at ~/.pi/agent both destroys the user's settings.json and silently
+    # undoes the isolation, since every later latch writes through the link.
+    # Worth guarding because polyglot and gaia hand the model under test an
+    # unsandboxed host shell, which is enough to plant it.
+    #
+    # Only ~/.pi is refused, not everywhere outside the repo: relocating
+    # .cache/ to another disk is legitimate, and the scratch dir only ever
+    # holds files pi put there.
+    pi_home = (Path.home() / ".pi").resolve()
+    resolved = _BENCH_AGENT_DIR.resolve()
+    if resolved == pi_home or pi_home in resolved.parents:
+        raise RuntimeError(
+            f"benchmark agent dir {_BENCH_AGENT_DIR} resolves inside {pi_home} "
+            f"({resolved}) -- that is the config this isolation exists to "
+            f"protect, so refusing to touch it. Remove the redirect, or export "
+            f"PI_CODING_AGENT_DIR to manage the agent dir yourself."
+        )
+    _BENCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    # Start each session from a known thinking level. thinking-budget's
+    # latch calls pi.setThinkingLevel(), which settings-manager.js persists
+    # to <agent dir>/settings.json under the GLOBAL scope -- so without this
+    # a run that latched to "off" would leave that behind as the startup
+    # default of every later run sharing this dir. Only pi itself ever
+    # writes this file, so nothing hand-authored is lost; bin/ and auth.json
+    # are deliberately kept (see above).
+    #
+    # Assumes one pi at a time per checkout, which every harness satisfies
+    # today (the pilots pin --n-concurrent 1). Raising that would need a
+    # per-session dir instead: a second trial's delete lands between a
+    # running trial's latch write and a third pi's startup read.
+    try:
+        (_BENCH_AGENT_DIR / "settings.json").unlink()
+    except OSError:
+        pass
+    # pi's Grep tool calls ensureTool("rg"), which downloads ripgrep from
+    # GitHub when <agent dir>/bin has no copy -- a mid-trial download, or a
+    # dead Grep tool offline. A download pi does still perform then lands in
+    # the real bin dir, exactly as it would without this isolation.
+    real_bin = Path.home() / ".pi" / "agent" / "bin"
+    link = _BENCH_AGENT_DIR / "bin"
+    if real_bin.is_dir():
+        try:
+            # readlink(), not exists(): exists() follows the link, so a
+            # dangling one reads as absent and symlink_to then raises
+            # FileExistsError into the handler below -- leaving the dead
+            # link in place forever, which is the failure this guards.
+            if not link.is_symlink():
+                stale = link.exists()
+            else:
+                stale = link.readlink() != real_bin
+            if stale:
+                link.unlink(missing_ok=True)
+            if not link.exists():
+                link.symlink_to(real_bin, target_is_directory=True)
+        except OSError:
+            pass
+    return str(_BENCH_AGENT_DIR)
+
+
 class PiProcessExited(RuntimeError):
     """pi exited before completing the request. Carries its stderr tail."""
 
@@ -149,6 +251,17 @@ _MAX_NON_TEXT_DELTAS = 5_000
 _NON_TEXT_DELTA_HEAD_KEEP = 500
 
 
+class PiBusyError(RuntimeError):
+    """pi refused the prompt as "already processing" on every readiness attempt.
+
+    Distinct from the generic RuntimeError every OTHER rejection reason still
+    raises, because this one is recoverable by waiting: the session is alive
+    and holding a transcript worth continuing, it is just mid-run (a long
+    compaction summarization, most often). prompt_with_error_retry treats it
+    as retryable for exactly that reason.
+    """
+
+
 @dataclass
 class PromptResult:
     """Outcome of a single prompt_and_collect() call."""
@@ -165,6 +278,15 @@ class PromptResult:
     #: provider error or came back empty -- see error_message), "deadline"
     #: (budget expired), or "process_exit" (pi died mid-run). Callers must not
     #: infer this from elapsed time.
+    #:
+    #: prompt_with_mid_run_compaction adds a fifth value, "compacted", which
+    #: prompt_and_collect itself never produces: an "agent_end" it relabelled
+    #: because that end was pi unwinding the run for a compaction the harness
+    #: asked for, not the agent finishing. It is an intermediate label -- a
+    #: cycle carrying it is normally followed by another -- so a caller of
+    #: that helper sees it as the FINAL stop_reason only when a brake
+    #: (compaction cap, budget floor, dead pi) stopped the loop right after
+    #: one, which is itself the accurate account of how such a trial ended.
     #:
     #: "error" is a refinement of "agent_end", not of the other two:
     #: "deadline"/"process_exit" always win over it, because those describe
@@ -252,6 +374,9 @@ class PiRpc:
         # Required api-key envs (pi requires SOMETHING even for local providers)
         full_env.setdefault("LLAMACPP_API_KEY", "noop")
         full_env.setdefault("OLLAMA_API_KEY", "noop")
+        # Not setdefault: an exported value must also skip the mkdir.
+        if "PI_CODING_AGENT_DIR" not in full_env:
+            full_env["PI_CODING_AGENT_DIR"] = _bench_agent_dir()
         if benchmark:
             full_env["LITTLE_CODER_BENCHMARK"] = benchmark
         if allowed_tools:
@@ -308,6 +433,8 @@ class PiRpc:
         self._event_q: list[dict] = []
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
+        # Not _cv's lock: a blocked write would stall event demultiplexing.
+        self._send_lock = threading.Lock()
         self._closed = False
         #: Set once pi's stdout reaches EOF, i.e. the process is going away.
         self._eof = False
@@ -417,11 +544,25 @@ class PiRpc:
 
     # ── Send / recv ──────────────────────────────────────────────────────
     def _send(self, obj: dict):
+        """Write one JSONL request to pi's stdin.
+
+        Called from two threads -- the reader thread answering an
+        `extension_ui_request`, and the caller thread issuing prompts /
+        get_state / compact -- so the write and its flush are serialized.
+        Interleaved, they produce a line pi answers with a parse error and
+        discards, which for a request awaited by id is not a visible failure
+        but a wait that only ends at its timeout. Before mid-generation
+        sends became routine (prompt_with_error_retry's idle-wait retry
+        path, prompt_with_mid_run_compaction's compact request) this needed
+        two threads to collide by accident; now it is an expected pairing.
+        """
         if self._proc.stdin is None or self._proc.stdin.closed:
             return
+        payload = json.dumps(obj) + "\n"
         try:
-            self._proc.stdin.write(json.dumps(obj) + "\n")
-            self._proc.stdin.flush()
+            with self._send_lock:
+                self._proc.stdin.write(payload)
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError):
             pass
 
@@ -702,9 +843,18 @@ class PiRpc:
             if resp.get("success"):
                 break
             err = str(resp.get("error", ""))
-            if "already processing" in err.lower() and readiness_attempt < 4:
-                time.sleep(2 * (readiness_attempt + 1))
-                continue
+            if "already processing" in err.lower():
+                if readiness_attempt < 4:
+                    time.sleep(2 * (readiness_attempt + 1))
+                    continue
+                # Typed only for THIS rejection reason. Every other one stays
+                # a generic RuntimeError, which prompt_with_error_retry
+                # treats as terminal -- widening the type would make
+                # genuinely unrecoverable rejections look retryable.
+                raise PiBusyError(
+                    f"pi stayed busy across {readiness_attempt + 1} readiness "
+                    f"attempts: {resp.get('error')}"
+                )
             raise RuntimeError(f"pi rejected prompt: {resp.get('error')}")
 
         # Trim any event still queued from before THIS response was recorded
@@ -1018,6 +1168,40 @@ class PiRpc:
             raise RuntimeError(f"pi rejected get_state: {resp.get('error')}")
         return resp.get("data", {})
 
+    def request_compact(self) -> str:
+        """Ask pi to compact the session now; return the request id.
+
+        Deliberately does NOT wait for the response. The only useful moment
+        to fire this is from inside an `on_event` callback, which runs on the
+        draining thread (see _drain_events_until) -- blocking there stalls
+        event demultiplexing and the tb_shell proxy with it, and the response
+        cannot arrive until pi has finished summarizing anyway. Pair it with
+        await_compact() once the aborted run has unwound.
+
+        pi's own `session.compact()` aborts the active run before it starts
+        summarizing, so the prompt_and_collect this is fired from will end
+        with an `agent_end` that means "we interrupted it", not "the agent
+        finished".
+        """
+        rid = str(uuid.uuid4())
+        self._send({"id": rid, "type": "compact"})
+        return rid
+
+    def await_compact(self, rid: str, timeout: float = 600) -> dict:
+        """Collect the response to a request_compact(), or raise.
+
+        Raises RuntimeError carrying pi's own error text on a failed
+        compaction (it has several: an already-compacted branch, a session
+        too small to compact, an extension cancelling it), TimeoutError if
+        the response does not arrive in `timeout`, and PiProcessExited if pi
+        went away first. Returns pi's CompactionResult payload; callers
+        mostly want `estimatedTokensAfter`, which pi marks optional.
+        """
+        resp = self._await_response(rid, timeout=timeout)
+        if not resp.get("success"):
+            raise RuntimeError(f"pi rejected compact: {resp.get('error')}")
+        return resp.get("data", {})
+
     def session_stats(self, timeout: float = 10) -> Optional[dict]:
         """Query pi's own cumulative token/cost accounting for this session.
 
@@ -1157,6 +1341,72 @@ ERROR_RETRY_PROMPT = (
     "complete — please continue working on it. If the task is actually "
     "already complete and verified, say so explicitly and stop."
 )
+#: How often wait_for_pi_idle re-reads pi's own state.
+PI_IDLE_POLL_SEC = 10.0
+#: Flat stuckness guard on top of the deadline bound: a pi wedged in
+#: `isCompacting` forever would otherwise burn the entire remaining trial
+#: budget waiting, and attempting the prompt anyway is strictly better than
+#: not attempting it at all.
+PI_IDLE_WAIT_CAP_SEC = 1800.0
+
+
+def wait_for_pi_idle(
+    rpc: PiRpc,
+    deadline: float,
+    *,
+    min_remaining_sec: float = ERROR_RETRY_MIN_BUDGET_SEC,
+    poll_sec: float = PI_IDLE_POLL_SEC,
+    cap_sec: float = PI_IDLE_WAIT_CAP_SEC,
+    now: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Poll pi's own state until it is neither streaming nor compacting.
+
+    Motivation, measured: the real TB2.0 `train-fasttext` failure was not the
+    context overflow itself but what came after -- the error retry landed in
+    a sustained "Agent is already processing" window (pi was mid-compaction,
+    which can run for many minutes on a 260k transcript) and exhausted its
+    five readiness attempts inside the first ~30 seconds of it. Waiting for
+    pi's own idle signal before re-prompting turns that into a recovery.
+
+    Returns True only when pi was actually observed idle. Every other
+    outcome -- the cap, the deadline, a state read that never succeeded --
+    returns False, and the caller is expected to attempt the prompt ANYWAY:
+    a stale or wrong idle reading must never by itself end a recoverable
+    trial, and the send loop's own readiness retry is the backstop if the
+    read was wrong. False on a dead pi too, where the caller's own liveness
+    checks are the right authority.
+
+    `now`/`sleep` are injected so tests can drive the whole wait without
+    spending real seconds, matching prompt_with_error_retry.
+    """
+    wait_until = min(now() + cap_sec, deadline - min_remaining_sec)
+    unreadable_logged = False
+    while True:
+        if not rpc.is_alive():
+            return False
+        try:
+            state = rpc.get_state()
+        except PiProcessExited:
+            return False
+        except Exception as exc:
+            # An unreadable state is "not idle yet": a pi too busy to
+            # answer get_state is the case this wait exists for.
+            if log is not None and not unreadable_logged:
+                log(f"could not read pi state while waiting for idle: {exc}")
+                unreadable_logged = True
+            state = None
+        if isinstance(state, dict) and not (
+            state.get("isStreaming") or state.get("isCompacting")
+        ):
+            return True
+        remaining = wait_until - now()
+        if remaining <= 0:
+            if log is not None:
+                log("pi never went idle within the wait bound; prompting anyway")
+            return False
+        sleep(min(poll_sec, remaining))
 
 
 @dataclass
@@ -1176,11 +1426,18 @@ class ErrorRetryOutcome:
     #: record n_error_retries > 0 with no trace of what it recovered from.
     error_message: str = ""
     #: "TypeName: message" when a RETRY raised and was turned into the merged
-    #: result instead of propagating, "" otherwise. Separate from
+    #: result instead of propagating -- including a PiBusyError the loop then
+    #: recovered from, which is retained the way `error_message` is, and
+    #: including an exception out of one of prompt_with_mid_run_compaction's
+    #: continuation cycles. "" otherwise. Separate from
     #: `error_message`, which is a provider verdict: this one is a harness
     #: fault (a rejected prompt, a dead pipe) that the caller would otherwise
     #: have seen as a raised exception and now cannot see at all.
     retry_exception: str = ""
+    #: Mid-run compactions prompt_with_mid_run_compaction deliberately
+    #: triggered. Always 0 out of prompt_with_error_retry, which has no
+    #: compaction mechanism of its own.
+    n_deliberate_compactions: int = 0
 
 
 def _merged_result(acc: PromptResult, latest: PromptResult) -> PromptResult:
@@ -1265,6 +1522,17 @@ def prompt_with_error_retry(
     left pi dead -- as a "process_exit" stop_reason rather than a retryable
     "error".
 
+    A `PiBusyError` out of a retry is the one exception type handled rather
+    than merged-and-returned. It means the session is alive and worth
+    continuing but was mid-run when the send landed -- the shape of the real
+    TB2.0 `train-fasttext` failure, where the retry hit a multi-minute
+    compaction window and the blanket handler then ended the trial on the
+    first of its two available retries. It re-enters the loop through the
+    same `wait_for_pi_idle` preamble every retry uses, still bounded by
+    `max_attempts` and the budget/liveness brakes, but outside
+    `identical_error_limit`: a busy rejection carries no error text to
+    compare and resolves by waiting, not by giving up.
+
     `sleep`/`now` are injected purely so tests can drive the whole policy
     without spending real seconds.
     """
@@ -1278,6 +1546,10 @@ def prompt_with_error_retry(
     attempts = 0
     n_retries = 0
     last_error = ""
+    # Retained across a recovery for the same reason last_error is: a trial
+    # that spent attempts on a busy pi and then succeeded would otherwise
+    # leave no trace of what it recovered from.
+    busy_exception = ""
     identical_streak = 0
     attempt_message = message
     merged: Optional[PromptResult] = None
@@ -1288,11 +1560,47 @@ def prompt_with_error_retry(
 
     while True:
         attempts += 1
+        if attempts > 1:
+            # pi can still be mid-compaction from the attempt that just
+            # failed, and a send into that window is what PiBusyError
+            # reports. attempt_timeout is recomputed AFTER the wait, which
+            # can itself spend up to PI_IDLE_WAIT_CAP_SEC.
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
+            attempt_timeout = max(0.0, deadline - now())
         if attempts == 1:
             result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
         else:
             try:
                 result = rpc.prompt_and_collect(attempt_message, attempt_timeout, on_event)
+            except PiBusyError as exc:
+                # Before the blanket handler below on purpose: that one ends
+                # the loop after a single retry, which is exactly how the
+                # real failure wasted the rest of its budget. A busy
+                # rejection carries no error text, so it deliberately does
+                # NOT feed identical_streak -- there is nothing to compare,
+                # and counting it would fast-fail the loop on a condition
+                # that resolves by waiting.
+                detail = f"{type(exc).__name__}: {exc}"
+                busy_exception = detail
+                _log(f"attempt {attempts}/{max_attempts} rejected: {exc}")
+                if attempts >= max_attempts:
+                    _log(f"not retrying: {max_attempts} attempts already used")
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                if (deadline - now()) < min_remaining_sec:
+                    _log(
+                        f"not retrying: only {deadline - now():.0f}s of budget "
+                        f"is left, below the {min_remaining_sec:.0f}s floor"
+                    )
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                if not rpc.is_alive():
+                    _log("not retrying: pi process is gone")
+                    return ErrorRetryOutcome(merged, n_retries, last_error, detail)
+                n_retries += 1
+                _log(f"retry {n_retries} after waiting for pi to go idle")
+                continue
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
                 _log(
@@ -1320,7 +1628,7 @@ def prompt_with_error_retry(
                 return ErrorRetryOutcome(merged, n_retries, last_error, detail)
         merged = result if merged is None else _merged_result(merged, result)
         if result.stop_reason != "error":
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         err = result.error_message or "provider error"
         identical_streak = identical_streak + 1 if err == last_error else 1
@@ -1332,13 +1640,13 @@ def prompt_with_error_retry(
 
         if attempts >= max_attempts:
             _log(f"not retrying: {max_attempts} attempts already used")
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
         if identical_streak >= identical_error_limit:
             _log(
                 f"not retrying: {identical_streak} consecutive attempts failed "
                 f"with the identical error, treating it as non-retryable"
             )
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         backoff = backoff_sec[min(n_retries, len(backoff_sec) - 1)] if backoff_sec else 0.0
         remaining_after_backoff = (deadline - now()) - backoff
@@ -1348,14 +1656,14 @@ def prompt_with_error_retry(
                 f"left after a {backoff:.0f}s backoff, below the "
                 f"{min_remaining_sec:.0f}s floor"
             )
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         if not rpc.is_alive():
             # pi can exit between attempts, once the derivation that would
             # have said "process_exit" has already run on this result.
             # Prompting anyway raises PiProcessExited out of the trial.
             _log("not retrying: pi process is gone")
-            return ErrorRetryOutcome(merged, n_retries, last_error)
+            return ErrorRetryOutcome(merged, n_retries, last_error, busy_exception)
 
         sleep(backoff)
         n_retries += 1
@@ -1364,6 +1672,423 @@ def prompt_with_error_retry(
         _log(
             f"retry {n_retries} on the same session with "
             f"{attempt_timeout:.0f}s of remaining budget"
+        )
+
+
+# ── Deliberate mid-run compaction ───────────────────────────────────────────
+
+#: Context-token estimate at which the harness asks pi to compact. Below the
+#: 262 144-token window the real TB2.0 `train-fasttext` trial overflowed, with
+#: enough slack for the turn already in flight to land.
+COMPACT_TRIGGER_TOKENS = 220_000
+#: A compaction that freed less than this much is not worth repeating: the
+#: transcript is dominated by whatever compaction cannot summarize away, so
+#: the next trigger would just spend another summarization on nothing.
+#: Clamped against the threshold it is measured from -- see
+#: COMPACT_REGAIN_MAX_FRACTION.
+COMPACT_REGAIN_MIN_TOKENS = 30_000
+#: Ceiling on the regain floor, as a fraction of the threshold that fired.
+#: Without it the flat floor above is unsatisfiable on a small window: a
+#: 32 768-token model triggers at 27 525, so demanding 30 000 tokens of
+#: headroom below that asks for a negative context. Six of the nine models
+#: in models.json declare exactly 32 768, and every one of them would have
+#: compacted once per trial and then gone inert -- on precisely the models
+#: that overflow soonest. Half the threshold is the weaker demand that
+#: remains satisfiable at every window, and it binds only below ~71k, so
+#: the tuned behaviour of the big windows is untouched.
+COMPACT_REGAIN_MAX_FRACTION = 0.5
+#: Hard cap on deliberate compactions per trial, so the outer loop is bounded
+#: independently of whether the anti-thrash check ever fires.
+MAX_DELIBERATE_COMPACTIONS = 5
+#: Same shape and escape hatch as ERROR_RETRY_PROMPT, for the same reason:
+#: the nudge has to be able to lose against an agent that genuinely finished.
+COMPACTION_CONTINUE_PROMPT = (
+    "Your session context was compacted to free space, which interrupted "
+    "what you were doing. The task is not complete — please continue from "
+    "where you left off. If the task is actually already complete and "
+    "verified, say so explicitly and stop."
+)
+
+
+def _turn_context_tokens(event: dict) -> Optional[int]:
+    """Context-token estimate carried by one `turn_end` event, or None.
+
+    input + cacheRead + cacheWrite is the prompt pi actually sent, and
+    output is what the turn added to it, so their sum approximates the
+    context the NEXT turn will carry. Parsed exactly as prompt_and_collect's
+    own usage aggregation does -- same defensive .get/isinstance handling,
+    because this is untrusted wire data from a pi build we don't control and
+    a malformed field here must not crash a trial over token accounting.
+    """
+    message = event.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    for src in ("input", "output", "cacheRead", "cacheWrite"):
+        val = usage.get(src, 0)
+        if isinstance(val, (int, float)):
+            total += val
+    return int(total)
+
+
+class _CompactionTrigger:
+    """A caller's `on_event`, wrapped to watch context growth on `turn_end`.
+
+    Disarmed rather than deleted when there is nothing to watch against (no
+    `context_window`) or when compaction has proved unhelpful: the wrapper
+    stays in the callback chain either way, so the caller's own on_event
+    keeps firing and only the compaction mechanism goes inert.
+    """
+
+    def __init__(
+        self,
+        rpc: PiRpc,
+        on_event: Optional[Callable[[dict], None]],
+        context_window: Optional[float],
+        *,
+        trigger_tokens: float = COMPACT_TRIGGER_TOKENS,
+        log: Optional[Callable[[str], None]] = None,
+    ):
+        self._rpc = rpc
+        self._inner = on_event
+        self._log = log
+        # A fraction of the window as well as the flat trigger, so a model
+        # with a smaller window still compacts before it overflows.
+        #
+        # Type-checked, not just truth-checked, for the reason
+        # _turn_context_tokens spells out: contextWindow is wire data from a
+        # pi build we don't control, and a malformed one must disarm the
+        # mechanism the way a missing one does -- never raise out of a
+        # trial. A non-positive window is malformed the same way: it would
+        # put the threshold at or below zero, firing a compaction on the
+        # first turn_end that carried any usage at all.
+        threshold = (
+            min(int(trigger_tokens), int(0.84 * context_window))
+            if isinstance(context_window, (int, float))
+            and not isinstance(context_window, bool)
+            and context_window > 0
+            else None
+        )
+        # Validated on the COMPUTED threshold rather than the input, so the
+        # check means what the note above says: int(0.84 * w) truncates to 0
+        # for any window under 1.19, which would otherwise arm the trigger at
+        # zero and fire it on the first turn_end carrying any usage at all.
+        self.threshold: Optional[int] = threshold if threshold else None
+        self._armed = self.threshold is not None
+        self.pending_rid: Optional[str] = None
+
+    def __call__(self, event: dict) -> None:
+        # The caller's logging runs first and unguarded: an exception out of
+        # it must keep behaving exactly as it did before this wrapper existed.
+        if self._inner is not None:
+            self._inner(event)
+        if event.get("type") != "turn_end":
+            return
+        tokens = _turn_context_tokens(event)
+        if tokens is None:
+            return
+        if not self._armed or self.pending_rid is not None:
+            return
+        if tokens < self.threshold:
+            return
+        try:
+            self.pending_rid = self._rpc.request_compact()
+        except Exception as exc:
+            # A failed request must not propagate: this runs inside
+            # _drain_events_until, where a raising callback discards the
+            # whole in-flight batch of events.
+            self._armed = False
+            if self._log is not None:
+                self._log(f"could not request compaction: {exc}")
+            return
+        # Disarmed until the request resolves, never re-checked per turn:
+        # two concurrent compact requests would have pi abort the run it
+        # started for the first one.
+        self._armed = False
+        if self._log is not None:
+            self._log(
+                f"requested compaction at ~{tokens} context tokens "
+                f"(threshold {self.threshold})"
+            )
+
+    def take_pending(self) -> Optional[str]:
+        """Hand back the outstanding compact request id, clearing it."""
+        rid, self.pending_rid = self.pending_rid, None
+        return rid
+
+    def rearm(self) -> None:
+        if self.threshold is not None:
+            self._armed = True
+
+    def disarm(self) -> None:
+        self._armed = False
+
+
+def prompt_with_mid_run_compaction(
+    rpc: PiRpc,
+    message: str,
+    timeout: float,
+    on_event: Optional[Callable[[dict], None]] = None,
+    *,
+    deadline: Optional[float] = None,
+    context_window: Optional[float] = None,
+    continue_message: str = COMPACTION_CONTINUE_PROMPT,
+    trigger_tokens: float = COMPACT_TRIGGER_TOKENS,
+    regain_min_tokens: float = COMPACT_REGAIN_MIN_TOKENS,
+    max_compactions: int = MAX_DELIBERATE_COMPACTIONS,
+    retry_message: str = ERROR_RETRY_PROMPT,
+    max_attempts: int = ERROR_RETRY_MAX_ATTEMPTS,
+    backoff_sec: tuple = ERROR_RETRY_BACKOFF_SEC,
+    min_remaining_sec: float = ERROR_RETRY_MIN_BUDGET_SEC,
+    identical_error_limit: int = ERROR_RETRY_IDENTICAL_LIMIT,
+    log: Optional[Callable[[str], None]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> ErrorRetryOutcome:
+    """prompt_with_error_retry(), plus compaction the harness triggers itself.
+
+    Motivation, measured: a TB2.0 `train-fasttext` trial ran 244 turns over
+    ~11 hours and then died of context overflow -- omlx refused a 264 975-token
+    prompt against a 262 144-token window. pi's own auto-compaction would
+    have prevented it, but it only checks at agent-run BOUNDARIES, and a
+    Harbor trial is structurally ONE agent run: no boundary ever occurs, so
+    the check never ran until the overflow had already forced one.
+
+    This helper supplies the boundary. It watches `turn_end` usage as the
+    events stream past, and when the context estimate crosses
+    `min(trigger_tokens, 0.84 * context_window)` it issues pi's `compact`
+    command mid-run. pi's `session.compact()` aborts the active run itself,
+    so the inner prompt_with_error_retry returns with an `agent_end` that is
+    really "we interrupted it" -- relabelled to "compacted" -- and this loop
+    re-prompts the same session with `continue_message` once the compaction
+    has finished.
+
+    A NEW outer loop, not a change to prompt_with_error_retry: that helper is
+    called as a black box, once per cycle, with the same absolute `deadline`
+    every time and whatever budget is left as its `timeout`. Its own retry
+    policy, brakes and merge semantics are untouched, so the two fixes can
+    fail independently -- with `context_window=None` (the adapter's probe
+    failed, or the model declares no window) the trigger never arms and this
+    degrades to exactly prompt_with_error_retry.
+
+    Four brakes end the loop: `max_compactions`, the `min_remaining_sec`
+    budget floor, a dead pi, and the anti-thrash check -- a compaction whose
+    `estimatedTokensAfter` shows less than `regain_min_tokens` of headroom
+    regained disarms the trigger for the rest of the trial rather than
+    spending another summarization proving the same thing. A compaction that
+    fails outright (pi reports "Already compacted" / "Nothing to compact" /
+    a cancelling extension, or never answers) disarms it too, but still gets
+    its continuation prompt: the run was aborted by `compact()` before any
+    of those failures could happen, so the session is sitting idle mid-task
+    either way.
+
+    A stop_reason other than `agent_end` coming back from a cycle that had a
+    compaction pending is left alone and ends the loop: "deadline",
+    "process_exit" and an exhausted "error" are terminal conditions of their
+    own, unrelated to the abort we asked for.
+
+    An exception out of a CONTINUATION cycle ends the loop too, but returns
+    the cycles already completed rather than propagating -- see the handler
+    for why that does not weaken prompt_with_error_retry's rule about its own
+    first attempt, which still applies to the trial's first prompt here.
+    """
+    if deadline is None:
+        deadline = now() + timeout
+
+    def _log(text: str) -> None:
+        if log is not None:
+            log(text)
+
+    trigger = _CompactionTrigger(
+        rpc, on_event, context_window, trigger_tokens=trigger_tokens, log=log
+    )
+    if trigger.threshold is None:
+        _log("mid-run compaction disabled: no context window to trigger against")
+
+    merged: Optional[PromptResult] = None
+    n_error_retries = 0
+    last_error = ""
+    retry_exception = ""
+    n_compactions = 0
+    cycle_message = message
+    cycle_timeout = min(timeout, max(0.0, deadline - now()))
+
+    while True:
+        try:
+            outcome = prompt_with_error_retry(
+                rpc,
+                cycle_message,
+                cycle_timeout,
+                trigger,
+                deadline=deadline,
+                retry_message=retry_message,
+                max_attempts=max_attempts,
+                backoff_sec=backoff_sec,
+                min_remaining_sec=min_remaining_sec,
+                identical_error_limit=identical_error_limit,
+                log=log,
+                sleep=sleep,
+                now=now,
+            )
+        except Exception as exc:
+            # prompt_with_error_retry leaves its own first attempt outside
+            # its try deliberately, so that wrapping a call site in it cannot
+            # swallow what a bare prompt_and_collect would have raised. That
+            # is right for the trial's FIRST prompt and wrong for every
+            # continuation after it: this loop calls the helper once per
+            # cycle, so a post-compaction continuation is an "attempt 1" too,
+            # and anything raised there ended the trial AND discarded every
+            # cycle already completed.
+            #
+            # `merged is None` is precisely "no cycle has completed yet",
+            # i.e. this IS the trial's first prompt, so it still propagates
+            # and the bare-prompt_and_collect contract is untouched.
+            #
+            # EVERY exception, not just the typed busy one. A pi wedged in a
+            # long summarization does not reliably answer "already
+            # processing" at all, and prompt_and_collect's readiness loop
+            # retries only on that explicit response -- so a pi too busy to
+            # send one raises TimeoutError out of _await_response instead,
+            # and a pi that died summarizing raises PiProcessExited, which
+            # prompt_and_collect's own docstring records ending a Harbor
+            # trial before its metadata was ever written. Those are the same
+            # wedged continuation in different clothes. The inner helper
+            # already answered this question the same way for its own
+            # retries, so catching less here would only mean one rejection
+            # preserves the trial's work on an inner retry and destroys it on
+            # a continuation cycle, decided by nothing but which side of a
+            # try the call happens to sit on. Ending the loop and discarding
+            # what was already earned are separate questions.
+            #
+            # Exception, never BaseException: harbor runs this inside
+            # asyncio.to_thread and cancels on trial timeout, and
+            # CancelledError is a BaseException.
+            if merged is None:
+                raise
+            detail = f"{type(exc).__name__}: {exc}"
+            _log(f"continuation after compaction {n_compactions} raised {detail}")
+            # Unconditionally, for the same reason prompt_with_error_retry
+            # prints its swallowed exceptions: `log` defaults to None, and
+            # this path turns a raised failure into an ordinary return.
+            print(
+                f"WARNING: continuation after compaction {n_compactions} "
+                f"raised {detail}; returning the {n_compactions} completed "
+                f"compaction cycle(s) instead",
+                file=sys.stderr,
+            )
+            if not rpc.is_alive():
+                # Same recheck prompt_with_error_retry does on the same kind
+                # of path: the accumulated verdict would otherwise report
+                # "compacted" -- or a retryable "error" -- for a session that
+                # is provably gone. `replace`, not mutation: `merged` can
+                # still be a cycle's own object.
+                merged = replace(
+                    merged, stop_reason="process_exit", error_message=""
+                )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, detail, n_compactions
+            )
+        # Summed / last-non-empty across cycles for the same reason
+        # prompt_with_error_retry keeps them across its own attempts: a
+        # later cycle recovering must not erase what the earlier ones cost.
+        n_error_retries += outcome.n_error_retries
+        last_error = outcome.error_message or last_error
+        retry_exception = outcome.retry_exception or retry_exception
+
+        result = outcome.result
+        rid = trigger.take_pending()
+        if rid is None:
+            merged = result if merged is None else _merged_result(merged, result)
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        n_compactions += 1
+        if result.stop_reason == "agent_end":
+            result = replace(result, stop_reason="compacted")
+        merged = result if merged is None else _merged_result(merged, result)
+        if result.stop_reason != "compacted":
+            _log(
+                f"compaction requested, but the run ended as "
+                f"{result.stop_reason!r} -- not continuing"
+            )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        # Awaiting the response is load-bearing, not a courtesy: pi's
+        # session.prompt() refuses a message only while `isStreaming`, never
+        # while `isCompacting`, so a continuation sent before the summary
+        # lands is accepted and races pi rebuilding the transcript under it.
+        try:
+            data = rpc.await_compact(
+                rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
+            )
+        except Exception as exc:
+            trigger.disarm()
+            _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
+            # Our await gave up, which does not mean pi's compaction did.
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
+        else:
+            after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
+            # Measured against the threshold that actually fired, not the
+            # flat trigger: on a window smaller than trigger_tokens the two
+            # differ, and a bound that never fires cannot say whether this
+            # compaction bought anything. A 100k-window model triggers at
+            # 84k, so a drop to 83k reads as 137k of headroom against the
+            # flat 220k -- enough to re-arm and compact again one turn
+            # later, spending every remaining compaction the cap allows on
+            # summarizations that free nothing.
+            regain_floor = min(
+                regain_min_tokens,
+                COMPACT_REGAIN_MAX_FRACTION * (trigger.threshold or 0),
+            )
+            regained_enough = (
+                isinstance(after, (int, float))
+                and trigger.threshold is not None
+                and after <= trigger.threshold - regain_floor
+            )
+            if regained_enough:
+                trigger.rearm()
+                _log(f"compaction left ~{int(after)} context tokens")
+            else:
+                # Also the branch an absent estimatedTokensAfter (pi marks it
+                # optional) takes: unmeasurable headroom is not evidence of
+                # headroom.
+                trigger.disarm()
+                _log(
+                    f"compaction regained too little headroom "
+                    f"(estimatedTokensAfter={after!r}); not compacting again"
+                )
+
+        if n_compactions >= max_compactions:
+            _log(f"not continuing: {max_compactions} deliberate compactions used")
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+        if (deadline - now()) < min_remaining_sec:
+            _log(
+                f"not continuing after compaction: only {deadline - now():.0f}s "
+                f"of budget is left, below the {min_remaining_sec:.0f}s floor"
+            )
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+        if not rpc.is_alive():
+            _log("not continuing after compaction: pi process is gone")
+            return ErrorRetryOutcome(
+                merged, n_error_retries, last_error, retry_exception, n_compactions
+            )
+
+        cycle_message = continue_message
+        cycle_timeout = max(0.0, deadline - now())
+        _log(
+            f"continuing after compaction {n_compactions} with "
+            f"{cycle_timeout:.0f}s of remaining budget"
         )
 
 
@@ -1424,7 +2149,8 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # Reserve room for the marker so the common case stays within `limit`.
     # A fixed reserve, not the marker's exact length, because that length
     # depends on the omitted count, which depends on where we cut.
-    marker_reserve = 40
+    # Sized for the self-describing marker below.
+    marker_reserve = 90
     body_budget = max(0, limit - marker_reserve - (len(footer) + 1 if footer else 0))
     if len(body) <= body_budget:
         return _with_footer(body)
@@ -1438,7 +2164,10 @@ def preview_tool_result(text: str, limit: int = 400) -> str:
     # No boundary at all (one unbroken token wider than the budget) leaves
     # `cut` as the hard slice -- unavoidable, and still better than also
     # losing the footer.
-    marker = f"… [+{len(body) - len(cut)} chars truncated]"
+    marker = (
+        f"… [+{len(body) - len(cut)} chars omitted from this log preview; "
+        "the model received the full output]"
+    )
     out = f"{cut}\n{marker}" if cut else marker
     return _with_footer(out)
 
@@ -1482,6 +2211,126 @@ def _resolve_little_coder_models_file() -> tuple[Path, str]:
     return Path.home() / ".config" / "little-coder" / "models.json", "home_default"
 
 
+#: Applied when no matched profile names a thinking_level, and when the
+#: settings file is missing or malformed. "high" is what the harness
+#: hardcoded before thinking_level existed; a None here would send no
+#: --thinking flag at all, leaving pi on whatever defaultThinkingLevel its
+#: agent dir supplies -- under PiRpc's isolation, none, so pi's built-in
+#: PI_BUILTIN_THINKING_LEVEL.
+DEFAULT_THINKING_LEVEL = "high"
+
+#: pi's own vocabulary, copied from its cli/args.js VALID_THINKING_LEVELS.
+#: Safe to duplicate because pi is vendored in this repo's node_modules, so
+#: the list and the pi that consumes it move together on every bump --
+#: test_thinking_level_resolver.py checks this copy against that file.
+#: A tuple, not a set: ascending effort order is what --help and the
+#: warning below should show, and membership over seven items is free.
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+#: pi's compiled-in level when neither --thinking nor a defaultThinkingLevel
+#: setting supplies one (core/defaults.js::DEFAULT_THINKING_LEVEL).
+PI_BUILTIN_THINKING_LEVEL = "medium"
+
+
+def _load_little_coder_settings() -> dict:
+    """The `little_coder` block, from the first settings file that has one.
+
+    Mirrors .pi/extensions/benchmark-profiles/index.ts::loadSettings() --
+    kept in sync by hand, there is no shared source of truth between this
+    Python harness and that TS extension. The home-directory candidate stays
+    the real ~/.pi/agent/settings.json even though PiRpc now points the
+    subprocess elsewhere (see _bench_agent_dir): the TS side resolves it from
+    $HOME, not from PI_CODING_AGENT_DIR, so this matches what the
+    extension actually reads.
+    """
+    for path in (_PI_PROJECT_SETTINGS_PATH, _PI_SETTINGS_PATH):
+        data = _read_json(path)
+        if data is None:
+            continue
+        little_coder = data.get("little_coder")
+        if isinstance(little_coder, dict):
+            return little_coder
+    return {}
+
+
+def _norm_key(s: str) -> str:
+    """Port of benchmark-profiles/index.ts::normKey(). Its `/:/g` regex is a
+    plain str.replace here -- identical for a single literal character, and
+    with no `re` dependency."""
+    return s.replace(":", "-")
+
+
+def _resolve_profile_from(
+    settings: dict,
+    provider_slash_model: str,
+    bench: Optional[str] = None,
+) -> dict:
+    """Port of benchmark-profiles/index.ts::resolveProfileFrom() -- kept in
+    sync by hand; benchmarks/test_thinking_level_resolver.py pins the two to
+    the same cases. Exact key match, then separator-insensitive prefix match,
+    then default_model_profile, then benchmark_overrides[bench] layered on.
+
+    Note the fallback is whole-profile, not per-field: a profile that matches
+    but omits a field does NOT inherit that field from default_model_profile.
+    """
+    profiles = _as_dict(settings.get("model_profiles"))
+    target = _norm_key(provider_slash_model)
+
+    base = profiles.get(provider_slash_model)
+    if not isinstance(base, dict):
+        base = None
+        for pattern, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            normalized = _norm_key(pattern)
+            if target == normalized or target.startswith(normalized):
+                base = profile
+                break
+    if base is None:
+        base = _as_dict(settings.get("default_model_profile"))
+
+    resolved = {k: v for k, v in base.items() if k != "benchmark_overrides"}
+    overrides = _as_dict(base.get("benchmark_overrides"))
+    if bench and isinstance(overrides.get(bench), dict):
+        resolved.update(overrides[bench])
+    return resolved
+
+
+def resolve_thinking_level(model: str, benchmark: Optional[str] = None) -> str:
+    """The `--thinking` level for a `provider/model`, from settings.json's
+    little_coder.model_profiles (see _resolve_profile_from for the lookup).
+
+    Orthogonal to thinking_budget: the level is a construction-time
+    instruction for how hard to think, the budget a runtime token cap the
+    thinking-budget extension enforces. Where they conflict the level wins --
+    an explicit thinking_level "off" means thinking is off no matter what
+    budget the same profile carries, since there is then nothing to cap.
+
+    Values outside pi's own vocabulary (PI_THINKING_LEVELS) fall back to
+    DEFAULT_THINKING_LEVEL with a warning rather than being passed through.
+    Passing them through would be silently lossy, not permissive: pi's
+    cli/args.js demotes an unrecognized --thinking to a *warning diagnostic*
+    and drops the flag entirely, so pi would quietly run at its own default
+    while the environment snapshot recorded the typo as `source: "cli"`.
+    settings.json's thinking_level is not schema-validated, so a typo there
+    is the realistic way this happens.
+    """
+    level = _resolve_profile_from(
+        _load_little_coder_settings(), model, benchmark
+    ).get("thinking_level")
+    if not isinstance(level, str) or not level:
+        return DEFAULT_THINKING_LEVEL
+    if level not in PI_THINKING_LEVELS:
+        print(
+            f"[rpc_client] settings.json thinking_level={level!r} is not one of "
+            f"{list(PI_THINKING_LEVELS)}; pi would silently ignore it. "
+            f"Using {DEFAULT_THINKING_LEVEL!r} instead.",
+            file=sys.stderr,
+        )
+        return DEFAULT_THINKING_LEVEL
+    return level
+
+
 def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     """maxTokens resolution: the user-override file wins if it defines this
     model; otherwise fall back to the shipped default at REPO_ROOT/models.json
@@ -1513,18 +2362,72 @@ def _find_model_max_tokens(provider: str, model_id: str) -> dict:
     return out
 
 
+def _pi_global_settings_path() -> tuple[Optional[Path], str]:
+    """The settings.json pi will read as its GLOBAL scope, and its path.
+
+    pi derives it from PI_CODING_AGENT_DIR, not from $HOME
+    (config.js::getAgentDir -> getSettingsPath), and PiRpc points every
+    benchmark subprocess at _BENCH_AGENT_DIR -- so ~/.pi/agent/settings.json,
+    which this provenance used to read, is a file pi no longer opens for
+    these runs.
+
+    A None path means "pi will read no global settings", for one of two
+    reasons named by the returned string:
+
+    bench_agent_dir_cleared -- no exported var, so PiRpc supplies the scratch
+    dir and clears its settings.json on every construction. Anything on disk
+    there is a prior run's thinking-budget latch that pi never sees, and the
+    snapshot can be built either side of that delete (harbor writes it before
+    PiRpc, polyglot before the run loop), so ignoring it is the only
+    ordering-independent answer.
+
+    relative_agent_dir -- an exported but relative PI_CODING_AGENT_DIR. pi
+    resolves it against the CHILD's cwd, which PiRpc sets per caller (the
+    per-exercise work dir for polyglot), so this process cannot say which
+    file that is. Reporting a guess resolved against the harness's own cwd
+    would name a file pi may never open.
+
+    Only the exported case is followed: PiRpc also honours the var from a
+    caller's env= dict, which os.environ cannot see. No caller passes one.
+
+    Not pi's whole picture -- settings-manager.js merges
+    <cwd>/.pi/settings.json over this scope -- but no benchmark cwd ships a
+    defaultThinkingLevel, so this is the only scope that can supply one.
+    """
+    env = os.environ.get("PI_CODING_AGENT_DIR")
+    if not env:
+        return None, "bench_agent_dir_cleared"
+    base = Path(env).expanduser()
+    if not base.is_absolute():
+        return None, "relative_agent_dir"
+    return base / "settings.json", "agent_dir"
+
+
 def _resolve_thinking(cli_thinking: Optional[str]) -> dict:
-    settings = _read_json(_PI_SETTINGS_PATH)
-    pi_default = settings.get("defaultThinkingLevel") if settings else None
+    settings_path, path_status = _pi_global_settings_path()
+    if settings_path is None:
+        pi_default = None
+    else:
+        settings = _read_json(settings_path)
+        pi_default = settings.get("defaultThinkingLevel") if settings else None
     if cli_thinking:
         resolved, source = cli_thinking, "cli"
     elif pi_default:
         resolved, source = pi_default, "pi_default_settings"
     else:
-        resolved, source = None, "unresolved"
+        # Not "unresolved": pi does resolve this case, to its own compiled-in
+        # level. Recording None here claimed ignorance about a value that is
+        # in fact knowable, which is how a benchmark ran at "medium" while
+        # its snapshot said nothing at all.
+        resolved, source = PI_BUILTIN_THINKING_LEVEL, "pi_builtin_default"
     return {
         "cli_value": cli_thinking,
         "pi_default_setting": pi_default,
+        # Which file the pi_default_setting above was read from -- the agent
+        # dir moves, so the value alone is ambiguous. None when pi will read
+        # no global settings at all; path_status says which case that is.
+        "pi_default_setting_file": str(settings_path) if settings_path else None,
+        "pi_default_setting_source": path_status,
         "resolved": resolved,
         "source": source,
         # Filled in later by the caller once a live PiRpc session exists and
@@ -1565,8 +2468,9 @@ def _capture_omlx_sampling(model_id: str, errors: list[dict]) -> dict:
 
 def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = None, agent: str = "pi") -> dict:
     """Best-effort snapshot of config that affects generation but isn't visible
-    to the harness's own CLI args: the machine-local default thinking level
-    pi falls back to when --thinking is unset, the model's maxTokens, the
+    to the harness's own CLI args: the default thinking level pi falls back
+    to when --thinking is unset (from whichever agent dir this run points pi
+    at -- see _pi_global_settings_path), the model's maxTokens, the
     model server's sampling params (temperature/top_p/top_k/repetition_penalty
     -- omlx only for now; rapid-mlx's sampling flags are CLI-launch-time only
     with no queryable file, so that provider degrades to a note rather than a
@@ -1609,6 +2513,8 @@ def capture_environment_snapshot(model: str, *, cli_thinking: Optional[str] = No
     except Exception as exc:
         errors.append({"source": "thinking", "error": f"{type(exc).__name__}: {exc}"})
         thinking = {"cli_value": cli_thinking, "pi_default_setting": None,
+                    "pi_default_setting_file": None,
+                    "pi_default_setting_source": "error",
                     "resolved": None, "source": "error", "confirmed_live": None}
     try:
         max_tokens = _find_model_max_tokens(provider, model_id)

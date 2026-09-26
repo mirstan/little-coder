@@ -26,16 +26,21 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 # Repo root, derived the same way _read_version_from_package_json() finds
 # package.json -- benchmarks/harbor_adapter/little_coder_agent.py is two
@@ -98,11 +103,12 @@ from rpc_client import (  # noqa: E402
     PiRpc,
     capture_environment_snapshot,
     preview_tool_result,
-    prompt_with_error_retry,
+    prompt_with_mid_run_compaction,
+    resolve_thinking_level,
 )
 
 
-DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"]
+DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset", "ShellRecall"]
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
 
 # Fallback when the real per-task timeout can't be derived (see
@@ -140,11 +146,34 @@ SNAPSHOT_LEAD_SEC = 600.0
 SNAPSHOT_MIN_BUDGET_SEC = 300.0
 SNAPSHOT_START_MARKER = "/tmp/.lc-start"
 SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-snapshot"
-SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
+# Stage dirs are "<prefix>.$$" and the cleanup glob is "<prefix>.*" --
+# _build_snapshot_command derives both from this one prefix, so a command
+# can never create a stage dir under a name its own cleanup line doesn't
+# reap.
+SNAPSHOT_STAGE_PREFIX = "/tmp/.lc-snapshot.stage"
+# Feeds `head -z -n` below, and is the threshold that tells a complete
+# snapshot from one truncated at the cap.
+SNAPSHOT_MAX_FILES = 500
 
-# Bounded, atomically-staged snapshot of files modified under /app since
-# SNAPSHOT_START_MARKER was touched. Every cap here answers a specific
-# failure mode:
+# Start-of-trial snapshot of the task's PRE-EXISTING /app files. Catches the
+# class no write-detector can see -- a program the model spawned overwriting
+# a task-provided input from inside its own process (the motivating trial:
+# overfull-hbox, whose generated Perl script opened /app/input.tex for write).
+# Its own publish path and stage prefix, never the deadline snapshot's: the
+# two are published at different times under different scopes, and a shared
+# name would have one command's cleanup reap the other's directory.
+INITIAL_SNAPSHOT_PUBLISH_PATH = "/tmp/.lc-initial"
+INITIAL_SNAPSHOT_STAGE_PREFIX = "/tmp/.lc-initial.stage"
+# Host-side destination, under the per-trial logs dir: per-trial by
+# construction, sitting next to environment_snapshot.json where a human doing
+# post-mortem recovery already looks, and download_dir lands it as a real
+# directory tree with the container's own paths preserved.
+INITIAL_SNAPSHOT_DIR_NAME = "initial_state"
+
+# Bounded, atomically-staged copy of files under /app, shared by both
+# snapshots (see _build_snapshot_command): the deadline one, scoped to files
+# modified since SNAPSHOT_START_MARKER was touched, and the start-of-trial
+# one, scoped to everything. Every cap here answers a specific failure mode:
 #   - per-file size cap (-size -10M) and an aggregate file-count cap
 #     (head -z -n 500) and an aggregate byte cap (209715200 = 200MB, via the
 #     `du --files0-from` sum) together bound total copy volume regardless of
@@ -153,11 +182,11 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 #   - a free-space reserve check (FREE >= TOTAL + 524288000, i.e. 500MB)
 #     protects storage_mb-tight task containers (10240MB typical in TB2.1
 #     task.tomls) from being pushed over their quota by the snapshot itself.
-#   - staging into $STAGE and only `mv`-ing it to SNAPSHOT_PUBLISH_PATH once
+#   - staging into $STAGE and only `mv`-ing it to the publish path once
 #     fully populated means a half-copied snapshot is never visible at the
 #     published path (atomic publish).
 #   - the whole body runs under an internal `timeout 20`, and the trailing
-#     `rm -rf SNAPSHOT_STAGE_GLOB` (outside that timeout) reaps a stage dir
+#     `rm -rf <stage prefix>.*` (outside that timeout) reaps a stage dir
 #     orphaned if the 20s kill lands mid-copy ("cleanup-on-timeout" duty).
 #     Documented here rather than as a trailing inline comment on the command
 #     string's own last line: _exec_async appends a wrapper epilogue
@@ -187,25 +216,103 @@ SNAPSHOT_STAGE_GLOB = "/tmp/.lc-snapshot.stage.*"
 #     no confirmed inventory of every TB task container's base image/findutils
 #     provenance, so rather than bet on GNU everywhere, `-s` alone is the
 #     whole fix here -- it's portable and sufficient on its own.
-_SNAPSHOT_COMMAND = (
-    "timeout 20 sh -c '\n"
-    "  set -e\n"
-    "  STAGE=/tmp/.lc-snapshot.stage.$$\n"
-    "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
-    "  # candidate list: files under /app changed since trial start, per-file <10M\n"
-    "  find /app -xdev -maxdepth 3 -type f -size -10M -newer /tmp/.lc-start -print0 2>/dev/null \\\n"
-    "    | head -z -n 500 > \"$STAGE/.list\"           # aggregate file-count cap\n"
-    "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
-    "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
-    "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
-    "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
-    "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
-    "    rm -f \"$STAGE/.list\"\n"
-    "    rm -rf /tmp/.lc-snapshot && mv \"$STAGE\" /tmp/.lc-snapshot   # atomic publish\n"
-    "  else\n"
-    "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
-    "  fi\n"
-    "' ; rm -rf /tmp/.lc-snapshot.stage.* 2>/dev/null"
+
+
+def _build_snapshot_command(
+    *,
+    scope_comment: str,
+    find_predicate: str,
+    publish_path: str,
+    stage_prefix: str,
+) -> str:
+    """Instantiate the bounded-copy command documented above.
+
+    Parameterized on exactly what differs between the two snapshots -- the
+    extra `find` predicate that sets the scope (and the comment naming it),
+    the publish path, and the stage-dir prefix -- so the second snapshot
+    inherits the first's hardening instead of growing a second copy
+    discipline of its own.
+
+    stage_prefix drives both `STAGE=<prefix>.$$` and the trailing
+    `rm -rf <prefix>.*`: passing them separately is how an instantiation ends
+    up leaking a stage dir per timeout kill under a name nothing reaps.
+
+    find_predicate is inserted after the shared caps and before -print0; ""
+    means no extra predicate. _SNAPSHOT_COMMAND's instantiation below is
+    byte-identical to the literal this constant held before the template
+    existed, pinned by test_harbor_snapshot.py -- that assertion is the whole
+    safety argument for refactoring a command that already runs in real
+    trials.
+    """
+    predicate = f" {find_predicate}" if find_predicate else ""
+    return (
+        "timeout 20 sh -c '\n"
+        "  set -e\n"
+        f"  STAGE={stage_prefix}.$$\n"
+        "  rm -rf \"$STAGE\" && mkdir -p \"$STAGE\"\n"
+        f"  # {scope_comment}\n"
+        f"  find /app -xdev -maxdepth 3 -type f -size -10M{predicate} -print0 2>/dev/null \\\n"
+        f"    | head -z -n {SNAPSHOT_MAX_FILES} > \"$STAGE/.list\"           # aggregate file-count cap\n"
+        "  TOTAL=$(du -cb --files0-from=\"$STAGE/.list\" 2>/dev/null | tail -1 | cut -f1)\n"
+        "  FREE=$(df -B1 --output=avail /tmp | tail -1)\n"
+        "  # non-empty candidate list AND aggregate byte cap 200MB AND leave >=500MB free space reserve\n"
+        "  if [ -s \"$STAGE/.list\" ] && [ \"${TOTAL:-0}\" -le 209715200 ] && [ \"${FREE:-0}\" -ge $((TOTAL + 524288000)) ]; then\n"
+        "    xargs -0 -a \"$STAGE/.list\" cp --parents -t \"$STAGE\" 2>/dev/null || true\n"
+        "    rm -f \"$STAGE/.list\"\n"
+        f"    rm -rf {publish_path} && mv \"$STAGE\" {publish_path}   # atomic publish\n"
+        "  else\n"
+        "    rm -rf \"$STAGE\"                                             # refuse oversize or empty\n"
+        "  fi\n"
+        f"' ; rm -rf {stage_prefix}.* 2>/dev/null"
+    )
+
+
+_SNAPSHOT_COMMAND = _build_snapshot_command(
+    scope_comment="candidate list: files under /app changed since trial start, per-file <10M",
+    find_predicate=f"-newer {SNAPSHOT_START_MARKER}",
+    publish_path=SNAPSHOT_PUBLISH_PATH,
+    stage_prefix=SNAPSHOT_STAGE_PREFIX,
+)
+
+# How many files the start-of-trial snapshot actually published, appended to
+# that command only -- outside the shared template, so the deadline
+# instantiation stays byte-identical. The rc cannot carry this: the template
+# ends in a best-effort cleanup `rm`, so rc reports that rm, and the refuse
+# branch exits 0 exactly like the publish branch does.
+_INITIAL_SNAPSHOT_COUNT_PREFIX = "lc-initial-files="
+_INITIAL_SNAPSHOT_COUNT_PROBE = (
+    f" ; printf '{_INITIAL_SNAPSHOT_COUNT_PREFIX}%s\\n' "
+    f'"$(find {INITIAL_SNAPSHOT_PUBLISH_PATH} -type f 2>/dev/null | wc -l)"'
+)
+
+# The same bounded copy with the freshness filter dropped: at trial start
+# "every file under /app" is exactly "every pre-existing file", which is the
+# scope this snapshot exists to preserve.
+#
+# Every cap carries over unchanged but means something different against that
+# wider scope -- flagged here, not resolved: -maxdepth 3, the file-count cap
+# and -size -10M were sized for a modified-file delta, so against a whole tree
+# they can truncate silently (rc is 0 either way), and a >200MB aggregate makes
+# the command refuse outright rather than copy part of the tree. Hence the
+# three-way outcome logging in _classify_initial_snapshot; a bare "succeeded"
+# would be a lie on two of those paths.
+_INITIAL_SNAPSHOT_COMMAND = (
+    # Unconditional cleanup of the publish path itself before staging even
+    # starts -- outside the shared template (which only clears it on its
+    # own success path), so a refusal always finds nothing there and the
+    # probe below correctly reports 0 files, not whatever a previous
+    # invocation happened to leave behind. Not expected to ever matter in
+    # practice (a fresh container has nothing at this path the first time
+    # this command ever runs), but "nothing at this path" should not be
+    # allowed to depend on that assumption holding.
+    f"rm -rf {INITIAL_SNAPSHOT_PUBLISH_PATH} ; "
+    + _build_snapshot_command(
+        scope_comment="candidate list: every file under /app at trial start, per-file <10M",
+        find_predicate="",
+        publish_path=INITIAL_SNAPSHOT_PUBLISH_PATH,
+        stage_prefix=INITIAL_SNAPSHOT_STAGE_PREFIX,
+    )
+    + _INITIAL_SNAPSHOT_COUNT_PROBE
 )
 
 
@@ -239,8 +346,13 @@ def _extract_exit_code(formatted_output: str) -> int | None:
     happen in practice -- _format_output always emits it); callers should
     treat that the same as "did not succeed".
     """
-    m = _HARNESS_EXIT_CODE_RE.search(formatted_output)
-    return int(m.group(1)) if m else None
+    # Last match, not the first: a command's own output can contain a line
+    # shaped like the footer, and a mid-line byte cut can even create one.
+    # The real footer is always last.
+    last = None
+    for last in _HARNESS_EXIT_CODE_RE.finditer(formatted_output):
+        pass
+    return int(last.group(1)) if last else None
 
 
 async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, logger: logging.Logger) -> None:
@@ -274,6 +386,431 @@ async def _snapshot_at_deadline(proxy: "_HarborShellProxy", delay_sec: float, lo
         raise
     except Exception as e:
         logger.info(f"LittleCoderAgent: deadline snapshot failed (non-fatal): {e}")
+
+
+_INITIAL_SNAPSHOT_COUNT_RE = re.compile(
+    rf"^{_INITIAL_SNAPSHOT_COUNT_PREFIX}\s*(\d+)", re.MULTILINE
+)
+# Bounds only the docker-cp download. TimeoutError is an Exception subclass,
+# so this is caught by the same try/except that already preserves the stage
+# outcome on a raised download error.
+_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC = 35.0
+# Backstop only: the stage (run_harness's own 25s) and the download (above)
+# are each individually bounded and already preserve the stage outcome on
+# their own timeout. Sized for slack above both, not to race them.
+_INITIAL_SNAPSHOT_TIMEOUT_SEC = 75.0
+
+
+def _parse_initial_snapshot_file_count(formatted_output: str) -> int | None:
+    """Pull _INITIAL_SNAPSHOT_COUNT_PROBE's count back out of run_harness's
+    returned string. Pure/module-level so it's directly testable without a
+    fake proxy.
+
+    None means the probe line never arrived -- a killed command, a `find`/`wc`
+    the image doesn't have, output truncated ahead of it -- which callers
+    treat the same as "did not succeed", never as zero files.
+    """
+    # Last match, for the same reason _extract_exit_code takes the last
+    # footer: a command's own output can contain a line shaped like this one.
+    last = None
+    for last in _INITIAL_SNAPSHOT_COUNT_RE.finditer(formatted_output):
+        pass
+    return int(last.group(1)) if last else None
+
+
+class _InitialSnapshotOutcome(NamedTuple):
+    outcome: str
+    download: bool
+    message: str
+
+
+def _classify_initial_snapshot(rc: int | None, file_count: int | None) -> _InitialSnapshotOutcome:
+    """Pure helper (split out for testability, like _compute_snapshot_delay_sec)
+    turning the start-of-trial snapshot's two observable results into the
+    outcome to log and whether there is anything worth downloading.
+
+    Four outcomes rather than "attempted"/"succeeded", because two real cases
+    are neither: a copy truncated at the file-count cap, and a refusal that
+    published nothing at all. Both exit 0, so rc alone cannot tell them from a
+    complete snapshot -- hence the file-count probe.
+
+    "partial" here means the file-count cap specifically. -maxdepth 3 and the
+    per-file -size -10M drop files with no observable trace, so even a
+    "succeeded" snapshot can be missing a large or deeply-nested original;
+    anything pointing the model at this copy has to say so.
+
+    rc is accepted and logged for visibility only, never branched on: the
+    wrapped command's own last statement is always its trailing cleanup
+    `rm`, which exits 0 whether staging succeeded, refused, or crashed
+    partway through, so the sentinel _wrap_command captures can never
+    actually distinguish those cases. The same is true of the pre-existing
+    deadline snapshot's rc, just never load-bearing there since it only
+    feeds a log message. A genuine crash before the probe's own printf
+    ever ran is instead caught below, correctly, by the probe line simply
+    never arriving.
+    """
+    if file_count is None:
+        return _InitialSnapshotOutcome(
+            "failed",
+            False,
+            f"failed -- stage command reported no file count (rc={rc}); skipping download",
+        )
+    if file_count == 0:
+        return _InitialSnapshotOutcome(
+            "refused",
+            False,
+            f"refused -- nothing published at {INITIAL_SNAPSHOT_PUBLISH_PATH} "
+            "(aggregate over the 200MB cap, free-space reserve unmet, or no "
+            "candidate files); skipping download",
+        )
+    if file_count >= SNAPSHOT_MAX_FILES:
+        return _InitialSnapshotOutcome(
+            "partial",
+            True,
+            f"partial -- {file_count} files, at the {SNAPSHOT_MAX_FILES}-file cap; "
+            "files past the cap have no start-of-trial copy",
+        )
+    return _InitialSnapshotOutcome(
+        "succeeded", True, f"succeeded -- {file_count} files staged"
+    )
+
+
+def _initial_snapshot_is_present(outcome: _InitialSnapshotOutcome | None) -> bool:
+    """True when staging actually published files the model can read.
+
+    The single gate for everything that points the model at the copy, so the
+    prompt paragraph and the extensions' env var can never disagree about
+    whether the path exists.
+    """
+    return outcome is not None and outcome.outcome not in ("failed", "refused")
+
+
+def _initial_snapshot_advertisement(
+    outcome: _InitialSnapshotOutcome | None,
+) -> str | None:
+    """The prompt paragraph telling the model the start-of-trial copy exists,
+    or None to say nothing. Pure/module-level, like _classify_initial_snapshot.
+
+    Silent on None/failed/refused: those are exactly the cases where the copy
+    may not be there, and pointing the model at a path that does not exist
+    costs it turns for nothing -- worse than never mentioning it.
+
+    The text is deliberately reactive, not a standing instruction to diff
+    against this copy as routine practice: it earns its place only when the
+    model already suspects a specific file was clobbered. And the restore
+    restraint is spelled out because the dangerous misreading is the obvious
+    one -- a model near its deadline "restoring" pristine originals over the
+    solution it just finished writing.
+    """
+    if not _initial_snapshot_is_present(outcome):
+        return None
+    app_copy = f"{INITIAL_SNAPSHOT_PUBLISH_PATH}/app"
+    text = (
+        "Recovery note: a reference copy of this task's starting files (taken "
+        "at trial start, before any of your changes) exists inside the "
+        f"container under `{app_copy}/` (e.g. `{app_copy}/somefile` mirrors "
+        "`/app/somefile`). If you ever suspect a task-provided file was "
+        "corrupted or overwritten — by a killed command, a buggy script, or "
+        "your own edit — diff against or restore from that copy instead of a "
+        "backup you made later. Restore from there only a file you believe you "
+        "corrupted — never over your own completed solution. Treat it as "
+        f"read-only and never write into `{INITIAL_SNAPSHOT_PUBLISH_PATH}`. It "
+        "may not contain very large (>10MB) or deeply nested files."
+    )
+    if outcome.outcome == "partial":
+        text += (
+            f" The copy hit its {SNAPSHOT_MAX_FILES}-file cap, so some starting "
+            "files are absent from it — absence there does not mean the file "
+            "didn't exist."
+        )
+    return text
+
+
+def _pi_env(
+    *,
+    budget_start_epoch_ms: int,
+    deadline_epoch_ms: int,
+    initial_snapshot: _InitialSnapshotOutcome | None,
+) -> dict[str, str]:
+    """The env pi's extensions are handed for this trial. Pure/module-level,
+    like _initial_snapshot_advertisement, so its contents are assertable
+    without standing up a whole run.
+
+    permission-gate's SAFE_PREFIXES whitelist is meant to guard a real user's
+    own machine during interactive use, and its own header documents this
+    opt-out for benchmark runs. Docker is the actual isolation boundary for a
+    TB trial, and every other TB agent (bare pi, codex) already runs here with
+    unrestricted tool access. Observed directly: fix-git blocked on `cd`/`git
+    -C`, prove-plus-comm blocked on `coqc`, configure-git-webserver blocked on
+    `setsid`/`nc`/`socat`/`crontab` -- three different tools across three
+    unrelated tasks, not a pattern fixable by allow-listing one command at a
+    time.
+
+    LITTLE_CODER_BUDGET_START_EPOCH_MS is the other end of the same interval
+    the deadline closes. Only the pair says what FRACTION of the trial is
+    gone, which is what tb-finalize-guard's progress checkpoints fire on; the
+    deadline alone says how long is left and nothing about how long that was
+    out of. Absolute epoch ms on both ends rather than a duration on one, so
+    a reader resolves them by one rule.
+
+    LITTLE_CODER_INITIAL_SNAPSHOT is what lets an extension mention the
+    start-of-trial copy: tb-finalize-guard runs on TB1.0 too, whose adapter
+    stages no such copy, so an unconditional pointer there would send the
+    model after a path that does not exist. Carrying the classified outcome
+    rather than a bare flag also lets the reader pass on the same
+    cap-truncation caveat the prompt paragraph carries.
+
+    Set to empty, not omitted, when no copy was staged: PiRpc builds the
+    child env as dict(os.environ) updated with this dict, so an omitted key
+    does not clear one already present in THIS process's own environment
+    (e.g. leaked from an earlier trial in the same worker/shell). Empty
+    still reads as "no copy" to the var's one reader,
+    initialSnapshotOutcome(), whose exact match on "succeeded"/"partial"
+    treats it the same as absent.
+    """
+    env = {
+        "LITTLE_CODER_PERMISSION_MODE": "accept-all",
+        "LITTLE_CODER_BUDGET_START_EPOCH_MS": str(budget_start_epoch_ms),
+        "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
+    }
+    env["LITTLE_CODER_INITIAL_SNAPSHOT"] = (
+        initial_snapshot.outcome if _initial_snapshot_is_present(initial_snapshot) else ""
+    )
+    return env
+
+
+async def _snapshot_initial_state(
+    proxy: "_HarborShellProxy",
+    environment: BaseEnvironment,
+    logs_dir: Path | None,
+    logger: logging.Logger,
+) -> _InitialSnapshotOutcome | None:
+    """Stage a bounded copy of the task's pre-existing /app files inside the
+    container at trial start, then pull it onto the host under
+    logs_dir/INITIAL_SNAPSHOT_DIR_NAME.
+
+    Insurance only: must never raise into the trial. A failed stage -- a
+    container without GNU coreutils, say -- degrades to "no snapshot" and
+    one log line; a download the environment backend can't do, or a slow
+    docker-cp, costs only the host-side copy. That same swallowing is why
+    the outcome is logged from the real rc and real file count: a silent
+    nothing here looks identical to success.
+
+    The container-side copy is left in place afterwards rather than deleted.
+    It gives the model an in-container restore source from turn 1 (`cp
+    /tmp/.lc-initial/app/input.tex /app/input.tex` would have recovered the
+    motivating trial outright). Accepted cost, flagged not fixed: it holds up
+    to 200MB of the same /tmp the deadline snapshot measures its own 500MB
+    free-space reserve against, so on a disk-tight container it can be what
+    makes that later snapshot refuse.
+
+    Returns the CONTAINER-side stage outcome (None when there isn't one), for
+    _initial_snapshot_advertisement to decide what the model gets told. That
+    is the copy the model can actually reach, so the host-side download
+    failing does not nullify it -- see the inner function.
+    """
+    if logs_dir is None:
+        logger.info(
+            "LittleCoderAgent: skipping initial snapshot -- no per-trial logs dir"
+        )
+        return None
+    try:
+        return await asyncio.wait_for(
+            _snapshot_initial_state_inner(proxy, environment, logs_dir, logger),
+            timeout=_INITIAL_SNAPSHOT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: initial snapshot failed (non-fatal): {e}")
+        return None
+
+
+async def _snapshot_initial_state_inner(
+    proxy: "_HarborShellProxy",
+    environment: BaseEnvironment,
+    logs_dir: Path,
+    logger: logging.Logger,
+) -> _InitialSnapshotOutcome:
+    """The two-step body _snapshot_initial_state wraps in its timeout and
+    catch-all: stage in the container, then download what got published.
+
+    The two steps have independent value, so the download gets its own
+    try/except rather than riding the caller's: the model is pointed at the
+    CONTAINER-side copy, which a failed host-side docker-cp neither removes
+    nor invalidates. Letting that failure discard the stage outcome would
+    silence the recovery note over a problem the model never sees."""
+    out = await proxy.run_harness(_INITIAL_SNAPSHOT_COMMAND, timeout=25)
+    result = _classify_initial_snapshot(
+        _extract_exit_code(out), _parse_initial_snapshot_file_count(out)
+    )
+    logger.info(f"LittleCoderAgent: initial snapshot {result.message}")
+    if not result.download:
+        return result
+    target = logs_dir / INITIAL_SNAPSHOT_DIR_NAME
+    try:
+        # Required, not defensive: docker's download_dir runs `docker compose
+        # cp service:SRC/. DEST`, and `docker cp SRC/. DEST` needs DEST to
+        # already exist -- only download_dir_with_exclusions' base
+        # implementation mkdirs its own target. Without this the download
+        # fails on every trial, and the catch-all would swallow it.
+        target.mkdir(parents=True, exist_ok=True)
+        await asyncio.wait_for(
+            environment.download_dir(INITIAL_SNAPSHOT_PUBLISH_PATH, target),
+            timeout=_INITIAL_SNAPSHOT_DOWNLOAD_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        logger.info(
+            f"LittleCoderAgent: initial snapshot download failed (non-fatal): {e}"
+        )
+        return result
+    logger.info(
+        f"LittleCoderAgent: initial snapshot downloaded to {target} "
+        f"(container-side copy kept at {INITIAL_SNAPSHOT_PUBLISH_PATH})"
+    )
+    return result
+
+
+# Start-of-trial toolchain probe. The image a TB task ships is minimal and
+# varies per task: write-compressor burned ~35 turns discovering by trial and
+# error that python3 was absent, then pivoting to Perl.
+#
+# Closed candidate list by design -- it is both what the probe asks about and
+# what _parse_toolchain_probe will accept back, so nothing outside it can
+# reach the model's prompt. Hence the prompt line's "others may exist".
+_TOOLCHAIN_CANDIDATES = (
+    "python3",
+    "python",
+    "perl",
+    "awk",
+    "gcc",
+    "cc",
+    "g++",
+    "make",
+    "node",
+)
+_TOOLCHAIN_PROBE_TIMEOUT_SEC = 10
+# Built from the tuple above so the two can never drift apart. Only stdout is
+# ever read: the loop's rc is non-zero whenever the LAST candidate happens to
+# be absent, the same rc-is-unusable trap _classify_initial_snapshot documents.
+_TOOLCHAIN_PROBE_COMMAND = (
+    "for c in "
+    + " ".join(_TOOLCHAIN_CANDIDATES)
+    + "; do command -v $c >/dev/null 2>&1 && printf '%s ' $c; done"
+)
+
+
+def _parse_toolchain_probe(out: str) -> list[str] | None:
+    """Pull the detected tools back out of run_harness's returned string.
+    Pure/module-level so it's directly testable without a fake proxy.
+
+    Filtered against _TOOLCHAIN_CANDIDATES rather than taken verbatim: the
+    string also carries _format_output's own footer line, and on a broken
+    image whatever the shell printed instead. This list is interpolated
+    straight into the model's prompt, so a fabricated tool name here is worse
+    than no line at all.
+
+    Returns None, never [], when nothing usable is found -- an empty result,
+    unparseable garbage and "no candidate present" are one case to every
+    caller: there is nothing safe to tell the model.
+    """
+    tokens = set((out or "").split())
+    found = [c for c in _TOOLCHAIN_CANDIDATES if c in tokens]
+    return found or None
+
+
+def _toolchain_probe_note(tools: list[str] | None) -> str | None:
+    """The prompt line a successful probe earns, or None to say nothing."""
+    if not tools:
+        return None
+    return (
+        "Toolchain probe — available in this container: "
+        + " ".join(tools)
+        + " (others may exist; probe before assuming)."
+    )
+
+
+class _ToolchainProbeResult(NamedTuple):
+    tools: list[str] | None
+    status: str
+
+
+async def _probe_toolchain(
+    proxy: "_HarborShellProxy", logger: logging.Logger
+) -> _ToolchainProbeResult:
+    """Run the probe once at trial start.
+
+    Best-effort like the snapshots either side of it: any failure degrades to
+    no prompt line, never to a wrong one. The returned `status` is what makes
+    that degradation legible after the fact: `tools` alone serializes to the
+    same JSON `null` whether the container call raised or the probe ran
+    cleanly and genuinely found none of the candidates -- `status` is the
+    raw record of which of those actually happened, for
+    environment_snapshot.json. (A run_harness timeout does not raise here --
+    _exec_async catches it in either shape, the docker backend's RuntimeError
+    or a raw asyncio.TimeoutError, and returns a normal error string -- so
+    that case is disclosed inside the raw output captured by the
+    non-exception branch below, not by the except.)
+    """
+    try:
+        out = await proxy.run_harness(
+            _TOOLCHAIN_PROBE_COMMAND, timeout=_TOOLCHAIN_PROBE_TIMEOUT_SEC
+        )
+    except Exception as e:
+        logger.info(f"LittleCoderAgent: toolchain probe failed (non-fatal): {e}")
+        return _ToolchainProbeResult(None, f"probe failed: {e}")
+    tools = _parse_toolchain_probe(out)
+    logger.info(f"LittleCoderAgent: toolchain probe -> {tools}")
+    # Sliced, not the full string: on a broken image this is _format_output's
+    # whole footer-and-all output, up to the ~48KB per-call cap -- more than
+    # a status field needs to disclose "what actually happened" and needless
+    # bulk in a JSON file meant for a quick post-mortem read.
+    return _ToolchainProbeResult(
+        tools, f"probe ran, raw output: {out[:2000]!r}"
+    )
+
+
+# Stated up front rather than left to the ShellSession tool description
+# alone, which is demonstrably too weak: overfull-hbox's model never once
+# passed `timeout`, so every long command ran under the 30s default.
+#
+# The not-killed sentence is measured, not assumed: on timeout, harbor
+# terminates only the host-side docker-exec client -- reproduced against a
+# live container, the in-container command survived and its statements past
+# the timeout still ran.
+_HARD_LIMITS_PARAGRAPH = (
+    "Hard limits of this environment: each ShellSession call fails at its "
+    "timeout (default 30s — pass `timeout: <seconds>` up to 600 for "
+    "compiles/installs/long scripts) and everything the command printed is "
+    "discarded with it. The command itself is not killed — it may still be "
+    "running in the container and finish later, with none of its output "
+    "ever shown — so inspect actual state (files, processes) before "
+    "re-running anything non-idempotent. Output is capped at 200 "
+    "lines / ~48KB per call. The container image is minimal: check which "
+    "interpreters and tools exist (`command -v python3 perl gcc ...`) before "
+    "designing an approach around one."
+)
+
+
+def _compose_prompt(
+    prefix: str, task_block: str, notes: Sequence[str | None] = ()
+) -> str:
+    """Assemble run()'s prompt from its two fixed halves plus whatever the
+    start-of-trial container probes produced.
+
+    A seam, not decoration: the notes are only known after those probes run,
+    many lines below where the prefix literal is written. Notes land between
+    the prefix and TASK deliberately: appended after the closing "say 'done'"
+    sentence, they would displace the model's last instruction.
+
+    _HARD_LIMITS_PARAGRAPH is unconditional and lives here rather than at the
+    call site so no caller can compose a prompt without it.
+    """
+    parts = [prefix, _HARD_LIMITS_PARAGRAPH, "\n\n"]
+    for note in notes:
+        if note:
+            parts.append(note)
+            parts.append("\n\n")
+    parts.append(task_block)
+    return "".join(parts)
 
 
 def _fallback_timeout_info() -> dict:
@@ -511,14 +1048,17 @@ def _build_environment_snapshot(
     model: str,
     *,
     max_turns: int,
+    thinking_level: str,
     ambient_max_turns_env: str | None,
     timeout_info: dict,
+    toolchain: list[str] | None = None,
+    toolchain_probe_status: str | None = None,
 ) -> dict:
     """Assemble the per-trial environment_snapshot.json payload:
     rpc_client.capture_environment_snapshot()'s existing pi-config
     introspection, plus the config values this adapter itself resolved --
-    the active turn cap, the ambient env var seen at process entry, this
-    process's own code identity, and the FULL timeout-provenance dict from
+    the active turn cap, the resolved thinking level, the ambient env var
+    seen at process entry, this process's own code identity, and the FULL timeout-provenance dict from
     _resolve_trial_timeout_info() (not just the effective float) so a
     reader can tell exactly which task.toml/cache-layout produced it.
 
@@ -526,7 +1066,7 @@ def _build_environment_snapshot(
     PiRpc/environment. Never raises on its own logic; capture_environment_
     snapshot() already guarantees no-raise for its half.
     """
-    snapshot = capture_environment_snapshot(model)
+    snapshot = capture_environment_snapshot(model, cli_thinking=thinking_level)
     snapshot["max_turns"] = max_turns
     snapshot["ambient_max_turns_env"] = ambient_max_turns_env
     snapshot["little_coder_version"] = _AGENT_VERSION
@@ -534,22 +1074,159 @@ def _build_environment_snapshot(
     snapshot["adapter_file"] = str(Path(__file__).resolve())
     snapshot["adapter_mtime"] = _ADAPTER_MTIME
     snapshot["timeout_provenance"] = timeout_info
+    # toolchain_probe alone can't tell "found nothing" from "never
+    # completed" -- both serialize as null. toolchain_probe_status is the
+    # raw record (the exception message, or the probe's actual stdout) that
+    # makes that distinction from the JSON file alone, without having to go
+    # find the matching logger.info line in the trial log.
+    snapshot["toolchain_probe"] = toolchain
+    snapshot["toolchain_probe_status"] = toolchain_probe_status
     return snapshot
+
+
+def _confirm_live_thinking(rpc, snapshot: dict, path: Path, logger) -> None:
+    """Backfill thinking.confirmed_live from pi's own resolved session state,
+    then rewrite `path`.
+
+    The rest of the snapshot records what this adapter REQUESTED. pi does not
+    necessarily honour it: clampThinkingLevel degrades any level to "off" for
+    a model registered with reasoning=false, so a non-reasoning model can run
+    with no thinking at all under a snapshot that says "high". Rather than
+    re-deriving that clamp in Python -- a second copy of pi's rules, free to
+    drift -- ask pi, exactly as aider_polyglot.py does.
+
+    Best-effort in every direction: a failed probe is recorded in the
+    snapshot's own `errors` (silence would be indistinguishable from "pi
+    agreed") and never propagates, because provenance must not fail a trial.
+    Rewrites rather than deferring the first write, which is deliberately
+    ordered ahead of PiRpc so it survives a construction failure.
+    """
+    try:
+        # Charged to the trial's wall-clock budget (anchored before PiRpc
+        # construction), so bounded well under get_state's 20s default.
+        state = rpc.get_state(timeout=5)
+        level = state.get("thinkingLevel")
+        if level:
+            snapshot.setdefault("thinking", {})["confirmed_live"] = level
+            if level != snapshot.get("thinking", {}).get("resolved"):
+                logger.warning(
+                    "LittleCoderAgent: pi resolved thinkingLevel="
+                    f"{level!r}, not the requested "
+                    f"{snapshot['thinking'].get('resolved')!r} "
+                    "(expected for a model registered with reasoning=false)"
+                )
+        else:
+            snapshot.setdefault("errors", []).append({
+                "source": "confirmed_thinking",
+                "error": f"get_state succeeded but returned no thinkingLevel: {state!r}",
+            })
+    except Exception as exc:
+        snapshot.setdefault("errors", []).append({
+            "source": "confirmed_thinking",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    try:
+        # Temp file + os.replace, not write_text: write_text truncates first,
+        # so a trial killed mid-rewrite would replace a complete snapshot
+        # with unparseable JSON -- losing the toolchain probe and timeout
+        # provenance too, not just the field being added.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2, default=str))
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"LittleCoderAgent: environment snapshot rewrite failed: {e}")
+
 
 # Same line-dedup + ANSI-strip + truncation used by the TB 1.0 adapter so
 # output-format consistency is preserved across benchmarks.
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_LINES = 200
+# Tiny relative to the byte caps below, which still catch anything past this
+# that's actually large.
+SMALL_OUTPUT_FLOOR_BYTES = 4 * 1024
+
+# Byte caps, which the line cap alone cannot enforce: one 1MB line is one
+# "line", so a `grep` hit on a single-line JSON file used to reach the model
+# whole and blow the context window (this is the path that actually crashed a
+# gpt2-codegolf trial). Head/tail split mirrors the 2:1 line ratio below.
+MAX_BODY_HEAD_BYTES = 32 * 1024
+MAX_BODY_TAIL_BYTES = 16 * 1024
+# Pre-dedup gate: bounds the cost of split/dedup, which otherwise walk the
+# whole output before any truncation runs.
+MAX_RAW_HEAD_BYTES = 256 * 1024
+MAX_RAW_TAIL_BYTES = 128 * 1024
 
 
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s or "")
 
 
+def _format_size(n: int) -> str:
+    """Human-readable byte count, matching pi's own truncation markers."""
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
+def _cap_bytes_head_tail(s: str, head_bytes: int, tail_bytes: int) -> tuple[str, int]:
+    """Keep the first `head_bytes` and last `tail_bytes` of `s`, joined by a
+    marker. Returns (text, dropped_bytes).
+
+    Cuts prefer a line boundary but must never require one -- the case this
+    exists for is output with no newline in it at all. Byte-identical to the
+    TypeScript capBytesHeadTail in .pi/extensions/shell-session/helpers.ts;
+    test_format_output.py pins a shared multi-byte vector across the two.
+    """
+    buf = s.encode("utf-8")
+    if len(buf) <= head_bytes + tail_bytes:
+        return s, 0
+
+    # Last newline in the head window, so the kept head is as long as the
+    # budget allows; the first newline would legally cut at byte 10 of 32K.
+    head_end = buf.rfind(b"\n", 0, head_bytes)
+    if head_end < 0:
+        head_end = head_bytes
+        # Back off continuation bytes, keeping the shorter valid prefix.
+        while head_end > 0 and buf[head_end] & 0xC0 == 0x80:
+            head_end -= 1
+
+    tail_start = buf.find(b"\n", len(buf) - tail_bytes)
+    if tail_start >= 0:
+        tail_start += 1
+    else:
+        tail_start = len(buf) - tail_bytes
+        # Mirror image of the head side: skip *forward* off a continuation
+        # byte. decode(errors="ignore") is not equivalent here -- it drops a
+        # phantom partial character instead of skipping to the next real one.
+        while tail_start < len(buf) and buf[tail_start] & 0xC0 == 0x80:
+            tail_start += 1
+
+    dropped = tail_start - head_end
+    head = buf[:head_end].decode("utf-8")
+    tail = buf[tail_start:].decode("utf-8")
+    return f"{head}\n  [... {_format_size(dropped)} truncated ...]\n{tail}", dropped
+
+
+def _compose_raw(stdout: str, stderr: str) -> str:
+    """The stdout/stderr composition _format_output cleans, split out from
+    _cleaned_output so the composition itself stays directly testable."""
+    return (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+
+
+def _cleaned_output(stdout: str, stderr: str) -> str:
+    """The exact ANSI-stripped, CR-normalized text _format_output's byte-cap
+    pipeline operates on. Shared with _HarborShellProxy's overflow-capture
+    path, which uploads it verbatim: two separate compositions could drift."""
+    return _strip_ansi(_compose_raw(stdout, stderr)).replace("\r", "")
+
+
 def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: bool) -> str:
-    raw = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
-    cleaned = _strip_ansi(raw).replace("\r", "")
-    lines = cleaned.split("\n")
+    cleaned = _cleaned_output(stdout, stderr)
+    raw_bytes = len(cleaned.encode("utf-8"))
+    pre_capped, pre_dropped = _cap_bytes_head_tail(cleaned, MAX_RAW_HEAD_BYTES, MAX_RAW_TAIL_BYTES)
+    lines = pre_capped.split("\n")
     # dedup
     deduped, last, dup = [], None, 0
     for ln in lines:
@@ -564,14 +1241,32 @@ def _format_output(stdout: str, stderr: str, code: int, cwd: str, timed_out: boo
         deduped.append(f"  [... {dup} duplicate line(s) collapsed ...]")
     # truncate
     truncated = False
-    if len(deduped) > MAX_LINES:
+    if len(deduped) > MAX_LINES and len("\n".join(deduped).encode("utf-8")) > SMALL_OUTPUT_FLOOR_BYTES:
         head, tail = MAX_LINES // 2, MAX_LINES // 4
         skipped = len(deduped) - head - tail
         deduped = deduped[:head] + [f"  [... {skipped} lines truncated ...]"] + deduped[-tail:]
         truncated = True
-    body = "\n".join(deduped)
+    body, post_dropped = _cap_bytes_head_tail(
+        "\n".join(deduped), MAX_BODY_HEAD_BYTES, MAX_BODY_TAIL_BYTES
+    )
+    byte_capped = pre_dropped > 0 or post_dropped > 0
+    # No "Full output:" line here, unlike the local subprocess backend: this
+    # function is pure and synchronous (and shared with tb_adapter), while
+    # producing a container-readable path needs an async upload. The harbor
+    # proxy splices that line in afterwards -- see
+    # _HarborShellProxy._capture_overflow.
     bits = [f"exit={code}", f"cwd={cwd}", f"timed_out={'true' if timed_out else 'false'}"]
-    if truncated: bits.append("output_truncated=true")
+    if truncated or byte_capped:
+        bits.append("output_truncated=true")
+        # Only alongside output_truncated: untruncated output is its own raw
+        # size, and the existing footer shape stays byte-identical for normal
+        # results.
+        bits.append(f"raw_bytes={raw_bytes}")
+    # Distinct from output_truncated=true, which also fires for the routine
+    # 200-line cap. Overflow capture gates on this one so a long-but-small
+    # pip/pytest log doesn't cost a docker-cp round-trip.
+    if byte_capped:
+        bits.append("byte_capped=true")
     bits.append("backend=harbor-env")
     footer = "[" + " ".join(bits) + "]"
     return f"{body}\n{footer}" if body else footer
@@ -590,13 +1285,86 @@ def _wrap_command(command: str, cwd: str | None, sentinel: str) -> str:
     cwd=None omits the leading `cd` and the trailing `pwd` entirely (used
     when track_cwd=False): sound only for a command that never itself needs
     a starting cwd and never `cd`s in a way the caller needs reported back --
-    true of _SNAPSHOT_COMMAND, the only cwd=None caller today, which uses
-    absolute paths (/app, /tmp) throughout.
+    true of every cwd=None caller today (both snapshot commands and the
+    start-marker touch, which use absolute paths (/app, /tmp) throughout;
+    the toolchain probe, whose only path resolution is `command -v`'s
+    PATH search).
     """
     body = f"{{ {command} ; }} ; __rc=$? ; printf '\\n{sentinel}:%d:' $__rc"
     if cwd is None:
         return body
     return f"cd {cwd} 2>/dev/null; {body} ; pwd"
+
+
+# Overflow capture: what _format_output's byte cap discards is pushed into the
+# container as a file the model can cat back. env.upload_file() is an
+# @abstractmethod on BaseEnvironment, so every harbor backend implements it --
+# unlike exec(), whose base signature has no stdin parameter, this is a
+# portable host->container transfer that needs no _wrap_command changes.
+# Deliberately an order of magnitude under the TS local backend's 512MB, which
+# this was first copied from: that one stages on the *host's* /tmp, while these
+# files land in the container's /tmp and are never deleted for the life of the
+# trial -- the same filesystem _SNAPSHOT_COMMAND refuses to snapshot into
+# unless 500MB stays free. At 64MB, full utilization still cannot push /tmp
+# under that reserve, so capture can't cost the trial its work-recovery net.
+_OVERFLOW_BUDGET_BYTES = 64 * 1024 * 1024
+# Prefix only: the directory gets a random suffix per proxy (see __init__),
+# because a path known before the trial starts can be pre-planted as a symlink
+# by the task principal, and both of docker's upload paths write as root.
+_CONTAINER_OVERFLOW_DIR_PREFIX = "/tmp/.lc_shell-"
+# Must fit inside run()'s fixed timeout+30 slack: a slow docker-cp has to
+# degrade to Phase 1's disclosure, not eat the caller's whole margin.
+_OVERFLOW_CAPTURE_TIMEOUT_SEC = 15
+
+
+def _stage_overflow_file(fd: int, cleaned: str) -> None:
+    """Write the capture's host-side staging file. Runs in a worker thread
+    (see _capture_overflow_inner) so a multi-megabyte payload never blocks the
+    event loop -- which asyncio.wait_for could not have preempted anyway.
+
+    fdopen takes ownership of fd before the fchmod so that a raising fchmod
+    (EPERM/EINVAL on a restrictive filesystem) still closes it on the way out.
+
+    mkstemp's 0600 is widened because both the docker-cp fast path and the tar
+    fallback (which force-extracts as uid=0/gid=0) land the file under an owner
+    the agent's own container process may not be -- without this, a non-root
+    task's shell gets Permission denied on the very file this feature exists to
+    make readable. What that costs on the host is contained by the 0700
+    staging directory the file lives in.
+    """
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o644)
+        f.write(cleaned)
+
+
+# Pinned to harbor 0.22.0's exact RuntimeError text (docker.py:682/741) --
+# re-check this match on any harbor upgrade. timeout_sec is always int here,
+# so no decimal-seconds alternate is needed.
+_HARBOR_TIMEOUT_MSG_RE = re.compile(r"^Command timed out after \d+ seconds$")
+_TIMEOUT_KILL_WARNING = (
+    "WARNING: this command hit its {N}s timeout and its connection was killed. "
+    "Any file it was mid-way through writing may now be HALF-WRITTEN, and any "
+    "cleanup/restore logic at the end of a script may not have completed — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. A compute-bound process may "
+    "even still be running in the container (check with ps). If the command simply "
+    "needs more time, re-run it with a larger `timeout` parameter (up to 600 seconds)."
+)
+# Distinct from _TIMEOUT_KILL_WARNING: run()'s bridge timeout (below) means only
+# that _exec_async has not returned to the reader thread within timeout+30s --
+# it says nothing about env.exec()'s own state. _exec_async may still be
+# running, may be about to return normally, or may already have hit the real
+# docker timeout above; we simply don't know from here. So this warning must
+# not claim the connection was killed, and must not tell the model to re-run
+# (a still-running command re-run now would duplicate its side effects).
+_BRIDGE_TIMEOUT_WARNING = (
+    "WARNING: this command hit its {N}s timeout and was cut off from this side -- "
+    "its connection was NOT confirmed killed, and the command may still be running in "
+    "the container. Any file it was mid-way through writing may now be HALF-WRITTEN, "
+    "and any cleanup/restore logic at the end of a script may not have run — re-verify "
+    "(cat/wc/diff) any file it touched before trusting it. Check whether it is still "
+    "running (ps) before doing anything else; re-running it now risks starting a "
+    "duplicate copy of a command that hasn't actually stopped."
+)
 
 
 class _HarborShellProxy:
@@ -621,7 +1389,82 @@ class _HarborShellProxy:
         # Before this lock existed, only the reader thread ever called run(),
         # so there was nothing to serialize against; run_harness is the first
         # caller that can execute concurrently with it.
+        #
+        # The lock does NOT cover overflow capture's own upload_file call --
+        # see _capture_overflow.
         self._exec_lock = asyncio.Lock()
+        # Per-proxy-instance, i.e. per trial: a fresh proxy (fresh container)
+        # starts with a fresh budget and a fresh overflow dir.
+        self._overflow_bytes_written = 0
+        # Guards the budget check and its reservation together; never held
+        # across the upload itself.
+        self._overflow_budget_lock = asyncio.Lock()
+        # Unpredictable until this proxy exists, so nothing can be waiting at
+        # the path -- see _CONTAINER_OVERFLOW_DIR_PREFIX.
+        self._overflow_dir = f"{_CONTAINER_OVERFLOW_DIR_PREFIX}{uuid.uuid4().hex[:12]}"
+        # Host-side staging dir, created on first capture: mkdtemp is 0700, so
+        # the 0644 files inside it are still unreachable to other users of a
+        # shared harness machine.
+        self._host_stage_dir: str | None = None
+
+    async def _capture_overflow(self, cleaned: str) -> str | None:
+        """Upload the full untruncated output into the container so a later
+        ShellSession call can cat it back, mirroring the TS local backend's
+        temp-file behavior.
+
+        Never raises and never blocks past _OVERFLOW_CAPTURE_TIMEOUT_SEC: on
+        any failure or timeout it degrades to returning None, leaving
+        output_truncated=true/raw_bytes= as the only disclosure -- exactly
+        Phase 1's behavior. Capture is a bonus; it must never make a result
+        worse than it was before this existed.
+
+        Runs outside _exec_lock deliberately (see run_harness's docstring):
+        the upload neither reads nor writes self.cwd, so there is nothing
+        here for the lock to protect, and holding it would stall unrelated
+        execs behind a docker-cp.
+        """
+        nbytes = len(cleaned.encode("utf-8"))
+        async with self._overflow_budget_lock:
+            if self._overflow_bytes_written + nbytes > _OVERFLOW_BUDGET_BYTES:
+                # Deliberately not shaped like the real "Full output: <path>"
+                # line it replaces: a naive split on that prefix would hand the
+                # model this sentence as a path and waste a turn catting it.
+                return "(full output not saved: per-session overflow-file budget exhausted)"
+            # Reserved before the upload rather than added after it: a
+            # model-issued and a harness-issued capture can overlap, and both
+            # would otherwise clear a check neither had yet paid for.
+            self._overflow_bytes_written += nbytes
+        try:
+            return await asyncio.wait_for(
+                self._capture_overflow_inner(cleaned),
+                timeout=_OVERFLOW_CAPTURE_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            # Catches the wait_for timeout too (asyncio.TimeoutError is an
+            # Exception subclass): a slow docker-cp must degrade the same way
+            # a failed one does.
+            async with self._overflow_budget_lock:
+                # Bytes that never landed must not stay reserved, or one
+                # flaky upload permanently shrinks the trial's budget.
+                self._overflow_bytes_written -= nbytes
+            self.logger.warning(f"LittleCoderAgent: overflow capture failed: {e}")
+            return None
+
+    async def _capture_overflow_inner(self, cleaned: str) -> str:
+        if self._host_stage_dir is None:
+            self._host_stage_dir = tempfile.mkdtemp(prefix="lc-shell-overflow-")
+        container_path = f"{self._overflow_dir}/{uuid.uuid4().hex[:12]}.out"
+        fd, host_tmp = tempfile.mkstemp(dir=self._host_stage_dir, suffix=".log")
+        try:
+            await asyncio.to_thread(_stage_overflow_file, fd, cleaned)
+            # The container-side directory is never mkdir'd here: harbor's
+            # docker backend falls back to a tar stream that mkdir -p's the
+            # target as root, so at worst the first capture of a trial costs
+            # one extra round-trip.
+            await self.env.upload_file(host_tmp, container_path)
+        finally:
+            os.unlink(host_tmp)
+        return f"Full output: {container_path}"
 
     async def _exec_async(self, command: str, timeout: int, track_cwd: bool = True) -> str:
         """track_cwd=False (used by run_harness -- see its docstring) skips
@@ -664,16 +1507,44 @@ class _HarborShellProxy:
                             self.cwd = cwd_line[0].strip()
                     out = out[:marker].rstrip()
         except asyncio.TimeoutError:
-            return _format_output("", "command timed out", -1, self.cwd, True)
+            # Dead for the docker backend today (harbor swallows this and
+            # raises RuntimeError instead -- see below), kept for other
+            # backends/future harbor versions where it may still fire.
+            warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+            return _format_output("", f"command timed out\n{warning}", -1, self.cwd, True)
         except Exception as e:
+            if _HARBOR_TIMEOUT_MSG_RE.fullmatch(str(e)):
+                # The real timeout path for docker -- see asyncio.TimeoutError branch above.
+                warning = _TIMEOUT_KILL_WARNING.format(N=timeout)
+                return _format_output("", f"env.exec error: {e}\n{warning}", -1, self.cwd, True)
             return _format_output("", f"env.exec error: {e}", -1, self.cwd, False)
-        return _format_output(out, err, code, self.cwd, False)
+        result_str = _format_output(out, err, code, self.cwd, False)
+        # byte_capped=true, not output_truncated=true: the latter also fires
+        # for the plain 200-line cap, which is the common case for a coding
+        # agent (pip install, pytest -v, git log) and has no discarded bytes
+        # worth a docker-cp.
+        #
+        # Footer line only, never the whole string: a command's own output can
+        # legitimately contain the literal flag text (the model catting back a
+        # file it wrote, or one of this feature's own overflow files), and a
+        # body-wide scan would upload needlessly and splice a lying "Full
+        # output:" note into an untruncated result. Same hazard
+        # _extract_exit_code's last-match rule already guards against.
+        if "byte_capped=true" in result_str.rsplit("\n", 1)[-1]:
+            note = await self._capture_overflow(_cleaned_output(out, err))
+            if note:
+                body, _, footer = result_str.rpartition("\n")
+                result_str = f"{body}\n{note}\n{footer}" if body else f"{note}\n{footer}"
+        return result_str
 
     def run(self, command: str, timeout: int) -> str:
         """Sync entry point called by PiRpc's reader thread."""
         fut = asyncio.run_coroutine_threadsafe(self._exec_async(command, timeout), self.loop)
         try:
             return fut.result(timeout=timeout + 30)
+        except concurrent.futures.TimeoutError as e:
+            warning = _BRIDGE_TIMEOUT_WARNING.format(N=timeout)
+            return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
         except Exception as e:
             return _format_output("", f"shell proxy error: {e}", -1, self.cwd, False)
 
@@ -688,25 +1559,46 @@ class _HarborShellProxy:
         complete it. run_harness instead awaits _exec_async directly -- same
         loop, no thread bridge, no fut.result().
 
-        This is also why the deadline-snapshot task (the only caller of this
-        method) must use ONLY run_harness, never run().
+        This is also why every harness-issued path -- the deadline-snapshot
+        task, the start-of-trial snapshot, the toolchain probe, the
+        start-marker touch -- must use ONLY run_harness, never run().
 
         _exec_async's own _exec_lock still serializes this against
-        model-issued commands (via run()), so a harness command and a
-        model command can never execute concurrently inside the container.
+        model-issued commands (via run()), so a harness command and a model
+        command never execute concurrently inside the container -- with one
+        deliberate, disclosed exception: overflow capture's upload_file (see
+        _capture_overflow) runs outside the lock and so can overlap either.
+        That is safe because it never touches self.cwd -- the only state the
+        lock exists to protect -- and its target path is absolute.
 
         Passes track_cwd=False: self.cwd is genuinely never read or written
         by a harness call (by construction, not by accident -- contrast the
         old docstring here, which claimed the same result but only held
         because every harness command happened to never `cd`). Sound because
-        _SNAPSHOT_COMMAND, the only harness command today, uses absolute
-        paths (/app, /tmp) throughout and needs no starting cwd.
+        every harness command today either uses absolute paths (/app, /tmp)
+        throughout (both snapshot instantiations, the start-marker touch) or
+        resolves paths only through `command -v`'s PATH search (the
+        toolchain probe), so none needs a starting cwd.
         """
         return await self._exec_async(command, timeout, track_cwd=False)
 
     def reset(self) -> str:
         self.cwd = "/app"
         return f"shell reset (cwd → /app)"
+
+    def cleanup_overflow_staging(self) -> None:
+        """Remove the private host-side staging directory (see
+        _capture_overflow_inner), if this proxy ever created one.
+
+        Split out so LittleCoderAgent.run()'s finally block is a single call
+        whose own correctness needs no test of its own -- what's worth
+        testing (None-safe, ignore_errors, actually removes a populated
+        directory) lives here and is exercised directly, the same way
+        _build_environment_snapshot is split out from run() for the same
+        reason. Best-effort: cleanup must never fail the trial.
+        """
+        if self._host_stage_dir is not None:
+            shutil.rmtree(self._host_stage_dir, ignore_errors=True)
 
 
 def _resolve_token_usage(result_usage: dict, turn_count: int, stats: dict | None) -> dict:
@@ -823,7 +1715,10 @@ class LittleCoderAgent(BaseAgent):
                 return proxy.reset()
             return f"Error: unknown ShellSession op '{op}'"
 
-        prompt = (
+        # Two halves with a seam between them (see _compose_prompt): the
+        # paragraphs that belong there are produced by container probes that
+        # only run further down, after the environment is reachable.
+        prompt_prefix = (
             "You are solving a Terminal-Bench 2.0 task inside a Linux container.\n"
             "The ONLY way to interact with the container is the ShellSession tool; "
             "its cwd persists between calls (tracked by the adapter). Any shell "
@@ -852,6 +1747,8 @@ class LittleCoderAgent(BaseAgent):
             "setup (like login credentials), that usually still means the server "
             "side of it must be functional and reachable, just that you're not "
             "responsible for the client's half.\n\n"
+        )
+        prompt_task_block = (
             f"TASK:\n{instruction}\n\n"
             "When the task is complete, stop calling tools and say 'done'."
         )
@@ -876,16 +1773,47 @@ class LittleCoderAgent(BaseAgent):
         # only line a reader should treat as "the trial's turn is actually
         # done".
         turn_counter = 0
+        # Heartbeat state for long single generations. message_update deltas
+        # (including thinking_delta, which is otherwise never logged at all)
+        # arrive continuously while a turn streams, but nothing was written
+        # to live_log_fh between turn/tool-call boundaries -- a turn with a
+        # large thinking budget can legitimately stream for over an hour
+        # with zero bytes hitting disk, making a live generation
+        # indistinguishable from a hung one to anyone tailing this file.
+        # Throttled so a fast-streaming turn doesn't turn this into a flush
+        # storm.
+        HEARTBEAT_INTERVAL_SEC = 30.0
+        # Seeded to "now", not 0.0: a zero start makes the very first delta
+        # satisfy the throttle and emit a "0s elapsed" line every turn.
+        heartbeat_last_ts = time.time()
+        heartbeat_turn_start_ts = heartbeat_last_ts
+        heartbeat_delta_chars = 0
 
         def on_event(ev: dict) -> None:
-            nonlocal turn_counter
+            nonlocal turn_counter, heartbeat_last_ts, heartbeat_turn_start_ts, heartbeat_delta_chars
             if live_log_fh is None:
                 return
             t = ev.get("type")
             if t == "message_update":
                 delta = ev.get("assistantMessageEvent", {})
-                if delta.get("type") == "text_delta":
+                delta_type = delta.get("type")
+                if delta_type == "text_delta":
                     pending_text.append(delta.get("delta", ""))
+                # toolcall_delta too: a long shell command or heredoc
+                # streams entirely as tool-call arguments, and that is the
+                # dominant shape of a Terminal-Bench turn.
+                if delta_type in ("text_delta", "thinking_delta", "toolcall_delta"):
+                    heartbeat_delta_chars += len(delta.get("delta", ""))
+                    now = time.time()
+                    if now - heartbeat_last_ts >= HEARTBEAT_INTERVAL_SEC:
+                        heartbeat_last_ts = now
+                        elapsed = now - heartbeat_turn_start_ts
+                        live_log_fh.write(
+                            f"... turn {turn_counter} still generating "
+                            f"({elapsed:.0f}s elapsed, ~{heartbeat_delta_chars} "
+                            f"chars streamed so far) ...\n"
+                        )
+                        live_log_fh.flush()
                 return
             if t == "tool_execution_start":
                 if pending_text:
@@ -944,6 +1872,9 @@ class LittleCoderAgent(BaseAgent):
                 live_log_fh.flush()
             elif t == "agent_start":
                 turn_counter += 1
+                heartbeat_turn_start_ts = time.time()
+                heartbeat_last_ts = heartbeat_turn_start_ts
+                heartbeat_delta_chars = 0
                 live_log_fh.write(f"=== turn {turn_counter} start ===\n")
                 live_log_fh.flush()
             elif t == "agent_end":
@@ -974,12 +1905,12 @@ class LittleCoderAgent(BaseAgent):
                 f"base={timeout_info['base_timeout_sec']:.0f}s "
                 f"x{timeout_info['multiplier']} -> {effective_timeout_sec:.0f}s"
             )
-        deadline_epoch_ms = int((time.time() + effective_timeout_sec) * 1000)
-        # The same instant as deadline_epoch_ms, on the monotonic clock the
-        # error-retry loop measures against. Derived from one shared
-        # effective_timeout_sec rather than re-read later, so a retry can
-        # never outlive the deadline pi itself was handed above.
-        prompt_deadline = time.monotonic() + effective_timeout_sec
+        # deadline_epoch_ms/prompt_deadline are anchored below, after the
+        # start-of-trial snapshot rather than here -- see that anchoring for
+        # why. Nothing between here and there needs either value:
+        # _build_environment_snapshot takes the resolved timeout_info dict,
+        # not these, and _compute_snapshot_delay_sec below only needs the
+        # plain effective_timeout_sec duration.
 
         # No turn cap: 40 was too tight (train-fasttext hit 41/40, one call
         # from its correct final fix), so it was raised to 80 -- which
@@ -1008,32 +1939,108 @@ class LittleCoderAgent(BaseAgent):
         # can never diverge.
         max_turns = 0
         ambient_max_turns_env = os.environ.get("LITTLE_CODER_MAX_TURNS")
+        # Hoisted for the same reason as max_turns: the log line, the
+        # environment snapshot and the PiRpc kwarg must all read one value.
+        thinking_level = resolve_thinking_level(model, "terminal_bench")
         self.logger.info(
             "LittleCoderAgent: config provenance "
             f"max_turns={max_turns} "
+            f"thinking_level={thinking_level} "
             f"ambient_LITTLE_CODER_MAX_TURNS={ambient_max_turns_env!r} "
             f"code_sha={_CODE_SHA} "
             f"adapter_file={__file__} adapter_mtime={_ADAPTER_MTIME}"
         )
 
+        # One cheap probe of what the image actually ships, before the
+        # deadline is anchored so its cost is not charged to the model. Run
+        # ahead of the start-of-trial snapshot below for the same reason the
+        # env-snapshot write right below is ordered ahead of it too -- see
+        # that comment.
+        toolchain = await _probe_toolchain(proxy, self.logger)
+
         # Per-trial environment_snapshot.json: best-effort, must never fail
-        # a trial. Executes before the PiRpc-construction
-        # try/except below so it (and the config-provenance log line above)
-        # still land even if PiRpc itself fails to construct (e.g. PI_BIN
-        # missing) -- exactly the diagnostics that failure needs most.
+        # a trial. Sits after the toolchain probe so it can record what that
+        # found, but deliberately AHEAD of _snapshot_initial_state below --
+        # unlike the probe, nothing this snapshot writes depends on that
+        # snapshot's outcome, and _snapshot_initial_state is bounded at 75s
+        # (including a docker-cp of up to 200MB) versus the probe's 10s.
+        # environment_snapshot.json must land early enough to survive even a
+        # mid-start termination, rather than depend on the initial-state
+        # stage+download finishing first.
+        # Still ahead of the PiRpc-construction try/except further below so
+        # it (and the config-provenance log line) land even if PiRpc itself
+        # fails to construct (e.g. PI_BIN missing) -- exactly the
+        # diagnostics that failure needs most.
+        # Kept in scope past the write so the post-PiRpc confirmation below
+        # can amend and rewrite it; None means "never successfully built",
+        # which that step treats as nothing to confirm.
+        snapshot: dict | None = None
         if self.logs_dir:
             try:
                 snapshot = _build_environment_snapshot(
                     model,
                     max_turns=max_turns,
+                    thinking_level=thinking_level,
                     ambient_max_turns_env=ambient_max_turns_env,
                     timeout_info=timeout_info,
+                    toolchain=toolchain.tools,
+                    toolchain_probe_status=toolchain.status,
                 )
                 (self.logs_dir / "environment_snapshot.json").write_text(
                     json.dumps(snapshot, indent=2, default=str)
                 )
             except Exception as e:
+                snapshot = None
                 self.logger.warning(f"LittleCoderAgent: environment snapshot failed: {e}")
+
+        # Start-of-trial snapshot of the task's pre-existing /app files.
+        # Unconditional, and deliberately ahead of the deadline-snapshot gate
+        # below rather than inside it: that gate's rationale is "this trial is
+        # too short for a mid-run snapshot of the model's own work to be worth
+        # scheduling", which does not transfer to a snapshot of originals. A
+        # short trial destroys a task-provided input just as irrecoverably as
+        # a long one, with less time left to notice, so nesting this inside
+        # the `if` would exempt exactly the trials least able to recover.
+        #
+        # Also why the model's own deadline is anchored below, after this
+        # await, rather than back where effective_timeout_sec was resolved:
+        # anchoring it there would let a slow container-side copy here
+        # silently eat into the model's nominal budget before its first
+        # prompt is even sent. Anchoring after means the model always gets
+        # the full effective_timeout_sec, regardless of how long staging
+        # and downloading this snapshot took.
+        #
+        # Both this and the toolchain probe above go through run_harness,
+        # which shares _exec_async's _exec_lock with every model-issued
+        # command -- so gathering the two concurrently would not actually
+        # run them in parallel inside the container, only add scheduling
+        # complexity for no wall-clock benefit. Staying sequential keeps
+        # this simple.
+        initial_snapshot = await _snapshot_initial_state(
+            proxy, environment, self.logs_dir, self.logger
+        )
+
+        # Composed here rather than right after the probe above:
+        # _initial_snapshot_advertisement derives from the initial-state
+        # snapshot's outcome, so composition has to wait for it -- and
+        # `prompt` isn't read until prompt_with_mid_run_compaction far
+        # below, so waiting costs nothing.
+        prompt = _compose_prompt(
+            prompt_prefix,
+            prompt_task_block,
+            [
+                _toolchain_probe_note(toolchain.tools),
+                _initial_snapshot_advertisement(initial_snapshot),
+            ],
+        )
+
+        budget_start_epoch_ms = int(time.time() * 1000)
+        deadline_epoch_ms = budget_start_epoch_ms + int(effective_timeout_sec * 1000)
+        # The same instant as deadline_epoch_ms, on the monotonic clock the
+        # error-retry loop measures against. Derived from one shared
+        # effective_timeout_sec rather than re-read later, so a retry can
+        # never outlive the deadline pi itself was handed above.
+        prompt_deadline = time.monotonic() + effective_timeout_sec
 
         # Schedule the best-effort deadline snapshot. Skipped entirely below
         # SNAPSHOT_MIN_BUDGET_SEC (see that constant's comment); the
@@ -1072,36 +2079,63 @@ class LittleCoderAgent(BaseAgent):
                 session_id=session_id,
                 tb_mode=True,
                 max_turns=max_turns,
+                # pi's own clampThinkingLevel degrades this to "off" for
+                # models with reasoning=false, so it is safe to pass
+                # unconditionally. Without it, pi falls back to the
+                # machine-local defaultThinkingLevel setting (pi's built-in
+                # fallback is "medium"); a machine set to "off" silently
+                # no-ops any thinkingFormat gated on reasoningEffort (e.g.
+                # "qwen").
+                thinking=thinking_level,
                 tb_shell_handler=tb_shell_handler,
-                # permission-gate's SAFE_PREFIXES whitelist is meant to guard
-                # a real user's own machine during interactive use, and its
-                # own header documents this opt-out for benchmark runs.
-                # Docker is the actual isolation boundary for a TB trial, and
-                # every other TB agent (bare pi, codex) already runs here with
-                # unrestricted tool access. Observed directly: fix-git blocked
-                # on `cd`/`git -C`, prove-plus-comm blocked on `coqc`,
-                # configure-git-webserver blocked on `setsid`/`nc`/`socat`/
-                # `crontab` -- three different tools across three unrelated
-                # tasks, not a pattern fixable by allow-listing one command at
-                # a time.
-                env={
-                    "LITTLE_CODER_PERMISSION_MODE": "accept-all",
-                    "LITTLE_CODER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
-                },
+                env=_pi_env(
+                    budget_start_epoch_ms=budget_start_epoch_ms,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    initial_snapshot=initial_snapshot,
+                ),
             )
             try:
+                # Inside this try, not between it and the PiRpc construction
+                # above: the `finally` below is the only thing that closes
+                # rpc, so an await in that gap leaks a pi subprocess when
+                # Harbor cancels a timed-out trial.
+                if snapshot is not None and self.logs_dir:
+                    await asyncio.to_thread(
+                        _confirm_live_thinking,
+                        rpc,
+                        snapshot,
+                        self.logs_dir / "environment_snapshot.json",
+                        self.logger,
+                    )
+                # Best-effort: a probe that fails leaves context_window None,
+                # which disarms mid-run compaction without touching the
+                # error-retry recovery underneath it.
+                context_window = None
+                try:
+                    state = await asyncio.to_thread(rpc.get_state)
+                    context_window = (state.get("model") or {}).get("contextWindow")
+                except Exception as e:
+                    self.logger.info(
+                        f"LittleCoderAgent: context-window probe failed (non-fatal): {e}"
+                    )
+
                 # Retried in place on a provider-error completion rather than
                 # called bare: a single errored completion used to end the
                 # whole trial with most of the wall clock unspent (measured
                 # at 62-81% unused across three of five failed TB2.1 trials).
-                # Same rpc, same session -- see prompt_with_error_retry.
+                # The outer wrapper adds the compaction boundary a Harbor
+                # trial structurally never reaches on its own -- one agent
+                # run for the whole trial, so pi's auto-compaction check at
+                # run boundaries never fires until an overflow forces one.
+                # Same rpc, same session -- see prompt_with_mid_run_compaction.
                 retry_outcome = await asyncio.to_thread(
-                    prompt_with_error_retry,
+                    prompt_with_mid_run_compaction,
                     rpc,
                     prompt,
                     effective_timeout_sec,
                     on_event,
                     deadline=prompt_deadline,
+                    context_window=context_window,
                     log=self.logger.warning,
                 )
                 result = retry_outcome.result
@@ -1119,6 +2153,11 @@ class LittleCoderAgent(BaseAgent):
                         log_fh.write(
                             f"=== retry raised (not propagated): "
                             f"{retry_outcome.retry_exception} ===\n"
+                        )
+                    if retry_outcome.n_deliberate_compactions:
+                        log_fh.write(
+                            f"=== deliberate compactions: "
+                            f"{retry_outcome.n_deliberate_compactions} ===\n"
                         )
                     log_fh.write(f"=== assistant text ===\n{result.assistant_text}\n\n")
                     for tc in result.tool_calls:
@@ -1171,12 +2210,15 @@ class LittleCoderAgent(BaseAgent):
                     "n_error_retries": retry_outcome.n_error_retries,
                     "error_message": retry_outcome.error_message,
                     # A retry that raised is turned into a normal return by
-                    # prompt_with_error_retry, so this field is the only place
+                    # the retry helper, so this field is the only place
                     # a harness fault reaches result.json at all.
                     "retry_exception": retry_outcome.retry_exception,
                     "n_tool_calls": len(result.tool_calls),
                     "n_turns": result.turn_count,
+                    # Every compaction pi reported, deliberate ones included;
+                    # the field below is the harness-triggered subset.
                     "n_compactions": result.compaction_events,
+                    "n_deliberate_compactions": retry_outcome.n_deliberate_compactions,
                     "n_notifications": len(rpc.notifications()) if hasattr(rpc, "notifications") else 0,
                     "little_coder_version": self.version(),
                     # Read from the trial's own config.json -- the pilot's
@@ -1205,6 +2247,11 @@ class LittleCoderAgent(BaseAgent):
                     pass
                 except Exception:
                     pass
+            # Per-capture files are unlinked as they're uploaded, but the
+            # private staging directory itself otherwise outlives the trial
+            # -- one empty 0700 dir leaked per trial that ever byte-capped,
+            # forever, on the shared harness host.
+            proxy.cleanup_overflow_staging()
             if log_fh:
                 log_fh.flush()
                 log_fh.close()

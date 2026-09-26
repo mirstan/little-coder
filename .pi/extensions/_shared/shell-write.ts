@@ -708,7 +708,7 @@ function firstWord(s: string): string {
 const WORD_BREAKS = new Set([">", "<", ";", "&", "|", "(", ")"]);
 
 /** Split on unquoted whitespace and control operators, keeping quoted runs together. */
-function splitWords(s: string): string[] {
+export function splitWords(s: string): string[] {
   const words: string[] = [];
   let cur = "";
   let quote: '"' | "'" | null = null;

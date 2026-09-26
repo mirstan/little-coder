@@ -8,6 +8,7 @@ import {
   isScratchPath,
   scan,
   splitCommandChain,
+  splitWords,
   stripHeredocBodies,
 } from "./shell-write.ts";
 
@@ -576,5 +577,19 @@ describe("SHELL_TOOLS", () => {
     for (const t of ["ShellSessionCwd", "ShellSessionReset", "ShellSend", "read", "edit"]) {
       expect(SHELL_TOOLS.has(t), t).toBe(false);
     }
+  });
+});
+
+describe("splitWords", () => {
+  // Public because truncated-view tokenizes a trailing `head`/`tail` segment
+  // with it. Quoted runs keep their quotes, which is why a quoted count
+  // (`head -n "50"`) is declined there rather than parsed.
+  it("splits on unquoted whitespace and keeps a quoted run whole", () => {
+    expect(splitWords('head -n 50 "my file.txt"')).toEqual([
+      "head",
+      "-n",
+      "50",
+      '"my file.txt"',
+    ]);
   });
 });

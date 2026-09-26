@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   WARN_REMAINING,
   WARN_REMAINING_MS,
+  finalizeWarnTurnWindowOpen,
   finalizeWarnWouldFire,
 } from "./finalize-warn-trigger.ts";
 
@@ -98,5 +99,30 @@ describe("finalizeWarnWouldFire — either trigger is enough", () => {
         now,
       }),
     ).toBe(true);
+  });
+});
+
+describe("finalizeWarnTurnWindowOpen — the level-triggered turn window", () => {
+  it("opens on exactly the turn the edge trigger fires on", () => {
+    // capForRun=40, WARN_REMAINING=5 -> the edge is turn 36.
+    expect(finalizeWarnTurnWindowOpen({ turnsThisRun: 35, capForRun: 40 })).toBe(false);
+    expect(finalizeWarnTurnWindowOpen({ turnsThisRun: 36, capForRun: 40 })).toBe(true);
+  });
+
+  it("stays open for every later turn, where the edge reads false", () => {
+    for (const turnsThisRun of [37, 38, 39, 40, 41]) {
+      expect(finalizeWarnWouldFire({ turnsThisRun, capForRun: 40, deadlineForRun: 0, now })).toBe(
+        false,
+      );
+      expect(finalizeWarnTurnWindowOpen({ turnsThisRun, capForRun: 40 })).toBe(true);
+    }
+  });
+
+  it("never opens without a cap, or under a cap too small to give real headroom", () => {
+    for (const capForRun of [0, -1, WARN_REMAINING, WARN_REMAINING - 1]) {
+      for (const turnsThisRun of [1, 5, 100]) {
+        expect(finalizeWarnTurnWindowOpen({ turnsThisRun, capForRun })).toBe(false);
+      }
+    }
   });
 });
