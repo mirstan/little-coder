@@ -5,6 +5,7 @@ import {
   buildCorrectionMessage,
   buildFailureSignatureMessage,
   buildNearDuplicateLoopMessage,
+  buildScriptFailureMessage,
   BLOCKED_CALL_REASON,
   phraseForUser,
   sameCall,
@@ -16,6 +17,7 @@ import {
   FailureSignatureTracker,
   type FailureSignatureDetection,
 } from "./failure-signature.ts";
+import { ScriptFailureTracker, type ScriptFailureDetection } from "./script-failure.ts";
 import { harnessIntervention, type InterventionCtx } from "../_shared/intervention.ts";
 
 // Port of local/quality.py. Hooks turn_end, inspects the assistant message
@@ -48,6 +50,10 @@ let turnValidatedCalls: ToolCall[] = [];
 // rather than cleared so each reset re-reads the env knobs.
 let fuzzyTracker = new FuzzyLoopTracker();
 let failsigTracker = new FailureSignatureTracker();
+// A third, independent watchdog: script write-run-fail cycles that never
+// content-cluster (see script-failure.ts). Same lifetime rule as the two
+// above -- survives a mid-task compaction, rebuilt on a genuine new prompt.
+let scriptFailureTracker = new ScriptFailureTracker();
 // This turn's tool results. tool_result fires mid-turn, before the calls that
 // produced it have been clustered, so they are correlated at turn_end.
 let turnResults: BufferedResult[] = [];
@@ -114,6 +120,7 @@ interface BufferedResult {
 function resetLoopDetectors(): void {
   fuzzyTracker = new FuzzyLoopTracker();
   failsigTracker = new FailureSignatureTracker();
+  scriptFailureTracker = new ScriptFailureTracker();
   turnResults = [];
   assessedTurns = 0;
 }
@@ -288,6 +295,7 @@ export default function (pi: ExtensionAPI) {
     // After the fuzzy update, so this turn's results can be credited to the
     // cluster their own call just joined.
     let failsigDetection: FailureSignatureDetection | null = null;
+    let scriptFailureDetection: ScriptFailureDetection | null = null;
     for (const r of thisTurnResults) {
       const clusterId = fuzzyTracker.clusterIdForToolCallId(r.toolCallId);
       const detection = failsigTracker.record(
@@ -302,15 +310,38 @@ export default function (pi: ExtensionAPI) {
         assessedTurns,
       );
       if (detection) failsigDetection = detection;
+      // Independent of the fuzzy/failsig correlation above: this tracker
+      // doesn't cluster by content at all, so it reads every result on its
+      // own regardless of what fuzzyTracker made of the call that produced it.
+      const scriptDetection = scriptFailureTracker.record({
+        input: r.input,
+        text: r.text,
+        isError: r.isError,
+      });
+      if (scriptDetection) scriptFailureDetection = scriptDetection;
     }
 
     if (verdict.ok) {
       consecutiveFailures = 0;
       blockedCall = null;
       tier2NotifiedKey = null;
-      // An ok verdict deliberately does NOT reset the two trackers: their
+      // An ok verdict deliberately does NOT reset the trackers: their
       // whole subject matter is loops made of individually-ok turns.
       steerLoopDetection(pi, ctx, failsigDetection, fuzzyDetection);
+      // Sent independently of the call above, not folded into
+      // steerLoopDetection's early-return chain: this is a different signal
+      // (no content clustering at all) and can and should fire on the same
+      // turn as a fuzzy/failsig detection, not instead of it.
+      if (scriptFailureDetection) {
+        harnessIntervention(
+          ctx,
+          `${scriptFailureDetection.count} script write-run-fail attempts this trial — nudging toward isolating the failing construct.`,
+        );
+        pi.sendUserMessage(
+          buildScriptFailureMessage(scriptFailureDetection.count, scriptFailureDetection.escalated),
+          { deliverAs: "steer" },
+        );
+      }
       return;
     }
 
