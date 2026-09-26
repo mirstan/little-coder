@@ -18,6 +18,9 @@ import {
   initialSnapshotOutcome,
   type InitialSnapshotOutcome,
 } from "../_shared/snapshot-paths.ts";
+import { inTbMode, tbProxyRun, tbSessionId, type ProxyUiCtx } from "../_shared/tb-proxy.ts";
+import { CHECK_TIMEOUT_SEC, footerExit, footerTimedOut } from "../syntax-check/helpers.ts";
+import { splitFooter } from "../truncated-view/truncation.ts";
 
 // tb-finalize-guard: a merged guard for Terminal-Bench with four independent
 // trigger conditions, scoped to LITTLE_CODER_BENCHMARK === "terminal_bench"
@@ -211,6 +214,51 @@ import {
 // level-triggered finalizeWarnTurnWindowOpen alongside both.
 //
 // ---------------------------------------------------------------------------
+// Trigger E — byte-limit-aware finalize guard
+// ---------------------------------------------------------------------------
+// Some TB tasks state a hard numeric size limit on the deliverable (a code-
+// golf constraint). Terminal-Bench mode has no Write/Edit tool at all --
+// every file write happens via an opaque shell command (a heredoc, `sed -i`,
+// a compiler's `-o` flag), so a write's effect on the target file's size is
+// never visible in the tool call's own arguments the way it would be if a
+// Write tool passed full file content directly. Nothing else in this file
+// tracks *how big* the deliverable is, only *whether* something was written
+// and *when* in the budget -- a shrinking-then-growing-again file, or one
+// that simply never gets under the limit, currently passes unnoticed.
+//
+// The limit and the deliverable's path are each parsed at most once, from
+// the task prompt, at `before_agent_start` -- mirroring capForRun/
+// deadlineForRun's own once-per-run resolution. Both regexes are
+// false-negative-biased by design: if either fails to find a single
+// confident match, this trigger stays permanently inert for the run rather
+// than guessing. A guard armed with the wrong path or the wrong limit is
+// worse than one that never fires -- it would tell the model to golf a file
+// that isn't the deliverable, or accept a size that isn't the real cap.
+//
+// Getting the real byte count reuses syntax-check's own solution to the
+// adjacent problem of reaching a file that lives in the TB container: the
+// `__LC_TB_SHELL__` proxy channel (`_shared/tb-proxy.ts`), which pi's host
+// process can use to run a command inside the container and read back its
+// output. A `wc -c` over that channel is a real count, not an inference from
+// command text. This only runs on a turn whose commands actually touched the
+// parsed deliverable path -- a turn doing unrelated work pays nothing.
+//
+// The over-budget count is session- rather than run-scoped: it tracks a
+// property of the whole trial's deliverable, so a mid-run compaction
+// continuation must not reset progress already made toward the limit.
+//
+// There is no explicit "finalize" tool call in TB mode to block -- a trial
+// simply runs until the model stops, the deadline hits, or turn-cap aborts
+// it, and grading happens externally afterward. Every trigger in this file
+// works the same way this one must: a `pi.sendUserMessage` steer nudge, not
+// a hard refusal. The escalation is two-toned, like Trigger C: a calm
+// "keep golfing" nudge ordinarily, or -- once inside the same near-deadline
+// window Triggers A/B/D already key off -- the same save-what-you-have
+// framing `resolveFinalizeMessage` gives Trigger C's own near-deadline
+// branch, so a model that can no longer realistically close the gap isn't
+// told to keep pushing on a constraint it may be out of turns to meet.
+//
+// ---------------------------------------------------------------------------
 // Shared instrumentation
 // ---------------------------------------------------------------------------
 // On every terminal_bench turn_end, log the turn's stopReason and a coarse
@@ -230,6 +278,9 @@ const MAX_TRIGGER_A_FIRES = 2; // per session
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
 
 const MAX_TRIGGER_C_FIRES = 2; // per session
+
+const SIZE_CHECK_TIMEOUT_SEC = CHECK_TIMEOUT_SEC; // same budget syntax-check gives its own container checks
+const OVER_BUDGET_CHECKS_BEFORE_NUDGE = 3; // consecutive over-budget checks -- avoids spamming mid-golf
 
 // ---- Trigger A state (session-scoped fire count; run-scoped turn/cap bookkeeping) ----
 let triggerAFireCount = 0;
@@ -269,6 +320,21 @@ let startForRun = 0;
 // steering messages (pi delivers each one, never coalesces them), so
 // firing both stacks two different nudges on the turn D already spoke to.
 let triggerDFiredAtTurn = 0;
+
+// ---- Trigger E state ----
+// byteLimitForRun/deliverablePathForRun are run-scoped, resolved once per
+// run like capForRun/deadlineForRun -- re-derived on every continuation, but
+// idempotent since the task prompt itself never changes mid-trial.
+// Undefined means "no confident single match" and leaves this trigger inert
+// for the run, never guessed at.
+let byteLimitForRun: number | undefined;
+let deliverablePathForRun: string | undefined;
+// Session-scoped: the over-budget count and last known size are properties
+// of the whole trial's deliverable, not one run segment, so a mid-run
+// compaction continuation must not reset progress already made toward the
+// limit.
+let lastKnownSize: number | undefined;
+let consecutiveOverBudgetChecks = 0;
 
 function isTerminalBench(): boolean {
   return process.env.LITTLE_CODER_BENCHMARK === "terminal_bench";
@@ -325,6 +391,54 @@ function hasNonScratchWrite(commands: string[]): boolean {
   return false;
 }
 
+/** True when at least one command in this turn writes the given path specifically. */
+function writesDeliverablePath(commands: string[], path: string): boolean {
+  for (const cmd of commands) {
+    for (const w of detectDeliverableWrites(cmd)) {
+      if (w.path === path) return true;
+    }
+  }
+  return false;
+}
+
+// A number plus a unit, allowing the phrasing this trigger is verified
+// against ("must be <5000 bytes") and adjacent variants. The leading `<` is
+// optional and absorbed by the numeric side of the match rather than gated
+// behind a `\b` -- `<` is itself a non-word character, so `\b<` can never
+// fire next to the space that almost always precedes it in prose.
+const BYTE_LIMIT_RE =
+  /(?:\b(?:under|below|less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+
+// An absolute path stated near an instruction verb, e.g. "Call your program
+// /app/gpt2.c".
+const DELIVERABLE_PATH_RE =
+  /\b(?:call\s+your\s+\w+|save\s+(?:it|your\s+\w+)\s+(?:as|to)|write\s+(?:it|your\s+\w+)\s+to|program\s+(?:at|to))\s+(\/\S+)/i;
+
+/**
+ * The byte limit stated in the prompt, normalized to bytes (kb/kilobytes
+ * x1024). Undefined when no confident single match exists -- exported for
+ * the smoke test against the real gpt2-codegolf prompt.
+ */
+export function parseByteLimit(prompt: string): number | undefined {
+  const m = BYTE_LIMIT_RE.exec(prompt);
+  if (!m) return undefined;
+  const value = Number(m[1]);
+  const unit = m[2].toLowerCase();
+  return unit.startsWith("k") ? value * 1024 : value;
+}
+
+/**
+ * The deliverable's absolute path stated in the prompt. Undefined when no
+ * confident single match exists. Trailing sentence punctuation (a comma or
+ * period immediately after the path, as in "Call your program /app/gpt2.c,
+ * I will compile...") is stripped -- `\S+` has no way to distinguish it from
+ * a path character, and no real deliverable path ends in one.
+ */
+export function parseDeliverablePath(prompt: string): string | undefined {
+  const m = DELIVERABLE_PATH_RE.exec(prompt);
+  return m ? m[1].replace(/[.,;:!?]+$/, "") : undefined;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     triggerAFireCount = 0;
@@ -332,6 +446,8 @@ export default function (pi: ExtensionAPI) {
     triggerCFireCount = 0;
     milestonesFired = new Set<number>();
     deliverableWriteEverSeen = false;
+    lastKnownSize = undefined;
+    consecutiveOverBudgetChecks = 0;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -344,6 +460,8 @@ export default function (pi: ExtensionAPI) {
     consecutiveNoWriteTurns = 0;
     lastTurnMessage = undefined;
     triggerDFiredAtTurn = 0;
+    byteLimitForRun = parseByteLimit((event as any).prompt ?? "");
+    deliverablePathForRun = parseDeliverablePath((event as any).prompt ?? "");
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -380,13 +498,15 @@ export default function (pi: ExtensionAPI) {
     // Computed for every turn, not just the ones Trigger B is armed for:
     // Trigger D's evidence flag has to be complete from turn 1, long before
     // Trigger B starts judging compliance.
-    const wroteDeliverable = hasNonScratchWrite(shellCommandsIn(toolCalls));
+    const commands = shellCommandsIn(toolCalls);
+    const wroteDeliverable = hasNonScratchWrite(commands);
     if (wroteDeliverable) deliverableWriteEverSeen = true;
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
 
     maybeAdvanceTriggerB(pi, ctx, wroteDeliverable);
+    await maybeCheckDeliverableSize(pi, ctx, commands);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
@@ -544,6 +664,19 @@ export function buildTriggerDMessage(
     `path NOW, even if it is rough or incomplete — then ${check} Keep improving it in ` +
     "place from there: a rough deliverable on disk beats a perfect plan that never got " +
     "written."
+  );
+}
+
+/**
+ * Trigger E's escalation text, for a deliverable currently `overBy` bytes
+ * past the stated `limit`. Exported and pure for the same reason as
+ * `buildTriggerAMessage`.
+ */
+export function buildTriggerEMessage(overBy: number, limit: number): string {
+  return (
+    `Your deliverable is currently ~${overBy} bytes over the ${limit}-byte limit ` +
+    "stated in the task. This must shrink before the file can be graded — keep " +
+    "reducing size, and re-check with `wc -c` after each pass."
   );
 }
 
@@ -755,4 +888,86 @@ function maybeFireTriggerD(pi: ExtensionAPI, ctx: any): void {
         : "nothing written outside /tmp") +
       " — sending a progress checkpoint.",
   );
+}
+
+/**
+ * The deliverable's real byte count via the same tb-proxy channel
+ * syntax-check uses to reach a file inside the TB container. Every failure
+ * mode -- not in TB mode, a proxy error, a timeout, a non-zero exit, a
+ * non-numeric response -- returns null rather than fabricating a size,
+ * matching syntax-check's own "every failure mode is silence" discipline.
+ */
+async function checkDeliverableSize(ctx: ProxyUiCtx, path: string): Promise<number | null> {
+  if (!inTbMode()) return null;
+  let text: string | null;
+  try {
+    text = await tbProxyRun(ctx, `wc -c ${path}`, SIZE_CHECK_TIMEOUT_SEC, tbSessionId());
+  } catch {
+    return null;
+  }
+  if (text === null) return null;
+  const { body, footer } = splitFooter(text);
+  if (footer === null || footerTimedOut(footer)) return null;
+  const exit = footerExit(footer);
+  if (exit !== 0) return null;
+  const m = /^\s*(\d+)/.exec(body);
+  return m ? Number(m[1]) : null;
+}
+
+function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[]): Promise<void> {
+  return (async () => {
+    if (deliverablePathForRun === undefined || byteLimitForRun === undefined) return;
+    if (!writesDeliverablePath(commands, deliverablePathForRun)) return;
+
+    const size = await checkDeliverableSize(ctx as ProxyUiCtx, deliverablePathForRun);
+    if (size === null) return;
+    lastKnownSize = size;
+
+    if (size <= byteLimitForRun) {
+      consecutiveOverBudgetChecks = 0;
+      return;
+    }
+
+    consecutiveOverBudgetChecks++;
+    // Free, non-harnessIntervention diagnostic on every over-budget check --
+    // the escalated nudge below is what actually costs a session-metrics
+    // intervention, gated by the consecutive-checks threshold so a run still
+    // mid-golf isn't interrupted on every single edit.
+    ctx.ui.notify(
+      `[byte-limit] ${deliverablePathForRun} is ${size} bytes, over the ` +
+        `${byteLimitForRun}-byte limit stated in the task.`,
+      "info",
+    );
+
+    if (consecutiveOverBudgetChecks < OVER_BUDGET_CHECKS_BEFORE_NUDGE) return;
+    // Turn-cap headroom: same clause as Triggers A/B/C/D.
+    if (capForRun > 0 && turnsThisRun >= capForRun) return;
+
+    const nearDeadline =
+      armed || finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun });
+    const overBy = size - byteLimitForRun;
+    const msg = nearDeadline
+      ? resolveFinalizeMessage("terminal_bench")
+      : buildTriggerEMessage(overBy, byteLimitForRun);
+
+    try {
+      pi.sendUserMessage(msg, { deliverAs: "steer" });
+    } catch {
+      // Don't burn the cooldown for a nudge that was never actually
+      // delivered — mirrors every other trigger's ordering.
+      return;
+    }
+    // Cooldown, not a one-shot latch: the next escalation needs another
+    // OVER_BUDGET_CHECKS_BEFORE_NUDGE consecutive over-budget checks, rather
+    // than firing on every check once the threshold is first crossed.
+    consecutiveOverBudgetChecks = 0;
+    harnessIntervention(
+      ctx,
+      `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
+        `${byteLimitForRun}-byte limit stated in the task` +
+        (nearDeadline
+          ? " — near deadline, telling the model to save its best version."
+          : " — telling the model to keep golfing."),
+    );
+  })();
 }
