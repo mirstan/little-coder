@@ -76,6 +76,22 @@ export interface ResultFacts {
   hasContent: boolean;
 }
 
+// A trailing exception line, independent of exit code. TB's ShellSession
+// wraps the model's command in `{ command ; } ; __rc=$?` with no `pipefail`
+// (benchmarks/harbor_adapter/little_coder_agent.py's _wrap_command) — under
+// bash's default semantics a piped command (`... | head`) reports the LAST
+// stage's exit code, so `python3 ... | head -40` reports 0 even when python3
+// raised. Content-based detection catches what the (masked) exit code can't.
+const EXCEPTION_LINE_RE = /^(\w*(?:Error|Exception|Warning)):\s*(.+)$/m;
+
+function lastMatch(re: RegExp, text: string): RegExpExecArray | null {
+  const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = g.exec(text)) !== null) last = m;
+  return last;
+}
+
 /**
  * Whether a tool result is a failure, and whether it says anything.
  *
@@ -90,13 +106,19 @@ export interface ResultFacts {
  * only the harness's status line or footer, which is byte-identical across
  * three unrelated no-match greps and would otherwise read as one repeated
  * failure.
+ *
+ * Exit code alone is also not enough: it can itself be wrong (see
+ * EXCEPTION_LINE_RE above), so a recognizable trailing exception line counts
+ * as failed even when the reported exit is 0.
  */
 export function readResult(text: string, isError: boolean, minTokens: number): ResultFacts {
   const { body, footer } = splitFooter(text);
   const exit = footerExit(footer);
+  const stripped = stripStatusLine(body.trimEnd());
+  const looksLikeUncaughtException = lastMatch(EXCEPTION_LINE_RE, stripped) !== null;
   return {
-    failed: isError === true || (exit !== null && exit !== 0),
-    hasContent: tokenize(stripStatusLine(body.trimEnd())).length >= minTokens,
+    failed: isError === true || (exit !== null && exit !== 0) || looksLikeUncaughtException,
+    hasContent: tokenize(stripped).length >= minTokens,
   };
 }
 
@@ -148,16 +170,30 @@ export function boundResultText(text: string): string {
   return text.slice(nl === -1 ? cut : nl + 1);
 }
 
+// Normalizes a matched exception line so two occurrences of "the same
+// mistake" compare equal even when a quoted literal (an argument name, a key)
+// differs between them -- e.g. "unexpected keyword argument 'psrn'" vs.
+// "... 'psm'" after a half-applied fix. Bigram-Jaccard is unreliable on text
+// this short (one token change moves a large fraction of the total bigrams),
+// so this is exact equality on the normalized string, not another ratio.
+function normalizeExceptionLine(line: string): string {
+  return line.replace(/'[^']*'/g, "'<TOK>'").replace(/"[^"]*"/g, '"<TOK>"');
+}
+
 export interface Signature {
   hash: string;
   shingles: Set<string>;
+  /** Normalized trailing exception line, if the tail has one. */
+  excLine?: string;
 }
 
 export function signatureOf(toolName: string, text: string, tailLines: number): Signature {
   const tail = normalizeTail(text, tailLines);
+  const excMatch = lastMatch(EXCEPTION_LINE_RE, tail);
   return {
     hash: createHash("sha1").update(`${toolName.toLowerCase()}\n${tail}`).digest("hex"),
     shingles: bigrams(tokenize(tail)),
+    excLine: excMatch ? normalizeExceptionLine(excMatch[0]) : undefined,
   };
 }
 
@@ -284,7 +320,11 @@ export class FailureSignatureTracker {
 
   private matches(a: Signature, b: Signature): boolean {
     if (a.hash === b.hash) return true;
-    return jaccard(a.shingles, b.shingles) >= this.opts.threshold;
+    if (jaccard(a.shingles, b.shingles) >= this.opts.threshold) return true;
+    // OR, not a replacement: a short, information-dense tail (e.g. a 5-line
+    // traceback) can fail the whole-tail Jaccard bar on a single differing
+    // token while still being "the same mistake" by its exception line.
+    return a.excLine !== undefined && a.excLine === b.excLine;
   }
 
   private notifyKey(key: string, sig: Signature): string {

@@ -86,6 +86,39 @@ describe("readResult", () => {
   });
 });
 
+// Real tool-result texts from extract-moves-from-video__6f2d2Tb's trial log
+// (agent/little_coder.log:781-826) -- a `psrn`/`psm` keyword-argument typo
+// repeated across 6 ShellSession calls, every one piping through `head`, so
+// `[exit=0 ...]` masks the real Python TypeError under bash's default
+// (non-pipefail) semantics. Only D has no pipe and genuinely fails at the
+// bash level.
+const EXIT0 = "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+const PSRN_TRACE = (n = 1) =>
+  `Traceback (most recent call last):\n  File "<string>", line 5, in <module>\nTypeError: image_to_data() got an unexpected keyword argument 'psrn'`.repeat(n);
+const CALL_A = `${PSRN_TRACE()}\ntry2\n${PSRN_TRACE()}\n${EXIT0}`;
+const CALL_B = `${PSRN_TRACE()}\n${EXIT0}`;
+const CALL_D = `bash: line 7: warning: here-document at line 1 delimited by end-of-file (wanted \`EOF')\nbash: -c: line 8: syntax error: unexpected end of file\n\n[exit=2 cwd=/app timed_out=false backend=harbor-env]`;
+const CALL_E = `written\nTraceback (most recent call last):\n  File "/app/probe.py", line 4, in <module>\n    data = pytesseract.image_to_data(img, psrn=11)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: image_to_data() got an unexpected keyword argument 'psrn'\n${EXIT0}`;
+const CALL_F = `4:data = pytesseract.image_to_data(img, psm=11)\nTraceback (most recent call last):\n  File "/app/probe.py", line 4, in <module>\n    data = pytesseract.image_to_data(img, psm=11)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: image_to_data() got an unexpected keyword argument 'psm'\n${EXIT0}`;
+
+describe("readResult — exit-code masking (Fix 1)", () => {
+  it("calls a piped Python TypeError failed even though the footer reports exit=0", () => {
+    expect(readResult(CALL_A, false, 4).failed).toBe(true);
+    expect(readResult(CALL_E, false, 4).failed).toBe(true);
+    expect(readResult(CALL_F, false, 4).failed).toBe(true);
+  });
+  it("still reads D's genuine bash-level failure from its exit code, unaffected", () => {
+    // D has no recognizable exception line -- it keeps failing via exit=2.
+    expect(readResult(CALL_D, false, 4).failed).toBe(true);
+  });
+  it("does not call a benign 'errors' mention a failure", () => {
+    const ok = "no errors found, all clear\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(ok, false, 4).failed).toBe(false);
+    const ok2 = "0 errors, 2 warnings\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(ok2, false, 4).failed).toBe(false);
+  });
+});
+
 describe("normalizeTail", () => {
   it("is idempotent", () => {
     const once = normalizeTail("a  \n\n\n b\t\n", 40);
@@ -339,5 +372,60 @@ describe("FailureSignatureTracker", () => {
     t.record(obs("./run --a", SHELL_FAIL), 1);
     t.record({ toolName: "Bash", input: { command: "./run --b" }, text: BASH_FAIL, isError: true }, 2);
     expect(t.record(obs("./run --c", SHELL_FAIL), 3)).toBeNull();
+  });
+
+  describe("exception-line fallback (Fix 2)", () => {
+    it("continues the streak across A-B and, after D resets it, across E-F -- both pairs score below the 0.95 Jaccard bar (0.9310, 0.7381) and are not byte-identical, so only the exception-line fallback keeps them counted as the same mistake instead of resetting", () => {
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("call-a", CALL_A), 1)).toBeNull();
+      // B continues A's streak (count 2) via the exception-line match --
+      // Jaccard alone (0.9310) falls just short of the 0.95 bar, so without
+      // Fix 2 this pair would already reset instead of combining.
+      expect(t.record(obs("call-b", CALL_B), 2)).toBeNull();
+      // C is a verbatim repeat of B's own command+text in the real log --
+      // deduped by the tracker's own "identical input" rule, count stays 2.
+      expect(t.record(obs("call-b", CALL_B), 3)).toBeNull();
+      // D is a genuinely different failure (no exception line at all) and
+      // correctly resets the streak.
+      expect(t.record(obs("call-d", CALL_D), 4)).toBeNull();
+      expect(t.record(obs("call-e", CALL_E), 5)).toBeNull();
+      // F continues E's streak (count 2) the same way B continued A's --
+      // this is the pair the plan's evidence measured at 0.7381 Jaccard,
+      // the one whole-tail similarity alone cannot catch at this text length.
+      expect(t.record(obs("call-f", CALL_F), 6)).toBeNull();
+      // The real trial had only these 6 calls, so the streak never crosses
+      // the default streak=3 firing bar within them -- extend the same
+      // recurring mistake by one more attempt and it fires immediately,
+      // proving the streak that got this far is the live, counting one:
+      const detection = t.record(obs("call-g", CALL_F), 7);
+      expect(detection).toMatchObject({ reason: "repeated_failure_signature", failed: true, count: 3 });
+    });
+
+    it("does not match two different exception types", () => {
+      const t = new FailureSignatureTracker();
+      const valueErr = `Traceback (most recent call last):\n  File "x.py", line 1\nValueError: invalid literal for int() with base 10: 'abc'\n${EXIT0}`;
+      const keyErr = `Traceback (most recent call last):\n  File "x.py", line 1\nKeyError: 'foo'\n${EXIT0}`;
+      t.record(obs("a", valueErr), 1);
+      t.record(obs("b", keyErr), 2);
+      expect(t.record(obs("c", valueErr), 3)).toBeNull();
+    });
+
+    it("does not match two genuinely different TypeErrors", () => {
+      const t = new FailureSignatureTracker();
+      const noneType = `Traceback (most recent call last):\n  File "x.py", line 1\nTypeError: 'NoneType' object is not subscriptable\n${EXIT0}`;
+      t.record(obs("a", CALL_E), 1);
+      t.record(obs("b", noneType), 2);
+      expect(t.record(obs("c", CALL_E), 3)).toBeNull();
+    });
+
+    it("does not let Fix 2 paper over D's genuinely different (exit-code) failure", () => {
+      // D has no recognizable exception line, so the exception-line fallback
+      // simply doesn't apply to it -- it can only match via hash/Jaccard,
+      // same as before this fix.
+      const t = new FailureSignatureTracker();
+      t.record(obs("a", CALL_E), 1);
+      t.record(obs("b", CALL_D), 2);
+      expect(t.record(obs("c", CALL_E), 3)).toBeNull();
+    });
   });
 });
