@@ -74,6 +74,37 @@ def split_train_val(
     return shuffled[val_count:], shuffled[:val_count]
 
 
+def split_three_way(
+    available: list[str], *, search_count: int, seed: int, language: str = "python",
+    explicit_search: list[str] | None = None,
+    acceptance_count: int | None = None, test_count: int | None = None,
+) -> tuple[list[ExerciseSpec], list[ExerciseSpec], list[ExerciseSpec]]:
+    """(search, acceptance, test), pairwise disjoint by construction: each
+    later leg samples with the earlier legs in `exclude=`. The search leg is
+    exactly select_exercises()'s own pick, so it is what train+val were
+    before this split existed. Omitted acceptance/test counts split the
+    remainder of the pool evenly (test gets the odd one). Unstratified --
+    class-stratified splitting needs M1's per-exercise pass rates."""
+    search = select_exercises(available, count=search_count, seed=seed,
+                              language=language, explicit=explicit_search)
+    taken = tuple(s.exercise for s in search)
+    remaining = len(set(available) - set(taken))
+    if acceptance_count is None:
+        acceptance_count = remaining // 2
+    if test_count is None:
+        test_count = remaining - acceptance_count
+    if acceptance_count <= 0 or test_count <= 0:
+        raise ValueError(
+            f"acceptance and test splits must both be non-empty (got {acceptance_count} and "
+            f"{test_count}); only {remaining} exercise(s) remain outside the search split"
+        )
+    acceptance = select_exercises(available, count=acceptance_count, seed=seed,
+                                  language=language, exclude=taken)
+    taken += tuple(s.exercise for s in acceptance)
+    test = select_exercises(available, count=test_count, seed=seed, language=language, exclude=taken)
+    return search, acceptance, test
+
+
 def describe_exercise(spec: ExerciseSpec, practice_dir_path: Path, *, max_chars: int = 2000) -> str:
     """Real exercise description for a reflective feedback record -- prefers
     the exercise's own instructions/README, falling back to listing stub and

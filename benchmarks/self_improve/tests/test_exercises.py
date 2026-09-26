@@ -6,6 +6,7 @@ from benchmarks.self_improve.exercises import (
     discover_exercises,
     practice_dir,
     select_exercises,
+    split_three_way,
     split_train_val,
 )
 
@@ -128,3 +129,45 @@ def test_describe_exercise_falls_back_to_stub_and_test_listing(tmp_path):
 def test_describe_exercise_handles_missing_directory(tmp_path):
     desc = describe_exercise(ExerciseSpec(exercise="does-not-exist"), tmp_path)
     assert "not found" in desc
+
+
+_POOL = [f"ex{i:02d}" for i in range(12)]
+
+
+def _names(specs):
+    return [s.exercise for s in specs]
+
+
+def test_split_three_way_is_pairwise_disjoint_and_deterministic():
+    first = split_three_way(_POOL, search_count=4, acceptance_count=3, test_count=3, seed=5)
+    second = split_three_way(_POOL, search_count=4, acceptance_count=3, test_count=3, seed=5)
+    assert first == second
+    search, acceptance, test = (set(_names(s)) for s in first)
+    assert (len(search), len(acceptance), len(test)) == (4, 3, 3)
+    assert not (search & acceptance or search & test or acceptance & test)
+
+
+def test_split_three_way_search_leg_matches_select_exercises():
+    """The search split is what run_gepa hands GEPA as train+val -- it must
+    stay exactly what select_exercises() picked before the split existed."""
+    search, _, _ = split_three_way(_POOL, search_count=4, acceptance_count=3, test_count=3, seed=5)
+    assert search == select_exercises(_POOL, count=4, seed=5)
+
+
+def test_split_three_way_defaults_split_the_remainder_evenly():
+    search, acceptance, test = split_three_way(_POOL, search_count=5, seed=1)
+    assert (len(acceptance), len(test)) == (3, 4)
+    assert set(_names(search)) | set(_names(acceptance)) | set(_names(test)) == set(_POOL)
+
+
+def test_split_three_way_explicit_search_keeps_the_others_disjoint():
+    search, acceptance, test = split_three_way(_POOL, search_count=0, explicit_search=["ex03", "ex07"], seed=1)
+    assert _names(search) == ["ex03", "ex07"]
+    assert not ({"ex03", "ex07"} & (set(_names(acceptance)) | set(_names(test))))
+
+
+def test_split_three_way_refuses_an_empty_acceptance_or_test_split():
+    with pytest.raises(ValueError, match="acceptance"):
+        split_three_way(["a", "b", "c"], search_count=2, seed=1)
+    with pytest.raises(ValueError, match="only 1 available"):
+        split_three_way(["a", "b", "c", "d"], search_count=2, acceptance_count=1, test_count=2, seed=1)

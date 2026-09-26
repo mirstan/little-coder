@@ -33,13 +33,14 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
 
 from benchmarks.self_improve.components import load_component_token_costs, load_components
-from benchmarks.self_improve.exercises import discover_exercises, practice_dir, select_exercises, split_train_val
+from benchmarks.self_improve.exercises import discover_exercises, practice_dir, split_three_way, split_train_val
 from benchmarks.self_improve.live_budget import (
     LiveBudget,
     LiveEvalBudgetExceeded,
@@ -55,6 +56,7 @@ from benchmarks.self_improve.live_eval import (
     _attempt_timeout_s,
     _sanitize_candidate,
 )
+from benchmarks.self_improve.manifest import Manifest
 from benchmarks.self_improve.polyglot_adapter import PolyglotGEPAAdapter
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 from benchmarks.self_improve.spend_log import SpendLog
@@ -213,10 +215,46 @@ def _resolve_exercises(args: argparse.Namespace):
     pdir = practice_dir(benchmark_root, args.language)
     available = discover_exercises(pdir)
     explicit = [e.strip() for e in args.exercises.split(",")] if args.exercises else None
-    specs = select_exercises(available, count=args.exercise_count, seed=args.seed,
-                              language=args.language, explicit=explicit)
+    # specs is the search split: GEPA's trainset and valset both come from it,
+    # exactly as before the three-way split existed. acceptance/test are only
+    # recorded in the manifest for now (T5 and report_test run outside GEPA).
+    specs, acceptance, test = split_three_way(
+        available, search_count=args.exercise_count, seed=args.seed, language=args.language,
+        explicit_search=explicit, acceptance_count=args.acceptance_count, test_count=args.test_count,
+    )
     trainset, valset = split_train_val(specs, val_count=args.val_count, seed=args.seed)
-    return benchmark_root, pdir, specs, trainset, valset
+    return benchmark_root, pdir, specs, trainset, valset, acceptance, test
+
+
+def _git_head(repo_root: Path) -> str | None:
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _build_manifest(args: argparse.Namespace, *, repo_root: Path, components_rel: Path, specs,
+                    acceptance, test, seed_candidate: dict[str, str]) -> Manifest:
+    return Manifest(
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        seed=args.seed,
+        benchmark="aider_polyglot",
+        language=args.language,
+        splits={
+            "search": [s.exercise for s in specs],
+            "acceptance": [s.exercise for s in acceptance],
+            "test": [s.exercise for s in test],
+        },
+        searchable_components=sorted(seed_candidate),
+        sampling={"temperature": args.temperature},
+        budget={"max_metric_calls": args.max_metric_calls, "max_wall_clock_s": args.max_wall_clock_s},
+        env_fingerprint={
+            "model": args.model,
+            "thinking": args.thinking,
+            "max_attempts": args.max_attempts,
+            "retry": not args.no_retry,
+            "components_config": str(components_rel),
+            "repo_head": _git_head(repo_root),
+        },
+    )
 
 
 def _resolve_components_yaml(repo_root: Path, components_config: str) -> tuple[Path, Path]:
@@ -263,7 +301,7 @@ def _run_live(args: argparse.Namespace) -> int:
             return 1
 
     try:
-        benchmark_root, pdir, specs, trainset, valset = _resolve_exercises(args)
+        benchmark_root, pdir, specs, trainset, valset, acceptance, test = _resolve_exercises(args)
     except ValueError as e:
         print(f"Refusing to run: {e}", file=sys.stderr)
         return 1
@@ -314,6 +352,7 @@ def _run_live(args: argparse.Namespace) -> int:
     print()
     print(f"  Exercises selected : {[s.exercise for s in specs]}")
     print(f"  Train / Val split  : {[s.exercise for s in trainset]} / {[s.exercise for s in valset]}")
+    print(f"  Acceptance / Test  : {[s.exercise for s in acceptance]} / {[s.exercise for s in test]}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -323,6 +362,16 @@ def _run_live(args: argparse.Namespace) -> int:
 
     if args.estimate_only:
         return 0
+
+    # Built (and validated) before the confirmation prompt so a bad
+    # pre-registration refuses before a human authorizes anything; written
+    # only once the run is authorized, still before any spend.
+    try:
+        manifest = _build_manifest(args, repo_root=repo_root, components_rel=components_rel, specs=specs,
+                                   acceptance=acceptance, test=test, seed_candidate=seed_candidate)
+    except ValueError as e:
+        print(f"Refusing to run: invalid run manifest: {e}", file=sys.stderr)
+        return 1
 
     if stop_file.exists():
         # A leftover gepa.stop from a PREVIOUS run at this --out-dir (the
@@ -363,6 +412,8 @@ def _run_live(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    manifest.save(out_dir / "manifest.yaml")
 
     with (
         SpendLog(out_dir / "spend_log.jsonl") as spend_log,
@@ -602,6 +653,12 @@ def main() -> int:
     ap.add_argument("--exercises", default=None, help="Comma-separated exercise names, bypassing selection.")
     ap.add_argument("--exercise-count", type=int, default=6)
     ap.add_argument("--val-count", type=int, default=3)
+    ap.add_argument("--acceptance-count", type=int, default=None,
+                     help="Size of the held-out acceptance split (default: half of the exercises "
+                          "outside the search split). Recorded in manifest.yaml; not used by GEPA.")
+    ap.add_argument("--test-count", type=int, default=None,
+                     help="Size of the held-out test split (default: the rest of the pool). "
+                          "Recorded in manifest.yaml; not used by GEPA.")
 
     ap.add_argument("--model", default=None, help="The model UNDER TEST for live rollouts. Required for a real run.")
     ap.add_argument("--confirm-live-rollouts", action="store_true",
@@ -611,6 +668,11 @@ def main() -> int:
     ap.add_argument("--max-attempts", type=int, default=2)
     ap.add_argument("--no-retry", action="store_true")
     ap.add_argument("--thinking", default=None)
+    ap.add_argument("--temperature", type=float, default=0.3,
+                     help="Sampling temperature to pre-register in manifest.yaml (must be > 0). "
+                          "Recorded only -- NOT passed to the agent, whose temperature comes from "
+                          ".pi/settings.json's model profile (default_model_profile is 0.3) or the "
+                          "model server. Set it to what the model under test actually uses.")
     ap.add_argument("--per-exercise-timeout-s", type=int, default=None)
     ap.add_argument("--max-wall-clock-s", type=float, default=14400.0)
     ap.add_argument("--assumed-exercise-seconds", type=float, default=None)

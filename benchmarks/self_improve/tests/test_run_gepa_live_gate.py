@@ -265,10 +265,11 @@ def test_check_components_clean_refuses_when_git_status_itself_fails(source_repo
 
 @pytest.fixture
 def fake_practice(tmp_path):
-    """Three real exercises (stub + genuine failing pytest test each) so
-    --exercise-count 3 --val-count 1 has a real pool to select from."""
+    """Five real exercises (stub + genuine failing pytest test each) so
+    --exercise-count 3 --val-count 1 has a real pool to select from, and any
+    3-exercise search split still leaves two for acceptance and test."""
     practice_root = tmp_path / "polyglot-benchmark"
-    for name in ("wordy", "acronym", "leap"):
+    for name in ("wordy", "acronym", "leap", "bob", "isogram"):
         ex_dir = practice_root / "python" / "exercises" / "practice" / name
         ex_dir.mkdir(parents=True)
         (ex_dir / f"{name}.py").write_text(_WORDY_STUB)
@@ -635,3 +636,90 @@ def test_optimize_overrun_before_any_valset_evaluation_writes_nothing(
     assert run_end["reason"] == "budget_backstop"
     assert run_end["partial"] is True
     assert run_end["best_candidate_idx"] is None
+
+
+def test_baseline_run_writes_the_manifest_before_any_spend(source_repo, fake_practice, tmp_path, monkeypatch):
+    """manifest.yaml pre-registers the run: the search split is exactly what
+    GEPA/baseline evaluates, acceptance and test hold the rest of the pool,
+    and it is already on disk when the first exercise runs."""
+    from benchmarks.self_improve.live_eval import LiveRunResult, PolyglotLiveRunner
+    from benchmarks.self_improve.manifest import Manifest
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    seen_at_first_run = []
+
+    def fake_run_batch(self, candidate, specs, *, sample_index=0):
+        seen_at_first_run.append((out_dir / "manifest.yaml").exists())
+        (spec,) = specs
+        return [LiveRunResult(task_id=spec.task_id, exercise=spec.exercise, language=spec.language,
+                              status="pass_1", score=1.0, success=True)]
+
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", fake_run_batch)
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--max-wall-clock-s", "600", "--temperature", "0.7", "--seed", "9",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
+    ])
+    assert code == 0
+    assert seen_at_first_run and seen_at_first_run[0] is True
+    m = Manifest.load(out_dir / "manifest.yaml")
+    assert m.splits["search"] == ["wordy", "acronym"]
+    assert sorted(m.splits["acceptance"] + m.splits["test"]) == ["bob", "isogram", "leap"]
+    assert m.seed == 9
+    assert m.language == "python"
+    assert m.sampling["temperature"] == 0.7
+    assert m.budget == {"max_metric_calls": 5, "max_wall_clock_s": 600.0}
+    seed = yaml.safe_load((source_repo / "config" / "components.yaml").read_text())
+    assert m.searchable_components == sorted(seed)
+    assert m.env_fingerprint["model"] == "gpt-fake"
+
+
+def test_estimate_only_writes_no_manifest(source_repo, fake_practice, tmp_path, monkeypatch):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercise-count", "3", "--val-count", "1",
+        "--out-dir", str(out_dir), "--estimate-only",
+    ])
+    assert code == 0
+    assert not (out_dir / "manifest.yaml").exists()
+
+
+def test_refuses_before_spend_when_nothing_is_left_for_acceptance_and_test(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy,acronym,leap,bob",
+        "--exercise-count", "4", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--baseline-only", "--yes",
+    ])
+    assert code == 1
+    assert "acceptance" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+
+def test_refuses_a_non_positive_temperature_before_spend(source_repo, fake_practice, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy,acronym",
+        "--exercise-count", "2", "--val-count", "1", "--temperature", "0",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--baseline-only", "--yes",
+    ])
+    assert code == 1
+    assert "temperature" in capsys.readouterr().err
+    assert not (out_dir / "manifest.yaml").exists()
+    assert not (out_dir / "spend_log.jsonl").exists()
