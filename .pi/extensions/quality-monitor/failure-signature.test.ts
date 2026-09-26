@@ -48,10 +48,10 @@ describe("readResult", () => {
   it("reads failure from the footer when nothing threw", () => {
     // The Terminal-Bench shell path: gating on isError alone leaves this
     // watchdog silent for every TB failure.
-    expect(readResult(SHELL_FAIL, false, 4)).toEqual({ failed: true, hasContent: true });
+    expect(readResult(SHELL_FAIL, false, 4)).toEqual({ failed: true, hasContent: true, failedBy: "exit" });
   });
   it("reads failure from the thrown-result flag", () => {
-    expect(readResult(BASH_FAIL, true, 4)).toEqual({ failed: true, hasContent: true });
+    expect(readResult(BASH_FAIL, true, 4)).toEqual({ failed: true, hasContent: true, failedBy: "exit" });
   });
   it("does not call a zero exit a failure", () => {
     const ok = "all 42 tests passed in 3 seconds\n[exit=0 cwd=/app timed_out=false backend=subprocess]";
@@ -65,6 +65,7 @@ describe("readResult", () => {
     expect(readResult("[exit=1 cwd=/app timed_out=false backend=subprocess]", false, 4)).toEqual({
       failed: true,
       hasContent: false,
+      failedBy: "exit",
     });
   });
   it("rejects a bare status line as contentless", () => {
@@ -110,6 +111,27 @@ describe("readResult — exit-code masking (Fix 1)", () => {
   it("still reads D's genuine bash-level failure from its exit code, unaffected", () => {
     // D has no recognizable exception line -- it keeps failing via exit=2.
     expect(readResult(CALL_D, false, 4).failed).toBe(true);
+  });
+
+  it("marks a masked-exit-0 failure as content-only, and D's real exit code as exit-proven (Finding 1)", () => {
+    expect(readResult(CALL_A, false, 4).failedBy).toBe("content");
+    expect(readResult(CALL_D, false, 4).failedBy).toBe("exit");
+  });
+
+  it("recognizes a qualified/dotted exception name as a failure signature (Finding 5)", () => {
+    const dotted =
+      "reading /data/payload.json\n" +
+      "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    // `\w*` before `Error:` cannot match the dots in a qualified type name,
+    // so this used to be neither exit-proven (masked at 0) nor content-proven
+    // -- exactly the blind spot this whole PR exists to close.
+    expect(readResult(dotted, false, 4)).toMatchObject({ failed: true, failedBy: "content" });
+    const httpError =
+      "GET https://api.example.com/v1/items failed\n" +
+      "requests.exceptions.HTTPError: 503 Server Error: Service Unavailable\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(httpError, false, 4).failed).toBe(true);
   });
   it("does not call a benign 'errors' mention a failure", () => {
     const ok = "no errors found, all clear\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
@@ -504,6 +526,83 @@ describe("FailureSignatureTracker", () => {
       expect(
         t.record(obs("d", keyErr("jobs/reindex.py", 265, "rebuild", "doc = index[doc_id]", "shard_id")), 4),
       ).toBeNull();
+    });
+
+    it("does not accumulate a streak across FileNotFoundErrors on two demonstrably different paths (Findings 2+3)", () => {
+      const t = new FailureSignatureTracker();
+      const notFound = (path: string) =>
+        `Traceback (most recent call last):\n  File "probe.py", line 9, in <module>\nFileNotFoundError: [Errno 2] No such file or directory: '${path}'\n${EXIT0}`;
+      expect(t.record(obs("a", notFound("/data/alpha_2023_run_input.csv")), 1)).toBeNull();
+      expect(t.record(obs("b", notFound("/var/lib/reports/beta_final_output.parquet")), 2)).toBeNull();
+      expect(t.record(obs("c", notFound("/srv/cache/gamma_manifest_shard.json")), 3)).toBeNull();
+    });
+
+    it("does not accumulate a streak across AttributeErrors on two unrelated modules (Findings 2+3)", () => {
+      const t = new FailureSignatureTracker();
+      const attrErr = (mod: string, attr: string) =>
+        `Traceback (most recent call last):\n  File "probe.py", line 3, in <module>\nAttributeError: module '${mod}' has no attribute '${attr}'\n${EXIT0}`;
+      expect(t.record(obs("a", attrErr("numpy", "nanstd")), 1)).toBeNull();
+      expect(t.record(obs("b", attrErr("pandas", "read_parquet")), 2)).toBeNull();
+      expect(t.record(obs("c", attrErr("requests", "adapters")), 3)).toBeNull();
+    });
+
+    it("does not let an incidental mid-tail Warning: line supply a false excLine match between unrelated failures (Finding 4)", () => {
+      // Defect: signatureOf's excLine extraction used to scan the WHOLE tail
+      // (lastMatch(EXCEPTION_LINE_RE, tail), Warning included) for the last
+      // match anywhere, so an incidental "Warning:" line sitting mid-tail --
+      // not the line the run actually ended on -- supplied excLine even
+      // though the real trailing line is not a recognizable exception at
+      // all. Two unrelated failures that both happen to log the same benign
+      // warning earlier would then match on that alone.
+      const attempt = (job: number) =>
+        [
+          "Warning: cache miss, rebuilding index",
+          ...Array.from({ length: 20 }, (_, i) => `processing job ${job * 1000 + i} of 999`),
+          "unexpected worker termination",
+          "[exit=1 cwd=/app timed_out=false backend=subprocess]",
+        ].join("\n");
+      expect(signatureOf("shellsession", attempt(1), 40).excLine).toBeUndefined();
+      expect(signatureOf("shellsession", attempt(9), 40).excLine).toBeUndefined();
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("job-1", attempt(1)), 1)).toBeNull();
+      expect(t.record(obs("job-9", attempt(9)), 2)).toBeNull();
+      expect(t.record(obs("job-42", attempt(42)), 3)).toBeNull();
+    });
+
+    it("lets a qualified/dotted exception name participate in signature matching (Finding 5)", () => {
+      const t = new FailureSignatureTracker();
+      const dotted = (path: string) =>
+        `reading ${path}\njson.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n${EXIT0}`;
+      expect(t.record(obs("a", dotted("/data/a.json")), 1)).toBeNull();
+      expect(t.record(obs("b", dotted("/data/b.json")), 2)).toBeNull();
+      expect(t.record(obs("c", dotted("/data/c.json")), 3)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 3,
+      });
+    });
+
+    it("does not let a masked-exit-0 content-only mismatch clobber a live exit-code-proven streak (Finding 1)", () => {
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("./run --a", SHELL_FAIL), 1)).toBeNull();
+      expect(t.record(obs("./run --b", SHELL_FAIL), 2)).toBeNull();
+      // Turn 3: the model reruns its own failing command as
+      // `... 2>&1 | tail -1` -- an ordinary debugging move. Still exit 0
+      // (piped), and its one-line tail happens to read as an unrelated
+      // exception, so readResult calls it failed via content alone; its
+      // hash/Jaccard score against the tracked SHELL_FAIL streak is nowhere
+      // near a match.
+      const rerunTail =
+        "TypeError: unrelated_probe() got an unexpected keyword argument 'zzz'\n" +
+        "[exit=0 cwd=/app timed_out=false backend=subprocess]";
+      expect(readResult(rerunTail, false, 4)).toMatchObject({ failed: true, failedBy: "content" });
+      expect(t.record(obs("./run --a 2>&1 | tail -1", rerunTail), 3)).toBeNull();
+      // Turn 4 resumes the ORIGINAL exit-code-proven failure. Pre-fix, turn
+      // 3's mismatch would have forget()-ed the tracked entry and restarted
+      // it at count 1; count is 3, proving the streak survived intact.
+      expect(t.record(obs("./run --c", SHELL_FAIL), 4)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 3,
+      });
     });
   });
 });
