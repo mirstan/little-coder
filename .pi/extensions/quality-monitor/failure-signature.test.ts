@@ -117,6 +117,36 @@ describe("readResult — exit-code masking (Fix 1)", () => {
     const ok2 = "0 errors, 2 warnings\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
     expect(readResult(ok2, false, 4).failed).toBe(false);
   });
+
+  it("does not call an exit=0 result failed for a mid-body line-initial Error: or Warning: that is not the last line", () => {
+    // Defect A: EXCEPTION_LINE_RE was scanned over the whole body via
+    // lastMatch, not just the trailing line, so a status message that merely
+    // starts with "Error:"/"Warning:" earlier in the output flipped this to
+    // true even though the command otherwise succeeded and said so last.
+    const errNotLast =
+      "Error: skipping bad row 7, continuing\nprocessed 41 of 42 rows\nwrote output.csv\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(errNotLast, false, 4).failed).toBe(false);
+    const warnNotLast =
+      "Warning: Permanently added 'github.com' (ED25519) to the list of known hosts.\nclone complete\nbuild finished successfully\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(warnNotLast, false, 4).failed).toBe(false);
+  });
+
+  it("does not call an exit=0 passing pytest run failed because of an exception line inside its captured-log section", () => {
+    // Defect A: a RuntimeError/ValueError line buried in captured-log output
+    // (not the trailing line) was still enough to flip `failed` to true even
+    // though the run passed and the real trailing line says so.
+    const passingWithCapturedLog =
+      "============================= test session starts ==============================\n" +
+      "collected 3 items\n\n" +
+      "test_foo.py::test_a PASSED\n" +
+      "--- Captured log call ---\n" +
+      "ValueError: bad input during warmup, retried and succeeded\n" +
+      "test_foo.py::test_b PASSED\n" +
+      "test_foo.py::test_c PASSED\n\n" +
+      "============================== 3 passed in 0.12s ==============================\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(passingWithCapturedLog, false, 4).failed).toBe(false);
+  });
 });
 
 describe("normalizeTail", () => {
@@ -401,6 +431,27 @@ describe("FailureSignatureTracker", () => {
       expect(detection).toMatchObject({ reason: "repeated_failure_signature", failed: true, count: 3 });
     });
 
+    it("regression pin: the E-F pair (0.7381 Jaccard, nearest the 0.5 floor) still counts as a match under the conjunctive rule", () => {
+      // Acceptance criterion: the fix must not regress the case the PR was
+      // built for. E and F score below the 0.95 whole-tail threshold but
+      // inside the [0.5, 0.95) fallback band the conjunctive rule (excLine
+      // equality AND jaccard >= EXC_LINE_JACCARD_FLOOR) is meant to admit --
+      // distinct from the KeyError test above, whose ~0.368 score falls
+      // below the floor.
+      const eShingles = signatureOf("shellsession", CALL_E, 40).shingles;
+      const fShingles = signatureOf("shellsession", CALL_F, 40).shingles;
+      const score = jaccard(eShingles, fShingles);
+      expect(score).toBeGreaterThanOrEqual(0.5);
+      expect(score).toBeLessThan(0.95);
+
+      const t = new FailureSignatureTracker({ streak: 2 });
+      expect(t.record(obs("call-e", CALL_E), 1)).toBeNull();
+      expect(t.record(obs("call-f", CALL_F), 2)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 2,
+      });
+    });
+
     it("does not match two different exception types", () => {
       const t = new FailureSignatureTracker();
       const valueErr = `Traceback (most recent call last):\n  File "x.py", line 1\nValueError: invalid literal for int() with base 10: 'abc'\n${EXIT0}`;
@@ -426,6 +477,33 @@ describe("FailureSignatureTracker", () => {
       t.record(obs("a", CALL_E), 1);
       t.record(obs("b", CALL_D), 2);
       expect(t.record(obs("c", CALL_E), 3)).toBeNull();
+    });
+
+    it("does not accumulate a streak across KeyErrors that share only the exception type, not the underlying cause", () => {
+      // Defect B: normalizeExceptionLine collapses the quoted literal that is
+      // the ONLY thing distinguishing these failures ('user_id' vs
+      // 'timestamp' vs ...), and matches() previously accepted excLine
+      // equality alone, independent of the whole-tail Jaccard check. These
+      // four tails share only "Traceback (most recent call last):", the
+      // "KeyError: '<TOK>'" shape and the EXIT0 footer -- everything else
+      // (file, line, function, expression) differs, scoring ~0.368 Jaccard,
+      // well under the 0.5 floor -- so none of them should count as a repeat
+      // of its predecessor.
+      const t = new FailureSignatureTracker();
+      const keyErr = (file: string, line: number, fn: string, expr: string, key: string) =>
+        `Traceback (most recent call last):\n  File "${file}", line ${line}, in ${fn}\n    ${expr}\nKeyError: '${key}'\n${EXIT0}`;
+      expect(
+        t.record(obs("a", keyErr("handlers/users.py", 42, "load_profile", "profile = cache[record_id]", "user_id")), 1),
+      ).toBeNull();
+      expect(
+        t.record(obs("b", keyErr("workers/ingest.py", 118, "flush_batch", "row = batch[cursor]", "timestamp")), 2),
+      ).toBeNull();
+      expect(
+        t.record(obs("c", keyErr("api/routes.py", 7, "handle_request", "ctx = session[token]", "csrf_token")), 3),
+      ).toBeNull();
+      expect(
+        t.record(obs("d", keyErr("jobs/reindex.py", 265, "rebuild", "doc = index[doc_id]", "shard_id")), 4),
+      ).toBeNull();
     });
   });
 });

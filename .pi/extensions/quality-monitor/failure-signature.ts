@@ -84,6 +84,24 @@ export interface ResultFacts {
 // raised. Content-based detection catches what the (masked) exit code can't.
 const EXCEPTION_LINE_RE = /^(\w*(?:Error|Exception|Warning)):\s*(.+)$/m;
 
+// readResult's own narrower check: the doc comment above promises "a
+// recognizable trailing exception line", but EXCEPTION_LINE_RE + lastMatch
+// scans the whole body for a match anywhere, and a Warning: is not a
+// failure. This is applied only to the last non-blank line (see
+// lastNonBlankLine below), and drops Warning from the alternation, so a
+// benign "Error: skipping bad row 7, continuing" earlier in the output, or a
+// captured-log ValueError/RuntimeError line inside an otherwise-passing
+// run, no longer flips an exit-0 result to failed.
+const TRAILING_EXCEPTION_LINE_RE = /^(\w*(?:Error|Exception)):\s*(.+)$/;
+
+function lastNonBlankLine(text: string): string {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== "") return lines[i];
+  }
+  return "";
+}
+
 function lastMatch(re: RegExp, text: string): RegExpExecArray | null {
   const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
   let m: RegExpExecArray | null;
@@ -108,14 +126,14 @@ function lastMatch(re: RegExp, text: string): RegExpExecArray | null {
  * failure.
  *
  * Exit code alone is also not enough: it can itself be wrong (see
- * EXCEPTION_LINE_RE above), so a recognizable trailing exception line counts
- * as failed even when the reported exit is 0.
+ * TRAILING_EXCEPTION_LINE_RE above), so a recognizable trailing exception
+ * line counts as failed even when the reported exit is 0.
  */
 export function readResult(text: string, isError: boolean, minTokens: number): ResultFacts {
   const { body, footer } = splitFooter(text);
   const exit = footerExit(footer);
   const stripped = stripStatusLine(body.trimEnd());
-  const looksLikeUncaughtException = lastMatch(EXCEPTION_LINE_RE, stripped) !== null;
+  const looksLikeUncaughtException = TRAILING_EXCEPTION_LINE_RE.test(lastNonBlankLine(stripped));
   return {
     failed: isError === true || (exit !== null && exit !== 0) || looksLikeUncaughtException,
     hasContent: tokenize(stripped).length >= minTokens,
@@ -242,6 +260,13 @@ interface Entry {
 // updated slot is the least likely to be mid-loop.
 const MAX_TRACKED = 16;
 
+// The floor `matches()` requires alongside excLine equality (see below): low
+// enough to still catch the psrn/psm-typo pair this fallback exists for
+// (0.9310, 0.7381 Jaccard, per the test fixtures), high enough to reject two
+// failures that share only an exception TYPE and nothing else (~0.368
+// Jaccard between two KeyErrors with unrelated files/lines/keys).
+const EXC_LINE_JACCARD_FLOOR = 0.5;
+
 /**
  * Counts how many differing attempts produced the same outcome, per tool.
  *
@@ -323,8 +348,18 @@ export class FailureSignatureTracker {
     if (jaccard(a.shingles, b.shingles) >= this.opts.threshold) return true;
     // OR, not a replacement: a short, information-dense tail (e.g. a 5-line
     // traceback) can fail the whole-tail Jaccard bar on a single differing
-    // token while still being "the same mistake" by its exception line.
-    return a.excLine !== undefined && a.excLine === b.excLine;
+    // token while still being "the same mistake" by its exception line. But
+    // excLine equality alone is too weak to stand on its own: normalizing
+    // away every quoted literal collapses genuinely different failures of
+    // the same exception type (KeyError: 'user_id' vs KeyError: 'timestamp')
+    // to the same string. Requiring a relaxed similarity floor alongside it
+    // still catches the motivating psrn/psm-typo pairs (0.9310, 0.7381
+    // Jaccard) while rejecting unrelated failures that share only a type.
+    return (
+      a.excLine !== undefined &&
+      a.excLine === b.excLine &&
+      jaccard(a.shingles, b.shingles) >= EXC_LINE_JACCARD_FLOOR
+    );
   }
 
   private notifyKey(key: string, sig: Signature): string {
