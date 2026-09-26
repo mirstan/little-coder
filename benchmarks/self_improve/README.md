@@ -151,7 +151,11 @@ python -m benchmarks.self_improve.report_trajectories \
 A real `run_gepa.py` run writes `<out-dir>/optimized_components.yaml`
 (pred_name → optimized instruction text) and never touches the actual repo
 files directly (the scratch worktree it ran in is destroyed on exit unless
-`--keep-scratch` was passed). Use `apply_results.py`'s `apply_and_open_pr()` (or its
+`--keep-scratch` was passed). If the live budget backstop or a persistent
+harness error stops `gepa.optimize()` early, the file still holds the best
+candidate GEPA had scored on the valset so far; `spend_log.jsonl`'s `run_end`
+then carries `partial: true` and the exit code is 3 (budget) or 4 (harness).
+Use `apply_results.py`'s `apply_and_open_pr()` (or its
 lower-level `create_branch_and_commit()`) to write the optimized text back
 into the real files, preserving each skill file's YAML frontmatter untouched
 except for a possible `token_cost:` update when the rewritten body's estimated

@@ -541,3 +541,97 @@ def test_baseline_only_persists_partial_results_on_a_persistent_harness_error(
     assert list(seed_baseline) == ["python/wordy"]
     records = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()]
     assert records[-1].get("reason") == "harness_error"
+
+
+def _optimize_argv(source_repo, fake_practice, tmp_path, out_dir):
+    return [
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--reflection-minibatch-size", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--reflection-model", "reflection/fake", "--confirm-real-run",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--yes",
+    ]
+
+
+def _valset_event(idx, candidate, score, is_best):
+    return {"iteration": idx, "candidate_idx": idx, "candidate": candidate,
+            "scores_by_val_id": {0: score}, "average_score": score,
+            "num_examples_evaluated": 1, "total_valset_size": 1, "parent_ids": [],
+            "is_best_program": is_best, "outputs_by_val_id": None}
+
+
+def _raise_budget():
+    from benchmarks.self_improve.live_budget import LiveEvalBudgetExceeded
+    raise LiveEvalBudgetExceeded("max_live_runs reached")
+
+
+def _raise_harness():
+    from benchmarks.self_improve.live_eval import LiveEvalHarnessError
+    raise LiveEvalHarnessError("results file missing")
+
+
+@pytest.mark.parametrize("raise_fn,expected_code,expected_reason", [
+    (_raise_budget, 3, "budget_backstop"),
+    (_raise_harness, 4, "harness_error"),
+])
+def test_optimize_overrun_writes_the_best_candidate_seen_so_far(
+    source_repo, fake_practice, tmp_path, monkeypatch, raise_fn, expected_code, expected_reason,
+):
+    """A budget or harness overrun escaping gepa.optimize() used to return
+    with no optimized_components.yaml at all -- every paid-for valset
+    evaluation was thrown away. The best candidate GEPA reported so far
+    (its own is_best_program verdict, not a later non-best one) must land
+    in the same file, sanitized, with the run marked partial."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        seed = dict(kwargs["seed_candidate"])
+        improved = {**seed, "agents_md": "---\nname: dup\n---\nImproved instructions.\n"}
+        worse = {**seed, "agents_md": "Worse instructions.\n"}
+        for cb in kwargs["callbacks"]:
+            cb.on_valset_evaluated(_valset_event(0, seed, 0.5, True))
+            cb.on_valset_evaluated(_valset_event(1, improved, 0.8, True))
+            cb.on_valset_evaluated(_valset_event(2, worse, 0.1, False))
+        raise_fn()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == expected_code
+    written = yaml.safe_load((out_dir / "optimized_components.yaml").read_text())
+    assert written["agents_md"] == "Improved instructions.\n"
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["event"] == "run_end"
+    assert run_end["reason"] == expected_reason
+    assert run_end["partial"] is True
+    assert run_end["best_candidate_idx"] == 1
+    assert run_end["best_val_score"] == 0.8
+
+
+def test_optimize_overrun_before_any_valset_evaluation_writes_nothing(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        _raise_budget()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == 3
+    assert not (out_dir / "optimized_components.yaml").exists()
+    assert "no candidate" in capsys.readouterr().err.lower()
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["reason"] == "budget_backstop"
+    assert run_end["partial"] is True
+    assert run_end["best_candidate_idx"] is None

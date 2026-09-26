@@ -484,6 +484,16 @@ def _run_live(args: argparse.Namespace) -> int:
                 return stop_file.exists()
 
         class _SpendLogCallback:
+            """Also remembers the best candidate GEPA has reported so far, in
+            memory, so a budget/harness overrun escaping gepa.optimize() can
+            still write it out -- without parsing GEPA's run_dir state format.
+            is_best_program is GEPA's own verdict (its val_evaluation_policy's
+            best program), the same rule result.best_candidate uses."""
+            def __init__(self) -> None:
+                self.best_candidate: dict[str, str] | None = None
+                self.best_candidate_idx: int | None = None
+                self.best_val_score: float | None = None
+
             def on_iteration_end(self, event) -> None:
                 state = event.get("state")
                 spend_log.iteration_end(
@@ -492,6 +502,13 @@ def _run_live(args: argparse.Namespace) -> int:
                     total_num_evals=getattr(state, "total_num_evals", None),
                 )
 
+            def on_valset_evaluated(self, event) -> None:
+                if event.get("is_best_program"):
+                    self.best_candidate = dict(event["candidate"])
+                    self.best_candidate_idx = event.get("candidate_idx")
+                    self.best_val_score = event.get("average_score")
+
+        spend_log_callback = _SpendLogCallback()
         stop_callbacks = [stopper, _StopFileStopper()]
         if args.max_wall_clock_s:
             stop_callbacks.append(TimeoutStopCondition(args.max_wall_clock_s * 0.8))
@@ -521,32 +538,56 @@ def _run_live(args: argparse.Namespace) -> int:
                 track_best_outputs=True,
                 display_progress_bar=False,
                 run_dir=str(out_dir / "gepa"),
-                callbacks=[_SpendLogCallback()],
+                callbacks=[spend_log_callback],
                 seed=args.seed,
                 raise_on_exception=True,
                 stop_callbacks=stop_callbacks,
             )
-        except LiveEvalBudgetExceeded as e:
-            print(f"\nBudget backstop fired: {e}", file=sys.stderr)
-            spend_log.run_end(reason="budget_backstop", error=str(e))
-            return 3
+        except (LiveEvalBudgetExceeded, LiveEvalHarnessError) as e:
+            if isinstance(e, LiveEvalBudgetExceeded):
+                reason, code = "budget_backstop", 3
+                print(f"\nBudget backstop fired: {e}", file=sys.stderr)
+            else:
+                reason, code = "harness_error", 4
+                print(f"\nHarness error, stopping optimization: {e}", file=sys.stderr)
+            # Every valset evaluation up to here was paid for -- keep the best
+            # one rather than only GEPA's run_dir state. Exit codes match
+            # --baseline-only's (3 budget, 4 harness).
+            best = spend_log_callback
+            if best.best_candidate is None:
+                print("No candidate finished a valset evaluation before the stop -- "
+                      "nothing written.", file=sys.stderr)
+            else:
+                print(f"PARTIAL RESULT: the run did not finish; writing the best candidate so far, "
+                      f"#{best.best_candidate_idx} (valset score {best.best_val_score}).",
+                      file=sys.stderr)
+                _write_optimized_components(out_dir, best.best_candidate)
+            spend_log.run_end(
+                reason=reason, error=str(e), partial=True,
+                best_candidate_idx=best.best_candidate_idx, best_val_score=best.best_val_score,
+            )
+            return code
 
-        # Sanitize before writing: GEPA's own candidate tracking (and hence
-        # best_candidate) carries whatever text the reflection LM proposed,
-        # including a re-emitted YAML frontmatter block if it "helpfully"
-        # produced one -- live_eval.py's materialize() strips that before
-        # every SCORING run, but that stripping never reaches back into
-        # GEPA's own retained result. Without this, the exact frontmatter-
-        # duplication bug the live-eval guard exists to prevent could still
-        # land in the file this writes and get applied for real.
-        optimized = _sanitize_candidate(dict(result.best_candidate))
-        (out_dir / "optimized_components.yaml").write_text(yaml.dump(optimized, sort_keys=True))
-        print(f"\nWrote optimized component text to {out_dir / 'optimized_components.yaml'}")
-        print("Review the diff, then use apply_results.py to open a PR -- nothing was "
-              "committed or pushed automatically.")
+        _write_optimized_components(out_dir, result.best_candidate)
         spend_log.run_end(reason="completed", total_metric_calls=getattr(result, "total_metric_calls", None))
 
     return 0
+
+
+def _write_optimized_components(out_dir: Path, candidate) -> None:
+    # Sanitize before writing: GEPA's own candidate tracking (and hence
+    # best_candidate) carries whatever text the reflection LM proposed,
+    # including a re-emitted YAML frontmatter block if it "helpfully"
+    # produced one -- live_eval.py's materialize() strips that before
+    # every SCORING run, but that stripping never reaches back into
+    # GEPA's own retained result. Without this, the exact frontmatter-
+    # duplication bug the live-eval guard exists to prevent could still
+    # land in the file this writes and get applied for real.
+    optimized = _sanitize_candidate(dict(candidate))
+    (out_dir / "optimized_components.yaml").write_text(yaml.dump(optimized, sort_keys=True))
+    print(f"\nWrote optimized component text to {out_dir / 'optimized_components.yaml'}")
+    print("Review the diff, then use apply_results.py to open a PR -- nothing was "
+          "committed or pushed automatically.")
 
 
 def main() -> int:
