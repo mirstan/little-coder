@@ -68,6 +68,17 @@ def test_environmental_results_are_never_cached(tmp_path):
         assert cache.get(candidate, run_config, "python/wordy") is None
 
 
+def test_unscoreable_statuses_are_a_subset_of_environmental():
+    """Two tiers that must not drift: anything too unreliable to score is too
+    unreliable to cache. fail_timeout is the one status that is scored but
+    still never cached."""
+    from benchmarks.self_improve.live_cache import ENVIRONMENTAL_STATUSES, UNSCOREABLE_STATUSES
+
+    assert UNSCOREABLE_STATUSES <= ENVIRONMENTAL_STATUSES
+    assert {"error", "harness_error", "empty_response"} <= UNSCOREABLE_STATUSES
+    assert ENVIRONMENTAL_STATUSES - UNSCOREABLE_STATUSES == {"fail_timeout"}
+
+
 def test_genuine_failure_is_still_cached(tmp_path):
     """"fail" (the model produced code, tests failed) is a genuine candidate
     outcome -- it must be cached, unlike an environmental failure."""

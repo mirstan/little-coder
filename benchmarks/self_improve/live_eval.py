@@ -30,7 +30,7 @@ from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
 from benchmarks.self_improve.ingest.common import summarize_for_reflection
 from benchmarks.self_improve.live_budget import LiveEvalBudgetExceeded
-from benchmarks.self_improve.live_cache import LiveResultCache
+from benchmarks.self_improve.live_cache import UNSCOREABLE_STATUSES, LiveResultCache
 from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
@@ -125,15 +125,44 @@ def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
     return value
 
 
-#: In-place retries for an exercise whose run came back "harness_error"
-#: before PolyglotLiveRunner.run_batch() gives up and raises
-#: LiveEvalHarnessError. Each retry is a real run, charged to LiveBudget.
+#: In-place retries for an exercise whose run came back with any status in
+#: live_cache.UNSCOREABLE_STATUSES, not only "harness_error" -- the name
+#: predates the broader meaning and is kept because run_gepa.py and the tests
+#: refer to it. What happens once they are spent depends on the status; see
+#: PolyglotLiveRunner.run_batch(). Each retry is a real run, charged to
+#: LiveBudget.
 HARNESS_ERROR_RETRIES = 2
+
+#: Consecutive exercises that still ended "error"/"empty_response" after
+#: their in-place retries, before run_batch() stops treating them as the
+#: candidate's 0.0 and raises LiveEvalHarnessError: a dead model server looks
+#: like that on every exercise. Reset by any scoreable live run. Mirrors
+#: aider_polyglot.py's MAX_CONSECUTIVE_ERRORS.
+CONSECUTIVE_UNSCOREABLE_LIMIT = 3
+
+#: record["reason"] prefixes for an "error" that retrying cannot change,
+#: written by aider_polyglot.py's _run_exercise (missing exercise dir, unknown
+#: agent) and by main()'s exception wrapper around it (the JS shared-deps
+#: RuntimeError from _prepare_javascript). If that wording changes, such an
+#: error is retried and then scored 0.0 instead, and a run of them trips
+#: CONSECUTIVE_UNSCOREABLE_LIMIT.
+_CONFIG_ERROR_REASON_PREFIXES = (
+    "exercise not found at ",
+    "unknown agent ",
+    "RuntimeError: shared JS deps missing at ",
+)
+
+
+def _is_config_error(result: "LiveRunResult") -> bool:
+    return result.status == "error" and (result.error or "").startswith(_CONFIG_ERROR_REASON_PREFIXES)
 
 
 class LiveEvalHarnessError(RuntimeError):
     """Raised by PolyglotLiveRunner.run_batch() when an exercise still comes
-    back "harness_error" after HARNESS_ERROR_RETRIES in-place retries.
+    back "harness_error" after HARNESS_ERROR_RETRIES in-place retries, when
+    an "error" is a config error that no retry can change, or when
+    CONSECUTIVE_UNSCOREABLE_LIMIT exercises in a row ended "error"/
+    "empty_response" even after their retries.
 
     A harness failure (missing/malformed results file, outer subprocess
     timeout) says nothing about the candidate, so scoring it 0.0 would
@@ -298,6 +327,7 @@ class PolyglotLiveRunner:
         self.thinking = thinking
         self.benchmark_root = Path(benchmark_root) if benchmark_root else None
         self.cache = cache
+        self._consecutive_unscoreable = 0
         #: Optional live_budget.LiveBudget -- checked before every live run
         #: (never before a cache hit) and RAISES rather than letting a run
         #: it refuses to start silently score 0.0, which would poison the
@@ -438,9 +468,14 @@ class PolyglotLiveRunner:
         The memo is keyed on the SANITIZED candidate, i.e. exactly what gets
         written, plus `sample_index` (which of k repeated samples this is).
 
-        A "harness_error" run is retried in place up to HARNESS_ERROR_RETRIES
-        times and then raises LiveEvalHarnessError -- it is never returned as
-        a scored result and never cached."""
+        A run with any status in UNSCOREABLE_STATUSES is retried in place up
+        to HARNESS_ERROR_RETRIES times, and is never cached. If it persists:
+        "harness_error" raises LiveEvalHarnessError and is never returned as
+        a scored result; "error"/"empty_response" are returned scored 0.0
+        (a candidate can cause them, e.g. by overflowing the context window),
+        unless CONSECUTIVE_UNSCOREABLE_LIMIT exercises in a row end that way,
+        which raises. A config "error" (see _is_config_error) raises without
+        retrying."""
         run_config = self.run_config
         sanitized = _sanitize_candidate(candidate)
         results: dict[str, LiveRunResult] = {}
@@ -473,24 +508,45 @@ class PolyglotLiveRunner:
                     # returns -- a later exercise in this same batch raising
                     # (e.g. the budget backstop above) must not erase the audit
                     # trail for exercises that already genuinely ran. Fired for
-                    # a harness_error run too: it genuinely ran and spent
-                    # budget, even though it is never scored. Fired BEFORE
+                    # an unscoreable run too: it genuinely ran and spent
+                    # budget, even when it is never scored. Fired BEFORE
                     # cache.put(): if the memo write itself raises (disk I/O),
                     # the audit record for an exercise that DID genuinely run
                     # must not be lost along with it.
                     if self.on_result is not None:
                         self.on_result(result)
-                    if result.status != "harness_error":
+                    if result.status not in UNSCOREABLE_STATUSES:
+                        self._consecutive_unscoreable = 0
                         break
+                    if _is_config_error(result):
+                        raise LiveEvalHarnessError(
+                            f"{spec.task_id!r} hit a config error that no retry can change -- "
+                            f"refusing to score it: {result.error}",
+                            result=result,
+                        )
                     logger.warning(
-                        "live_eval: %s hit harness_error (try %d/%d): %s",
-                        spec.task_id, _try + 1, 1 + HARNESS_ERROR_RETRIES, result.error,
+                        "live_eval: %s hit %s (try %d/%d): %s",
+                        spec.task_id, result.status, _try + 1, 1 + HARNESS_ERROR_RETRIES, result.error,
                     )
                 else:
-                    raise LiveEvalHarnessError(
-                        f"{spec.task_id!r} still hit harness_error after {HARNESS_ERROR_RETRIES} "
-                        f"retries -- refusing to score a harness failure: {result.error}",
-                        result=result,
+                    if result.status == "harness_error":
+                        raise LiveEvalHarnessError(
+                            f"{spec.task_id!r} still hit harness_error after {HARNESS_ERROR_RETRIES} "
+                            f"retries -- refusing to score a harness failure: {result.error}",
+                            result=result,
+                        )
+                    self._consecutive_unscoreable += 1
+                    if self._consecutive_unscoreable >= CONSECUTIVE_UNSCOREABLE_LIMIT:
+                        raise LiveEvalHarnessError(
+                            f"{self._consecutive_unscoreable} consecutive exercises ended "
+                            f"{result.status!r} even after {HARNESS_ERROR_RETRIES} retries each "
+                            f"(last: {spec.task_id!r}) -- the environment looks broken, refusing "
+                            f"to score it: {result.error}",
+                            result=result,
+                        )
+                    logger.warning(
+                        "live_eval: %s still hit %s after %d retries -- scoring it 0.0, uncached",
+                        spec.task_id, result.status, HARNESS_ERROR_RETRIES,
                     )
                 results[spec.task_id] = result
                 if self.cache is not None:
@@ -530,6 +586,7 @@ class PolyglotLiveRunner:
                 effective_timeout = max(1.0, remaining)
                 budget_clamped = True
 
+        results_file.unlink(missing_ok=True)
         # Written BEFORE Popen() -- see mark_spawn_pending()'s own docstring
         # for the TOCTOU gap this closes (a SIGKILL between Popen() returning
         # and set_active_pid(proc.pid) below would otherwise leave no marker
@@ -732,7 +789,7 @@ class PolyglotLiveRunner:
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
             reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
             diff_summary=diff_summary, notifications=notifications, usage=usage,
-            **base_kwargs,
+            error=reason if isinstance(reason := record.get("reason"), str) else None, **base_kwargs,
         )
 
     def _compute_diff(self, spec: ExerciseSpec, workdir: Path) -> str:

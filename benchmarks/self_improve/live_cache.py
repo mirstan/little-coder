@@ -23,7 +23,9 @@ it, transparently covers whatever GEPA's cache didn't already filter out.
 Never caches an environmental failure (timeout/error/empty-response/
 harness_error) -- those are properties of the environment, not the
 candidate; caching one would permanently pin a candidate at a false low
-score for the rest of a run.
+score for the rest of a run. Two tiers: UNSCOREABLE_STATUSES are also
+retried in place by live_eval's run_batch() (see there for what happens
+when they persist); fail_timeout is scored as-is but still never cached.
 """
 from __future__ import annotations
 
@@ -33,11 +35,18 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+#: Result statuses with no scoreable agent attempt behind them: live_eval's
+#: run_batch() retries these in place rather than scoring the first one.
+#: "error"/"empty_response" come from aider_polyglot.py's own status
+#: vocabulary (_classify_status); "harness_error" is a live_eval-level
+#: failure (missing results file, unparseable output, etc).
+UNSCOREABLE_STATUSES = frozenset({"harness_error", "error", "empty_response"})
 #: Result statuses that describe the ENVIRONMENT failing, not the candidate
-#: -- never cached. Mirrors aider_polyglot.py's own status vocabulary
-#: (_classify_status) plus "harness_error" for a live_eval-level failure
-#: (missing results file, unparseable output, etc).
-ENVIRONMENTAL_STATUSES = frozenset({"error", "fail_timeout", "empty_response", "harness_error"})
+#: -- never cached. A superset of UNSCOREABLE_STATUSES by construction:
+#: anything too unreliable to score first time is too unreliable to cache.
+#: fail_timeout is scored but not cached, because the per-attempt deadline is
+#: wall-clock, so a slow model server can cause it as easily as the candidate.
+ENVIRONMENTAL_STATUSES = UNSCOREABLE_STATUSES | {"fail_timeout"}
 
 
 def candidate_hash(candidate: Mapping[str, str]) -> str:

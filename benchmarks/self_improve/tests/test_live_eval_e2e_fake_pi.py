@@ -715,22 +715,30 @@ def _canned(spec, status, score=0.0, error=None):
     )
 
 
-def test_harness_error_is_retried_in_place_and_never_cached(runner_factory, tmp_path, monkeypatch):
+#: Statuses run_batch() retries in place. harness_error then raises;
+#: error/empty_response are returned scored 0.0 (never cached). Membership is
+#: pinned against live_cache.UNSCOREABLE_STATUSES in test_live_cache.py.
+_RUNTIME_UNSCOREABLE = ["empty_response", "error"]
+_ALL_UNSCOREABLE = ["harness_error", *_RUNTIME_UNSCOREABLE]
+
+
+@pytest.mark.parametrize("status", _ALL_UNSCOREABLE)
+def test_unscoreable_status_is_retried_in_place_and_never_cached(status, runner_factory, tmp_path, monkeypatch):
     cache = LiveResultCache(tmp_path / "cache")
     candidate = {"agents_md": "text"}
-    outcomes = iter(["harness_error", "pass_1"])
+    outcomes = iter([status, "pass_1"])
     seen = []
     for runner in runner_factory(cache=cache, on_result=seen.append):
         def _next(spec):
-            status = next(outcomes)
-            return _canned(spec, status, score=1.0 if status == "pass_1" else 0.0, error="boom")
+            s = next(outcomes)
+            return _canned(spec, s, score=1.0 if s == "pass_1" else 0.0, error="boom")
         monkeypatch.setattr(runner, "_run_one_uncached", _next)
         results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
         run_config = runner.run_config
 
     assert [r.status for r in results] == ["pass_1"]
     # Both genuine runs reach the audit trail; only the real outcome is scored.
-    assert [r.status for r in seen] == ["harness_error", "pass_1"]
+    assert [r.status for r in seen] == [status, "pass_1"]
     cached = cache.get(live_eval._sanitize_candidate(candidate), run_config, "python/wordy")
     assert cached["status"] == "pass_1"
 
@@ -750,13 +758,156 @@ def test_persistent_harness_error_raises_instead_of_scoring_zero(runner_factory,
     assert not list((tmp_path / "cache").rglob("*.json"))
 
 
-def test_harness_error_retries_count_against_the_live_budget(runner_factory, monkeypatch):
+@pytest.mark.parametrize("status", _RUNTIME_UNSCOREABLE)
+def test_persistent_runtime_unscoreable_is_scored_zero_and_never_cached(status, runner_factory, tmp_path, monkeypatch):
+    """A candidate can cause these deterministically (an AGENTS.md bloated
+    past n_ctx, a skill file that crashes pi), so once the in-place retries
+    are spent the candidate gets the 0.0 it earned -- one bad proposal must
+    not abort the whole GEPA run. Never cached: a transient fault that
+    outlasted the retries must not pin the candidate for the rest of a run."""
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, status, error="boom"))
+        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert [r.status for r in results] == [status]
+    assert results[0].score == 0.0
+    assert [r.status for r in seen] == [status] * (1 + live_eval.HARNESS_ERROR_RETRIES)
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+@pytest.mark.parametrize("status", _ALL_UNSCOREABLE)
+def test_unscoreable_retries_count_against_the_live_budget(status, runner_factory, monkeypatch):
     import time as time_module
 
     from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
 
     budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=2)
     for runner in runner_factory(budget=budget):
-        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "harness_error"))
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, status))
         with pytest.raises(LiveEvalBudgetExceeded):
             runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+
+def test_fail_timeout_is_scored_once_not_retried_and_not_cached(runner_factory, tmp_path, monkeypatch):
+    """Guards against over-extending the retry set: fail_timeout is scored
+    (a looping agent is a candidate outcome) and a retry would cost up to a
+    full per-attempt wall clock, but it is still never cached."""
+    cache = LiveResultCache(tmp_path / "cache")
+    calls = []
+    for runner in runner_factory(cache=cache):
+        def _timeout(spec):
+            calls.append(spec.task_id)
+            return _canned(spec, "fail_timeout")
+        monkeypatch.setattr(runner, "_run_one_uncached", _timeout)
+        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert calls == ["python/wordy"]
+    assert results[0].status == "fail_timeout"
+    assert results[0].score == 0.0
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+@pytest.mark.parametrize("reason", [
+    "exercise not found at /somewhere/wordy",
+    "unknown agent 'nope'",
+    "RuntimeError: shared JS deps missing at /x/node_modules; create them with ...",
+])
+def test_config_error_raises_immediately_without_retrying(reason, runner_factory, tmp_path, monkeypatch):
+    """These can't change on retry, and aren't the candidate's doing."""
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "error", error=reason))
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="config"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert [r.status for r in seen] == ["error"]
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+def _canned_by_exercise(statuses: dict):
+    def _run(spec):
+        status = statuses[spec.exercise]
+        return _canned(spec, status, score=1.0 if status == "pass_1" else 0.0, error="boom")
+    return _run
+
+
+def test_consecutive_persistent_unscoreable_exercises_trip_the_circuit_breaker(runner_factory, monkeypatch):
+    """A dead model server shows up as every exercise ending persistent
+    error/empty_response -- that must fail loud rather than score a whole
+    batch 0.0."""
+    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
+    names = [f"ex{i}" for i in range(limit)]
+    seen = []
+    for runner in runner_factory(on_result=seen.append):
+        monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(dict.fromkeys(names, "empty_response")))
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="consecutive"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(n) for n in names])
+
+    assert len(seen) == limit * (1 + live_eval.HARNESS_ERROR_RETRIES)
+
+
+def test_circuit_breaker_counts_across_run_batch_calls(runner_factory, monkeypatch):
+    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
+    names = [f"ex{i}" for i in range(limit)]
+    for runner in runner_factory():
+        monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(dict.fromkeys(names, "error")))
+        for name in names[:-1]:
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(name)])
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="consecutive"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(names[-1])])
+
+
+def test_a_scoreable_result_resets_the_circuit_breaker(runner_factory, monkeypatch):
+    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
+    statuses = {f"bad{i}": "error" for i in range(limit - 1)}
+    statuses["good"] = "fail"
+    statuses.update({f"late{i}": "empty_response" for i in range(limit - 1)})
+    for runner in runner_factory():
+        monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(statuses))
+        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec(n) for n in statuses])
+
+    assert [r.status for r in results] == list(statuses.values())
+
+
+def test_pi_dying_on_attempt_one_is_retried_then_scored_zero_uncached(runner_factory, tmp_path, monkeypatch):
+    """Real subprocess chain: fake_pi acks then exits, rpc_client reports
+    process_exit, aider_polyglot's attempt loop breaks and classifies the run
+    "error". Retried in place, then scored 0.0 and never cached."""
+    monkeypatch.setenv("FAKE_PI_MODE", "crash_after_ack")
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+
+    assert [r.status for r in seen] == ["error"] * (1 + live_eval.HARNESS_ERROR_RETRIES)
+    assert results[0].status == "error"
+    assert results[0].score == 0.0
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+def test_missing_exercise_is_a_config_error_and_raises_after_one_run(runner_factory, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_MODE", "clean")
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="exercise not found"):
+            runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("no_such_exercise")])
+
+    assert [r.status for r in seen] == ["error"]
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
+def test_a_stale_results_file_is_not_read_back_as_this_runs_outcome(runner_factory):
+    """A subprocess that dies before writing its own results must not be
+    scored from whatever the previous try left in the worktree."""
+    for runner in runner_factory():
+        results_file = runner.worktree.path / "benchmarks" / "results_full_polyglot.json"
+        results_file.write_text(json.dumps({"exercises": {"pi/python/wordy": {"status": "pass_1"}}}))
+        runner.python_executable = shutil.which("false") or "/usr/bin/false"
+        result = runner._run_one_uncached(ExerciseSpec("wordy"))
+
+    assert result.status == "harness_error"
+    assert "results file missing" in result.error

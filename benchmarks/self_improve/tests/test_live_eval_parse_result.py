@@ -66,3 +66,31 @@ def test_parse_result_defaults_to_empty_lessons_when_field_absent(tmp_path):
     result = runner._parse_result(spec, results_file, log_root, stderr="", exit_code=0)
 
     assert result.self_reported_lessons == []
+
+
+def test_parse_result_carries_the_records_reason_into_error(tmp_path):
+    """aider_polyglot.py records why an exercise ended in "error" (e.g.
+    "exercise not found at ...") under "reason"; run_batch() needs it to tell
+    a config error from a runtime one, and reflection feedback needs a cause."""
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    _write_results(results_file, "pi/python/wordy", {"status": "error", "reason": "X"})
+
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+
+    assert result.status == "error"
+    assert result.error == "X"
+
+
+def test_parse_result_leaves_error_unset_when_the_record_has_no_reason(tmp_path):
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    _write_results(results_file, "pi/python/wordy", {"status": "fail"})
+
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+
+    assert result.error is None

@@ -18,6 +18,7 @@ from gepa.core.adapter import EvaluationBatch
 from benchmarks.self_improve.components import _estimate_token_cost
 from benchmarks.self_improve.exercises import ExerciseSpec, describe_exercise
 from benchmarks.self_improve.ingest.common import merge_component_usage
+from benchmarks.self_improve.live_cache import UNSCOREABLE_STATUSES
 from benchmarks.self_improve.live_eval import LiveRunResult, PolyglotLiveRunner
 
 #: skill-inject's/knowledge-inject's per-turn injection budgets
@@ -100,6 +101,14 @@ def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_i
             f"The benchmark harness itself failed before the agent could be properly scored "
             f"({result.error}). This outcome says NOTHING about the quality of {pred_name}; "
             f"do not rewrite it in response to this record."
+        )
+    elif result.status in UNSCOREABLE_STATUSES:
+        cause = f": {result.error}" if result.error else ""
+        parts.append(
+            f"No gradable attempt was recorded (status={result.status}{cause}) -- the agent "
+            f"process exited or the model returned an empty response before its work could be "
+            f"tested, even after in-place retries. This outcome says NOTHING reliable about the "
+            f"quality of {pred_name}; do not rewrite it in response to this record."
         )
     elif result.success:
         parts.append(f"Tests passed on attempt {result.attempts}.")
