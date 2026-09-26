@@ -225,7 +225,12 @@ import {
 // module's header for why (this constant used to be hand-copied here and in
 // finalize-warn/index.ts with nothing enforcing they stayed in lockstep).
 const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WARN_REMAINING_MS
-const MAX_TRIGGER_A_FIRES = 2; // per session
+// Raised from 2: a real trial (cancel-async-tasks__LcJTEba) showed two
+// genuine early-pause fires exhausting the cap before the model's actual
+// final toolless declaration, which then got no re-verification nudge at
+// all. A magnitude tweak, not a structural fix -- a trial with 3 genuine
+// early-quit patterns still exhausts this cap.
+const MAX_TRIGGER_A_FIRES = 3; // per session
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
 
@@ -246,6 +251,12 @@ let armed = false;
 let armedAtTurn = 0;
 let consecutiveNoWriteTurns = 0;
 let triggerBFired = false;
+
+// True from the turn of a non-scratch write until a test-invocation command
+// is seen (or the run resets). Strengthens Trigger A's message with an
+// explicit "you edited without retesting" clause -- a mechanically-checkable
+// signal, not a claim about the edit's intent (see looksLikeTestInvocation).
+let dirtySinceLastTest = false;
 
 // ---- Trigger C state ----
 // Fire count is session-scoped, like Trigger A's. The message snapshot is
@@ -293,6 +304,26 @@ function contentShape(message: any): { text: string; toolCallCount: number; tool
 // authorization judgment, not a claim that ShellSend can't produce writes:
 // a model driving an interactive editor/REPL through it is plainly working.
 const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
+
+// Heuristic, not exhaustive -- a command-name allowlist can't cover every
+// language/framework's test invocation, and false negatives here just mean
+// this trigger's extra clause doesn't fire (Trigger A's base message still
+// does). False positives (treating a non-test command as a test run) are
+// the costlier direction (they'd suppress the clause when it should have
+// fired) but the patterns below are specific enough to keep that rare.
+const TEST_INVOCATION_PATTERNS: RegExp[] = [
+  /\bpytest\b/, /\bpy\.test\b/, /\bpython3?\s+-m\s+pytest\b/,
+  /\bpython3?\s+-m\s+unittest\b/,
+  /\bgo\s+test\b/, /\bcargo\s+test\b/,
+  /\bnpm\s+(run\s+)?test\b/, /\byarn\s+test\b/,
+  /\bmake\s+(test|check)\b/,
+  /\brspec\b/, /\brake\s+test\b/,
+  /\bmvn\s+test\b/, /\bgradle\s+test\b/,
+];
+
+export function looksLikeTestInvocation(cmd: string): boolean {
+  return TEST_INVOCATION_PATTERNS.some((re) => re.test(cmd));
+}
 
 /**
  * Every command-shaped string found in this turn's tool calls: the `command`
@@ -342,6 +373,7 @@ export default function (pi: ExtensionAPI) {
     armed = false;
     armedAtTurn = 0;
     consecutiveNoWriteTurns = 0;
+    dirtySinceLastTest = false;
     lastTurnMessage = undefined;
     triggerDFiredAtTurn = 0;
   });
@@ -380,8 +412,15 @@ export default function (pi: ExtensionAPI) {
     // Computed for every turn, not just the ones Trigger B is armed for:
     // Trigger D's evidence flag has to be complete from turn 1, long before
     // Trigger B starts judging compliance.
-    const wroteDeliverable = hasNonScratchWrite(shellCommandsIn(toolCalls));
+    const commandsThisTurn = shellCommandsIn(toolCalls);
+    const wroteDeliverable = hasNonScratchWrite(commandsThisTurn);
     if (wroteDeliverable) deliverableWriteEverSeen = true;
+
+    // Order matters: a write followed by a test run in the SAME turn should
+    // still clear the flag, so the test-invocation check runs after (and can
+    // override) the write-detection set.
+    if (wroteDeliverable) dirtySinceLastTest = true;
+    if (commandsThisTurn.some(looksLikeTestInvocation)) dirtySinceLastTest = false;
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
@@ -432,6 +471,7 @@ const RESTORE_RESTRAINT =
 export function buildTriggerAMessage(
   minutesLeft: number,
   baseline: InitialSnapshotOutcome | undefined,
+  dirtySinceLastTest: boolean = false,
 ): string {
   // (1) names a verification protocol rather than asking for a "spot-check":
   // both observed failures were re-checks incapable of failing. (2)/(3)
@@ -449,6 +489,11 @@ export function buildTriggerAMessage(
         `${INITIAL_SNAPSHOT_APP_DIR}/ (${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors ` +
         "/app/somefile); it predates every change you made, unlike a backup of your " +
         `own. ${baselineCaveats(baseline)}${RESTORE_RESTRAINT}`;
+
+  const dirtyClause = !dirtySinceLastTest
+    ? ""
+    : "You edited a file since your last test run without re-running your tests " +
+      "afterward — re-run them against this exact change before considering it done. ";
 
   return (
     `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
@@ -469,6 +514,7 @@ export function buildTriggerAMessage(
     "(3) if you were ever unsure what's expected, resolve it " +
     "by the most literal reading of the task text. " +
     baselineClause +
+    dirtyClause +
     "If this recheck passes, say so " +
     "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
     "do not give up early."
@@ -575,7 +621,7 @@ function maybeFireTriggerA(
   if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   const minutesLeft = Math.max(0, Math.round(remainingMs / 60000));
-  const msg = buildTriggerAMessage(minutesLeft, initialSnapshotOutcome());
+  const msg = buildTriggerAMessage(minutesLeft, initialSnapshotOutcome(), dirtySinceLastTest);
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });

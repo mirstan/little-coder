@@ -3,6 +3,7 @@ import setupExtension, {
   buildTriggerAMessage,
   buildTriggerCRecoveryMessage,
   buildTriggerDMessage,
+  looksLikeTestInvocation,
 } from "./index.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
@@ -303,7 +304,7 @@ describe("tb-finalize-guard", () => {
       expect(h.sent).toHaveLength(1);
     });
 
-    it("fires at most twice per session", async () => {
+    it("fires at most three times per session", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
@@ -311,7 +312,22 @@ describe("tb-finalize-guard", () => {
       await turn(h, assistantTurn({ text: "One." }));
       await turn(h, assistantTurn({ text: "Two." }));
       await turn(h, assistantTurn({ text: "Three." }));
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Four." }));
+      expect(h.sent).toHaveLength(3);
+    });
+
+    it("a real trial's shape (two early pauses, then a real final declaration) now gets a third fire where it previously would have been suppressed", async () => {
+      // Replays cancel-async-tasks__LcJTEba's exact shape: two genuine
+      // early-pause fires, then a real final toolless declaration that the
+      // old MAX_TRIGGER_A_FIRES=2 cap left unnudged.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(180);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "I think I'm done for now." })); // fire #1 (early pause)
+      await turn(h, assistantTurn({ text: "Let me pause here too." })); // fire #2 (early pause)
+      await turn(h, assistantTurn({ text: "That's everything." })); // the real final declaration
+      expect(h.sent).toHaveLength(3);
     });
 
     it("latch survives before_agent_start (no re-arming across runs in one session)", async () => {
@@ -326,8 +342,9 @@ describe("tb-finalize-guard", () => {
       setDeadlineMinutesFromNow(30);
       await startRun(h);
       await turn(h, assistantTurn({ text: "Two." })); // fire #2 this session
-      await turn(h, assistantTurn({ text: "Three." })); // would be #3 — blocked
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Three." })); // fire #3 this session
+      await turn(h, assistantTurn({ text: "Four." })); // would be #4 — blocked
+      expect(h.sent).toHaveLength(3);
     });
 
     it("resets on session_start, allowing fresh fires for a new task", async () => {
@@ -337,12 +354,13 @@ describe("tb-finalize-guard", () => {
       await newSession(h);
       await turn(h, assistantTurn({ text: "One." }));
       await turn(h, assistantTurn({ text: "Two." }));
-      expect(h.sent).toHaveLength(2); // session limit reached
+      await turn(h, assistantTurn({ text: "Three." }));
+      expect(h.sent).toHaveLength(3); // session limit reached
 
       setDeadlineMinutesFromNow(30);
       await newSession(h); // session_start resets the latch
-      await turn(h, assistantTurn({ text: "Three." }));
-      expect(h.sent).toHaveLength(3);
+      await turn(h, assistantTurn({ text: "Four." }));
+      expect(h.sent).toHaveLength(4);
     });
 
     it("does not burn the fire count or notify when sendUserMessage throws", async () => {
@@ -383,6 +401,76 @@ describe("tb-finalize-guard", () => {
       // What a TB1.0 trial gets: same benchmark name, no container-side copy.
       expect(h.sent[0].text).toBe(buildTriggerAMessage(30, undefined));
       expect(h.sent[0].text).not.toContain(INITIAL_SNAPSHOT_APP_DIR);
+    });
+
+    it("strengthens the message when a write happened with no test-invocation since", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, no test since
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("does not add the retest clause when a test-invocation ran after the write", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write
+      await turn(h, shellTurn(["pytest tests/"])); // test-invocation clears the flag
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+
+    it("clears the flag when the write and the test run land in the same turn", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt", "pytest tests/"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+  });
+
+  describe("looksLikeTestInvocation", () => {
+    it("matches common test-runner invocations across languages", () => {
+      const positives = [
+        "pytest",
+        "python -m pytest tests/",
+        "python3 -m pytest -k foo",
+        "python -m unittest discover",
+        "go test ./...",
+        "cargo test",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "make test",
+        "make check",
+        "rspec spec/",
+        "rake test",
+        "mvn test",
+        "gradle test",
+      ];
+      for (const cmd of positives) expect(looksLikeTestInvocation(cmd)).toBe(true);
+    });
+
+    it("does not match plausible near-misses that merely contain the word 'test'", () => {
+      const negatives = [
+        "cat test_notes.txt",
+        "ls test_data/",
+        "echo 'contest results' > /app/out.txt",
+        "vim test_plan.md",
+        "grep -r test src/",
+      ];
+      for (const cmd of negatives) expect(looksLikeTestInvocation(cmd)).toBe(false);
     });
   });
 
@@ -890,33 +978,34 @@ describe("tb-finalize-guard", () => {
       await fire(h.pi, "session_start", {}, h.ctx);
       await startRun(h, 10);
 
-      // Exhaust Trigger A's session cap (2 fires).
+      // Exhaust Trigger A's session cap (3 fires).
       await turn(h, assistantTurn({ text: "One." })); // turn 1
       await turn(h, assistantTurn({ text: "Two." })); // turn 2
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Two-point-five." })); // turn 2.5
+      expect(h.sent).toHaveLength(3);
 
       // Trigger C fires on a settled run with an errored final message,
       // unaffected by Trigger A's now-exhausted cap.
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 3
       await settle(h);
-      expect(h.sent).toHaveLength(3);
+      expect(h.sent).toHaveLength(4);
 
       // A fresh run, still within the same session — Trigger C fires again.
       await startRun(h, 10);
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of the new run
       await settle(h);
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Trigger C's own session-scoped cap is now exhausted; a 3rd settled
       // error run does not fire.
       await startRun(h, 10);
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of yet another run
       await settle(h);
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Trigger A's cap is still exhausted, unaffected by Trigger C's fires.
       await turn(h, assistantTurn({ text: "Three." })); // turn 2 of this run
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Drive turns up to Trigger B's arm point (turn 6 for capForRun=10)
       // with no-op shell turns, then two non-compliant turns to fire B —
@@ -927,7 +1016,7 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
       await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
       await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
-      expect(h.sent).toHaveLength(5);
+      expect(h.sent).toHaveLength(6);
     });
   });
 
