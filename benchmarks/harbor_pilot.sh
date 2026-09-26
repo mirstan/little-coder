@@ -2,8 +2,12 @@
 # Pilot runner for Terminal-Bench 2.1 via harbor.
 #
 # Usage:
-#   benchmarks/harbor_pilot.sh hello-world
-#   benchmarks/harbor_pilot.sh task-a task-b
+#   benchmarks/harbor_pilot.sh prove-plus-comm
+#   benchmarks/harbor_pilot.sh task-a terminal-bench/task-b
+#
+# Task names may be bare (as in tb21_splits.json) or dataset-prefixed; bare
+# names get the dataset's org prefix. (hello-world is not in the TB2.1
+# dataset.)
 #
 # Runbook note: a running Harbor job never reloads code -- it imports
 # LittleCoderAgent once at job start and keeps running that frozen module
@@ -88,6 +92,14 @@ fi
 
 TASK_FLAGS=()
 for t in "$@"; do
+  # Harbor's package registry (0.22+) names tasks "<org>/<task>" and matches
+  # --include-task-name against that full name, so a bare "fix-git" matches
+  # nothing ("No tasks matched the filter(s)"). Bare names -- the form
+  # tb21_splits.json uses -- get the dataset's org prefix; already-prefixed
+  # names pass through unchanged.
+  if [[ "$t" != */* ]]; then
+    t="${DATASET%%/*}/$t"
+  fi
   TASK_FLAGS+=(--include-task-name "$t")
 done
 
