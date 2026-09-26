@@ -1340,6 +1340,14 @@ describe("tb-finalize-guard", () => {
       it("finds nothing in a prompt with no size language — false-negative bias", () => {
         expect(parseByteLimit("Write a function that reverses a string.")).toBeUndefined();
       });
+
+      it("does not misread a floor ('no/not less than') as this trigger's ceiling", () => {
+        expect(parseByteLimit("The file must be no less than 5000 bytes.")).toBeUndefined();
+        expect(parseByteLimit("Output should be not less than 2KB.")).toBeUndefined();
+        // The un-negated phrase still fires — only the floor-shaped negation
+        // is excluded.
+        expect(parseByteLimit("Output should be less than 2KB.")).toBe(2048);
+      });
     });
 
     describe("path parsing", () => {
@@ -1494,6 +1502,94 @@ describe("tb-finalize-guard", () => {
         // LITTLE_CODER_TB_MODE deliberately left unset.
         await newSessionWithPrompt(h, REAL_PROMPT);
         await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("continuation-prompt latching", () => {
+      // Regression: a mid-run-compaction or error-retry continuation re-fires
+      // before_agent_start with COMPACTION_CONTINUE_PROMPT/ERROR_RETRY_PROMPT
+      // (rpc_client.py), not the task text. Re-parsing unconditionally on
+      // every run used to silently wipe an already-resolved limit/path the
+      // first time either fired — this trigger going dark for the rest of
+      // the trial with no signal that it happened.
+      const COMPACTION_CONTINUE_PROMPT =
+        "Your session context was compacted to free space, which interrupted " +
+        "what you were doing. The task is not complete — please continue from " +
+        "where you left off. If the task is actually already complete and " +
+        "verified, say so explicitly and stop.";
+
+      it("keeps the limit/path resolved from the first run across a continuation run's own before_agent_start", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // Simulate the harness re-firing before_agent_start for a
+        // post-compaction continuation — same session, no session_start.
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: {}, prompt: COMPACTION_CONTINUE_PROMPT },
+          h.ctx,
+        );
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        // Still checks size — the limit/path survived the continuation's
+        // own before_agent_start instead of being wiped to undefined.
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+
+      it("clears the latch at session_start so a later trial doesn't inherit a stale limit/path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // A fresh session with no size language at all — the module-level
+        // latch must not carry the previous session's resolved values over.
+        await fire(h.pi, "session_start", {}, h.ctx);
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: {}, prompt: "Write a function that reverses a string." },
+          h.ctx,
+        );
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("relative-path deliverable writes", () => {
+      // Regression: the harness's own prompt prefix ("Default working
+      // directory is /app", "cd <path> persists") teaches exactly the
+      // relative command forms strict path equality never matched — the
+      // real gpt2-codegolf trial's own `sed -i ... gpt2.c` pass on the file
+      // it had just written was one of them.
+      it("checks size when the write targets the deliverable via a relative path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["cd /app && sed -i 's/foo/bar/g' gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+
+      it("does not check size for an unrelated file sharing the deliverable's basename at a different absolute path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["cat /app/vocab.bpe > /tmp/gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("still does not check size for a genuinely different filename (e.g. the compiled binary)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["gcc -O3 -lm gpt2.c -o a.out"]));
         expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
       });
     });

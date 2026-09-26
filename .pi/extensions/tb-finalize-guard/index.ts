@@ -322,11 +322,16 @@ let startForRun = 0;
 let triggerDFiredAtTurn = 0;
 
 // ---- Trigger E state ----
-// byteLimitForRun/deliverablePathForRun are run-scoped, resolved once per
-// run like capForRun/deadlineForRun -- re-derived on every continuation, but
-// idempotent since the task prompt itself never changes mid-trial.
-// Undefined means "no confident single match" and leaves this trigger inert
-// for the run, never guessed at.
+// byteLimitForRun/deliverablePathForRun are SESSION-scoped, latched on first
+// successful parse, not re-derived on every run like capForRun/deadlineForRun.
+// The task prompt is only the actual task text on the trial's first
+// before_agent_start -- a mid-run-compaction or error-retry continuation
+// re-fires before_agent_start with COMPACTION_CONTINUE_PROMPT/
+// ERROR_RETRY_PROMPT instead (rpc_client.py), neither of which mentions a
+// size or path, so re-parsing on every run would silently wipe an
+// already-resolved limit the moment either fires. Undefined means "no
+// confident single match (yet)" and leaves this trigger inert until one
+// resolves, never guessed at.
 let byteLimitForRun: number | undefined;
 let deliverablePathForRun: string | undefined;
 // Session-scoped: the over-budget count and last known size are properties
@@ -391,11 +396,30 @@ function hasNonScratchWrite(commands: string[]): boolean {
   return false;
 }
 
+// True when a write target names the same deliverable as `deliverablePath`,
+// tolerating the relative-cwd forms the harness's own prompt prefix teaches
+// the model to use ("Default working directory is /app" + "cd <path>
+// persists") -- e.g. "gpt2.c" or "./gpt2.c" against "/app/gpt2.c". Exact
+// equality still wins first; otherwise the two must share a basename AND
+// the write target must not itself be a DIFFERENT absolute path (which
+// would be a same-named file somewhere else, not this deliverable).
+// Over-matching here only costs one extra `wc -c` proxy call --
+// checkDeliverableSize always re-checks `deliverablePath` itself, never the
+// matched string -- so a false positive is cheap and a false negative
+// (the bug this replaces) is the only direction that actually mattered.
+function refersToDeliverable(writtenPath: string, deliverablePath: string): boolean {
+  if (writtenPath === deliverablePath) return true;
+  if (writtenPath.startsWith("/")) return false;
+  const deliverableBase = deliverablePath.split("/").pop();
+  const writtenBase = writtenPath.split("/").pop();
+  return !!deliverableBase && deliverableBase === writtenBase;
+}
+
 /** True when at least one command in this turn writes the given path specifically. */
 function writesDeliverablePath(commands: string[], path: string): boolean {
   for (const cmd of commands) {
     for (const w of detectDeliverableWrites(cmd)) {
-      if (w.path === path) return true;
+      if (refersToDeliverable(w.path, path)) return true;
     }
   }
   return false;
@@ -406,8 +430,14 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // optional and absorbed by the numeric side of the match rather than gated
 // behind a `\b` -- `<` is itself a non-word character, so `\b<` can never
 // fire next to the space that almost always precedes it in prose.
+//
+// "less than" is excluded when preceded by "no"/"not" -- "no less than N
+// bytes" states a FLOOR, and reading it as this trigger's ceiling would arm
+// the guard backwards (steering the model to shrink a file that has no
+// upper limit at all). The other alternatives don't have a floor-shaped
+// negation in ordinary prose, so only this one needs the guard.
 const BYTE_LIMIT_RE =
-  /(?:\b(?:under|below|less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+  /(?:\b(?:under|below|(?<!no\s)(?<!not\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
 
 // An absolute path stated near an instruction verb, e.g. "Call your program
 // /app/gpt2.c".
@@ -416,8 +446,12 @@ const DELIVERABLE_PATH_RE =
 
 /**
  * The byte limit stated in the prompt, normalized to bytes (kb/kilobytes
- * x1024). Undefined when no confident single match exists -- exported for
- * the smoke test against the real gpt2-codegolf prompt.
+ * x1024). Undefined when the pattern doesn't match at all. First-match, not
+ * ambiguity-checked: a prompt stating two DIFFERENT size constraints (e.g. a
+ * per-record size alongside the deliverable's own limit) resolves to
+ * whichever the regex reaches first, not a detected conflict -- narrow
+ * enough that no task in the current suite exercises it. Exported for the
+ * smoke test against the real gpt2-codegolf prompt.
  */
 export function parseByteLimit(prompt: string): number | undefined {
   const m = BYTE_LIMIT_RE.exec(prompt);
@@ -428,11 +462,12 @@ export function parseByteLimit(prompt: string): number | undefined {
 }
 
 /**
- * The deliverable's absolute path stated in the prompt. Undefined when no
- * confident single match exists. Trailing sentence punctuation (a comma or
- * period immediately after the path, as in "Call your program /app/gpt2.c,
- * I will compile...") is stripped -- `\S+` has no way to distinguish it from
- * a path character, and no real deliverable path ends in one.
+ * The deliverable's absolute path stated in the prompt. Undefined when the
+ * pattern doesn't match at all -- first-match, same caveat as
+ * `parseByteLimit` above. Trailing sentence punctuation (a comma or period
+ * immediately after the path, as in "Call your program /app/gpt2.c, I will
+ * compile...") is stripped -- `\S+` has no way to distinguish it from a path
+ * character, and no real deliverable path ends in one.
  */
 export function parseDeliverablePath(prompt: string): string | undefined {
   const m = DELIVERABLE_PATH_RE.exec(prompt);
@@ -448,6 +483,8 @@ export default function (pi: ExtensionAPI) {
     deliverableWriteEverSeen = false;
     lastKnownSize = undefined;
     consecutiveOverBudgetChecks = 0;
+    byteLimitForRun = undefined;
+    deliverablePathForRun = undefined;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -460,8 +497,16 @@ export default function (pi: ExtensionAPI) {
     consecutiveNoWriteTurns = 0;
     lastTurnMessage = undefined;
     triggerDFiredAtTurn = 0;
-    byteLimitForRun = parseByteLimit((event as any).prompt ?? "");
-    deliverablePathForRun = parseDeliverablePath((event as any).prompt ?? "");
+    // Latch, don't overwrite: a continuation run's prompt is
+    // COMPACTION_CONTINUE_PROMPT/ERROR_RETRY_PROMPT, not the task text --
+    // see the state comment above for why re-parsing unconditionally here
+    // would erase an already-resolved limit/path.
+    if (byteLimitForRun === undefined) {
+      byteLimitForRun = parseByteLimit((event as any).prompt ?? "");
+    }
+    if (deliverablePathForRun === undefined) {
+      deliverablePathForRun = parseDeliverablePath((event as any).prompt ?? "");
+    }
   });
 
   pi.on("turn_start", async (_event, ctx) => {
