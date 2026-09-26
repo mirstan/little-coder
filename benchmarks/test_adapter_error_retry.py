@@ -611,7 +611,8 @@ class _CycleRpc:
     """
 
     def __init__(self, cycles, clock=None, compact_results=(), alive=True,
-                 die_on_prompt=False, busy_for_sec_after_compact=0.0):
+                 die_on_prompt=False, busy_for_sec_after_compact=0.0,
+                 busy_on_first_n_continuation_sends=0):
         self._cycles = list(cycles)
         self._clock = clock
         self._compact_results = list(compact_results)
@@ -626,6 +627,14 @@ class _CycleRpc:
         #: cannot fire before the trial's own first prompt.
         self._busy_for_sec_after_compact = busy_for_sec_after_compact
         self._busy_until = None
+        #: Models the OTHER shape of the same gap: a poll-vs-send race, not a
+        #: long busy window. get_state() reports idle immediately (never sets
+        #: _busy_until above), but the next N prompt_and_collect() sends are
+        #: still rejected busy anyway, succeeding on send N+1. Armed on a
+        #: *successful* await_compact, same as busy_for_sec_after_compact, so
+        #: it only ever fires against a continuation send.
+        self._busy_on_first_n_continuation_sends = busy_on_first_n_continuation_sends
+        self._busy_sends_remaining = 0
         self.calls = []            # [(message, timeout)]
         self.compact_requests = []
         self.awaited = []
@@ -634,11 +643,10 @@ class _CycleRpc:
     def prompt_and_collect(self, message, timeout=900, on_event=None):
         self.calls.append((message, timeout))
         if self._busy_until is not None and self._clock.now() < self._busy_until:
-            raise PiBusyError(
-                "pi stayed busy across 5 readiness attempts: "
-                "Agent is already processing. Specify streamingBehavior "
-                "('steer' or 'followUp') to queue the message."
-            )
+            self._raise_busy()
+        if self._busy_sends_remaining > 0:
+            self._busy_sends_remaining -= 1
+            self._raise_busy()
         assert self._cycles, "prompt_and_collect called more often than scripted"
         nxt = self._cycles.pop(0)
         if isinstance(nxt, Exception):
@@ -650,6 +658,15 @@ class _CycleRpc:
             if on_event is not None:
                 on_event(ev)
         return result
+
+    def _raise_busy(self):
+        if self._die_on_prompt:
+            self.alive = False
+        raise PiBusyError(
+            "pi stayed busy across 5 readiness attempts: "
+            "Agent is already processing. Specify streamingBehavior "
+            "('steer' or 'followUp') to queue the message."
+        )
 
     def is_alive(self):
         return self.alive
@@ -672,6 +689,8 @@ class _CycleRpc:
             raise nxt
         if self._busy_for_sec_after_compact:
             self._busy_until = self._clock.now() + self._busy_for_sec_after_compact
+        if self._busy_on_first_n_continuation_sends:
+            self._busy_sends_remaining = self._busy_on_first_n_continuation_sends
         return nxt
 
 
@@ -858,8 +877,20 @@ _CONTINUATION_FAILURES = [
     RuntimeError("pi rejected prompt: No model selected"),
 ]
 
+#: The subset of _CONTINUATION_FAILURES the blanket `except Exception`
+#: handler still catches and ends the trial on immediately. PiBusyError is
+#: excluded on purpose: the dedicated `except PiBusyError` branch now
+#: retries it instead of ending the trial (see
+#: test_continuation_retries_when_a_stale_idle_read_still_lands_busy and
+#: test_continuation_gives_up_gracefully_if_pi_stays_busy_past_the_wait_bound
+#: for that behavior), so it no longer belongs to the "ends immediately"
+#: group this list feeds.
+_TERMINAL_CONTINUATION_FAILURES = [
+    f for f in _CONTINUATION_FAILURES if not isinstance(f, rpc_client.PiBusyError)
+]
 
-@pytest.mark.parametrize("failure", _CONTINUATION_FAILURES,
+
+@pytest.mark.parametrize("failure", _TERMINAL_CONTINUATION_FAILURES,
                          ids=lambda e: type(e).__name__)
 def test_a_failed_continuation_keeps_the_cycles_already_completed(failure):
     """prompt_with_error_retry leaves its first attempt unguarded on purpose,
@@ -1002,6 +1033,46 @@ def test_continuation_waits_for_pi_to_go_idle_after_a_compaction():
     assert outcome.result.stop_reason == "agent_end"
     assert "finished" in outcome.result.assistant_text
     assert rpc.state_calls > 0
+
+
+def test_continuation_retries_when_a_stale_idle_read_still_lands_busy():
+    """The OTHER shape of the same gap: a poll-vs-send race, not a long busy
+    window. get_state() reports idle immediately, so wait_for_pi_idle
+    returns without spending its own wait -- but the continuation's very
+    next prompt_and_collect() send is still rejected busy anyway. Before
+    this fix: that PiBusyError has nothing catching it before the blanket
+    `except Exception`, which ends the trial with stop_reason=compacted on
+    the very first rejection. After: the new `except PiBusyError` branch
+    waits and resends instead, reaching the second scripted cycle."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        busy_on_first_n_continuation_sends=1,
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.result.stop_reason != "compacted"
+    assert outcome.result.stop_reason == "agent_end"
+    assert "finished" in outcome.result.assistant_text
+
+
+def test_continuation_busy_retry_ends_gracefully_if_pi_dies_mid_wait():
+    """Liveness brake: this retry loop rechecks rpc.is_alive() before each
+    busy-retry wait, exactly like every other liveness recheck in this
+    function, so a pi that dies producing the busy rejection cannot leave
+    this loop waiting on it forever."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+        busy_on_first_n_continuation_sends=1,
+        die_on_prompt=True,
+    )
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert outcome.result.stop_reason == "process_exit"
 
 
 def test_a_failed_compaction_disarms_further_attempts():

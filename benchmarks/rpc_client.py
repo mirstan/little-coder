@@ -1776,10 +1776,14 @@ def prompt_with_mid_run_compaction(
     "process_exit" and an exhausted "error" are terminal conditions of their
     own, unrelated to the abort we asked for.
 
-    An exception out of a CONTINUATION cycle ends the loop too, but returns
-    the cycles already completed rather than propagating -- see the handler
-    for why that does not weaken prompt_with_error_retry's rule about its own
-    first attempt, which still applies to the trial's first prompt here.
+    Most exceptions out of a CONTINUATION cycle end the loop, but return the
+    cycles already completed rather than propagating -- see the handler for
+    why that does not weaken prompt_with_error_retry's rule about its own
+    first attempt, which still applies to the trial's first prompt here. A
+    `PiBusyError` is the one exception NOT ended this way: the same
+    rejection prompt_with_error_retry's own attempts>1 path already
+    recovers from by waiting and resending, so a continuation's send is
+    retried in place instead, bounded by the same liveness/budget brakes.
     """
     if deadline is None:
         deadline = now() + timeout
@@ -1819,6 +1823,59 @@ def prompt_with_mid_run_compaction(
                 sleep=sleep,
                 now=now,
             )
+        except PiBusyError as exc:
+            # wait_for_pi_idle's own docstring says its idle reading can be
+            # stale or wrong -- a stale/wrong read must never by itself end a
+            # recoverable trial. This is the identical rejection
+            # prompt_with_error_retry's own attempts>1 path already recovers
+            # from by waiting and resending (its own PiBusyError handler);
+            # here the continuation's send is a brand-new call's attempt 1,
+            # which never goes through that path, so without this handler
+            # the same rejection falls straight through to the blanket
+            # `except Exception` below and ends the trial instead of
+            # retrying. Bounded by the same is_alive()/min_remaining_sec
+            # brakes the rest of this loop already uses -- no new cap needed,
+            # since each PiBusyError already cost its own ~20s readiness loop
+            # inside prompt_and_collect before it could even be raised.
+            if merged is None:
+                raise
+            detail = f"{type(exc).__name__}: {exc}"
+            _log(
+                f"continuation after compaction {n_compactions} hit a busy "
+                f"pi ({detail}); waiting for it to go idle and retrying"
+            )
+            if not rpc.is_alive():
+                merged = replace(
+                    merged, stop_reason="process_exit", error_message=""
+                )
+                return ErrorRetryOutcome(
+                    merged, n_error_retries, last_error, detail, n_compactions
+                )
+            if (deadline - now()) <= min_remaining_sec:
+                # <=, not <: wait_for_pi_idle's own internal bound is
+                # `deadline - min_remaining_sec` too, so a busy pi that never
+                # goes idle converges exactly to that instant -- landing
+                # exactly ON the floor, not past it -- and each further call
+                # then returns immediately without sleeping (its own
+                # `remaining <= 0` check fires at once). A strict `<` here
+                # would accept that exact instant as "still enough budget",
+                # call wait_for_pi_idle again, get the same instant back, and
+                # spin forever never advancing the clock at all.
+                _log(
+                    f"not retrying the continuation: only "
+                    f"{deadline - now():.0f}s of budget is left, at or below "
+                    f"the {min_remaining_sec:.0f}s floor"
+                )
+                merged = replace(merged, stop_reason="compacted")
+                return ErrorRetryOutcome(
+                    merged, n_error_retries, last_error, detail, n_compactions
+                )
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
+            cycle_timeout = max(0.0, deadline - now())
+            continue
         except Exception as exc:
             # prompt_with_error_retry leaves its own first attempt outside
             # its try deliberately, so that wrapping a call site in it cannot
@@ -1833,21 +1890,22 @@ def prompt_with_mid_run_compaction(
             # i.e. this IS the trial's first prompt, so it still propagates
             # and the bare-prompt_and_collect contract is untouched.
             #
-            # EVERY exception, not just the typed busy one. A pi wedged in a
-            # long summarization does not reliably answer "already
-            # processing" at all, and prompt_and_collect's readiness loop
-            # retries only on that explicit response -- so a pi too busy to
-            # send one raises TimeoutError out of _await_response instead,
-            # and a pi that died summarizing raises PiProcessExited, which
-            # prompt_and_collect's own docstring records ending a Harbor
-            # trial before its metadata was ever written. Those are the same
-            # wedged continuation in different clothes. The inner helper
-            # already answered this question the same way for its own
-            # retries, so catching less here would only mean one rejection
-            # preserves the trial's work on an inner retry and destroys it on
-            # a continuation cycle, decided by nothing but which side of a
-            # try the call happens to sit on. Ending the loop and discarding
-            # what was already earned are separate questions.
+            # Every exception except the recoverable busy rejection carved
+            # out above. A pi wedged in a long summarization does not
+            # reliably answer "already processing" at all, and
+            # prompt_and_collect's readiness loop retries only on that
+            # explicit response -- so a pi too busy to send one raises
+            # TimeoutError out of _await_response instead, and a pi that died
+            # summarizing raises PiProcessExited, which prompt_and_collect's
+            # own docstring records ending a Harbor trial before its metadata
+            # was ever written. Those are the same wedged continuation in
+            # different clothes. The inner helper already answered this
+            # question the same way for its own retries, so catching less
+            # here would only mean one rejection preserves the trial's work
+            # on an inner retry and destroys it on a continuation cycle,
+            # decided by nothing but which side of a try the call happens to
+            # sit on. Ending the loop and discarding what was already earned
+            # are separate questions.
             #
             # Exception, never BaseException: harbor runs this inside
             # asyncio.to_thread and cancels on trial timeout, and
