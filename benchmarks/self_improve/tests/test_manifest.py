@@ -79,3 +79,14 @@ def test_load_rejects_unknown_fields_and_other_schema_versions(tmp_path):
     path.write_text(yaml.safe_dump({**data, "schema_version": MANIFEST_SCHEMA_VERSION + 1}))
     with pytest.raises(ValueError, match="schema_version"):
         Manifest.load(path)
+
+
+def test_save_refuses_to_overwrite_an_existing_manifest(tmp_path):
+    """The manifest pre-registers a run, so it is write-once: a second save
+    to the same path must fail loudly and leave the original bytes."""
+    path = tmp_path / "manifest.yaml"
+    _manifest(seed=1).save(path)
+    before = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        _manifest(seed=2).save(path)
+    assert path.read_bytes() == before

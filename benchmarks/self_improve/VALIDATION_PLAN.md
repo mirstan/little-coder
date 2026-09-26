@@ -157,10 +157,14 @@ own iteration loop, so live executions are capped at exactly `--max-metric-calls
 3. **Then run `--baseline-only`** (real live rollouts, no reflection LM) to confirm
    the whole pipeline works end to end and the seed isn't already saturated at a
    perfect score on the chosen exercises: same flags, swap `--estimate-only` for
-   `--baseline-only --yes`. Inspect `<out-dir>/seed_baseline.json` and
-   `spend_log.jsonl`.
-4. Only then run for real: add `--reflection-model <configured model>` +
-   `$REFLECTION_LM_API_KEY` + `--confirm-real-run` and drop `--baseline-only`.
+   `--baseline-only --yes`, and pass an explicit `--out-dir <baseline-out-dir>`.
+   Inspect `<baseline-out-dir>/seed_baseline.json` and `spend_log.jsonl`.
+4. Only then run for real, in a **fresh** out-dir: add `--reflection-model
+   <configured model>` + `$REFLECTION_LM_API_KEY` + `--confirm-real-run`, drop
+   `--baseline-only`, and pass `--out-dir <new-out-dir> --live-cache-dir
+   <baseline-out-dir>/live_cache` so the seed's valset evaluation is served from
+   the baseline's warm cache. Reusing `<baseline-out-dir>` is refused: one
+   out-dir holds one pre-registered run (its `manifest.yaml` is write-once).
 5. Record wall-clock time and, if the reflection model API reports usage/cost,
    record that too. `spend_log.jsonl` (append-only, flushed per line) is the
    authoritative record of what actually ran, regardless of how the process exited.

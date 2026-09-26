@@ -80,6 +80,19 @@ python -m benchmarks.self_improve.run_gepa --baseline-only --yes \
   --model <model under test> --confirm-live-rollouts --max-metric-calls <N>
 ```
 
+One `--out-dir` holds one pre-registered run. A live run (baseline or real)
+refuses with exit 1, before the confirmation prompt, when its `--out-dir`
+already holds any of `manifest.yaml`, `gepa/gepa_state.bin`,
+`optimized_components.yaml`, `seed_baseline.json` or `spend_log.jsonl`. A dir
+holding only `live_cache/` is accepted. So after a baseline, run the real
+optimization in a fresh `--out-dir` and point it at the baseline's warm cache:
+
+```bash
+python -m benchmarks.self_improve.run_gepa ... \
+  --out-dir benchmarks/self_improve/runs/<new-run> \
+  --live-cache-dir <baseline-out-dir>/live_cache
+```
+
 ### Real (costs money AND real compute): two independent gates
 
 ```bash
@@ -164,6 +177,12 @@ cost differs from what's currently recorded (see `TDD_SPEC.md` §7.2).
 codebase that pushes a branch and opens a real GitHub PR — it defaults to
 `False` and is never invoked by any test; run it deliberately, once you've
 reviewed the local commit.
+
+Each `<out-dir>` is written by exactly one run: `manifest.yaml` is created
+once and never rewritten, and a second run into the same dir is refused (see
+the `--baseline-only` section). Apply results from the out-dir of the run you
+mean; start any further run in a new `--out-dir`, reusing the warm cache with
+`--live-cache-dir <earlier-out-dir>/live_cache`.
 
 ## Current validation status (see VALIDATION_PLAN.md for the full picture)
 

@@ -16,7 +16,10 @@ Two independent, real-cost resources need two independent gates:
 constructing a worktree or an adapter -- provably free.
 --baseline-only runs the seed candidate once over the selected exercises (no
 reflection LM needed, but still behind the live-rollout gate) to validate
-the whole pipeline and pre-warm the cache before any reflection spend.
+the whole pipeline and pre-warm the cache before any reflection spend. The
+real run then goes in a fresh --out-dir with --live-cache-dir
+<baseline-out-dir>/live_cache: a live run refuses an --out-dir that already
+holds a previous run's files (_PRIOR_RUN_MARKERS).
 
 See VALIDATION_PLAN.md for the full design.
 Historical-log ingestion + frozen-data reporting (VALIDATION_PLAN Layers
@@ -257,6 +260,23 @@ def _build_manifest(args: argparse.Namespace, *, repo_root: Path, components_rel
     )
 
 
+#: Files a previous run leaves in its --out-dir. gepa/gepa_state.bin matters
+#: most: gepa.optimize() silently resumes from it when run_dir= points at a
+#: dir that holds one. live_cache/ and gepa.stop are deliberately absent --
+#: a warm cache is safe to share, and a stop file has its own refusal.
+_PRIOR_RUN_MARKERS = (
+    "manifest.yaml",
+    "gepa/gepa_state.bin",
+    "optimized_components.yaml",
+    "seed_baseline.json",
+    "spend_log.jsonl",
+)
+
+
+def _prior_run_artifacts(out_dir: Path) -> list[str]:
+    return [m for m in _PRIOR_RUN_MARKERS if (out_dir / m).exists()]
+
+
 def _resolve_components_yaml(repo_root: Path, components_config: str) -> tuple[Path, Path]:
     """Returns (absolute path under repo_root, path relative to repo_root).
     components.yaml paths are conventionally repo-relative -- resolving
@@ -360,7 +380,11 @@ def _run_live(args: argparse.Namespace) -> int:
     print(f"\n  Run dir       : {out_dir}")
     print(f"  Graceful stop : touch {stop_file}")
 
+    prior = _prior_run_artifacts(out_dir)
     if args.estimate_only:
+        if prior:
+            print(f"\n  Note: {out_dir} already holds a previous run ({', '.join(prior)}); "
+                  "a real run there would be refused. Use a fresh --out-dir.")
         return 0
 
     # Built (and validated) before the confirmation prompt so a bad
@@ -385,6 +409,29 @@ def _run_live(args: argparse.Namespace) -> int:
         print(
             f"Refusing to run: a stop file already exists at {stop_file}. If this is a leftover "
             f"from a previous run, remove it first: rm {stop_file}", file=sys.stderr,
+        )
+        return 1
+    nested_stop_file = out_dir / "gepa" / "gepa.stop"
+    if nested_stop_file.exists():
+        # GEPA's own FileStopper (added whenever run_dir= is passed) checks
+        # <run_dir>/gepa.stop, so a leftover there stops the run exactly like
+        # the top-level one above.
+        print(
+            f"Refusing to run: a stop file already exists at {nested_stop_file}. If this is a "
+            f"leftover from a previous run, remove it first: rm {nested_stop_file}", file=sys.stderr,
+        )
+        return 1
+
+    if prior:
+        # One out-dir is one pre-registered run. Reusing it would let
+        # gepa.optimize() silently resume from gepa/gepa_state.bin, and the
+        # new manifest would replace the one the earlier run was judged by.
+        print(
+            f"Refusing to run: {out_dir} already holds a previous run ({', '.join(prior)}). "
+            f"Each run needs its own pre-registered out-dir: pass a fresh --out-dir. To reuse the "
+            f"previous run's warm cache, add --live-cache-dir {out_dir / 'live_cache'} (or the "
+            f"--live-cache-dir that run used)",
+            file=sys.stderr,
         )
         return 1
 
@@ -494,9 +541,10 @@ def _run_live(args: argparse.Namespace) -> int:
                 spend_log.run_end(reason="budget_backstop", error=str(e))
                 return 3
             except LiveEvalHarnessError as e:
-                # run_batch() refuses to score a persistent harness failure
-                # (see LiveEvalHarnessError) -- same partial persistence as
-                # the budget backstop above, distinct reason and exit code.
+                # run_batch() raises instead of scoring on the paths listed
+                # in LiveEvalHarnessError's docstring -- same partial
+                # persistence as the budget backstop above, distinct reason
+                # and exit code.
                 print(f"\nHarness error, stopping baseline: {e}", file=sys.stderr)
                 (out_dir / "seed_baseline.json").write_text(
                     json.dumps({r.task_id: r.to_dict() for r in results}, indent=2, default=str)

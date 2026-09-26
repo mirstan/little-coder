@@ -723,3 +723,150 @@ def test_refuses_a_non_positive_temperature_before_spend(source_repo, fake_pract
     assert "temperature" in capsys.readouterr().err
     assert not (out_dir / "manifest.yaml").exists()
     assert not (out_dir / "spend_log.jsonl").exists()
+
+
+def _baseline_argv(source_repo, fake_practice, tmp_path, out_dir, *extra):
+    return [
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice),
+        "--exercises", "wordy,acronym", "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes", *extra,
+    ]
+
+
+def _fake_pass_run_batch(calls):
+    from benchmarks.self_improve.live_eval import LiveRunResult
+
+    def fake_run_batch(self, candidate, specs, *, sample_index=0):
+        calls.append([s.task_id for s in specs])
+        return [LiveRunResult(task_id=s.task_id, exercise=s.exercise, language=s.language,
+                              status="pass_1", score=1.0, success=True) for s in specs]
+    return fake_run_batch
+
+
+def test_refuses_to_reuse_an_out_dir_that_already_holds_a_manifest(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    """One out-dir is one pre-registered run. A second run into the same dir
+    must refuse before any spend and leave the first manifest byte-for-byte."""
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", _fake_pass_run_batch(calls))
+    out_dir = tmp_path / "run_out"
+    assert _run_main(_baseline_argv(source_repo, fake_practice, tmp_path, out_dir)) == 0
+    manifest_bytes = (out_dir / "manifest.yaml").read_bytes()
+    calls.clear()
+    capsys.readouterr()
+
+    code = _run_main(_baseline_argv(source_repo, fake_practice, tmp_path, out_dir, "--seed", "7"))
+    assert code == 1
+    assert calls == []
+    assert (out_dir / "manifest.yaml").read_bytes() == manifest_bytes
+    err = capsys.readouterr().err
+    assert "manifest.yaml" in err
+    assert "--live-cache-dir" in err
+
+
+def test_refuses_an_out_dir_with_leftover_gepa_state_and_never_calls_optimize(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """gepa.optimize() auto-resumes from <run_dir>/gepa_state.bin, so an
+    out-dir holding one must be refused before optimize is ever reached."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+    optimize_calls = []
+    monkeypatch.setattr(gepa, "optimize", lambda **kw: optimize_calls.append(kw))
+    out_dir = tmp_path / "run_out"
+    (out_dir / "gepa").mkdir(parents=True)
+    (out_dir / "gepa" / "gepa_state.bin").write_bytes(b"state")
+
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == 1
+    assert optimize_calls == []
+    assert not (out_dir / "manifest.yaml").exists()
+    assert not (out_dir / "spend_log.jsonl").exists()
+
+
+@pytest.mark.parametrize("marker", [
+    "manifest.yaml", "gepa/gepa_state.bin", "optimized_components.yaml",
+    "seed_baseline.json", "spend_log.jsonl",
+])
+def test_every_prior_run_marker_refuses_a_baseline_run(
+    source_repo, fake_practice, tmp_path, monkeypatch, marker,
+):
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", _fake_pass_run_batch(calls))
+    out_dir = tmp_path / "run_out"
+    (out_dir / marker).parent.mkdir(parents=True, exist_ok=True)
+    (out_dir / marker).write_text("prior")
+
+    assert _run_main(_baseline_argv(source_repo, fake_practice, tmp_path, out_dir)) == 1
+    assert calls == []
+    assert (out_dir / marker).read_text() == "prior"
+
+
+def test_an_out_dir_holding_only_a_live_cache_is_accepted(source_repo, fake_practice, tmp_path, monkeypatch):
+    """A warm live_cache/ is not prior run state -- only the cache the next
+    run may reuse -- so it must not trip the reuse refusal."""
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", _fake_pass_run_batch(calls))
+    out_dir = tmp_path / "run_out"
+    (out_dir / "live_cache").mkdir(parents=True)
+    (out_dir / "live_cache" / "entry.json").write_text("{}")
+
+    assert _run_main(_baseline_argv(source_repo, fake_practice, tmp_path, out_dir)) == 0
+    assert calls
+    assert (out_dir / "manifest.yaml").exists()
+
+
+def test_estimate_only_on_an_out_dir_with_prior_run_state_writes_nothing(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    (out_dir / "gepa").mkdir(parents=True)
+    (out_dir / "manifest.yaml").write_text("prior")
+    (out_dir / "gepa" / "gepa_state.bin").write_bytes(b"state")
+
+    def snapshot():
+        return {p.relative_to(out_dir): p.read_bytes() for p in out_dir.rglob("*") if p.is_file()}
+
+    before = snapshot()
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercise-count", "3", "--val-count", "1",
+        "--out-dir", str(out_dir), "--estimate-only",
+    ])
+    assert code == 0
+    assert snapshot() == before
+
+
+def test_refuses_a_leftover_nested_gepa_stop_file(source_repo, fake_practice, tmp_path, monkeypatch):
+    """GEPA adds its own FileStopper at <run_dir>/gepa.stop (run_dir is
+    <out-dir>/gepa), so a leftover there would stop the run at the first
+    check exactly like the top-level one."""
+    from benchmarks.self_improve.live_eval import PolyglotLiveRunner
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(PolyglotLiveRunner, "run_batch", _fake_pass_run_batch(calls))
+    out_dir = tmp_path / "run_out"
+    (out_dir / "gepa").mkdir(parents=True)
+    (out_dir / "gepa" / "gepa.stop").write_text("")
+
+    assert _run_main(_baseline_argv(source_repo, fake_practice, tmp_path, out_dir)) == 1
+    assert calls == []
+    assert (out_dir / "gepa" / "gepa.stop").exists()
+    assert not (out_dir / "manifest.yaml").exists()

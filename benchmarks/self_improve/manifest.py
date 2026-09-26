@@ -82,7 +82,10 @@ class Manifest:
         return cls(**data)
 
     def save(self, path: Path) -> None:
-        Path(path).write_text(yaml.safe_dump(self.to_dict(), sort_keys=False))
+        """Write-once: exclusive create, so saving over an existing manifest
+        raises FileExistsError instead of re-registering a run in place."""
+        with Path(path).open("x") as f:
+            f.write(yaml.safe_dump(self.to_dict(), sort_keys=False))
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
