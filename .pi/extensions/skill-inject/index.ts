@@ -43,10 +43,12 @@ let pinnedSkill: string | null = null;
 // itself contain the original task-triggering language -- without a latch, the
 // directive silently stops firing for the remainder of a long trial the moment
 // it compacts, which is exactly the scenario the compaction-continuation fix
-// in this PR exists for. Sourced from a real trial's task prompt only, on the
-// same first-turn basis the harness already uses to send the actual task
-// instructions -- these are not derived from later, potentially adversarial,
-// tool output.
+// in this PR exists for. Only the raw task-identification predicate latches;
+// the per-turn capability gate (anyShellToolAvailable) is evaluated fresh on
+// every turn from THIS latch, below, not baked into the stored boolean --
+// see the before_agent_start handler for why. Session-scoped like
+// gaia-finalize-guard's own latch (gaia-finalize-guard/index.ts) -- reset on
+// session_start, below, so a `/clear`/`/new` starts genuinely fresh.
 let sawGpt2CheckpointTask = false;
 let sawRamanFittingTask = false;
 
@@ -719,6 +721,22 @@ export default function (pi: ExtensionAPI) {
     shouldInject.reset();
   });
 
+  // `/clear`/`/new` fires session_start, not session_compact -- and
+  // clear-command/index.ts:12 documents that `/clear`/`/new` "resets every
+  // session_start-scoped extension's module state". Unlike session_compact
+  // above, this is a genuine session BOUNDARY: the task-identification
+  // latches must reset here too, or a Raman/gpt2-checkpoint identification
+  // from the PREVIOUS session keeps injecting into an unrelated new one
+  // forever. Mirrors gaia-finalize-guard/index.ts's own
+  // `pi.on("session_start", ...)` latch-reset pattern. Reuses the same
+  // shouldInject.reset() session_compact already calls -- not a second reset
+  // mechanism -- since a fresh session's dedupe must also start clean.
+  pi.on("session_start", async () => {
+    sawGpt2CheckpointTask = false;
+    sawRamanFittingTask = false;
+    shouldInject.reset();
+  });
+
   // Track tool usage across the whole session so recency + error-recovery
   // state is available on the next before_agent_start.
   pi.on("tool_result", async (event) => {
@@ -761,15 +779,23 @@ export default function (pi: ExtensionAPI) {
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
     const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
-    // Latched, not the raw per-turn result -- see sawGpt2CheckpointTask /
-    // sawRamanFittingTask above. Once either has been true on any turn this
-    // session, it stays true for every turn after, including a generic
-    // post-compaction continuation prompt that matches neither predicate on
-    // its own.
-    sawGpt2CheckpointTask ||= shouldInjectGpt2CheckpointDirective(event.prompt ?? "", allowed);
-    sawRamanFittingTask ||= shouldInjectRamanFittingDirective(event.prompt ?? "", allowed);
-    const gpt2CheckpointTask = sawGpt2CheckpointTask;
-    const ramanFittingTask = sawRamanFittingTask;
+    // Only the raw task-identification predicate latches -- see
+    // sawGpt2CheckpointTask / sawRamanFittingTask above. Once either has been
+    // true on any turn this session, it stays true for every turn after,
+    // including a generic post-compaction continuation prompt that matches
+    // neither predicate on its own. The capability gate (anyShellToolAvailable)
+    // is deliberately NOT part of what latches: "a shell tool is available"
+    // is a per-turn fact, not a durable one, so it's ANDed in fresh below
+    // rather than baked into the stored boolean the way
+    // shouldInjectGpt2CheckpointDirective/shouldInjectRamanFittingDirective
+    // do -- baking it in would freeze whatever a turn's allow-list looked
+    // like the moment identification first latched, and keep injecting a
+    // directive whose "verify empirically"/"check the converted value"
+    // advice needs a shell even once a later turn has none.
+    sawGpt2CheckpointTask ||= looksLikeGpt2CheckpointTask(event.prompt ?? "");
+    sawRamanFittingTask ||= looksLikeRamanFittingTask(event.prompt ?? "");
+    const gpt2CheckpointTask = sawGpt2CheckpointTask && anyShellToolAvailable(allowed);
+    const ramanFittingTask = sawRamanFittingTask && anyShellToolAvailable(allowed);
 
     if (
       selected.length === 0 &&
@@ -806,9 +832,14 @@ export default function (pi: ExtensionAPI) {
     // current data) beats research, and the two recurring-task-specific
     // notes (gpt2-checkpoint, raman-fitting) — each naming one exact wrong
     // prior for one fixed task — go last, in no particular order relative to
-    // each other since a prompt can trip at most one of them. Delivered at
-    // the conversation tail (see _shared/inject.ts), which is later still
-    // than the end of the system prompt.
+    // each other. A single prompt can trip only one of the two RAW predicates
+    // (GPT-2 checkpoint parsing and Raman peak-fitting are disjoint tasks),
+    // but the session-scoped latches above mean a session that has visited
+    // both tasks on different turns can have BOTH gpt2CheckpointTask and
+    // ramanFittingTask true at once on a later turn — the ordering here still
+    // applies when that happens. Delivered at the conversation tail (see
+    // _shared/inject.ts), which is later still than the end of the system
+    // prompt.
     const directive =
       (researchTask ? researchDirective(allowed) : "") +
       (temporalTask ? temporalDirective(allowed) : "") +

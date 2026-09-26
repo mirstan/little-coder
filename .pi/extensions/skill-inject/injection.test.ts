@@ -925,6 +925,203 @@ describe("gpt2-checkpoint/raman-fitting identification latches across turns", ()
   });
 });
 
+// Iteration 3 of this PR's own loop. Two distinct regressions introduced by
+// iteration 2's latch (087ee3d), confirmed against that commit:
+//
+// Problem A -- the latches (sawGpt2CheckpointTask / sawRamanFittingTask) and
+// the pre-existing shouldInject dedupe were reset ONLY on session_compact,
+// never on session_start. A `/clear`/`/new` (a session_start event, per
+// clear-command/index.ts:12's documented convention) starts a genuinely new
+// session, but the latch stayed true, so a stale directive kept firing into
+// an unrelated session forever.
+//
+// Problem B -- `sawRamanFittingTask ||= shouldInjectRamanFittingDirective(...)`
+// (and the gpt2-checkpoint equivalent) latched the CONJUNCTION of "this is a
+// raman-fitting session" (durable) and "a shell tool is available THIS turn"
+// (per-turn). Once true, a later turn with no shell tool in its allow-list
+// still got the directive, defeating the capability gate.
+describe("session_start resets the task-identification latches (Problem A) and the capability gate is re-evaluated every turn (Problem B)", () => {
+  const SHELL_ONLY = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"];
+  const NO_SHELL = ["read", "edit"];
+
+  // Mirrors benchmarks/rpc_client.py's COMPACTION_CONTINUE_PROMPT verbatim --
+  // no "Raman"/graphene/band language and no GPT-2/.ckpt language.
+  const GENERIC_CONTINUATION_PROMPT =
+    "Your session context was compacted to free space, which interrupted " +
+    "what you were doing. The task is not complete — please continue from " +
+    "where you left off. If the task is actually already complete and " +
+    "verified, say so explicitly and stop.";
+
+  const RAMAN_PROMPT =
+    "You are given the output file of a Raman Setup. We used it to measure " +
+    "some graphene sample.\n" +
+    'Fit the G and 2D Peak of the spectrum and return the x0, gamma, ' +
+    'amplitude and offset of the peaks and write them to a file called ' +
+    '"/app/results.json".';
+
+  const GPT2_PROMPT =
+    "I have downloaded the gpt-2 weights stored as a TF .ckpt. Write me a " +
+    "dependency-free C file that samples from the model with arg-max " +
+    "sampling. Call your program /app/gpt2.c, I will compile with gcc -O3 " +
+    "-lm. It should read the .ckpt and the .bpe file. Your c program must " +
+    'be <5000 bytes. I will run it /app/a.out gpt2-124M.ckpt vocab.bpe ' +
+    '"[input string here]" and you should continue the output under ' +
+    "whatever GPT-2 would print for the next 20 tokens.";
+
+  // The latch is module-level state, so each test drives a freshly imported
+  // copy rather than leaking a latched identification into its neighbours.
+  async function freshHandlers(): Promise<Record<string, Handler>> {
+    vi.resetModules();
+    const mod = await import("./index.ts");
+    return handlersFor(mod.default);
+  }
+
+  function turnWithTools(prompt: string, allowedTools: string[]) {
+    const event = turn(prompt);
+    event.systemPromptOptions.littleCoder.allowedTools = allowedTools;
+    return event;
+  }
+
+  it("does not inject the raman directive into an unrelated new session after a session_start event, even though the previous session latched it", async () => {
+    const h = await freshHandlers();
+    expect(h.session_start).toBeDefined();
+
+    const first = await h.before_agent_start(turnWithTools(RAMAN_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+
+    // `/clear`/`/new` -- a session_start event -- must reset the latch.
+    await h.session_start({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools("edit the parser to fix an unrelated bug", SHELL_ONLY),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+  });
+
+  it("does not inject the gpt2-checkpoint directive into an unrelated new session after a session_start event, even though the previous session latched it", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turnWithTools(GPT2_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## TF checkpoint format note");
+
+    await h.session_start({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools("edit the parser to fix an unrelated bug", SHELL_ONLY),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+  });
+
+  it("also resets the shouldInject dedupe on session_start, mirroring the existing session_compact reset", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turn("edit the parser"), ctx);
+    expect(first?.message).toBeDefined();
+
+    const second = await h.before_agent_start(turn("edit the parser"), ctx);
+    expect(second).toBeUndefined();
+
+    await h.session_start({}, ctx);
+
+    const third = await h.before_agent_start(turn("edit the parser"), ctx);
+    expect(third?.message).toBeDefined();
+    expect(third.message.content).toBe(first.message.content);
+  });
+
+  it("a fresh session that never triggers either predicate still behaves exactly as before, including across a session_start (regression)", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(
+      turnWithTools("edit the parser to fix the bug", SHELL_ONLY),
+      ctx,
+    );
+    expect(first?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+    expect(first?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+
+    await h.session_start({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools(GENERIC_CONTINUATION_PROMPT, SHELL_ONLY),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+    expect(second?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+  });
+
+  it("does not inject the directive on a later turn with no shell tool available, even though raman-fitting was already latched on an earlier shell-enabled turn", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turnWithTools(RAMAN_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+
+    // Reset the tail-message dedupe so the second turn's block isn't
+    // silently swallowed for being byte-identical to the first -- without
+    // this, a still-buggy capability gate would produce the SAME directive
+    // text again, the dedupe would suppress it, and the assertion below
+    // would pass for the wrong reason (no message at all) rather than
+    // because the gate actually re-evaluated and excluded the directive.
+    await h.session_compact({}, ctx);
+
+    // Same session -- the task-identification latch must still hold -- but
+    // this turn's allow-list has no shell tool, so the capability-gate half
+    // of the old conjunction must be re-evaluated fresh and suppress the
+    // directive rather than firing on the frozen latched conjunction.
+    const second = await h.before_agent_start(
+      turnWithTools(GENERIC_CONTINUATION_PROMPT, NO_SHELL),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+  });
+
+  it("does not inject the gpt2-checkpoint directive on a later shell-less turn either, once identification is latched", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turnWithTools(GPT2_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## TF checkpoint format note");
+
+    await h.session_compact({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools(GENERIC_CONTINUATION_PROMPT, NO_SHELL),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").not.toContain("## TF checkpoint format note");
+  });
+
+  it("still latches the raman-fitting directive across a generic continuation turn within the same session, once a shell tool is available again (regression, iteration 2's own behavior)", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turnWithTools(RAMAN_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+
+    await h.session_compact({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools(GENERIC_CONTINUATION_PROMPT, SHELL_ONLY),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+  });
+
+  it("session_compact does NOT clear the task-identification latches -- only session_start does", async () => {
+    const h = await freshHandlers();
+
+    const first = await h.before_agent_start(turnWithTools(RAMAN_PROMPT, SHELL_ONLY), ctx);
+    expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+
+    // A mid-trial compaction must not un-latch an already-identified task.
+    await h.session_compact({}, ctx);
+
+    const second = await h.before_agent_start(
+      turnWithTools(GENERIC_CONTINUATION_PROMPT, SHELL_ONLY),
+      ctx,
+    );
+    expect(second?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
+  });
+});
+
 describe("knowledge-inject still injects after the #73 conversion", () => {
   // Scoring is word=1.0 / phrase=2.0 against MIN_SCORE_THRESHOLD=2.0, so the
   // prompt needs one phrase keyword or two single-word ones from a shipped
