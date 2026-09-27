@@ -331,8 +331,15 @@ export default function (pi: ExtensionAPI) {
       // Sent independently of the call above, not folded into
       // steerLoopDetection's early-return chain: this is a different signal
       // (no content clustering at all) and can and should fire on the same
-      // turn as a fuzzy/failsig detection, not instead of it.
+      // turn as a fuzzy/failsig detection, not instead of it. markNotified()
+      // is called here, inside the ok-verdict branch, and nowhere in
+      // record() itself: a threshold crossed on a turn that turns out
+      // non-ok (verdict.ok false, this whole branch skipped) must not
+      // silently burn its one notification -- due() keeps reporting it on
+      // the next record() call until a message actually reaches
+      // sendUserMessage.
       if (scriptFailureDetection) {
+        scriptFailureTracker.markNotified();
         harnessIntervention(
           ctx,
           `${scriptFailureDetection.count} script write-run-fail attempts this trial — nudging toward isolating the failing construct.`,
