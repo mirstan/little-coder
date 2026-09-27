@@ -403,17 +403,60 @@ describe("tb-finalize-guard", () => {
       expect(h.sent[0].text).not.toContain(INITIAL_SNAPSHOT_APP_DIR);
     });
 
-    it("strengthens the message when a write happened with no test-invocation since", async () => {
+    it("strengthens the message when a write happened with no test-invocation since a real test seen earlier this session", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
+      // Primes testInvocationEverSeen so the categorical "since your last
+      // test run" claim is warranted (iteration 2: that claim is gated on
+      // having ever seen a real test this session — see the "honest
+      // fallback" tests below for the zero-ever-seen case).
+      await turn(h, shellTurn(["pytest tests/"]));
       await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, no test since
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).toContain(
         "You edited a file since your last test run without re-running your tests",
       );
+    });
+
+    it("uses the honest fallback (not the categorical claim) when no test has ever run this session", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // No test invocation anywhere this session — testInvocationEverSeen
+      // stays false, so the strong "since your last test run" claim (which
+      // presupposes a last test run that never happened) must not fire.
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, zero tests ever
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).toContain("You have not run any tests yet this session");
+    });
+
+    it("keeps testInvocationEverSeen across runs in the same session (session_start-scoped, not before_agent_start)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["pytest tests/"])); // a real test, run 1
+      await startRun(h); // new run, SAME session — before_agent_start must not reset it
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // write, no test this run
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+
+      await newSession(h); // session_start DOES reset it
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // write, zero tests this session
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(2);
+      expect(h.sent[1].text).toContain("You have not run any tests yet this session");
     });
 
     it("does not add the retest clause when a test-invocation ran after the write", async () => {
@@ -444,6 +487,10 @@ describe("tb-finalize-guard", () => {
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
+      // Primes testInvocationEverSeen so this test isolates the heredoc
+      // invariant (dirty stays true) from the separate, session-scoped
+      // categorical-vs-fallback clause choice covered elsewhere.
+      await turn(h, shellTurn(["pytest tests/"]));
       // A heredoc write whose BODY text contains "pytest" — no test invocation
       // actually ran, so the flag must stay dirty (root-cause case (a)).
       await turn(
@@ -457,20 +504,90 @@ describe("tb-finalize-guard", () => {
       );
     });
 
-    it("stays dirty when a chained write follows the turn's only test invocation", async () => {
+    it("no longer stays dirty when a chained write follows the SAME command's own test invocation (iteration 2)", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
-      // Test runs first, then a write, both chained in one command — the
-      // write comes AFTER the only test, so the flag must end the turn dirty
-      // (root-cause case (b), order-blindness).
+      // Iteration 1 made this chain end dirty (strict last-segment-wins).
+      // Iteration 2 found that rule creates a false positive for a test's
+      // own output-handling (`pytest 2>&1 | tee log`, `pytest && echo done
+      // > DONE`) and cannot distinguish that shape from this one using only
+      // per-segment ordering. The accepted fix: once a real test invocation
+      // is seen in a command, a LATER write in that SAME command no longer
+      // re-dirties (see the cross-command test below for the write this
+      // does NOT suppress).
       await turn(h, shellTurn(["python -m pytest && sed -i 's/x/y/' /app/main.py"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still dirties on a write in a DIFFERENT, later command even after the same turn's test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Guards against over-suppression: the same-command carve-out above
+      // must not silently swallow a write that is its own separate command.
+      await turn(h, shellTurn(["pytest tests/", "echo done > /app/DONE"]));
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).toContain(
         "You edited a file since your last test run without re-running your tests",
       );
+    });
+
+    it("does not re-dirty on a pipe to the test's own output (pytest 2>&1 | tee log)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Root-cause case 1 (the new regression): the pipe's second segment
+      // is a non-scratch write, and being last in execution order, iteration
+      // 1's strict last-wins rule wrongly re-dirtied the flag even though
+      // this is the test's own output being logged, not a deliverable edit.
+      await turn(h, shellTurn(["pytest 2>&1 | tee /app/test.log"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).not.toContain("You have not run any tests yet this session");
+    });
+
+    it("does not re-dirty on a test chained with a redirect of its own output (pytest && echo done > DONE)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["pytest && echo done > /app/DONE"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).not.toContain("You have not run any tests yet this session");
+    });
+
+    it("a plain redirect that merely writes the word 'pytest' as file content is not a test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Root-cause case 2: `echo pytest > file` must not be read as running
+      // pytest — it writes the word "pytest" as file content. No real test
+      // has ever run this session, so the flag stays dirty AND the message
+      // must use the honest fallback, not the categorical claim.
+      await turn(h, shellTurn(["echo pytest > /app/result.txt"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).toContain("You have not run any tests yet this session");
     });
 
     it("still clears the flag for a real, unquoted, unchained test invocation", async () => {
@@ -519,6 +636,11 @@ describe("tb-finalize-guard", () => {
         // command must not match — "make test" here sits inside the commit
         // message, not on the command line.
         "git commit -m 'make test pass'",
+        // Iteration 2 root-cause case 2: a plain (non-heredoc) redirect that
+        // writes the word "pytest" as file content, unquoted, is not a test
+        // invocation — the runner name must be the command being run, not an
+        // argument to an unrelated command like `echo`.
+        "echo pytest > /app/result.txt",
       ];
       for (const cmd of negatives) expect(looksLikeTestInvocation(cmd)).toBe(false);
     });

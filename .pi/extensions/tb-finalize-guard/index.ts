@@ -262,6 +262,11 @@ let triggerBFired = false;
 // is seen (or the run resets). Strengthens Trigger A's message with an
 // explicit "you edited without retesting" clause -- a mechanically-checkable
 // signal, not a claim about the edit's intent (see looksLikeTestInvocation).
+// Since iteration 2, a write is judged per COMMAND, not per whole-turn last-
+// wins: a later write in the SAME command as an already-seen real test does
+// not re-set this (see the turn_end loop below) -- only a write in a
+// different command, or one that precedes every test in its own command,
+// does.
 let dirtySinceLastTest = false;
 
 // ---- Trigger C state ----
@@ -280,6 +285,17 @@ let lastTurnMessage: any = undefined;
 // not change within a session.
 let milestonesFired = new Set<number>();
 let deliverableWriteEverSeen = false;
+// True once a real, unquoted test invocation has EVER been observed in the
+// session -- session-scoped like deliverableWriteEverSeen (same
+// session_start reset point, never reset by before_agent_start, so a later
+// run in the same session doesn't lose evidence an earlier run established).
+// Gates whether buildTriggerAMessage's dirty clause may assert the
+// categorical "you edited a file since your last test run" claim: that
+// claim presupposes a last test run that may never have happened (iteration
+// 2, root-cause case 3 -- no test suite, or one whose only runner is absent
+// from TEST_INVOCATION_PATTERNS). When this is still false, a non-scratch
+// write gets the honest fallback clause instead (see buildTriggerAMessage).
+let testInvocationEverSeen = false;
 let startForRun = 0;
 // Run-scoped: which turn (if any) Trigger D fired at, so Trigger A's own
 // turn_end for that SAME turn can skip -- both are separately queued
@@ -314,32 +330,39 @@ const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
 // Heuristic, not exhaustive -- a command-name allowlist can't cover every
 // language/framework's test invocation. A false negative here (an unlisted
 // runner -- vitest, jest, tox, ctest, etc. are all absent from the list
-// below, and note this repo's own test command is `npx vitest run`) does
-// NOT mean the clause below simply fails to fire: `dirtySinceLastTest` stays
-// true and the retest-nudge clause fires anyway, wrongly accusing a model
-// that just re-ran its tests through a runner this list doesn't recognize.
-// That is the costlier direction, and it is not rare -- it fires on every
-// turn whose only test run used an unlisted runner.
+// below, and note this repo's own test command is `npx vitest run`) no
+// longer forces a false accusation the way it did before iteration 2:
+// `testInvocationEverSeen` (above) gates the categorical "since your last
+// test run" claim, so a session that never triggers a RECOGNIZED runner
+// gets the honest "no tests observed" fallback instead (root-cause case 3;
+// see buildTriggerAMessage). One narrower window remains -- a session whose
+// FIRST test run used a recognized runner (so `testInvocationEverSeen` is
+// already true) can still be wrongly accused if a LATER retest used only an
+// unlisted one -- but the common, previously-unconditional case (no
+// recognized runner ever seen all session) is fixed. The pattern LIST itself
+// staying incomplete is still a separate, not-yet-filed concern.
 //
 // A false positive (matching text that never executed as a test at all --
-// inside a heredoc body, a comment, or a quoted string) is the direction
-// that gets silently SUPPRESSED instead: the clause simply doesn't fire when
-// it should have. That is also not rare -- `cat > file <<'EOF'` bodies that
-// merely mention a runner name, and a quoted string like
-// `git commit -m 'make test pass'`, both hit it easily. Matching against
-// per-segment, quote-aware text (see `looksLikeTestInvocation` below, and
-// where it's called against `splitCommandChain` segments in `turn_end`)
-// closes the heredoc/quoting/ordering gaps; the pattern LIST itself staying
-// incomplete (the false-negative direction above) is a separate,
-// not-yet-filed concern.
+// inside a heredoc body, a comment, a quoted string, or as a plain unquoted
+// ARGUMENT to some other command, e.g. `echo pytest > file` -- iteration 2
+// root-cause case 2) is the direction that gets silently SUPPRESSED instead:
+// the clause simply doesn't fire when it should have. That is also not rare
+// -- `cat > file <<'EOF'` bodies that merely mention a runner name, and a
+// quoted string like `git commit -m 'make test pass'`, both hit it easily.
+// Matching against per-segment, quote-aware text ANCHORED to the start of
+// the segment (see `looksLikeTestInvocation` below, and where it's called
+// against `splitCommandChain` segments in `turn_end`) closes the
+// heredoc/quoting/ordering gaps and the "runner name used only as another
+// command's argument" gap; the pattern LIST itself staying incomplete (the
+// false-negative direction above) is a separate, not-yet-filed concern.
 const TEST_INVOCATION_PATTERNS: RegExp[] = [
-  /\bpytest\b/, /\bpy\.test\b/, /\bpython3?\s+-m\s+pytest\b/,
-  /\bpython3?\s+-m\s+unittest\b/,
-  /\bgo\s+test\b/, /\bcargo\s+test\b/,
-  /\bnpm\s+(run\s+)?test\b/, /\byarn\s+test\b/,
-  /\bmake\s+(test|check)\b/,
-  /\brspec\b/, /\brake\s+test\b/,
-  /\bmvn\s+test\b/, /\bgradle\s+test\b/,
+  /^pytest\b/, /^py\.test\b/, /^python3?\s+-m\s+pytest\b/,
+  /^python3?\s+-m\s+unittest\b/,
+  /^go\s+test\b/, /^cargo\s+test\b/,
+  /^npm\s+(run\s+)?test\b/, /^yarn\s+test\b/,
+  /^make\s+(test|check)\b/,
+  /^rspec\b/, /^rake\s+test\b/,
+  /^mvn\s+test\b/, /^gradle\s+test\b/,
 ];
 
 /**
@@ -365,10 +388,16 @@ function maskQuotedText(cmd: string): string {
  * command segment (see `splitCommandChain`) -- contains a real, unquoted
  * test-runner invocation. Quoted/escaped text is masked out first (see
  * `maskQuotedText`) so a runner name embedded in a string literal, rather
- * than on the command line itself, cannot match.
+ * than on the command line itself, cannot match. `TEST_INVOCATION_PATTERNS`
+ * is anchored (`^`) against the masked text with leading whitespace trimmed,
+ * not matched anywhere in the segment -- so a runner name that only appears
+ * as an unquoted ARGUMENT to some other command (`echo pytest >
+ * /app/result.txt` -- iteration 2 root-cause case 2) does not match: the
+ * segment must actually START with the invocation, not merely contain its
+ * name somewhere after another command word.
  */
 export function looksLikeTestInvocation(cmd: string): boolean {
-  const unquoted = maskQuotedText(cmd);
+  const unquoted = maskQuotedText(cmd).trimStart();
   return TEST_INVOCATION_PATTERNS.some((re) => re.test(unquoted));
 }
 
@@ -410,6 +439,7 @@ export default function (pi: ExtensionAPI) {
     triggerCFireCount = 0;
     milestonesFired = new Set<number>();
     deliverableWriteEverSeen = false;
+    testInvocationEverSeen = false;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -467,18 +497,35 @@ export default function (pi: ExtensionAPI) {
     // raw text: each command is split into its chained segments in order
     // (splitCommandChain already strips heredoc bodies first), and each
     // segment in turn can set the flag (a non-scratch write) or clear it (a
-    // real, unquoted test invocation) -- so the LAST writer/tester in
-    // execution order wins for the turn, rather than "did either pattern
+    // real, unquoted test invocation) -- rather than "did either pattern
     // appear anywhere in the turn's raw text" (which let a heredoc body's
     // mention of a runner name, or a write that happened before the turn's
     // only test, wrongly clear the flag -- root-cause cases (a) and (b)).
-    // Within one segment a write is still set before the test check can
-    // clear it, preserving the original same-segment ordering.
+    //
+    // Iteration 2: strict last-writer-wins per turn (iteration 1's rule)
+    // created a NEW false positive -- a command whose real test invocation
+    // is immediately followed, in the SAME command, by a write that is
+    // plausibly the test's own output-handling (`pytest 2>&1 | tee log`,
+    // `pytest && echo done > DONE`) got wrongly re-dirtied by that later
+    // segment. `sawRealTestInThisCommand` is scoped to one `cmd` (reset for
+    // each command in `commandsThisTurn`): once a real test invocation is
+    // seen in a command, a LATER write in that SAME command no longer
+    // re-dirties -- but a write in a DIFFERENT, later command still dirties
+    // normally, and a write that PRECEDES every test in its own command
+    // still dirties too (same-segment ordering, and same-command
+    // write-before-test, are both preserved). `testInvocationEverSeen` is
+    // session-scoped (see its declaration) and gates the message clause
+    // (see buildTriggerAMessage), not this flag.
     for (const cmd of commandsThisTurn) {
+      let sawRealTestInThisCommand = false;
       for (const segment of splitCommandChain(cmd)) {
         const nonScratchWrite = detectDeliverableWrites(segment).some((w) => !isScratchPath(w.path));
-        if (nonScratchWrite) dirtySinceLastTest = true;
-        if (looksLikeTestInvocation(segment)) dirtySinceLastTest = false;
+        if (nonScratchWrite && !sawRealTestInThisCommand) dirtySinceLastTest = true;
+        if (looksLikeTestInvocation(segment)) {
+          dirtySinceLastTest = false;
+          sawRealTestInThisCommand = true;
+          testInvocationEverSeen = true;
+        }
       }
     }
 
@@ -527,11 +574,16 @@ const RESTORE_RESTRAINT =
  *
  * `baseline` is the start-of-trial copy's outcome, or undefined to say
  * nothing about it at all (see _shared/snapshot-paths.ts).
+ *
+ * `testInvocationEverSeen` gates which dirty clause fires (see below): the
+ * categorical "since your last test run" claim presupposes a last test run
+ * that may never have happened.
  */
 export function buildTriggerAMessage(
   minutesLeft: number,
   baseline: InitialSnapshotOutcome | undefined,
   dirtySinceLastTest: boolean = false,
+  testInvocationEverSeen: boolean = false,
 ): string {
   // (1) names a verification protocol rather than asking for a "spot-check":
   // both observed failures were re-checks incapable of failing. (2)/(3)
@@ -552,8 +604,11 @@ export function buildTriggerAMessage(
 
   const dirtyClause = !dirtySinceLastTest
     ? ""
-    : "You edited a file since your last test run without re-running your tests " +
-      "afterward — re-run them against this exact change before considering it done. ";
+    : testInvocationEverSeen
+      ? "You edited a file since your last test run without re-running your tests " +
+        "afterward — re-run them against this exact change before considering it done. "
+      : "You have not run any tests yet this session — if this task has a test " +
+        "suite, run it before considering this done. ";
 
   return (
     `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
@@ -681,7 +736,12 @@ function maybeFireTriggerA(
   if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   const minutesLeft = Math.max(0, Math.round(remainingMs / 60000));
-  const msg = buildTriggerAMessage(minutesLeft, initialSnapshotOutcome(), dirtySinceLastTest);
+  const msg = buildTriggerAMessage(
+    minutesLeft,
+    initialSnapshotOutcome(),
+    dirtySinceLastTest,
+    testInvocationEverSeen,
+  );
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });
