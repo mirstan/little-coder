@@ -3,7 +3,7 @@ name: stochastic-training-variance
 type: domain-knowledge
 topic: Stochastic Training Variance Near a Threshold
 token_cost: 150
-keywords: [train, accuracy, classifier, fasttext, epoch, hyperparameter, accuracy threshold, training run, random seed, cross validation, test set, at least 0]
+keywords: [train, accuracy, classifier, fasttext, epoch, hyperparameter, accuracy threshold, training run, random seed, cross-validation]
 user-invocable: false
 ---
 Training a model is not a single deterministic measurement -- random weight

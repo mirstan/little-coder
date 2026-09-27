@@ -127,11 +127,24 @@ describe("stochastic-training-variance entry", () => {
   // scorer: "deterministic"+"reproducible", "validation"+"threshold",
   // "classifier"+"training"). Unlike the gpt2 test, this one can actually
   // fail if a future keyword edit reopens the boundary.
+  //
+  // spec iter2-f00, truth 1: two more prompts below pin the phrase-keyword
+  // boundary the iteration-1 fix itself reopened -- `test set` and
+  // `at least 0` were still in the keyword list and, being phrase keywords,
+  // fired the entry alone (2.0 >= MIN_SCORE_THRESHOLD) on ANY prompt
+  // containing that substring, ML or not (verified by hand against the real
+  // scorer before the fix: all four scored 2.0). Both keywords are now
+  // removed from the frontmatter; these four pin the boundary against a
+  // future edit reintroducing either one.
   it("does not fire on prompts that share old keywords but describe no training run or metric threshold", () => {
     const falsePositives = [
       "make the pipeline deterministic and reproducible",
       "add validation and a threshold check",
       "Refactor the spam classifier module for readability; do not change training behaviour.",
+      "Run the test setup script in /app and make sure it exits cleanly.",
+      "Restore the sqlite db and verify the integrity check passes on the test set.",
+      "Write a compressor. The compression ratio must be at least 0.8 on the provided corpus.",
+      "I need a build script; the coverage gate is at least 0.9 line coverage.",
     ];
     for (const prompt of falsePositives) {
       expect(scoreEntry(prompt, entry(keywords)), prompt).toBeLessThan(MIN_SCORE_THRESHOLD);
@@ -208,14 +221,16 @@ describe("knowledge-inject real selection/budget path", () => {
     }
 
     // Computed, not assumed: on this prompt the corrected entry's real score
-    // (train + fasttext + accuracy + "test set" + "at least 0") is high
-    // enough that it still consumes enough of the 200-token budget to keep
-    // Workspace Documentation out, even at the honest cost of 150 -- the
-    // original bug (a false-cheap declared cost) is fixed, but the greedy
-    // budget-fit ALGORITHM is unchanged and out of scope for this fix (spec
-    // iter1-f00). This pins the corrected-cost outcome so a future edit to
-    // either file re-computes it rather than silently reintroducing (or
-    // silently "fixing") the eviction.
+    // (train + fasttext + accuracy = 3.0, post spec iter2-f00's removal of
+    // the "test set" and "at least 0" phrase keywords that used to inflate
+    // this same score to 7.0) is still >= MIN_SCORE_THRESHOLD and high
+    // enough in the sort that it consumes enough of the 200-token budget to
+    // keep Workspace Documentation out, even at the honest cost of 150 --
+    // the original bug (a false-cheap declared cost) is fixed, but the
+    // greedy budget-fit ALGORITHM is unchanged and out of scope for this fix
+    // (spec iter1-f00). This pins the corrected-cost outcome so a future
+    // edit to either file re-computes it rather than silently reintroducing
+    // (or silently "fixing") the eviction.
     expect(selected).toContain("Stochastic Training Variance Near a Threshold");
     expect(selected).not.toContain("Workspace Documentation");
     expect(used).toBe(150);
