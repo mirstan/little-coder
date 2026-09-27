@@ -232,13 +232,14 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // deadlineForRun's own once-per-run resolution. Both regexes are
 // false-negative-biased by design: if either fails to find a single
 // confident match, this trigger stays permanently inert for the run rather
-// than guessing. For the byte limit, "a single confident match" also folds
-// in ambiguity: a prompt stating two DIFFERENT sizes (see `parseByteLimit`'s
-// own doc comment) is treated the same as no match at all, rather than
-// resolved to whichever the regex happens to reach first. A guard armed with
-// the wrong path or the wrong limit is worse than one that never fires -- it
-// would tell the model to golf a file that isn't the deliverable, or accept
-// a size that isn't the real cap.
+// than guessing. For both, "a single confident match" also folds in
+// ambiguity: a prompt stating two DIFFERENT sizes, or naming two DISTINCT
+// candidate deliverable paths (see `parseByteLimit`'s and
+// `parseDeliverablePath`'s own doc comments), is treated the same as no match
+// at all, rather than resolved to whichever the regex happens to reach
+// first. A guard armed with the wrong path or the wrong limit is worse than
+// one that never fires -- it would tell the model to golf a file that isn't
+// the deliverable, or accept a size that isn't the real cap.
 //
 // Getting the real byte count reuses syntax-check's own solution to the
 // adjacent problem of reaching a file that lives in the TB container: the
@@ -251,11 +252,14 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // not be allowed to interpret. The per-turn check
 // (`maybeCheckDeliverableSize`) only runs on a turn whose commands actually
 // touched the parsed deliverable path -- a turn doing unrelated work pays
-// nothing -- with one exception: `maybeCheckDeliverableSizeAtEnd` always
-// re-checks once at `agent_end`, regardless of what (if anything) the run's
-// own last turn touched, so a deliverable that regressed over budget
-// earlier and was then only compiled/run -- or never touched again -- for
-// the rest of the run still gets a corrective nudge before the trial ends.
+// nothing -- with one exception: `maybeCheckDeliverableSizeAtEnd` re-checks
+// once at `agent_end` regardless of what (if anything) the run's own last
+// turn touched, so a deliverable that regressed over budget earlier and was
+// then only compiled/run -- or never touched again -- for the rest of the
+// run still gets a corrective nudge before the trial ends. It stands down,
+// like Trigger C, on an aborted run or at the turn-cap, and the `agent_end`
+// handler skips it outright when Trigger C already fired on the same event
+// -- see `maybeCheckDeliverableSizeAtEnd`'s own comment.
 //
 // The over-budget count is session- rather than run-scoped: it tracks a
 // property of the whole trial's deliverable, so a mid-run compaction
@@ -348,6 +352,10 @@ let triggerDFiredAtTurn = 0;
 // confident single match (yet)" and leaves this trigger inert until one
 // resolves, never guessed at.
 let byteLimitForRun: number | undefined;
+// Latched alongside byteLimitForRun, from the same parse -- see
+// `parseByteLimitDetails`'s own doc comment for what inclusive/exclusive
+// means for the comparator sites below.
+let byteLimitInclusiveForRun: boolean | undefined;
 let deliverablePathForRun: string | undefined;
 // Session-scoped: the over-budget count and last known size are properties
 // of the whole trial's deliverable, not one run segment, so a mid-run
@@ -462,13 +470,52 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // 5000 bytes" used to parse as a 5000-byte ceiling. The other alternatives
 // don't have a floor-shaped negation in ordinary prose, so only this one
 // needs the guard.
+//
+// The word alternation is its own capture group (group 1) so
+// `byteLimitCandidates` can tell which phrasing actually matched: "at most"
+// and "no more than" state an INCLUSIVE upper bound (exactly N is
+// compliant), while every other alternative here -- "under"/"below"/"less
+// than", the bare "must be" fallback, and the symbolic "<" (which leaves
+// group 1 undefined) -- states an EXCLUSIVE one (exactly N is over budget).
+// See `parseByteLimitDetails`.
 const BYTE_LIMIT_RE =
-  /(?:\b(?:under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+  /(?:\b(under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+
+/** True when `phrase` (BYTE_LIMIT_RE's own group 1) states an inclusive upper bound. */
+function isInclusivePhrase(phrase: string | undefined): boolean {
+  return phrase !== undefined && /^(?:at\s+most|no\s+more\s+than)$/i.test(phrase);
+}
 
 // An absolute path stated near an instruction verb, e.g. "Call your program
-// /app/gpt2.c".
+// /app/gpt2.c". An optional surrounding quote/backtick right after the verb
+// phrase is consumed but not captured (e.g. "save it as `/app/out.c`") --
+// without it the leading quote character sits where the pattern requires a
+// literal "/", so the whole phrase fails to match at all; a trailing
+// quote/backtick is handled separately, by `stripTrailingPunctuation` below,
+// since `\S+` can't tell it apart from a path character while capturing.
 const DELIVERABLE_PATH_RE =
-  /\b(?:call\s+your\s+\w+|save\s+(?:it|your\s+\w+)\s+(?:as|to)|write\s+(?:it|your\s+\w+)\s+to|program\s+(?:at|to))\s+(\/\S+)/i;
+  /\b(?:call\s+your\s+\w+|save\s+(?:it|your\s+\w+)\s+(?:as|to)|write\s+(?:it|your\s+\w+)\s+to|program\s+(?:at|to))\s+[`"']?(\/\S+)/i;
+
+/** Strips trailing sentence punctuation and a closing quote/backtick -- no real deliverable path ends in one. */
+function stripTrailingPunctuation(path: string): string {
+  return path.replace(/[`"'.,;:!?]+$/, "");
+}
+
+/**
+ * Every DELIVERABLE_PATH_RE match in `prompt`, normalized the same way
+ * `parseDeliverablePath` returns them. Matches a fresh global clone, mirroring
+ * `byteLimitCandidates`'s own reason for not mutating the shared const.
+ */
+function deliverablePathCandidates(prompt: string): string[] {
+  const re = new RegExp(DELIVERABLE_PATH_RE.source, DELIVERABLE_PATH_RE.flags + "g");
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(prompt))) {
+    out.push(stripTrailingPunctuation(m[1]));
+    if (re.lastIndex === m.index) re.lastIndex++; // guard against a zero-length match looping forever
+  }
+  return out;
+}
 
 // A per-item quantifier opening the SAME sentence as a byte-limit match --
 // "each record must be 64 bytes" states a per-record size, not the
@@ -506,23 +553,28 @@ function sentenceBounds(prompt: string, at: number): { start: number; end: numbe
 /**
  * Every BYTE_LIMIT_RE match in `prompt`, each normalized to bytes and flagged
  * `disqualified` when its own sentence's context (see the two RE's above)
- * marks it as being about something other than the deliverable's own size.
+ * marks it as being about something other than the deliverable's own size,
+ * plus `inclusive` per `isInclusivePhrase` on the phrase actually matched
+ * (group 1 -- undefined for the bare symbolic "<" match, which is exclusive).
  * Matches a fresh global clone of BYTE_LIMIT_RE rather than mutating the
  * shared const -- BYTE_LIMIT_RE itself stays a plain non-global pattern for
  * every other caller.
  */
-function byteLimitCandidates(prompt: string): { value: number; disqualified: boolean }[] {
+function byteLimitCandidates(
+  prompt: string,
+): { value: number; disqualified: boolean; inclusive: boolean }[] {
   const re = new RegExp(BYTE_LIMIT_RE.source, BYTE_LIMIT_RE.flags + "g");
-  const out: { value: number; disqualified: boolean }[] = [];
+  const out: { value: number; disqualified: boolean; inclusive: boolean }[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(prompt))) {
-    const unit = m[2].toLowerCase();
-    const value = unit.startsWith("k") ? Number(m[1]) * 1024 : Number(m[1]);
+    const unit = m[3].toLowerCase();
+    const value = unit.startsWith("k") ? Number(m[2]) * 1024 : Number(m[2]);
+    const inclusive = isInclusivePhrase(m[1]);
     const { start, end } = sentenceBounds(prompt, m.index);
     const before = prompt.slice(start, m.index);
     const after = prompt.slice(m.index + m[0].length, end);
     const disqualified = PER_ITEM_QUALIFIER_RE.test(before) || OUTPUT_QUALIFIER_RE.test(after);
-    out.push({ value, disqualified });
+    out.push({ value, disqualified, inclusive });
     if (re.lastIndex === m.index) re.lastIndex++; // guard against a zero-length match looping forever
   }
   return out;
@@ -540,30 +592,56 @@ function byteLimitCandidates(prompt: string): { value: number; disqualified: boo
  * be 64 bytes; the program must be under 5000 bytes" used to return 64 (the
  * unrelated per-record constraint). Exported for the smoke test against the
  * real gpt2-codegolf prompt.
+ *
+ * A thin wrapper over `parseByteLimitDetails` that drops the inclusive/
+ * exclusive distinction that function also reports -- kept for callers (and
+ * tests) that only need the numeric value.
  */
 export function parseByteLimit(prompt: string): number | undefined {
+  return parseByteLimitDetails(prompt)?.value;
+}
+
+/**
+ * Like `parseByteLimit`, but also reports whether the phrasing that resolved
+ * `value` is an INCLUSIVE upper bound ("at most N"/"no more than N", where
+ * exactly N is compliant) or an EXCLUSIVE one ("under N"/"below N"/"less
+ * than N"/"<N", and the bare "must be" fallback -- its originally documented
+ * intent -- where exactly N is already over budget). Confirmed regression
+ * this replaces: every parsed limit used to be enforced as a strict ceiling
+ * regardless of phrasing, so "at most 5000 bytes" (where exactly 5000 is
+ * compliant) was enforced identically to "<5000 bytes" (where it isn't).
+ */
+export function parseByteLimitDetails(
+  prompt: string,
+): { value: number; inclusive: boolean } | undefined {
   const candidates = byteLimitCandidates(prompt).filter((c) => !c.disqualified);
   if (candidates.length === 0) return undefined;
   const distinctValues = new Set(candidates.map((c) => c.value));
   if (distinctValues.size > 1) return undefined;
-  return candidates[0].value;
+  return { value: candidates[0].value, inclusive: candidates[0].inclusive };
 }
 
 /**
- * The deliverable's absolute path stated in the prompt. Undefined when the
- * pattern doesn't match at all -- first-match, and unlike `parseByteLimit`
- * above (which is now ambiguity-checked, see there), this parser has no
- * equivalent disambiguation: a prompt with two candidate paths still
- * resolves to whichever DELIVERABLE_PATH_RE reaches first. Narrow enough
- * that no task in the current suite exercises it. Trailing sentence
- * punctuation (a comma or period immediately after the path, as in "Call
- * your program /app/gpt2.c, I will compile...") is stripped -- `\S+` has no
- * way to distinguish it from a path character, and no real deliverable path
- * ends in one.
+ * The deliverable's absolute path stated in the prompt. Undefined when
+ * DELIVERABLE_PATH_RE doesn't match at all, OR -- mirroring `parseByteLimit`'s
+ * own ambiguity handling above -- when more than one DISTINCT absolute path
+ * survives across the whole prompt: a prompt naming both an input and an
+ * output path (e.g. "Write your input to /app/in, save your output to
+ * /app/out") can trigger this pattern on each clause, and neither match is
+ * more textually "the deliverable" than the other, so this returns undefined
+ * rather than guessing whichever DELIVERABLE_PATH_RE reaches first. Trailing
+ * sentence punctuation and a closing quote/backtick (a comma or period
+ * immediately after the path, as in "Call your program /app/gpt2.c, I will
+ * compile...", or a backtick/quote closing a quoted path) are stripped --
+ * `\S+` has no way to distinguish them from a path character, and no real
+ * deliverable path ends in one.
  */
 export function parseDeliverablePath(prompt: string): string | undefined {
-  const m = DELIVERABLE_PATH_RE.exec(prompt);
-  return m ? m[1].replace(/[.,;:!?]+$/, "") : undefined;
+  const candidates = deliverablePathCandidates(prompt);
+  if (candidates.length === 0) return undefined;
+  const distinct = new Set(candidates);
+  if (distinct.size > 1) return undefined;
+  return candidates[0];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -577,6 +655,7 @@ export default function (pi: ExtensionAPI) {
     consecutiveOverBudgetChecks = 0;
     triggerEEndFireCount = 0;
     byteLimitForRun = undefined;
+    byteLimitInclusiveForRun = undefined;
     deliverablePathForRun = undefined;
   });
 
@@ -595,7 +674,9 @@ export default function (pi: ExtensionAPI) {
     // see the state comment above for why re-parsing unconditionally here
     // would erase an already-resolved limit/path.
     if (byteLimitForRun === undefined) {
-      byteLimitForRun = parseByteLimit((event as any).prompt ?? "");
+      const details = parseByteLimitDetails((event as any).prompt ?? "");
+      byteLimitForRun = details?.value;
+      byteLimitInclusiveForRun = details?.inclusive;
     }
     if (deliverablePathForRun === undefined) {
       deliverablePathForRun = parseDeliverablePath((event as any).prompt ?? "");
@@ -649,7 +730,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (!isTerminalBench()) return;
-    maybeFireTriggerC(pi, ctx);
+    const firedC = maybeFireTriggerC(pi, ctx);
+    if (firedC) return; // precedence: don't stack Trigger E's own nudge on Trigger C's
     await maybeCheckDeliverableSizeAtEnd(pi, ctx);
   });
 }
@@ -909,11 +991,17 @@ function maybeAdvanceTriggerB(pi: ExtensionAPI, ctx: any, wroteDeliverable: bool
   );
 }
 
-function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
-  if (triggerCFireCount >= MAX_TRIGGER_C_FIRES) return;
+// Returns whether this actually fired (sent a steer) -- same shape as
+// `maybeFireTriggerA`'s own boolean return, used by the `agent_end` handler
+// to give this trigger precedence over `maybeCheckDeliverableSizeAtEnd` on
+// the same event: both can plausibly fire off the same settled run, and
+// stacking Trigger E's own nudge on top of this one's would be a second,
+// contradictory steer.
+function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): boolean {
+  if (triggerCFireCount >= MAX_TRIGGER_C_FIRES) return false;
 
   const last = lastTurnMessage;
-  if (!last) return;
+  if (!last) return false;
 
   // Aborted runs are a harness decision (thinking-budget's ctx.abort,
   // turn-cap, a user Esc), not a dead run — and thinking-budget in
@@ -923,12 +1011,12 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
   // only thinking tokens had streamed leaves a message with zero text and
   // zero tool calls (thinking blocks are invisible to contentShape), which
   // would otherwise slip through the isEmpty path below.
-  if (last.stopReason === "aborted") return;
+  if (last.stopReason === "aborted") return false;
 
   const { text, toolCallCount } = contentShape(last);
   const isEmpty = text.trim().length === 0 && toolCallCount === 0;
   const isError = last.stopReason === "error";
-  if (!isEmpty && !isError) return;
+  if (!isEmpty && !isError) return false;
 
   // Turn-cap consistency: at settled time a steer starts a FRESH run
   // (before_agent_start re-fires, resetting turn-cap's counter), so unlike
@@ -936,7 +1024,7 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
   // would hand a capped-out run an entire new turn budget, overriding
   // turn-cap's policy decision to end the run. Stand down at the cap, same
   // clause as Triggers A/B.
-  if (capForRun > 0 && turnsThisRun >= capForRun) return;
+  if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   // Near-deadline framing check. `armed` is Trigger B's run-scoped latch,
   // set at turn_start when finalizeWarnWouldFire is true — reusing it here
@@ -960,7 +1048,7 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
   } catch {
     // Don't burn the fire count or notify for a nudge that was never
     // actually delivered — mirrors Trigger A/B's own ordering.
-    return;
+    return false;
   }
   triggerCFireCount++;
   harnessIntervention(
@@ -971,6 +1059,7 @@ function maybeFireTriggerC(pi: ExtensionAPI, ctx: any): void {
         ? "telling the model to save its best-effort result now."
         : "telling the model to retry and keep working."),
   );
+  return true;
 }
 
 function maybeFireTriggerD(pi: ExtensionAPI, ctx: any): void {
@@ -1068,10 +1157,14 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
     if (size === null) return;
     lastKnownSize = size;
 
-    // Strict "<N bytes", not "<=N": a file of exactly the stated limit is
-    // still over budget. Confirmed regression this replaces: `<= ` treated
-    // an exactly-N-byte file as compliant.
-    if (size < byteLimitForRun) {
+    // Strict "<N bytes" for an EXCLUSIVE limit, "<=N" for an INCLUSIVE one
+    // ("at most"/"no more than" -- see `parseByteLimitDetails`): a file of
+    // exactly the stated limit is over budget only under the exclusive
+    // reading. Confirmed regression this replaces: every parsed limit used
+    // to be enforced as a strict exclusive ceiling regardless of phrasing,
+    // so an inclusive "at most N" wrongly flagged an exactly-N-byte file.
+    const compliant = byteLimitInclusiveForRun ? size <= byteLimitForRun : size < byteLimitForRun;
+    if (compliant) {
       consecutiveOverBudgetChecks = 0;
       return;
     }
@@ -1109,14 +1202,22 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
     // OVER_BUDGET_CHECKS_BEFORE_NUDGE consecutive over-budget checks, rather
     // than firing on every check once the threshold is first crossed.
     consecutiveOverBudgetChecks = 0;
-    harnessIntervention(
-      ctx,
-      `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
-        `${byteLimitForRun}-byte limit stated in the task` +
-        (nearDeadline
-          ? " — near deadline, telling the model to save its best version."
-          : " — telling the model to keep golfing."),
-    );
+    try {
+      // The steer above already landed; a stale `ctx` after an await that
+      // crossed a session-replacing abort/compaction boundary must not
+      // throw this diagnostic-only notify out of the awaited turn_end
+      // handler.
+      harnessIntervention(
+        ctx,
+        `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
+          `${byteLimitForRun}-byte limit stated in the task` +
+          (nearDeadline
+            ? " — near deadline, telling the model to save its best version."
+            : " — telling the model to keep golfing."),
+      );
+    } catch {
+      // Nothing else to do -- the steer already went out.
+    }
   })();
 }
 
@@ -1137,16 +1238,31 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
  * later turn at `agent_end` for a cooldown to wait out), and its own fire
  * count (`triggerEEndFireCount`/`MAX_TRIGGER_E_END_FIRES`) is independent of
  * `consecutiveOverBudgetChecks`.
+ *
+ * Mirrors `maybeFireTriggerC`'s own two stand-downs -- abort check first,
+ * then turn-cap -- since both run off the same `agent_end` and this one
+ * used to have neither: an aborted run (thinking-budget's abort-then-recover
+ * sequencing, a context-watchdog compaction resume) must not receive a
+ * second, contradictory steer stacked on the queued recovery message, and a
+ * run that ended at its turn-cap has no later turn for a corrective nudge to
+ * land on anyway (same reasoning as Trigger C's own turn-cap clause). The
+ * `agent_end` handler additionally skips calling this at all when Trigger C
+ * itself fired on the same event -- see there.
  */
 function maybeCheckDeliverableSizeAtEnd(pi: ExtensionAPI, ctx: any): Promise<void> {
   return (async () => {
     if (deliverablePathForRun === undefined || byteLimitForRun === undefined) return;
     if (triggerEEndFireCount >= MAX_TRIGGER_E_END_FIRES) return;
+    if (lastTurnMessage?.stopReason === "aborted") return;
+    if (capForRun > 0 && turnsThisRun >= capForRun) return;
 
     const size = await checkDeliverableSize(ctx as ProxyUiCtx, deliverablePathForRun);
     if (size === null) return;
     lastKnownSize = size;
-    if (size < byteLimitForRun) return; // compliant -- nothing to say
+    // Inclusive/exclusive comparator -- see `maybeCheckDeliverableSize`'s own
+    // comment on the same distinction.
+    const compliant = byteLimitInclusiveForRun ? size <= byteLimitForRun : size < byteLimitForRun;
+    if (compliant) return; // compliant -- nothing to say
 
     const overBy = size - byteLimitForRun;
     const nearDeadline =
@@ -1163,11 +1279,18 @@ function maybeCheckDeliverableSizeAtEnd(pi: ExtensionAPI, ctx: any): Promise<voi
       return;
     }
     triggerEEndFireCount++;
-    harnessIntervention(
-      ctx,
-      `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
-        `${byteLimitForRun}-byte limit at run end with no write this run to have caught it — ` +
-        "telling the model to fix it before the trial ends.",
-    );
+    try {
+      // The steer above already landed; a stale `ctx` after an await that
+      // crossed a session-replacing abort/compaction boundary must not
+      // throw this notify out of the awaited `agent_end` handler.
+      harnessIntervention(
+        ctx,
+        `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
+          `${byteLimitForRun}-byte limit at run end with no write this run to have caught it — ` +
+          "telling the model to fix it before the trial ends.",
+      );
+    } catch {
+      // Nothing else to do -- the steer already went out.
+    }
   })();
 }

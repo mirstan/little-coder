@@ -1399,6 +1399,25 @@ describe("tb-finalize-guard", () => {
         await turn(h, shellTurn(["gcc -o /app/gpt2.c gpt2.c"]));
         expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
       });
+
+      it("does not silently latch an input path when the prompt also names a distinct output path", () => {
+        // Confirmed by execution: first-match-with-no-disambiguation used to
+        // resolve to /app/in (the "write ... to" trigger reaches the input
+        // clause first), not /app/out (the actual deliverable) -- neither
+        // path is more textually "the deliverable" than the other from the
+        // regex's own point of view, so it must not guess.
+        expect(
+          parseDeliverablePath("Write your input to /app/in, save your output to /app/out."),
+        ).not.toBe("/app/in");
+        expect(
+          parseDeliverablePath("Write your input to /app/in, save your output to /app/out."),
+        ).toBeUndefined();
+      });
+
+      it("resolves a single quoted or backticked path instead of failing to match or corrupting the capture", () => {
+        expect(parseDeliverablePath("Save it as `/app/out.c`.")).toBe("/app/out.c");
+        expect(parseDeliverablePath('Call your program "/app/gpt2.c".')).toBe("/app/gpt2.c");
+      });
     });
 
     describe("size-check triggering", () => {
@@ -1486,6 +1505,43 @@ describe("tb-finalize-guard", () => {
         }
         expect(h.sent).toHaveLength(1);
         expect(h.sent[0].text).toBe(buildTriggerEMessage(0, 5000));
+      });
+
+      it("does NOT flag a file at exactly an inclusive limit ('at most N') as over budget", async () => {
+        // "at most 5000 bytes" is an INCLUSIVE upper bound -- exactly 5000 is
+        // compliant, unlike REAL_PROMPT's exclusive "<5000 bytes" (covered by
+        // the strict-comparator test above, which must keep failing at
+        // exactly the limit).
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(
+          h,
+          "Your program must be at most 5000 bytes. Call your program /app/gpt2.c.",
+        );
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5000, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("still flags a file one byte over an inclusive limit ('no more than N')", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(
+          h,
+          "Your program must be no more than 5000 bytes. Call your program /app/gpt2.c.",
+        );
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5001, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(1, 5000));
       });
     });
 
@@ -1757,6 +1813,82 @@ describe("tb-finalize-guard", () => {
         await settle(h);
         expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
         expect(h.sent).toHaveLength(0);
+      });
+
+      it("stands down on an aborted run instead of stacking a steer on thinking-budget's own abort-recovery", async () => {
+        // Confirmed gap: this check had neither of maybeFireTriggerC's two
+        // guards, so an aborted run (thinking-budget abort-then-recover,
+        // context-watchdog compaction resume) still got Trigger E's own
+        // steer stacked on top of whatever recovery message the abort
+        // already queued.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, assistantTurn({ thinking: "let me think...", stopReason: "aborted" }));
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("stands down at the turn cap (no later turn for a corrective nudge to land on)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await fire(h.pi, "session_start", {}, h.ctx);
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: { littleCoder: { maxTurns: 2 } }, prompt: REAL_PROMPT },
+          h.ctx,
+        );
+        await turn(h, shellTurn(["ls -la"])); // turn 1
+        await turn(h, shellTurn(["ls -la"])); // turn 2 == capForRun
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("does not also fire (a second, redundant nudge) when Trigger C already fired on this same agent_end", async () => {
+        // Trigger C already told the model the run died/errored; stacking
+        // Trigger E's own over-budget nudge on the same agent_end would be a
+        // second contradictory steer for one event.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, assistantTurn({ stopReason: "error" })); // qualifies Trigger C
+        await settle(h);
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("does not throw out of agent_end when ctx.ui.notify fails on the post-await harnessIntervention call", async () => {
+        // Confirmed gap: only the pi.sendUserMessage call was try/caught;
+        // harnessIntervention's own ctx.ui.notify right after it was not, so
+        // a stale ctx after an await that crossed a session-replacing
+        // abort/compaction boundary would throw unhandled out of agent_end.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        let notifyCalls = 0;
+        h.ctx.ui.notify = () => {
+          notifyCalls++;
+          throw new Error("ctx.ui is stale after the await");
+        };
+        await expect(settle(h)).resolves.toBeUndefined();
+        expect(h.sent).toHaveLength(1); // the steer itself still went out
+        expect(notifyCalls).toBeGreaterThan(0);
       });
     });
   });
