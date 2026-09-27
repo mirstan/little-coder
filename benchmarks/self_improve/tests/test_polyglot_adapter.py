@@ -386,17 +386,22 @@ def test_reflective_dataset_caps_do_not_blow_up_on_a_huge_pytest_tail():
 
 
 @pytest.mark.parametrize("status", ["error", "empty_response"])
-def test_reflective_dataset_runtime_unscoreable_disclaims_component_causality(status):
-    """run_batch() returns a persistent error/empty_response scored 0.0; the
-    reflection LM must not rewrite a component in response to provider noise,
-    and must not be told the harness failed when it didn't."""
+def test_reflective_dataset_runtime_unscoreable_names_both_environment_and_candidate_as_possible_causes(status):
+    """run_batch() returns a persistent error/empty_response scored 0.0. The
+    candidate can cause it (context overflow, a crashing component) as well
+    as the environment, so the feedback must not forbid a rewrite, and must
+    not say the harness failed when it didn't."""
     specs = [ExerciseSpec("a")]
     runner = FakeRunner({"python/a": _result(
         "python/a", "a", status=status, score=0.0, success=False, error="provider said no",
     )})
     adapter = _adapter(runner)
-    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
-    feedback = adapter.make_reflective_dataset({"skills_tools_bash": "text"}, batch, ["skills_tools_bash"])["skills_tools_bash"][0]["Feedback"]
-    assert "NOTHING reliable about the quality" in feedback
+    text = "t" * 1234
+    batch = adapter.evaluate(specs, {"skills_tools_bash": text}, capture_traces=True)
+    feedback = adapter.make_reflective_dataset({"skills_tools_bash": text}, batch, ["skills_tools_bash"])["skills_tools_bash"][0]["Feedback"]
+    assert "context window" in feedback
+    assert "environment" in feedback
+    assert "1234 characters" in feedback
     assert "provider said no" in feedback
     assert "harness itself failed" not in feedback
+    assert "do not rewrite" not in feedback

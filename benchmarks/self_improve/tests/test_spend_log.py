@@ -69,3 +69,14 @@ def test_summarize_handles_empty_log(tmp_path):
     summary = summarize(path)
     assert summary["total_exercises"] == 0
     assert summary["memo_hit_rate"] == 0.0
+
+
+def test_summarize_counts_seed_probe_runs(tmp_path):
+    path = tmp_path / "spend_log.jsonl"
+    with SpendLog(path) as log:
+        log.exercise(exercise_id="python/a", status="error", score=0.0, memo_hit=False, probe=False)
+        log.exercise(exercise_id="python/a", status="pass_1", score=1.0, memo_hit=False, probe=True)
+        log.exercise(exercise_id="python/b", status="pass_1", score=1.0)
+    summary = summarize(path)
+    assert summary["total_exercises"] == 3
+    assert summary["probe_runs"] == 1

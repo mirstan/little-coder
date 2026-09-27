@@ -71,7 +71,10 @@ class PolyglotRolloutOutput:
     from_cache: bool
 
 
-def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_index: Mapping[str, str]) -> str:
+def _component_feedback(
+    pred_name: str, result: LiveRunResult, knowledge_topic_index: Mapping[str, str],
+    component_chars: int | None = None,
+) -> str:
     """Assembled from real measured data, in order: outcome, injection
     evidence, test/diff evidence, and the scoring rule stated explicitly so
     the reflection LM optimizes the right objective."""
@@ -104,11 +107,18 @@ def _component_feedback(pred_name: str, result: LiveRunResult, knowledge_topic_i
         )
     elif result.status in UNSCOREABLE_STATUSES:
         cause = f": {result.error}" if result.error else ""
+        size_note = (
+            f" {pred_name} is currently {component_chars} characters."
+            if component_chars is not None else ""
+        )
         parts.append(
             f"No gradable attempt was recorded (status={result.status}{cause}) -- the agent "
             f"process exited or the model returned an empty response before its work could be "
-            f"tested, even after in-place retries. This outcome says NOTHING reliable about the "
-            f"quality of {pred_name}; do not rewrite it in response to this record."
+            f"tested, even after in-place retries. This can come from the environment (a model "
+            f"server fault) or from the candidate itself, e.g. injected text large enough to "
+            f"overflow the model's context window, or a component that makes the agent process "
+            f"crash.{size_note} If {pred_name} was injected in this run and is large, shrinking "
+            f"it is a reasonable response; otherwise this record says little about its quality."
         )
     elif result.success:
         parts.append(f"Tests passed on attempt {result.attempts}.")
@@ -266,7 +276,10 @@ class PolyglotGEPAAdapter:
                         "self_reported_lessons": result.self_reported_lessons,
                         **token_cost_info,
                     },
-                    "Feedback": _component_feedback(component, result, self.knowledge_topic_index),
+                    "Feedback": _component_feedback(
+                        component, result, self.knowledge_topic_index,
+                        component_chars=len(candidate.get(component, "")),
+                    ),
                     "score": result.score,
                 })
             dataset[component] = records

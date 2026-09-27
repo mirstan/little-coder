@@ -475,6 +475,49 @@ def test_spend_log_zeroes_duration_for_a_cache_hit(source_repo, fake_practice, t
     assert [r["usage"] for r in first_run if r.get("event") == "exercise"] == [expected_usage] * 2
 
 
+def test_runner_is_built_with_the_seed_as_its_probe_and_spend_log_carries_the_probe_flag(
+    source_repo, fake_practice, tmp_path, monkeypatch,
+):
+    """The breaker's seed probe needs the (filtered) seed at runner
+    construction; spend_log.jsonl must be able to tell a probe run from a
+    candidate run, since both are real spend."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({
+        "wordy.py": _b64(_WORDY_SOLUTION), "acronym.py": _b64(_WORDY_SOLUTION),
+    }))
+    captured = {}
+    real_runner = run_gepa.PolyglotLiveRunner
+
+    class _CapturingRunner(real_runner):
+        def __init__(self, **kwargs):
+            captured["probe_candidate"] = kwargs.get("probe_candidate")
+            super().__init__(**kwargs)
+
+        def run_batch(self, candidate, specs, **kw):
+            captured.setdefault("candidates", []).append(dict(candidate))
+            return super().run_batch(candidate, specs, **kw)
+
+    monkeypatch.setattr(run_gepa, "PolyglotLiveRunner", _CapturingRunner)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy,acronym",
+        "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
+    ])
+    assert code == 0
+    # --baseline-only evaluates the seed itself, so its candidate IS the probe.
+    assert captured["probe_candidate"]
+    assert captured["candidates"] == [captured["probe_candidate"]] * 2
+    records = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()]
+    exercise_records = [r for r in records if r.get("event") == "exercise"]
+    assert exercise_records and all(r["probe"] is False for r in exercise_records)
+
+
 @pytest.mark.parametrize("extra_flags,expected_skip", [([], True), (["--no-skip-perfect-score"], False)])
 def test_optimize_skips_perfect_scores_by_default_and_passes_perfect_score(
     source_repo, fake_practice, tmp_path, monkeypatch, extra_flags, expected_skip,
