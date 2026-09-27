@@ -539,10 +539,12 @@ export default function (pi: ExtensionAPI) {
     // of those kinds; if any write in the segment is a real edit, a copy, a
     // move, or a compile-to-a-deliverable-path, it still dirties even though
     // `sawRealTestInThisCommand` is already true. A known, accepted residual
-    // gap: a heredoc SOURCE write (`pytest && cat > /app/main.py <<'EOF' ...
-    // EOF`) is also redirect-shaped by the write-kind classification, so it
-    // is still incorrectly exempted here -- narrower than what iteration 2
-    // shipped, not solved by this fix.
+    // gap: `ShellWrite.kind` only encodes redirect SHAPE (`>`/`>>`/`tee`),
+    // never what content is being written, so any same-command write of
+    // arbitrary new content to a deliverable path -- a heredoc source
+    // (`pytest && cat > /app/main.py <<'EOF' ... EOF`), a plain `echo`/`cat`/
+    // `printf` redirect, not just heredocs -- is still incorrectly exempted
+    // here. Narrower than what iteration 2 shipped, not solved by this fix.
     //
     // `testInvocationEverSeen` is session-scoped (see its declaration) and
     // gates the message clause (see buildTriggerAMessage), not this flag.
