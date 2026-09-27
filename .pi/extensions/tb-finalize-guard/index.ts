@@ -475,11 +475,21 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // `byteLimitCandidates` can tell which phrasing actually matched: "at most"
 // and "no more than" state an INCLUSIVE upper bound (exactly N is
 // compliant), while every other alternative here -- "under"/"below"/"less
-// than", the bare "must be" fallback, and the symbolic "<" (which leaves
-// group 1 undefined) -- states an EXCLUSIVE one (exactly N is over budget).
-// See `parseByteLimitDetails`.
+// than", and the symbolic "<" (which leaves group 1 undefined) -- states an
+// EXCLUSIVE one (exactly N is over budget). See `parseByteLimitDetails`.
+//
+// A bare "must be" is deliberately NOT one of these alternatives, even
+// though "must be <5000 bytes" is the phrasing this trigger is verified
+// against: unlike every alternative above, "must be" carries no bound
+// semantics of its own -- it just introduces ANY size statement, including
+// an exact/fixed size that isn't a limit at all ("the header must be 16
+// bytes" states a fixed size, not a ceiling). Confirmed regression: a bare
+// `must\s+be` alternative here used to arm the guard with a false ceiling
+// on prompts stating an exact size. "must be <5000 bytes" still resolves
+// correctly without it, since the `<\s*` alternative matches the "<5000"
+// half on its own.
 const BYTE_LIMIT_RE =
-  /(?:\b(under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than|must\s+be)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
+  /(?:\b(under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
 
 /** True when `phrase` (BYTE_LIMIT_RE's own group 1) states an inclusive upper bound. */
 function isInclusivePhrase(phrase: string | undefined): boolean {
@@ -605,11 +615,11 @@ export function parseByteLimit(prompt: string): number | undefined {
  * Like `parseByteLimit`, but also reports whether the phrasing that resolved
  * `value` is an INCLUSIVE upper bound ("at most N"/"no more than N", where
  * exactly N is compliant) or an EXCLUSIVE one ("under N"/"below N"/"less
- * than N"/"<N", and the bare "must be" fallback -- its originally documented
- * intent -- where exactly N is already over budget). Confirmed regression
- * this replaces: every parsed limit used to be enforced as a strict ceiling
- * regardless of phrasing, so "at most 5000 bytes" (where exactly 5000 is
- * compliant) was enforced identically to "<5000 bytes" (where it isn't).
+ * than N"/"<N", where exactly N is already over budget). Confirmed
+ * regression this replaces: every parsed limit used to be enforced as a
+ * strict ceiling regardless of phrasing, so "at most 5000 bytes" (where
+ * exactly 5000 is compliant) was enforced identically to "<5000 bytes"
+ * (where it isn't).
  */
 export function parseByteLimitDetails(
   prompt: string,

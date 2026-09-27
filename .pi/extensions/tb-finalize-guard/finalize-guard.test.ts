@@ -1384,6 +1384,15 @@ describe("tb-finalize-guard", () => {
           ),
         ).toBeUndefined();
       });
+
+      it("does not arm a bare 'must be N bytes' as a limit — an exact/fixed size states no bound", () => {
+        // Confirmed by execution: a bare "must be" alongside no other bound
+        // word used to parse as a false ceiling ({value: 16, inclusive:
+        // false}), arming the guard against a file with no real size
+        // constraint at all -- "must be" only introduces a size statement,
+        // it doesn't say which direction it bounds.
+        expect(parseByteLimit("Save your output to /app/header.bin. The header must be 16 bytes.")).toBeUndefined();
+      });
     });
 
     describe("path parsing", () => {
