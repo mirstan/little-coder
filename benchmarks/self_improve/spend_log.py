@@ -62,14 +62,11 @@ def _read_records(path: Path) -> list[dict[str, Any]]:
 
 def summarize(path: Path) -> dict[str, Any]:
     """Totals for a spend_log.jsonl: exercise count, memo hit rate,
-    per-status breakdown, cumulative live wall clock, and how many of the
-    exercise records were seed-probe runs (see live_eval's
-    CONSECUTIVE_UNSCOREABLE_LIMIT) rather than candidate runs."""
+    per-status breakdown, cumulative live wall clock."""
     records = _read_records(path)
     exercises = [r for r in records if r.get("event") == "exercise"]
     total = len(exercises)
     memo_hits = sum(1 for r in exercises if r.get("memo_hit"))
-    probe_runs = sum(1 for r in exercises if r.get("probe"))
     by_status: dict[str, int] = {}
     total_wall_s = 0.0
     for r in exercises:
@@ -82,5 +79,4 @@ def summarize(path: Path) -> dict[str, Any]:
         "memo_hit_rate": (memo_hits / total) if total else 0.0,
         "by_status": by_status,
         "total_wall_s": total_wall_s,
-        "probe_runs": probe_runs,
     }

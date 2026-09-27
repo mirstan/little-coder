@@ -163,8 +163,10 @@ Row 1 reuse makes untouched exercises free. It also means they carry **no inform
 **GEPA frontier.** Pass `objective_scores = {pass, -tokens}` with `frontier_type="hybrid"`, so parent selection can explore efficient lineages (F7). Acceptance stays custom.
 
 **Timeouts and errors.**
-- Timeouts are measured in **turns** and cached like any other outcome.
-- `harness_error` is **excluded** and re-queued, never scored.
+- `harness_error` (the harness failed; no agent outcome exists) is **excluded**. It is retried in place (`HARNESS_ERROR_RETRIES`), and if it persists the run stops with `LiveEvalHarnessError` (exit 4, partial results written). It is never scored or cached. A config `error` (missing exercise, unknown agent, missing JS deps) stops the run the same way, without retrying.
+- Runtime `error` / `empty_response` are retried in place, then **scored 0.0** and kept out of `live_cache`. The environment or the candidate (for example, context overflow) can cause them, and the harness does not guess which. GEPA's own EvaluationCache still records the 0.0 for the rest of that `optimize()` call.
+- Exposure to a dead model server is bounded by the live budget (wall clock and run cap), not by a breaker. It shows up in `spend_log.jsonl` as each exercise's `status`, plus `error` when one was recorded. Pi crashes and empty responses usually carry no reason, so the status is the signal. `summarize()` gives `by_status`.
+- `fail_timeout` is **scored** (a looping agent is a candidate outcome) and not retried. Today's per-attempt deadline is wall clock, so it is kept out of `live_cache`. Once timeouts are measured in turns (planned), they would be cached like any other outcome.
 
 ### 7.2 T4: the child evaluation, inside `adapter.evaluate`
 
@@ -242,8 +244,8 @@ Accept only if **all** of the following hold:
 These are read from `~/.omlx/settings.json`, `~/.omlx/model_settings.json` and `/v1/models`.
 
 **Rules.**
-- `fail_timeout` is cached like any other outcome.
-- `harness_error` is never cached.
+- `fail_timeout` is cached like any other outcome once it is turn-measured; today's wall-clock `fail_timeout` is kept out of `live_cache`.
+- `harness_error`, `error` and `empty_response` are never cached.
 
 ## 9. Inference layer (oMLX)
 
@@ -315,7 +317,7 @@ Order: M0 → M1 → (M1b, M2, M4, all free) → M4b → M3 (conditional) → M5
 
 **Phase 0: correctness fixes (S each)**
 1. Key the cache on the sanitized text; add the sample index; set `skip_perfect_score=True`.
-2. Exclude `harness_error` from scoring and caching, and re-queue it.
+2. Exclude `harness_error` from scoring and caching (retry in place, then stop the run); retry runtime `error`/`empty_response` in place, then score them 0.0 without caching them.
 3. Write partial results on a wall-clock overrun (catch `LiveEvalBudgetExceeded`, then write `optimized_components.yaml` from the best-so-far state).
 4. Carry `usage` (prompt, cacheRead, output) through the results JSON → `LiveRunResult` → `spend_log`.
 5. Add content hashes to the skill-inject and knowledge-inject notify payloads.

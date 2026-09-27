@@ -9,6 +9,7 @@ that makes a candidate's text actually reach a live agent.
 """
 import base64
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -103,8 +104,7 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
     monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
     monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
 
-    def _make(cache=None, budget=None, pi_bin=FAKE_PI, per_exercise_timeout_s=60, on_result=None,
-              probe_candidate=None):
+    def _make(cache=None, budget=None, pi_bin=FAKE_PI, per_exercise_timeout_s=60, on_result=None):
         with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=pi_bin) as wt:
             yield PolyglotLiveRunner(
                 worktree=wt,
@@ -116,7 +116,6 @@ def runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
                 per_exercise_timeout_s=per_exercise_timeout_s,
                 budget=budget,
                 on_result=on_result,
-                probe_candidate=probe_candidate,
             )
 
     return _make
@@ -761,13 +760,14 @@ def test_persistent_harness_error_raises_instead_of_scoring_zero(runner_factory,
 
 
 @pytest.mark.parametrize("status", _RUNTIME_UNSCOREABLE)
-def test_persistent_runtime_unscoreable_is_scored_zero_and_never_cached(status, runner_factory, tmp_path, monkeypatch):
+def test_persistent_runtime_unscoreable_is_scored_zero_and_never_cached(status, runner_factory, tmp_path, monkeypatch, caplog):
     """A candidate can cause these deterministically (an AGENTS.md bloated
     past n_ctx, a skill file that crashes pi), so once the in-place retries
     are spent the candidate gets the 0.0 it earned -- one bad proposal must
     not abort the whole GEPA run. Kept out of live_cache, so a transient
     fault that outlasted the retries is not pinned across runs (GEPA's own
     EvaluationCache still records the 0.0 for the rest of this optimize())."""
+    caplog.set_level(logging.WARNING, logger="benchmarks.self_improve.live_eval")
     cache = LiveResultCache(tmp_path / "cache")
     seen = []
     for runner in runner_factory(cache=cache, on_result=seen.append):
@@ -778,6 +778,24 @@ def test_persistent_runtime_unscoreable_is_scored_zero_and_never_cached(status, 
     assert results[0].score == 0.0
     assert [r.status for r in seen] == [status] * (1 + live_eval.HARNESS_ERROR_RETRIES)
     assert not list((tmp_path / "cache").rglob("*.json"))
+    final = [r.getMessage() for r in caplog.records if "still hit" in r.getMessage()]
+    assert len(final) == 1
+    for part in (status, "boom", "python/wordy", "0.0"):
+        assert part in final[0]
+
+
+def test_persistent_runtime_unscoreable_without_a_reason_is_logged_as_such(runner_factory, monkeypatch, caplog):
+    """A pi crash or an empty response usually records no reason; the
+    warning must say so rather than print None."""
+    caplog.set_level(logging.WARNING, logger="benchmarks.self_improve.live_eval")
+    for runner in runner_factory():
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "empty_response"))
+        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert results[0].score == 0.0
+    final = [r.getMessage() for r in caplog.records if "still hit" in r.getMessage()]
+    assert len(final) == 1
+    assert "<no reason recorded>" in final[0]
 
 
 @pytest.mark.parametrize("status", _ALL_UNSCOREABLE)
@@ -837,44 +855,30 @@ def _canned_by_exercise(statuses: dict):
     return _run
 
 
-def test_consecutive_persistent_unscoreable_exercises_trip_the_circuit_breaker(runner_factory, monkeypatch):
-    """A dead model server shows up as every exercise ending persistent
-    error/empty_response -- that must fail loud rather than score a whole
-    batch 0.0. With no probe candidate configured nothing can tell the
-    environment from the candidate, so the breaker raises outright."""
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
+def test_many_consecutive_persistent_unscoreables_across_candidates_never_raise(runner_factory, tmp_path, monkeypatch):
+    """Nothing tries to tell a dead model server from a broken candidate:
+    however many exercises in a row end error/empty_response, across
+    candidates and run_batch() calls, each is scored 0.0 and kept out of
+    live_cache, and the LiveBudget is what bounds the spend. A scored
+    outcome in the middle of the batch keeps its place."""
+    first = {"ex0": "error", "ex1": "empty_response", "ex2": "fail", "ex3": "error"}
+    second = {"ex4": "empty_response", "ex5": "error", "ex6": "empty_response"}
+    statuses = {**first, **second}
+    unscoreable = [n for n, s in statuses.items() if s != "fail"]
+    cache = LiveResultCache(tmp_path / "cache")
     seen = []
-    for runner in runner_factory(on_result=seen.append):
-        monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(dict.fromkeys(names, "empty_response")))
-        with pytest.raises(live_eval.LiveEvalHarnessError, match="consecutive"):
-            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(n) for n in names])
-
-    assert len(seen) == limit * (1 + live_eval.HARNESS_ERROR_RETRIES)
-
-
-def test_circuit_breaker_counts_across_run_batch_calls(runner_factory, monkeypatch):
-    """No probe candidate configured: the streak spans run_batch calls."""
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    for runner in runner_factory():
-        monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(dict.fromkeys(names, "error")))
-        for name in names[:-1]:
-            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(name)])
-        with pytest.raises(live_eval.LiveEvalHarnessError, match="consecutive"):
-            runner.run_batch({"agents_md": "text"}, [ExerciseSpec(names[-1])])
-
-
-def test_a_scoreable_result_resets_the_circuit_breaker(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    statuses = {f"bad{i}": "error" for i in range(limit - 1)}
-    statuses["good"] = "fail"
-    statuses.update({f"late{i}": "empty_response" for i in range(limit - 1)})
-    for runner in runner_factory():
+    for runner in runner_factory(cache=cache, on_result=seen.append):
         monkeypatch.setattr(runner, "_run_one_uncached", _canned_by_exercise(statuses))
-        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec(n) for n in statuses])
+        results = runner.run_batch({"agents_md": "candidate A"}, [ExerciseSpec(n) for n in first])
+        results += runner.run_batch({"agents_md": "candidate B"}, [ExerciseSpec(n) for n in second])
 
+    assert len(unscoreable) == 6
     assert [r.status for r in results] == list(statuses.values())
+    assert all(r.score == 0.0 for r in results)
+    assert len(seen) == len(unscoreable) * (1 + live_eval.HARNESS_ERROR_RETRIES) + 1
+    assert [r.task_id for r in results if r.status != "fail"] == [f"python/{n}" for n in unscoreable]
+    # Only the scored "fail" is cached.
+    assert len(list((tmp_path / "cache").rglob("*.json"))) == 1
 
 
 def test_pi_dying_on_attempt_one_is_retried_then_scored_zero_uncached(runner_factory, tmp_path, monkeypatch):
@@ -918,207 +922,10 @@ def test_a_stale_results_file_is_not_read_back_as_this_runs_outcome(runner_facto
     assert "results file missing" in result.error
 
 
-#: Marker a candidate's AGENTS.md carries when the fake below should treat it
-#: as broken (e.g. bloated past the model's context window).
-_BLOATED = "BLOATED"
-_SEED = {"agents_md": "Seed instructions.\n"}
-_BLOATED_A = {"agents_md": f"{_BLOATED} A\n"}
-_BLOATED_B = {"agents_md": f"{_BLOATED} B\n"}
-
-
-def _fake_reading_the_worktree(runner, seen_by_fake, *, seed_fails_on=(), always_error=False):
-    """Decides the outcome from the MATERIALIZED AGENTS.md, so it can tell a
-    probe run from a candidate run and proves the worktree was really
-    rewritten (to the seed for the probe, back to the candidate after)."""
-    def _run(spec):
-        text = (runner.worktree.path / "AGENTS.md").read_text()
-        bloated = _BLOATED in text
-        seen_by_fake.append((spec.exercise, "bloated" if bloated else "seed"))
-        if always_error or bloated or spec.exercise in seed_fails_on:
-            return _canned(spec, "error", error="context overflow")
-        return _canned(spec, "pass_1", score=1.0)
-    return _run
-
-
-def _runs_per_unscoreable_exercise():
-    return 1 + live_eval.HARNESS_ERROR_RETRIES
-
-
-def test_candidate_caused_unscoreable_streak_is_cleared_by_a_passing_seed_probe(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit + 1)]
-    seen, fake_seen = [], []
-    for runner in runner_factory(on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen))
-        results = runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-
-    assert [r.status for r in results] == ["error"] * len(names)
-    assert all(r.score == 0.0 for r in results)
-    r = _runs_per_unscoreable_exercise()
-    assert len(seen) == limit * r + 1 + r
-    assert [r_.probe for r_ in seen].count(True) == 1
-    # The probe ran the seed on the exercise that tripped the breaker (no
-    # known-good exercise for the seed yet) ...
-    assert fake_seen[limit * r] == (names[limit - 1], "seed")
-    # ... and the candidate was put back for the exercise after it.
-    assert fake_seen[limit * r + 1:] == [(names[-1], "bloated")] * r
-
-
-def test_environment_caused_streak_raises_when_the_seed_probe_also_fails(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    seen, fake_seen = [], []
-    for runner in runner_factory(on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen, always_error=True))
-        with pytest.raises(live_eval.LiveEvalHarnessError) as excinfo:
-            runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-
-    message = str(excinfo.value)
-    assert f"{limit} consecutive unscoreable exercises across 1 candidate(s)" in message
-    assert f"seed probe on 'python/{names[-1]}' also ended 'error'" in message
-    assert excinfo.value.result.probe is True
-    assert len(seen) == (limit + 1) * _runs_per_unscoreable_exercise()
-
-
-def test_streak_on_the_probe_candidate_itself_raises_without_probing(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    seen, fake_seen = [], []
-    for runner in runner_factory(on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen, always_error=True))
-        with pytest.raises(live_eval.LiveEvalHarnessError, match="seed") as excinfo:
-            runner.run_batch(dict(_SEED), [ExerciseSpec(n) for n in names])
-
-    assert "consecutive unscoreable exercises across 1 candidate(s)" in str(excinfo.value)
-    assert len(seen) == limit * _runs_per_unscoreable_exercise()
-    assert not any(r.probe for r in seen)
-
-
-def test_streak_spanning_two_candidates_is_probed_not_blamed_on_the_environment(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    seen, fake_seen = [], []
-    for runner in runner_factory(on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen))
-        runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names[:-1]])
-        results = runner.run_batch(_BLOATED_B, [ExerciseSpec(names[-1])])
-
-    assert [r.status for r in results] == ["error"]
-    assert [r.probe for r in seen].count(True) == 1
-
-
-def test_streak_spanning_two_candidates_reports_both_when_the_probe_also_fails(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    fake_seen = []
-    for runner in runner_factory(probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen, always_error=True))
-        runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names[:-1]])
-        with pytest.raises(live_eval.LiveEvalHarnessError, match=r"across 2 candidate\(s\)"):
-            runner.run_batch(_BLOATED_B, [ExerciseSpec(names[-1])])
-
-
-def test_seed_probe_ignores_a_cached_seed_result(runner_factory, tmp_path, monkeypatch):
-    """A cache hit says nothing about whether the environment is up NOW."""
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    cache = LiveResultCache(tmp_path / "cache")
-    seen, fake_seen = [], []
-    for runner in runner_factory(cache=cache, on_result=seen.append, probe_candidate=_SEED):
-        cache.put(live_eval._sanitize_candidate(_SEED), runner.run_config, f"python/{names[-1]}",
-                  _canned(ExerciseSpec(names[-1]), "pass_1", score=1.0).to_dict())
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen, always_error=True))
-        with pytest.raises(live_eval.LiveEvalHarnessError, match="seed probe"):
-            runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-
-    assert [r.probe for r in seen].count(True) == _runs_per_unscoreable_exercise()
-    assert not any(r.from_cache for r in seen)
-
-
-def test_a_passing_seed_probe_is_not_written_to_the_live_cache(runner_factory, tmp_path, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    cache = LiveResultCache(tmp_path / "cache")
-    fake_seen = []
-    for runner in runner_factory(cache=cache, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen))
-        runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-        run_config = runner.run_config
-
-    assert (names[-1], "seed") in fake_seen
-    assert cache.get(live_eval._sanitize_candidate(_SEED), run_config, f"python/{names[-1]}") is None
-    assert not list((tmp_path / "cache").rglob("*.json"))
-
-
-@pytest.mark.parametrize("seed_source", ["live", "cache"])
-def test_seed_probe_runs_on_an_exercise_the_seed_is_known_to_score(seed_source, runner_factory, tmp_path, monkeypatch):
-    """Probing only the failing exercise would blame the environment when
-    that exercise is the problem (e.g. one the seed itself can't finish)."""
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    bad = [f"ex{i}" for i in range(1, limit + 1)]
-    cache = LiveResultCache(tmp_path / "cache")
-    seen, fake_seen = [], []
-    for runner in runner_factory(cache=cache, on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached",
-                            _fake_reading_the_worktree(runner, fake_seen, seed_fails_on={bad[-1]}))
-        if seed_source == "cache":
-            cache.put(live_eval._sanitize_candidate(_SEED), runner.run_config, "python/ex0",
-                      _canned(ExerciseSpec("ex0"), "pass_1", score=1.0).to_dict())
-        (seed_result,) = runner.run_batch(_SEED, [ExerciseSpec("ex0")])
-        assert seed_result.from_cache is (seed_source == "cache")
-        results = runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in bad])
-
-    assert [r.status for r in results] == ["error"] * limit
-    probes = [r for r in seen if r.probe]
-    assert [r.task_id for r in probes] == ["python/ex0"]
-
-
-def test_seed_probe_prefers_the_failing_exercise_when_the_seed_scored_it(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    bad = [f"bad{i}" for i in range(limit)]
-    seen, fake_seen = [], []
-    for runner in runner_factory(on_result=seen.append, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen))
-        # The seed scores the last bad exercise first, then another one, so
-        # "most recent known-good" and "the failing exercise" differ.
-        runner.run_batch(_SEED, [ExerciseSpec(bad[-1]), ExerciseSpec("other")])
-        runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in bad])
-
-    assert [r.task_id for r in seen if r.probe] == [f"python/{bad[-1]}"]
-
-
-def test_seed_probe_runs_count_against_the_live_budget(runner_factory, monkeypatch):
-    import time as time_module
-
-    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
-
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600,
-                        max_live_runs=limit * _runs_per_unscoreable_exercise())
-    fake_seen = []
-    for runner in runner_factory(budget=budget, probe_candidate=_SEED):
-        monkeypatch.setattr(runner, "_run_one_uncached", _fake_reading_the_worktree(runner, fake_seen))
-        with pytest.raises(LiveEvalBudgetExceeded):
-            runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-
-    assert all(kind == "bloated" for _ex, kind in fake_seen)
-
-
-def test_harness_error_inside_the_seed_probe_names_the_probe(runner_factory, monkeypatch):
-    limit = live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT
-    names = [f"ex{i}" for i in range(limit)]
-    for runner in runner_factory(probe_candidate=_SEED):
-        def _run(spec):
-            if _BLOATED in (runner.worktree.path / "AGENTS.md").read_text():
-                return _canned(spec, "error", error="context overflow")
-            return _canned(spec, "harness_error", error="results file missing")
-        monkeypatch.setattr(runner, "_run_one_uncached", _run)
-        with pytest.raises(live_eval.LiveEvalHarnessError, match=r"^seed probe on .*results file missing"):
-            runner.run_batch(_BLOATED_A, [ExerciseSpec(n) for n in names])
-
-
-def test_live_run_result_from_dict_accepts_an_entry_without_the_probe_field():
-    d = _canned(ExerciseSpec("wordy"), "pass_1", score=1.0).to_dict()
-    del d["probe"]
-    assert live_eval.LiveRunResult.from_dict(d).probe is False
+def test_live_run_result_from_dict_ignores_a_field_it_no_longer_has():
+    """A memo entry written by a build that carried an extra field (e.g.
+    the removed "probe" flag) must still load rather than raise TypeError."""
+    entry = _canned(ExerciseSpec("wordy"), "fail").to_dict()
+    entry["probe"] = False
+    loaded = live_eval.LiveRunResult.from_dict(entry)
+    assert loaded == live_eval.LiveRunResult.from_dict(_canned(ExerciseSpec("wordy"), "fail").to_dict())

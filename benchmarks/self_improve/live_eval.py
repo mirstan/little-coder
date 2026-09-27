@@ -30,7 +30,7 @@ from benchmarks.self_improve.exercises import ExerciseSpec, practice_dir
 from benchmarks.self_improve.ingest.aider_polyglot_ingest import pass_n_score
 from benchmarks.self_improve.ingest.common import summarize_for_reflection
 from benchmarks.self_improve.live_budget import LiveEvalBudgetExceeded
-from benchmarks.self_improve.live_cache import UNSCOREABLE_STATUSES, LiveResultCache, candidate_hash
+from benchmarks.self_improve.live_cache import UNSCOREABLE_STATUSES, LiveResultCache
 from benchmarks.self_improve.scratch_worktree import ScratchWorktree
 
 logger = logging.getLogger(__name__)
@@ -126,32 +126,21 @@ def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
 
 
 #: In-place retries for an exercise whose run came back with any status in
-#: live_cache.UNSCOREABLE_STATUSES, not only "harness_error" -- the name
-#: predates the broader meaning and is kept because run_gepa.py and the tests
-#: refer to it. What happens once they are spent depends on the status; see
-#: PolyglotLiveRunner.run_batch(). Each retry is a real run, charged to
+#: live_cache.UNSCOREABLE_STATUSES, not only "harness_error" (a config
+#: "error" is not retried; see _is_config_error) -- the name predates the
+#: broader meaning; the tests still refer to it. Once they are spent,
+#: "harness_error" raises LiveEvalHarnessError and "error"/"empty_response"
+#: are returned scored 0.0 and kept out of live_cache (see
+#: PolyglotLiveRunner.run_batch()). Each retry is a real run, charged to
 #: LiveBudget.
 HARNESS_ERROR_RETRIES = 2
-
-#: Consecutive exercises, across any candidates and run_batch() calls, that
-#: still ended "error"/"empty_response" after their in-place retries, before
-#: run_batch() asks whether the environment is at fault: a dead model server
-#: looks like that on every exercise, but so does a candidate bloated past
-#: the context window. With a probe candidate (the seed), the seed is re-run
-#: live; if it is unscoreable too, run_batch() raises LiveEvalHarnessError,
-#: otherwise the 0.0s stand and the streak starts over. With no probe
-#: candidate, or when the failing candidate IS the probe candidate, it
-#: raises outright. Reset by any scoreable live run, a scoreable probe
-#: included. Mirrors aider_polyglot.py's MAX_CONSECUTIVE_ERRORS.
-CONSECUTIVE_UNSCOREABLE_LIMIT = 3
 
 #: record["reason"] prefixes for an "error" that retrying cannot change,
 #: written by aider_polyglot.py's _run_exercise (missing exercise dir, unknown
 #: agent) and by main()'s exception wrapper around it (the JS shared-deps
 #: RuntimeError from _prepare_javascript). If that wording changes, such an
-#: error is retried and then scored 0.0 instead, and a run of them reaches
-#: CONSECUTIVE_UNSCOREABLE_LIMIT, where the seed probe (if configured) hits
-#: the same config error and raises.
+#: error is retried and then scored 0.0 like any other runtime error, which
+#: wastes retries and hides the misconfiguration behind 0.0 scores.
 _CONFIG_ERROR_REASON_PREFIXES = (
     "exercise not found at ",
     "unknown agent ",
@@ -165,13 +154,10 @@ def _is_config_error(result: "LiveRunResult") -> bool:
 
 class LiveEvalHarnessError(RuntimeError):
     """Raised by PolyglotLiveRunner.run_batch() when an exercise still comes
-    back "harness_error" after HARNESS_ERROR_RETRIES in-place retries, when
-    an "error" is a config error that no retry can change, or when
-    CONSECUTIVE_UNSCOREABLE_LIMIT exercises in a row ended "error"/
-    "empty_response" even after their retries and the seed probe (see
-    CONSECUTIVE_UNSCOREABLE_LIMIT) was unscoreable too or could not be run.
-    A failure inside the seed probe itself is re-raised with a "seed probe
-    on ..." prefix.
+    back "harness_error" after HARNESS_ERROR_RETRIES in-place retries, or
+    when an "error" is a config error that no retry can change (see
+    _is_config_error). A persistent runtime "error"/"empty_response" never
+    raises; it is scored 0.0.
 
     A harness failure (missing/malformed results file, outer subprocess
     timeout) says nothing about the candidate, so scoring it 0.0 would
@@ -294,17 +280,16 @@ class LiveRunResult:
     error: str | None = None
     from_cache: bool = False
     exit_code: int | None = None
-    #: True for a seed-probe run (see CONSECUTIVE_UNSCOREABLE_LIMIT): real
-    #: spend reported through on_result, but never returned as a scored
-    #: result and never cached. Defaulted so older memo entries still load.
-    probe: bool = False
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LiveRunResult":
-        return cls(**dict(d))
+        # Unknown keys (a field an older build wrote and this one dropped)
+        # are ignored rather than raising TypeError.
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 class PolyglotLiveRunner:
@@ -330,7 +315,6 @@ class PolyglotLiveRunner:
         python_executable: str = sys.executable,
         budget=None,
         on_result=None,
-        probe_candidate: Mapping[str, str] | None = None,
     ):
         self.worktree = worktree
         self.components_yaml = Path(components_yaml)
@@ -341,16 +325,6 @@ class PolyglotLiveRunner:
         self.thinking = thinking
         self.benchmark_root = Path(benchmark_root) if benchmark_root else None
         self.cache = cache
-        #: The candidate re-run live when the unscoreable streak reaches
-        #: CONSECUTIVE_UNSCOREABLE_LIMIT (run_gepa.py passes the seed).
-        #: None keeps the old behaviour: the breaker raises outright.
-        self._probe_sanitized = _sanitize_candidate(probe_candidate) if probe_candidate else None
-        #: One candidate_hash per exercise that stayed unscoreable after its
-        #: retries; only run_batch() appends to it or decides to trip.
-        self._unscoreable_streak: list[str] = []
-        #: task_id -> spec for every exercise the probe candidate got a
-        #: scoreable result on (live or from live_cache), most recent last.
-        self._probe_known_good: dict[str, ExerciseSpec] = {}
         #: Optional live_budget.LiveBudget -- checked before every live run
         #: (never before a cache hit) and RAISES rather than letting a run
         #: it refuses to start silently score 0.0, which would poison the
@@ -495,17 +469,17 @@ class PolyglotLiveRunner:
         to HARNESS_ERROR_RETRIES times, and is never written to live_cache.
         If it persists: "harness_error" raises LiveEvalHarnessError and is
         never returned as a scored result; "error"/"empty_response" are
-        returned scored 0.0 (a candidate can cause them, e.g. by overflowing
-        the context window). Kept out of live_cache only: GEPA's own
-        EvaluationCache (valset and minibatch put_batch) and its Pareto
-        valset scores still record that 0.0 for the rest of this optimize()
-        call, which is right when the candidate caused it. When
-        CONSECUTIVE_UNSCOREABLE_LIMIT exercises in a row end that way, the
-        seed probe described there decides whether to raise. A config
-        "error" (see _is_config_error) raises without retrying."""
+        returned scored 0.0 with a WARNING log naming the status, reason and
+        task_id. The environment or the candidate can cause them (e.g. a
+        candidate overflowing the context window), and nothing here tries to
+        tell which. Kept out of live_cache only: GEPA's own EvaluationCache
+        (valset and minibatch put_batch) and its Pareto valset scores still
+        record that 0.0 for the rest of this optimize() call, so a dead
+        model server scores every exercise 0.0 until the LiveBudget
+        wall-clock or run cap stops the run. A config "error" (see
+        _is_config_error) raises without retrying."""
         run_config = self.run_config
         sanitized = _sanitize_candidate(candidate)
-        is_probe_candidate = self._probe_sanitized is not None and sanitized == self._probe_sanitized
         results: dict[str, LiveRunResult] = {}
         misses: list[ExerciseSpec] = []
         for spec in specs:
@@ -517,8 +491,6 @@ class PolyglotLiveRunner:
                 result = LiveRunResult.from_dict(cached)
                 result.from_cache = True
                 results[spec.task_id] = result
-                if is_probe_candidate and result.status not in UNSCOREABLE_STATUSES:
-                    self._note_probe_known_good(spec)
                 if self.on_result is not None:
                     self.on_result(result)
             else:
@@ -527,24 +499,14 @@ class PolyglotLiveRunner:
         if misses:
             self.worktree.reset()
             self._write_sanitized(sanitized)
-            for i, spec in enumerate(misses):
+            for spec in misses:
                 result = self._run_with_retries(spec)
-                if result.status not in UNSCOREABLE_STATUSES:
-                    self._unscoreable_streak.clear()
-                    if is_probe_candidate:
-                        self._note_probe_known_good(spec)
-                else:
-                    self._unscoreable_streak.append(candidate_hash(sanitized))
-                    if len(self._unscoreable_streak) >= CONSECUTIVE_UNSCOREABLE_LIMIT:
-                        self._probe_or_raise(spec, result, is_probe_candidate=is_probe_candidate)
-                        # Only reached when the seed probe scored, which
-                        # rewrote the worktree to the seed.
-                        if i + 1 < len(misses):
-                            self.worktree.reset()
-                            self._write_sanitized(sanitized)
+                if result.status in UNSCOREABLE_STATUSES:
                     logger.warning(
-                        "live_eval: %s still hit %s after %d retries -- scoring it 0.0, kept out of live_cache",
+                        "live_eval: %s still hit %s after %d retries (reason: %s) -- "
+                        "scoring it 0.0, kept out of live_cache",
                         spec.task_id, result.status, HARNESS_ERROR_RETRIES,
+                        result.error or "<no reason recorded>",
                     )
                 results[spec.task_id] = result
                 if self.cache is not None:
@@ -552,29 +514,23 @@ class PolyglotLiveRunner:
 
         return [results[spec.task_id] for spec in specs]
 
-    def _note_probe_known_good(self, spec: ExerciseSpec) -> None:
-        self._probe_known_good.pop(spec.task_id, None)
-        self._probe_known_good[spec.task_id] = spec
-
-    def _run_with_retries(self, spec: ExerciseSpec, *, probe: bool = False) -> LiveRunResult:
+    def _run_with_retries(self, spec: ExerciseSpec) -> LiveRunResult:
         """Runs one exercise live against whatever is materialized, retrying
         an unscoreable status in place. Returns the first scoreable result,
         or the last unscoreable one once the retries are spent; raises for a
-        config error or a persistent harness_error. Leaves the unscoreable
-        streak to the caller."""
+        config error or a persistent harness_error."""
         for _try in range(1 + HARNESS_ERROR_RETRIES):
             if self.budget is not None:
                 self.budget.check_before_exercise(spec.task_id)  # raises rather than faking a score
             result = self._run_one_uncached(spec)
-            result.probe = probe
             if self.budget is not None:
                 self.budget.record_live_run()
             # Emitted here, per-run, rather than after the whole batch
             # returns -- a later exercise in this same batch raising
             # (e.g. the budget backstop above) must not erase the audit
             # trail for exercises that already genuinely ran. Fired for
-            # an unscoreable run and a probe run too: each genuinely ran and
-            # spent budget, even when it is never scored. Fired BEFORE
+            # an unscoreable run too: it genuinely ran and spent budget,
+            # even when it is never scored. Fired BEFORE
             # run_batch()'s cache.put(): if the memo write itself raises
             # (disk I/O), the audit record for an exercise that DID
             # genuinely run must not be lost along with it.
@@ -589,7 +545,7 @@ class PolyglotLiveRunner:
                     result=result,
                 )
             logger.warning(
-                "live_eval: %s%s hit %s (try %d/%d): %s", "seed probe on " if probe else "",
+                "live_eval: %s hit %s (try %d/%d): %s",
                 spec.task_id, result.status, _try + 1, 1 + HARNESS_ERROR_RETRIES, result.error,
             )
         if result.status == "harness_error":
@@ -599,59 +555,6 @@ class PolyglotLiveRunner:
                 result=result,
             )
         return result
-
-    def _probe_or_raise(self, spec: ExerciseSpec, result: LiveRunResult, *, is_probe_candidate: bool) -> None:
-        """The unscoreable streak reached CONSECUTIVE_UNSCOREABLE_LIMIT on
-        `spec`. Raises unless a live seed probe scores; on a scoreable probe
-        clears the streak and returns with the SEED materialized."""
-        n = len(self._unscoreable_streak)
-        k = len(set(self._unscoreable_streak))
-        measured = (
-            f"{n} consecutive unscoreable exercises across {k} candidate(s) "
-            f"(last: {spec.task_id!r}, {result.status!r} after {HARNESS_ERROR_RETRIES} retries)"
-        )
-        if self._probe_sanitized is None:
-            raise LiveEvalHarnessError(
-                f"{measured}; no seed probe is configured, so the environment is presumed "
-                f"broken -- refusing to score it: {result.error}",
-                result=result,
-            )
-        if is_probe_candidate:
-            raise LiveEvalHarnessError(
-                f"{measured}; the failing candidate is the seed itself, so there is no seed "
-                f"probe to run -- the environment or the seed looks broken, refusing to score "
-                f"it: {result.error}",
-                result=result,
-            )
-        if spec.task_id in self._probe_known_good:
-            probe_spec = spec
-        elif self._probe_known_good:
-            probe_spec = next(reversed(self._probe_known_good.values()))
-        else:
-            probe_spec = spec
-        logger.warning("live_eval: %s -- running a seed probe on %s", measured, probe_spec.task_id)
-        # Straight to a live run: a live_cache hit says nothing about the
-        # environment now, and a write could overwrite the seed's own entry.
-        self.worktree.reset()
-        self._write_sanitized(self._probe_sanitized)
-        try:
-            probe = self._run_with_retries(probe_spec, probe=True)
-        except LiveEvalHarnessError as e:
-            raise LiveEvalHarnessError(
-                f"seed probe on {probe_spec.task_id!r} (after {measured}): {e}", result=e.result,
-            ) from e
-        if probe.status in UNSCOREABLE_STATUSES:
-            raise LiveEvalHarnessError(
-                f"{measured}; seed probe on {probe_spec.task_id!r} also ended {probe.status!r} "
-                f"-- the environment looks broken, refusing to score it: {probe.error}",
-                result=probe,
-            )
-        self._note_probe_known_good(probe_spec)
-        self._unscoreable_streak.clear()
-        logger.warning(
-            "live_eval: %s, but the seed probe on %s scored (%s) -- treating the failures as "
-            "the candidate's own and keeping their 0.0s", measured, probe_spec.task_id, probe.status,
-        )
 
     def _run_one_uncached(self, spec: ExerciseSpec) -> LiveRunResult:
         script = self.worktree.path / "benchmarks" / "aider_polyglot.py"

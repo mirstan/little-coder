@@ -542,11 +542,6 @@ def _run_live(args: argparse.Namespace) -> int:
             thinking=args.thinking, benchmark_root=benchmark_root,
             cache=cache, per_exercise_timeout_s=per_exercise_timeout_s,
             budget=budget,
-            # Re-run live when the unscoreable circuit breaker trips, to tell
-            # a broken environment from a broken candidate (see
-            # live_eval.CONSECUTIVE_UNSCOREABLE_LIMIT). Under --baseline-only
-            # the candidate IS the seed, so the breaker raises without probing.
-            probe_candidate=seed_candidate,
             # Called per-result INSIDE run_batch() (cache hits included), not
             # after a whole batch returns -- a later exercise in the same
             # batch raising (e.g. the budget backstop) must not erase the
@@ -556,10 +551,15 @@ def _run_live(args: argparse.Namespace) -> int:
             # the same real wall-clock time every time that result is reused.
             # Tokens are spend too, so a hit zeroes usage the same way (the
             # memoized LiveRunResult still carries the original numbers).
+            # `error` is LiveRunResult.error capped at 500 characters (a
+            # harness_error's carries a stderr tail, and every try is
+            # logged). With `status`, it is what shows a run of runtime
+            # errors from a dead server here; it is often None for those.
             on_result=lambda r: spend_log.exercise(
                 exercise_id=r.task_id, status=r.status, score=r.score,
                 memo_hit=r.from_cache, duration_s=0.0 if r.from_cache else r.elapsed_s,
-                usage=_ZERO_USAGE if r.from_cache else r.usage, probe=r.probe,
+                usage=_ZERO_USAGE if r.from_cache else r.usage,
+                error=(r.error[:500] if r.error else r.error),
             ),
         )
 
