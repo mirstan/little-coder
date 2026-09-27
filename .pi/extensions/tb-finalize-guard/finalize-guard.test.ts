@@ -105,8 +105,30 @@ async function newSession(h: ReturnType<typeof makeHarness>, maxTurns?: number) 
   await startRun(h, maxTurns);
 }
 
+// The extension now derives dirtySinceLastTest/testInvocationEverSeen/
+// deliverableWriteEverSeen from tool_result (real per-call completion
+// order), not from turn_end's aggregate message.content array -- see
+// index.ts's tool_result handler. Real pi fires one tool_result per tool
+// call as it completes, then turn_end once the whole turn settles; this
+// helper mirrors that so existing shellTurn/shellSendTurn fixtures (whose
+// array order already encodes the intended logical order for a synthetic
+// single-caller test) keep working unchanged, while a test that wants to
+// exercise genuinely out-of-array-order sibling completion can still fire
+// tool_result directly itself before calling turn().
 async function turn(h: ReturnType<typeof makeHarness>, event: any) {
   await fire(h.pi, "turn_start", {}, h.ctx);
+  const content = event?.message?.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type !== "toolCall") continue;
+      await fire(
+        h.pi,
+        "tool_result",
+        { toolName: block.name, input: block.arguments ?? {} },
+        h.ctx,
+      );
+    }
+  }
   await fire(h.pi, "turn_end", event, h.ctx);
 }
 
@@ -621,6 +643,59 @@ describe("tb-finalize-guard", () => {
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+
+    it("judges two SEPARATE same-turn tool calls by real completion order, not by their position in the turn's tool-call array", async () => {
+      // pi runs same-turn SIBLING tool calls in parallel -- the array order
+      // a turn_end message reports them in is not a reliable stand-in for
+      // which one actually finished first. This fires tool_result directly,
+      // in the TRUE completion order (test finishes, THEN the write
+      // finishes), while the turn_end message's own array lists them in the
+      // OPPOSITE order (write listed first, test listed second) -- exactly
+      // the case where the old array-order-driven logic and the real
+      // execution order disagree. The correct answer follows real
+      // completion order: a write that finished AFTER the last real test
+      // must still count as dirty, even though it appears BEFORE the test
+      // in the array.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+
+      await fire(h.pi, "turn_start", {}, h.ctx);
+      // Real completion order: test result arrives first...
+      await fire(h.pi, "tool_result", { toolName: "ShellSession", input: { command: "pytest tests/" } }, h.ctx);
+      // ...then the write's result arrives second (finished LAST, after the
+      // test already ran) -- even though the message below lists it FIRST.
+      await fire(
+        h.pi,
+        "tool_result",
+        { toolName: "ShellSession", input: { command: "echo done > /app/result.txt" } },
+        h.ctx,
+      );
+      await fire(
+        h.pi,
+        "turn_end",
+        {
+          message: {
+            content: [
+              { type: "toolCall", name: "ShellSession", arguments: { command: "echo done > /app/result.txt" } },
+              { type: "toolCall", name: "ShellSession", arguments: { command: "pytest tests/" } },
+            ],
+            stopReason: undefined,
+          },
+        },
+        h.ctx,
+      );
+
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      // Real completion order says the write came after the test -> dirty.
+      // The array's own listed order would have said the opposite (test
+      // last, so clean) if array position were still driving this.
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
     });
   });
 

@@ -270,6 +270,14 @@ let triggerBFired = false;
 // does.
 let dirtySinceLastTest = false;
 
+// True once any command THIS TURN has written outside scratch -- reset at
+// turn_start, set incrementally as each tool_result arrives (see the
+// tool_result handler below), read once at turn_end. Split out from
+// dirtySinceLastTest because Trigger B/D's evidence check is turn-scoped
+// ("did THIS turn write"), while dirtySinceLastTest is a standing latch that
+// only clears on a real test run.
+let turnWroteDeliverable = false;
+
 // ---- Trigger C state ----
 // Fire count is session-scoped, like Trigger A's. The message snapshot is
 // run-scoped: AgentSettledEvent carries no messages (unlike agent_end), so
@@ -414,34 +422,49 @@ export function looksLikeTestInvocation(cmd: string): boolean {
 }
 
 /**
- * Every command-shaped string found in this turn's tool calls: the `command`
- * argument for anything in SHELL_TOOLS, plus (for Trigger B's evidence-of-work
- * purposes only) ShellSend's `text` argument — confirmed against
- * bg-shell/index.ts's ShellSend tool definition, which takes `text`, not
- * `command`.
+ * The command-shaped string carried by a single tool call, if any: the
+ * `command` argument for anything in SHELL_TOOLS, plus (for Trigger B's
+ * evidence-of-work purposes only) ShellSend's `text` argument — confirmed
+ * against bg-shell/index.ts's ShellSend tool definition, which takes `text`,
+ * not `command`. Used by the tool_result handler below to extract each
+ * call's command as its own result arrives.
  */
-function shellCommandsIn(toolCalls: any[]): string[] {
-  const commands: string[] = [];
-  for (const c of toolCalls) {
-    if (typeof c?.name !== "string") continue;
-    const args = c.arguments ?? c.input ?? {};
-    if (SHELL_TOOLS.has(c.name)) {
-      if (typeof args?.command === "string") commands.push(args.command);
-    } else if (EVIDENCE_ONLY_SHELL_TOOLS.has(c.name)) {
-      if (typeof args?.text === "string") commands.push(args.text);
-    }
+function shellCommandOf(name: unknown, args: Record<string, unknown>): string | undefined {
+  if (typeof name !== "string") return undefined;
+  if (SHELL_TOOLS.has(name)) {
+    return typeof args?.command === "string" ? args.command : undefined;
   }
-  return commands;
+  if (EVIDENCE_ONLY_SHELL_TOOLS.has(name)) {
+    return typeof args?.text === "string" ? args.text : undefined;
+  }
+  return undefined;
 }
 
-/** True when at least one command in this turn writes somewhere other than scratch. */
-function hasNonScratchWrite(commands: string[]): boolean {
-  for (const cmd of commands) {
-    for (const w of detectDeliverableWrites(cmd)) {
-      if (!isScratchPath(w.path)) return true;
+/**
+ * Advance dirtySinceLastTest/testInvocationEverSeen for ONE command string,
+ * in isolation. Pulled out of the old turn_end loop so it can be driven
+ * per-tool_result (real completion order) instead of per-turn_end-aggregate
+ * (array order, which pi does not guarantee reflects same-turn sibling
+ * execution order -- see the tool_result handler). Segment order WITHIN one
+ * command string is untouched: splitCommandChain already returns a single
+ * command's chained segments in their genuine left-to-right execution
+ * order, since `&&`/`;`/`|` chaining inside one string is truly sequential
+ * regardless of how pi schedules separate tool calls.
+ */
+function advanceDirtyLatchForCommand(cmd: string): void {
+  let sawRealTestInThisCommand = false;
+  for (const segment of splitCommandChain(cmd)) {
+    const nonScratchWrites = detectDeliverableWrites(segment).filter((w) => !isScratchPath(w.path));
+    if (nonScratchWrites.length > 0) {
+      const allTestOutputShaped = nonScratchWrites.every((w) => TEST_OUTPUT_WRITE_KINDS.has(w.kind));
+      if (!sawRealTestInThisCommand || !allTestOutputShaped) dirtySinceLastTest = true;
+    }
+    if (looksLikeTestInvocation(segment)) {
+      dirtySinceLastTest = false;
+      sawRealTestInThisCommand = true;
+      testInvocationEverSeen = true;
     }
   }
-  return false;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -469,6 +492,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     turnsThisRun++;
+    turnWroteDeliverable = false;
     if (!isTerminalBench()) return;
     if (!armed && !triggerBFired && finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) {
       armed = true;
@@ -479,13 +503,41 @@ export default function (pi: ExtensionAPI) {
     maybeFireTriggerD(pi, ctx);
   });
 
+  // Drives dirtySinceLastTest/testInvocationEverSeen/turnWroteDeliverable
+  // per INDIVIDUAL tool call, in the order pi actually reports each call's
+  // result -- not from turn_end's aggregated message.content array, whose
+  // order is NOT a reliable stand-in for execution order when a turn issues
+  // several SIBLING tool calls: pi runs those in parallel, so "toolCalls[0]
+  // ran before toolCalls[1]" does not hold in general (only a single
+  // command's own internal &&/;/| chaining is genuinely sequential, and
+  // that ordering is untouched here -- see advanceDirtyLatchForCommand).
+  // tool_result fires once per call as it actually completes, which is the
+  // best ordering signal pi exposes for cross-call sequencing; two calls
+  // that finish in the same tick still arrive as two separate events in
+  // whatever order pi's own event loop happens to deliver them, which is a
+  // real (if unspecified) order rather than a guessed one.
+  pi.on("tool_result", async (event) => {
+    if (!isTerminalBench()) return;
+    const e = event as any;
+    const args = e?.input ?? e?.arguments ?? {};
+    const cmd = shellCommandOf(e?.toolName ?? e?.name, args);
+    if (cmd === undefined) return;
+
+    const nonScratchWrites = detectDeliverableWrites(cmd).filter((w) => !isScratchPath(w.path));
+    if (nonScratchWrites.length > 0) {
+      turnWroteDeliverable = true;
+      deliverableWriteEverSeen = true;
+    }
+    advanceDirtyLatchForCommand(cmd);
+  });
+
   pi.on("turn_end", async (event, ctx) => {
     if (!isTerminalBench()) return;
     const message: any = (event as any)?.message;
     if (!message) return;
     lastTurnMessage = message;
 
-    const { text, toolCallCount, toolCalls } = contentShape(message);
+    const { text, toolCallCount } = contentShape(message);
 
     // Shared instrumentation: log every terminal_bench turn_end's stopReason
     // and coarse content shape, regardless of trigger state. Diagnostic
@@ -498,76 +550,18 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
-    // Computed for every turn, not just the ones Trigger B is armed for:
-    // Trigger D's evidence flag has to be complete from turn 1, long before
-    // Trigger B starts judging compliance.
-    const commandsThisTurn = shellCommandsIn(toolCalls);
-    const wroteDeliverable = hasNonScratchWrite(commandsThisTurn);
-    if (wroteDeliverable) deliverableWriteEverSeen = true;
-
-    // Re-derived per execution-ordered command SEGMENT, not per whole-turn
-    // raw text: each command is split into its chained segments in order
-    // (splitCommandChain already strips heredoc bodies first), and each
-    // segment in turn can set the flag (a non-scratch write) or clear it (a
-    // real, unquoted test invocation) -- rather than "did either pattern
-    // appear anywhere in the turn's raw text" (which let a heredoc body's
-    // mention of a runner name, or a write that happened before the turn's
-    // only test, wrongly clear the flag -- root-cause cases (a) and (b)).
-    //
-    // Iteration 2: strict last-writer-wins per turn (iteration 1's rule)
-    // created a NEW false positive -- a command whose real test invocation
-    // is immediately followed, in the SAME command, by a write that is
-    // plausibly the test's own output-handling (`pytest 2>&1 | tee log`,
-    // `pytest && echo done > DONE`) got wrongly re-dirtied by that later
-    // segment. `sawRealTestInThisCommand` is scoped to one `cmd` (reset for
-    // each command in `commandsThisTurn`) so a same-command carve-out can
-    // exempt exactly that shape -- but a write in a DIFFERENT, later command
-    // still dirties normally, and a write that PRECEDES every test in its
-    // own command still dirties too (same-segment ordering, and
-    // same-command write-before-test, are both preserved).
-    //
-    // Iteration 3: iteration 2's carve-out collapsed a segment's writes to a
-    // single boolean before checking `sawRealTestInThisCommand`, so ONCE any
-    // test was seen in the command, it unconditionally exempted EVERY later
-    // write in that command from re-dirtying -- including a genuine
-    // deliverable edit (`pytest && sed -i 's/x/y/' /app/main.py`, `make
-    // test; cp fixed.py /app/main.py`), which is exactly the "late edit
-    // after a passing test, never re-tested" shape this guard exists to
-    // catch. The carve-out is now scoped to only test-output-shaped writes
-    // (see `TEST_OUTPUT_WRITE_KINDS`): a same-command write after the test
-    // is exempted only when EVERY non-scratch write in that segment is one
-    // of those kinds; if any write in the segment is a real edit, a copy, a
-    // move, or a compile-to-a-deliverable-path, it still dirties even though
-    // `sawRealTestInThisCommand` is already true. A known, accepted residual
-    // gap: `ShellWrite.kind` only encodes redirect SHAPE (`>`/`>>`/`tee`),
-    // never what content is being written, so any same-command write of
-    // arbitrary new content to a deliverable path -- a heredoc source
-    // (`pytest && cat > /app/main.py <<'EOF' ... EOF`), a plain `echo`/`cat`/
-    // `printf` redirect, not just heredocs -- is still incorrectly exempted
-    // here. Narrower than what iteration 2 shipped, not solved by this fix.
-    //
-    // `testInvocationEverSeen` is session-scoped (see its declaration) and
-    // gates the message clause (see buildTriggerAMessage), not this flag.
-    for (const cmd of commandsThisTurn) {
-      let sawRealTestInThisCommand = false;
-      for (const segment of splitCommandChain(cmd)) {
-        const nonScratchWrites = detectDeliverableWrites(segment).filter((w) => !isScratchPath(w.path));
-        if (nonScratchWrites.length > 0) {
-          const allTestOutputShaped = nonScratchWrites.every((w) => TEST_OUTPUT_WRITE_KINDS.has(w.kind));
-          if (!sawRealTestInThisCommand || !allTestOutputShaped) dirtySinceLastTest = true;
-        }
-        if (looksLikeTestInvocation(segment)) {
-          dirtySinceLastTest = false;
-          sawRealTestInThisCommand = true;
-          testInvocationEverSeen = true;
-        }
-      }
-    }
+    // dirtySinceLastTest/testInvocationEverSeen/deliverableWriteEverSeen are
+    // no longer derived here from the turn's tool calls in aggregate -- see
+    // the tool_result handler above, which drives them per individual call
+    // in real completion order instead (a turn's own toolCall array order is
+    // not a reliable stand-in for execution order across same-turn SIBLING
+    // calls, which pi runs in parallel). turnWroteDeliverable is that
+    // handler's per-turn accumulator, reset at turn_start and read once here.
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
 
-    maybeAdvanceTriggerB(pi, ctx, wroteDeliverable);
+    maybeAdvanceTriggerB(pi, ctx, turnWroteDeliverable);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
