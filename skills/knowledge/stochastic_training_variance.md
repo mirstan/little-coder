@@ -2,8 +2,8 @@
 name: stochastic-training-variance
 type: domain-knowledge
 topic: Stochastic Training Variance Near a Threshold
-token_cost: 90
-keywords: [train, training, accuracy, threshold, classifier, fasttext, seed, epoch, hyperparameter, reproducible, deterministic, validation, holdout]
+token_cost: 150
+keywords: [train, accuracy, classifier, fasttext, epoch, hyperparameter, accuracy threshold, training run, random seed, cross validation, test set, at least 0]
 user-invocable: false
 ---
 Training a model is not a single deterministic measurement -- random weight
@@ -16,7 +16,15 @@ verify this for the specific library in front of you rather than assuming
 fixed pass/fail threshold, do not report or rely on one run's number,
 especially when it lands close to that threshold: measure your own
 run-to-run spread first (e.g. a couple of reruns, or cross-validation vs. an
-independent holdout), and if the threshold sits inside that spread, retrain
-across several seeds/resamples and report the best result, or ensemble
-predictions across runs, rather than shipping whichever single draw happened
-to land in this trial.
+independent holdout). If the threshold sits inside that spread, prefer
+raising the expected score outright -- more data, more epochs, better
+hyperparameters -- so the run clears the threshold with margin instead of
+depending on a favorable draw. If that is not practical, retrain across
+several seeds/resamples, pick the best-scoring run on a selection split, and
+then report its score on a held-out split that played no part in choosing
+it: the selection split's own score is still just the most optimistic draw
+in the sample, not an unbiased estimate of how the chosen model performs.
+Only ensemble predictions across runs when the task's deliverable format
+actually accepts multiple models -- a verifier that loads one native model
+file from a fixed path will not accept a multi-model wrapper, and scores
+that as a failed load rather than a pass.

@@ -118,4 +118,106 @@ describe("stochastic-training-variance entry", () => {
       "whatever GPT-2 would print for the next 20 tokens.";
     expect(scoreEntry(gpt2Codegolf, entry(keywords))).toBeLessThan(MIN_SCORE_THRESHOLD);
   });
+
+  // spec iter1-f00, truth 4: the test above proves only zero-overlap silence;
+  // it cannot detect the false-positive boundary the old 13-bare-word keyword
+  // list actually crossed. These three prompts describe no training run and
+  // no metric threshold, but scored >= MIN_SCORE_THRESHOLD under the old list
+  // purely from incidental bare-word pairs (verified by hand against the real
+  // scorer: "deterministic"+"reproducible", "validation"+"threshold",
+  // "classifier"+"training"). Unlike the gpt2 test, this one can actually
+  // fail if a future keyword edit reopens the boundary.
+  it("does not fire on prompts that share old keywords but describe no training run or metric threshold", () => {
+    const falsePositives = [
+      "make the pipeline deterministic and reproducible",
+      "add validation and a threshold check",
+      "Refactor the spam classifier module for readability; do not change training behaviour.",
+    ];
+    for (const prompt of falsePositives) {
+      expect(scoreEntry(prompt, entry(keywords)), prompt).toBeLessThan(MIN_SCORE_THRESHOLD);
+    }
+  });
+});
+
+// spec iter1-f00, truth 2: exercises the REAL selection/budget path end to
+// end -- not a re-derivation by eye -- on the real train-fasttext prompt.
+// Mirrors index.ts:117-131's score-sort + greedy-budget-fit loop exactly:
+// sort by score descending, PER_ENTRY_CAP = 150 clamp (index.ts:31, not
+// exported so mirrored here as a literal), budget = 200, accumulate `used`,
+// skip an entry that would exceed budget. Re-check this test's mirrored
+// constants against index.ts if that loop, or PER_ENTRY_CAP, ever changes.
+describe("knowledge-inject real selection/budget path", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const kDir = join(here, "..", "..", "..", "skills", "knowledge");
+  const pDir = join(here, "..", "..", "..", "skills", "protocols");
+  const PER_ENTRY_CAP = 150;
+  const BUDGET = 200;
+
+  function loadRealEntries(dir: string): KnowledgeEntry[] {
+    const out: KnowledgeEntry[] = [];
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(".md")) continue;
+      const parsed = parseSkillFile(readFileSync(join(dir, file), "utf-8"));
+      if (!parsed) continue;
+      const fm = parsed.frontmatter as Record<string, unknown>;
+      const topic =
+        (typeof fm.topic === "string" ? fm.topic : "") ||
+        (typeof fm.name === "string" ? fm.name : "");
+      if (!topic || !parsed.body) continue;
+      let cost = typeof fm.token_cost === "number" ? fm.token_cost : 150;
+      if (cost > PER_ENTRY_CAP) cost = PER_ENTRY_CAP;
+      const keywords = Array.isArray(fm.keywords)
+        ? (fm.keywords as string[]).map((k) => k.toLowerCase())
+        : [];
+      out.push({ topic, body: parsed.body, tokenCost: cost, keywords, requiresTools: [] });
+    }
+    return out;
+  }
+
+  it("fits the corrected stochastic-training-variance entry under budget on the real train-fasttext prompt", () => {
+    const prompt =
+      "Please train a fasttext model on the yelp data in the data/ folder. " +
+      "The final model size needs to be less than 150MB but get at least " +
+      "0.62 accuracy on a private test set that comes from the same yelp " +
+      "review distribution. The model should be saved as /app/model.bin";
+
+    const entries = [...loadRealEntries(kDir), ...loadRealEntries(pDir)];
+    const stochastic = entries.find(
+      (e) => e.topic === "Stochastic Training Variance Near a Threshold",
+    );
+    expect(stochastic).toBeDefined();
+    // truth 1: token_cost is no longer the 3x+ outlier (90); it is honestly
+    // capped at PER_ENTRY_CAP like its similarly-sized siblings.
+    expect(stochastic!.tokenCost).toBe(150);
+
+    // Mirror index.ts:117-124's scoring/filter/sort exactly.
+    const scored: Array<{ score: number; entry: KnowledgeEntry }> = [];
+    for (const e of entries) {
+      const s = scoreEntry(prompt, e);
+      if (s >= MIN_SCORE_THRESHOLD) scored.push({ score: s, entry: e });
+    }
+    scored.sort((a, b) => b.score - a.score);
+
+    // Mirror index.ts:126-131's greedy budget-fit loop exactly.
+    const selected: string[] = [];
+    let used = 0;
+    for (const { entry } of scored) {
+      if (used + entry.tokenCost > BUDGET) continue;
+      selected.push(entry.topic);
+      used += entry.tokenCost;
+    }
+
+    // Computed, not assumed: on this prompt the corrected entry's real score
+    // (train + fasttext + accuracy + "test set" + "at least 0") is high
+    // enough that it still consumes enough of the 200-token budget to keep
+    // Workspace Documentation out, even at the honest cost of 150 -- the
+    // original bug (a false-cheap declared cost) is fixed, but the greedy
+    // budget-fit ALGORITHM is unchanged and out of scope for this fix (spec
+    // iter1-f00). This pins the corrected-cost outcome so a future edit to
+    // either file re-computes it rather than silently reintroducing (or
+    // silently "fixing") the eviction.
+    expect(selected).toContain("Stochastic Training Variance Near a Threshold");
+    expect(selected).not.toContain("Workspace Documentation");
+    expect(used).toBe(150);
+  });
 });
