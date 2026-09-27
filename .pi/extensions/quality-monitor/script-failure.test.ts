@@ -43,9 +43,15 @@ describe("looksLikeScriptRun", () => {
   });
 
   // Truth: "The interpreter+script-extension match only counts when that
-  // token is the command chain's own final segment."
-  describe("final-segment requirement", () => {
-    it("does not match when the interpreter+script token is not the chain's final segment", () => {
+  // token is in the chain's ATTRIBUTED segment" -- as of iter2-f00 Member 1,
+  // that is the final `;`/`|`/newline-delimited segment UNLESS it's a pure
+  // output filter piped from an upstream segment, in which case attribution
+  // walks back to that upstream segment (see the dedicated "piped real-run
+  // attribution" describe block above for that case). A `;`/newline
+  // boundary is never walked back across -- the two sides are independent
+  // commands -- which is what the first test below still exercises.
+  describe("attributed-segment requirement", () => {
+    it("does not match when the interpreter+script token is in a `;`-separated, unrelated segment", () => {
       expect(looksLikeScriptRun({ command: "python3 solve.py; grep expected missing.txt" })).toBe(false);
     });
     it("matches when the interpreter+script token IS the chain's final segment", () => {
@@ -68,6 +74,63 @@ describe("looksLikeScriptRun", () => {
       expect(looksLikeScriptRun({ command: "perl final.pl || echo fallback" })).toBe(true);
     });
   });
+
+  // Truth (iter2-f00, Member 1): a real trial-shaped piped script run is
+  // detected and attributed to the script segment, not the trailing filter.
+  // These are the exact command shapes replayed from the real
+  // overfull-hbox__Mq8QoTa trial (benchmarks/harbor_runs/2026-09-24__21-02-23
+  // in the sibling little-coder-dev checkout) -- see iter2-f00.result.md for
+  // what was actually tested against that trial's log.
+  describe("piped real-run attribution (iter2-f00 Member 1)", () => {
+    it("attributes a perl run piped to a filtering grep to the perl segment", () => {
+      expect(
+        looksLikeScriptRun({ command: 'perl solve.pl 40 2>&1 | grep -vE "Use of uninitialized"' }),
+      ).toBe(true);
+    });
+    it("attributes a python3 run piped to head to the python3 segment", () => {
+      expect(looksLikeScriptRun({ command: "python3 solve.py 2>&1 | head -40" })).toBe(true);
+    });
+    it("walks back across several chained pure-filter segments", () => {
+      expect(
+        looksLikeScriptRun({ command: 'perl solve.pl 2>&1 | grep -vE "x" | head -40' }),
+      ).toBe(true);
+    });
+    it("still recognizes the same real command wrapped in `timeout N`", () => {
+      // The real trial wraps nearly every long-running script call this way
+      // (`timeout 60 perl test6.pl`, `timeout 150 perl lever.pl`, ...) --
+      // without stripping the wrapper, the first-word invocation check below
+      // would reject these the same way it correctly rejects
+      // `ls python3 missing.py`.
+      expect(
+        looksLikeScriptRun({ command: 'timeout 60 perl test6.pl 2>&1 | grep -vE "Uninitialized"' }),
+      ).toBe(true);
+    });
+    it("does not reattribute across a `;`/newline boundary -- only a `|` carries a filter's input from the script", () => {
+      // Same command text as the existing final-segment test above, stated
+      // here under its Member-1 rationale: `;` makes the two commands
+      // independent, so the chain's real exit (grep's) is judged on its own
+      // and correctly does not match.
+      expect(
+        looksLikeScriptRun({ command: "python3 solve.py; grep expected missing.txt" }),
+      ).toBe(false);
+    });
+  });
+
+  // Truth (iter2-f00, Member 1, Codex): a non-script command whose text
+  // merely CONTAINS interpreter+extension-shaped substrings in unrelated
+  // args does not match -- the interpreter token must be the actual
+  // executable (or a wrapper's argument that becomes one), not just present
+  // somewhere in the string.
+  describe("command-invocation-shape requirement (iter2-f00 Member 1, Codex)", () => {
+    it("does not match when the interpreter word is another command's argument, not its own executable", () => {
+      expect(looksLikeScriptRun({ command: "ls python3 missing.py" })).toBe(false);
+    });
+    it("does not match a literal interpreter+extension substring inside a grep pattern", () => {
+      expect(
+        looksLikeScriptRun({ command: 'grep "python3 solve.py" file.txt' }),
+      ).toBe(false);
+    });
+  });
 });
 
 describe("ScriptFailureTracker", () => {
@@ -87,18 +150,47 @@ describe("ScriptFailureTracker", () => {
     expect(detections[5]).toEqual({ count: 6, escalated: true });
   });
 
-  // Re-checked per fix-discipline: verbatim-repeat exclusion changes this
-  // trial's expected count. Of the raw 8 events, `solve.pl`/`net6.pl`/
-  // `final.pl` each repeat their own immediately preceding command verbatim,
-  // so only 5 are now genuinely distinct -- crossing threshold 1 but never
-  // reaching threshold 2 (6). Still nonzero, per the invariant.
-  it("mirrors the real trial's event shape after verbatim-repeat exclusion: 5 distinct events from the raw 8, threshold 1 only", () => {
+  // Re-checked per fix-discipline (iter2-f00, Member 2): this fixture's
+  // expected count changes again with the dedup key. Each of the 8 events
+  // below carries a DIFFERENT failure body (`distinct failure ${i}`), i.e.
+  // each is a genuinely distinct failure even where the command text repeats
+  // (`solve.pl`/`net6.pl`/`final.pl` each repeat their own immediately
+  // preceding command verbatim, in TEXT only). Iteration 1's command-text-
+  // only dedup wrongly suppressed those 3 repeats as "the same attempt seen
+  // twice", losing 3 of the raw 8 -- exactly the defect iter2-f00 Member 2
+  // fixes: dedup is now (command text, failure signature), so a command
+  // rerun that fails DIFFERENTLY is no longer conflated with a truly
+  // identical immediate repeat. All 8 are now counted, crossing both
+  // thresholds.
+  it("mirrors the real trial's event shape: all 8 raw events count once dedup keys on (command, failure signature) rather than command text alone", () => {
     const paths = [
       "solve.pl", "solve.pl", "lever.pl", "test6.pl",
       "net6.pl", "net6.pl", "final.pl", "final.pl",
     ];
     const detections = paths.map((p, i) => recordAndDeliver(tracker, scriptResult(p, 139, `distinct failure ${i}`)));
-    expect(detections.filter((d) => d !== null)).toEqual([{ count: 3, escalated: false }]);
+    expect(detections.filter((d) => d !== null)).toEqual([
+      { count: 3, escalated: false },
+      { count: 6, escalated: true },
+    ]);
+  });
+
+  // Truth (iter2-f00, Member 2): a rewrite-then-rerun of the same command
+  // text, where the SECOND run fails DIFFERENTLY, is not suppressed as a
+  // verbatim repeat -- this is the canonical write->run->fail,
+  // REWRITE->run->fail loop the tracker exists to catch, and the command
+  // text is typically identical across retries (only the file changed).
+  it("counts an immediate rerun of the identical command text when it fails differently (rewrite happened in between)", () => {
+    recordAndDeliver(tracker, scriptResult("lever.pl", 2, "some other bug")); // count 1
+    expect(
+      recordAndDeliver(tracker, scriptResult("solve.pl", 2, "undefined variable $x at line 12")),
+    ).toBeNull(); // count 2: first solve.pl attempt, below threshold 1
+    // Same command text as the immediately preceding counted event, but the
+    // file was rewritten between the two runs and this run fails
+    // DIFFERENTLY -- must count as a new distinct failure, not be suppressed
+    // as a verbatim repeat the way command-text-only dedup used to.
+    expect(
+      recordAndDeliver(tracker, scriptResult("solve.pl", 2, "index out of range at line 40")),
+    ).toEqual({ count: 3, escalated: false });
   });
 
   it("does not double-notify threshold 1 on the turns between it and threshold 2", () => {
@@ -282,6 +374,15 @@ async function fireScriptResultOnNonOkTurn(h: any, path: string, code: number) {
   }
   return fire(h, "turn_end", { message: { stopReason: "stop", content: [] } });
 }
+// A plain ok-verdict turn with no tool calls/results of its own at all --
+// used to prove Member 3's fix: `due()` is checked once per ok-verdict
+// turn_end regardless of whether THIS turn produced a new qualifying script
+// result, not only from inside scriptFailureTracker.record().
+async function fireOkTextOnlyTurn(h: any, text: string) {
+  return fire(h, "turn_end", {
+    message: { stopReason: "stop", content: [{ type: "text", text }] },
+  });
+}
 
 describe("quality-monitor turn_end integration: script-failure tracker", () => {
   it("sends its own steer message at count 3, independent of near_duplicate_loop", async () => {
@@ -327,5 +428,28 @@ describe("quality-monitor turn_end integration: script-failure tracker", () => {
     const scriptMsgs = h.followUps.filter((f) => f.msg.includes("different script-write attempts"));
     expect(scriptMsgs).toHaveLength(1);
     expect(scriptMsgs[0].msg).toContain("4 different script-write attempts");
+  });
+
+  // Truth (iter2-f00, Member 3): the gap the test above does NOT cover --
+  // that one still delivers via a new qualifying script result arriving on
+  // the later ok turn. Here the later ok-verdict turn has NO ShellSession
+  // call/result of its own at all, so `record()` is never invoked for it;
+  // only a `due()` check independent of that turn's own results can surface
+  // the still-pending threshold.
+  it("re-offers a threshold crossed on a non-ok turn on a later ok-verdict turn that has NO new script-shaped result of its own", async () => {
+    const h = harness();
+    await fire(h, "session_start", {});
+    await fireScriptFailureTurn(h, "solve.pl", 2); // count 1, ok verdict
+    await fireScriptFailureTurn(h, "lever.pl", 2); // count 2, ok verdict
+    // count 3: threshold 1 crossed, but this turn's verdict is non-ok, so
+    // the steer is never sent and markNotified() never runs.
+    await fireScriptResultOnNonOkTurn(h, "test6.pl", 2);
+    expect(h.followUps.filter((f) => f.msg.includes("different script-write attempts"))).toHaveLength(0);
+    // A later ok-verdict turn with no tool call/result at all -- just text --
+    // must still deliver the still-pending count-3 message.
+    await fireOkTextOnlyTurn(h, "Let me reconsider the approach.");
+    const scriptMsgs = h.followUps.filter((f) => f.msg.includes("different script-write attempts"));
+    expect(scriptMsgs).toHaveLength(1);
+    expect(scriptMsgs[0].msg).toContain("3 different script-write attempts");
   });
 });

@@ -295,7 +295,6 @@ export default function (pi: ExtensionAPI) {
     // After the fuzzy update, so this turn's results can be credited to the
     // cluster their own call just joined.
     let failsigDetection: FailureSignatureDetection | null = null;
-    let scriptFailureDetection: ScriptFailureDetection | null = null;
     for (const r of thisTurnResults) {
       const clusterId = fuzzyTracker.clusterIdForToolCallId(r.toolCallId);
       const detection = failsigTracker.record(
@@ -313,13 +312,26 @@ export default function (pi: ExtensionAPI) {
       // Independent of the fuzzy/failsig correlation above: this tracker
       // doesn't cluster by content at all, so it reads every result on its
       // own regardless of what fuzzyTracker made of the call that produced it.
-      const scriptDetection = scriptFailureTracker.record({
+      // The return value itself is not read here -- see the `due()` call
+      // below (Member 3) for why the count update is all this loop needs to
+      // do for scriptFailureTracker.
+      scriptFailureTracker.record({
         input: r.input,
         text: r.text,
         isError: r.isError,
       });
-      if (scriptDetection) scriptFailureDetection = scriptDetection;
     }
+    // Member 3: checked once per ok-verdict turn_end, independent of whether
+    // THIS turn's own results included a new qualifying script-shaped
+    // failure. `due()` is computed fresh from the tracker's current
+    // count/notifiedThreshold (see its own doc), so a threshold that crossed
+    // on an earlier turn whose delivery never happened (that turn's verdict
+    // came back non-ok, so this whole `if (verdict.ok)` branch never ran)
+    // is picked up here the next time an ok-verdict turn_end fires, even if
+    // that turn produced no ShellSession result of its own at all -- rather
+    // than only ever being re-offered when ANOTHER new qualifying failure
+    // happens to arrive later, which is not guaranteed.
+    const scriptFailureDetection: ScriptFailureDetection | null = scriptFailureTracker.due();
 
     if (verdict.ok) {
       consecutiveFailures = 0;
@@ -335,9 +347,11 @@ export default function (pi: ExtensionAPI) {
       // is called here, inside the ok-verdict branch, and nowhere in
       // record() itself: a threshold crossed on a turn that turns out
       // non-ok (verdict.ok false, this whole branch skipped) must not
-      // silently burn its one notification -- due() keeps reporting it on
-      // the next record() call until a message actually reaches
-      // sendUserMessage.
+      // silently burn its one notification -- `due()` (computed above,
+      // Member 3) keeps reporting it on every subsequent ok-verdict turn_end
+      // until a message actually reaches sendUserMessage, regardless of
+      // whether that later turn's own results include a new qualifying
+      // script result of their own.
       if (scriptFailureDetection) {
         scriptFailureTracker.markNotified();
         harnessIntervention(
