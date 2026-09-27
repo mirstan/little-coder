@@ -438,6 +438,52 @@ describe("tb-finalize-guard", () => {
       expect(h.sent).toHaveLength(1);
       expect(h.sent[0].text).not.toContain("without re-running your tests");
     });
+
+    it("does not clear the flag when a heredoc body merely mentions a test framework", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // A heredoc write whose BODY text contains "pytest" — no test invocation
+      // actually ran, so the flag must stay dirty (root-cause case (a)).
+      await turn(
+        h,
+        shellTurn(["cat > /app/solution.py <<'EOF'\nimport pytest\n\ndef test_x(): ...\nEOF"]),
+      );
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("stays dirty when a chained write follows the turn's only test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Test runs first, then a write, both chained in one command — the
+      // write comes AFTER the only test, so the flag must end the turn dirty
+      // (root-cause case (b), order-blindness).
+      await turn(h, shellTurn(["python -m pytest && sed -i 's/x/y/' /app/main.py"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still clears the flag for a real, unquoted, unchained test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write
+      await turn(h, shellTurn(["python -m pytest"])); // the working case — must not regress
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
   });
 
   describe("looksLikeTestInvocation", () => {
@@ -469,6 +515,10 @@ describe("tb-finalize-guard", () => {
         "echo 'contest results' > /app/out.txt",
         "vim test_plan.md",
         "grep -r test src/",
+        // Root-cause case (c): a quoted/embedded runner name in an unrelated
+        // command must not match — "make test" here sits inside the commit
+        // message, not on the command line.
+        "git commit -m 'make test pass'",
       ];
       for (const cmd of negatives) expect(looksLikeTestInvocation(cmd)).toBe(false);
     });

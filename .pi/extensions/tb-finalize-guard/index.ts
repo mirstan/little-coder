@@ -2,7 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
-import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
+import {
+  SHELL_TOOLS,
+  detectDeliverableWrites,
+  isScratchPath,
+  splitCommandChain,
+  scan,
+} from "../_shared/shell-write.ts";
 import {
   finalizeWarnTurnWindowOpen,
   finalizeWarnWouldFire,
@@ -306,11 +312,26 @@ function contentShape(message: any): { text: string; toolCallCount: number; tool
 const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
 
 // Heuristic, not exhaustive -- a command-name allowlist can't cover every
-// language/framework's test invocation, and false negatives here just mean
-// this trigger's extra clause doesn't fire (Trigger A's base message still
-// does). False positives (treating a non-test command as a test run) are
-// the costlier direction (they'd suppress the clause when it should have
-// fired) but the patterns below are specific enough to keep that rare.
+// language/framework's test invocation. A false negative here (an unlisted
+// runner -- vitest, jest, tox, ctest, etc. are all absent from the list
+// below, and note this repo's own test command is `npx vitest run`) does
+// NOT mean the clause below simply fails to fire: `dirtySinceLastTest` stays
+// true and the retest-nudge clause fires anyway, wrongly accusing a model
+// that just re-ran its tests through a runner this list doesn't recognize.
+// That is the costlier direction, and it is not rare -- it fires on every
+// turn whose only test run used an unlisted runner.
+//
+// A false positive (matching text that never executed as a test at all --
+// inside a heredoc body, a comment, or a quoted string) is the direction
+// that gets silently SUPPRESSED instead: the clause simply doesn't fire when
+// it should have. That is also not rare -- `cat > file <<'EOF'` bodies that
+// merely mention a runner name, and a quoted string like
+// `git commit -m 'make test pass'`, both hit it easily. Matching against
+// per-segment, quote-aware text (see `looksLikeTestInvocation` below, and
+// where it's called against `splitCommandChain` segments in `turn_end`)
+// closes the heredoc/quoting/ordering gaps; the pattern LIST itself staying
+// incomplete (the false-negative direction above) is a separate,
+// not-yet-filed concern.
 const TEST_INVOCATION_PATTERNS: RegExp[] = [
   /\bpytest\b/, /\bpy\.test\b/, /\bpython3?\s+-m\s+pytest\b/,
   /\bpython3?\s+-m\s+unittest\b/,
@@ -321,8 +342,34 @@ const TEST_INVOCATION_PATTERNS: RegExp[] = [
   /\bmvn\s+test\b/, /\bgradle\s+test\b/,
 ];
 
+/**
+ * Blank out every quoted (or escaped) character in `cmd`, preserving length
+ * and position so a regex's `\b` boundaries still land correctly. This is
+ * what keeps `looksLikeTestInvocation` from matching a runner name that only
+ * appears inside a quoted string, e.g. `git commit -m 'make test pass'`
+ * (root-cause case (c)) -- the quoted span becomes spaces, so `make test`
+ * never appears as adjacent, unquoted words.
+ */
+function maskQuotedText(cmd: string): string {
+  const masked = new Array<boolean>(cmd.length).fill(true);
+  scan(cmd, (_ch, i, quote) => {
+    masked[i] = quote !== null;
+  });
+  let out = "";
+  for (let i = 0; i < cmd.length; i++) out += masked[i] ? " " : cmd[i];
+  return out;
+}
+
+/**
+ * True when `cmd` -- a single already-heredoc-stripped, already-chain-split
+ * command segment (see `splitCommandChain`) -- contains a real, unquoted
+ * test-runner invocation. Quoted/escaped text is masked out first (see
+ * `maskQuotedText`) so a runner name embedded in a string literal, rather
+ * than on the command line itself, cannot match.
+ */
 export function looksLikeTestInvocation(cmd: string): boolean {
-  return TEST_INVOCATION_PATTERNS.some((re) => re.test(cmd));
+  const unquoted = maskQuotedText(cmd);
+  return TEST_INVOCATION_PATTERNS.some((re) => re.test(unquoted));
 }
 
 /**
@@ -416,11 +463,24 @@ export default function (pi: ExtensionAPI) {
     const wroteDeliverable = hasNonScratchWrite(commandsThisTurn);
     if (wroteDeliverable) deliverableWriteEverSeen = true;
 
-    // Order matters: a write followed by a test run in the SAME turn should
-    // still clear the flag, so the test-invocation check runs after (and can
-    // override) the write-detection set.
-    if (wroteDeliverable) dirtySinceLastTest = true;
-    if (commandsThisTurn.some(looksLikeTestInvocation)) dirtySinceLastTest = false;
+    // Re-derived per execution-ordered command SEGMENT, not per whole-turn
+    // raw text: each command is split into its chained segments in order
+    // (splitCommandChain already strips heredoc bodies first), and each
+    // segment in turn can set the flag (a non-scratch write) or clear it (a
+    // real, unquoted test invocation) -- so the LAST writer/tester in
+    // execution order wins for the turn, rather than "did either pattern
+    // appear anywhere in the turn's raw text" (which let a heredoc body's
+    // mention of a runner name, or a write that happened before the turn's
+    // only test, wrongly clear the flag -- root-cause cases (a) and (b)).
+    // Within one segment a write is still set before the test check can
+    // clear it, preserving the original same-segment ordering.
+    for (const cmd of commandsThisTurn) {
+      for (const segment of splitCommandChain(cmd)) {
+        const nonScratchWrite = detectDeliverableWrites(segment).some((w) => !isScratchPath(w.path));
+        if (nonScratchWrite) dirtySinceLastTest = true;
+        if (looksLikeTestInvocation(segment)) dirtySinceLastTest = false;
+      }
+    }
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
