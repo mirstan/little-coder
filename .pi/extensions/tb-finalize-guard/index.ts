@@ -8,6 +8,7 @@ import {
   isScratchPath,
   splitCommandChain,
   scan,
+  type WriteKind,
 } from "../_shared/shell-write.ts";
 import {
   finalizeWarnTurnWindowOpen,
@@ -365,6 +366,17 @@ const TEST_INVOCATION_PATTERNS: RegExp[] = [
   /^mvn\s+test\b/, /^gradle\s+test\b/,
 ];
 
+// Iteration 3: the kinds `detectDeliverableWrites` can report (see
+// `shell-write.ts`'s `WriteKind`) that plausibly represent a TEST'S OWN
+// output-handling rather than a genuine deliverable edit -- a pipe target, a
+// stdout/stderr redirect, or an append. Deliberately excludes `copy`,
+// `move`, `inplace`, and `compile` (an edit, a clobber, or a build artifact
+// landing on a deliverable path -- none of those are the test writing its
+// own output) and also excludes `dd` (block-level copy, same reasoning).
+// This is the boundary the same-command carve-out below is scoped to; see
+// its comment for why the boundary exists.
+const TEST_OUTPUT_WRITE_KINDS: ReadonlySet<WriteKind> = new Set(["redirect", "append", "tee"]);
+
 /**
  * Blank out every quoted (or escaped) character in `cmd`, preserving length
  * and position so a regex's `\b` boundaries still land correctly. This is
@@ -508,19 +520,40 @@ export default function (pi: ExtensionAPI) {
     // plausibly the test's own output-handling (`pytest 2>&1 | tee log`,
     // `pytest && echo done > DONE`) got wrongly re-dirtied by that later
     // segment. `sawRealTestInThisCommand` is scoped to one `cmd` (reset for
-    // each command in `commandsThisTurn`): once a real test invocation is
-    // seen in a command, a LATER write in that SAME command no longer
-    // re-dirties -- but a write in a DIFFERENT, later command still dirties
-    // normally, and a write that PRECEDES every test in its own command
-    // still dirties too (same-segment ordering, and same-command
-    // write-before-test, are both preserved). `testInvocationEverSeen` is
-    // session-scoped (see its declaration) and gates the message clause
-    // (see buildTriggerAMessage), not this flag.
+    // each command in `commandsThisTurn`) so a same-command carve-out can
+    // exempt exactly that shape -- but a write in a DIFFERENT, later command
+    // still dirties normally, and a write that PRECEDES every test in its
+    // own command still dirties too (same-segment ordering, and
+    // same-command write-before-test, are both preserved).
+    //
+    // Iteration 3: iteration 2's carve-out collapsed a segment's writes to a
+    // single boolean before checking `sawRealTestInThisCommand`, so ONCE any
+    // test was seen in the command, it unconditionally exempted EVERY later
+    // write in that command from re-dirtying -- including a genuine
+    // deliverable edit (`pytest && sed -i 's/x/y/' /app/main.py`, `make
+    // test; cp fixed.py /app/main.py`), which is exactly the "late edit
+    // after a passing test, never re-tested" shape this guard exists to
+    // catch. The carve-out is now scoped to only test-output-shaped writes
+    // (see `TEST_OUTPUT_WRITE_KINDS`): a same-command write after the test
+    // is exempted only when EVERY non-scratch write in that segment is one
+    // of those kinds; if any write in the segment is a real edit, a copy, a
+    // move, or a compile-to-a-deliverable-path, it still dirties even though
+    // `sawRealTestInThisCommand` is already true. A known, accepted residual
+    // gap: a heredoc SOURCE write (`pytest && cat > /app/main.py <<'EOF' ...
+    // EOF`) is also redirect-shaped by the write-kind classification, so it
+    // is still incorrectly exempted here -- narrower than what iteration 2
+    // shipped, not solved by this fix.
+    //
+    // `testInvocationEverSeen` is session-scoped (see its declaration) and
+    // gates the message clause (see buildTriggerAMessage), not this flag.
     for (const cmd of commandsThisTurn) {
       let sawRealTestInThisCommand = false;
       for (const segment of splitCommandChain(cmd)) {
-        const nonScratchWrite = detectDeliverableWrites(segment).some((w) => !isScratchPath(w.path));
-        if (nonScratchWrite && !sawRealTestInThisCommand) dirtySinceLastTest = true;
+        const nonScratchWrites = detectDeliverableWrites(segment).filter((w) => !isScratchPath(w.path));
+        if (nonScratchWrites.length > 0) {
+          const allTestOutputShaped = nonScratchWrites.every((w) => TEST_OUTPUT_WRITE_KINDS.has(w.kind));
+          if (!sawRealTestInThisCommand || !allTestOutputShaped) dirtySinceLastTest = true;
+        }
         if (looksLikeTestInvocation(segment)) {
           dirtySinceLastTest = false;
           sawRealTestInThisCommand = true;

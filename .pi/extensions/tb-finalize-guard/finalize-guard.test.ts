@@ -504,23 +504,44 @@ describe("tb-finalize-guard", () => {
       );
     });
 
-    it("no longer stays dirty when a chained write follows the SAME command's own test invocation (iteration 2)", async () => {
+    it("still dirties when a chained write after the SAME command's own test invocation is a genuine edit, not test-output-shaped (iteration 3)", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       // Iteration 1 made this chain end dirty (strict last-segment-wins).
-      // Iteration 2 found that rule creates a false positive for a test's
-      // own output-handling (`pytest 2>&1 | tee log`, `pytest && echo done
-      // > DONE`) and cannot distinguish that shape from this one using only
-      // per-segment ordering. The accepted fix: once a real test invocation
-      // is seen in a command, a LATER write in that SAME command no longer
-      // re-dirties (see the cross-command test below for the write this
-      // does NOT suppress).
+      // Iteration 2 introduced a same-command carve-out to fix a real false
+      // positive (a test's own output-handling: `pytest 2>&1 | tee log`,
+      // `pytest && echo done > DONE`) but collapsed the write list to a
+      // boolean before checking it, so the carve-out wrongly exempted EVERY
+      // later write in the command -- including a genuine deliverable edit
+      // like `sed -i` that has nothing to do with the test's own output.
+      // Iteration 3 narrows the carve-out: it only exempts a same-command
+      // write when EVERY non-scratch write in the segment is test-output-
+      // shaped (a pipe target, a stdout/stderr redirect, an append); an
+      // in-place edit like this one must still dirty (see the two tests
+      // below for the writes this fix must NOT re-dirty).
       await turn(h, shellTurn(["python -m pytest && sed -i 's/x/y/' /app/main.py"]));
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
-      expect(h.sent[0].text).not.toContain(
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still dirties when a chained write after the SAME command's own test invocation is a copy onto the deliverable (iteration 3)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Same root cause as the `sed -i` case above, exercised via `cp`
+      // instead of an in-place edit: a copy onto a deliverable path is not
+      // test-output-shaped either, so it must dirty even though it follows
+      // the same command's own test invocation.
+      await turn(h, shellTurn(["make test; cp /tmp/fixed.py /app/main.py"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
         "You edited a file since your last test run without re-running your tests",
       );
     });
