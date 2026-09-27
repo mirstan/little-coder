@@ -150,6 +150,34 @@ describe("stochastic-training-variance entry", () => {
       expect(scoreEntry(prompt, entry(keywords)), prompt).toBeLessThan(MIN_SCORE_THRESHOLD);
     }
   });
+
+  // spec iter3-f00 (post needs-human review): iterations 1-2 fixed 2 specific
+  // phrase keywords ("test set", "at least 0") caught by name, but left the
+  // defect CLASS open -- any remaining phrase keyword still fires the entry
+  // alone (2.0 >= MIN_SCORE_THRESHOLD) regardless of ML content, since a
+  // phrase match alone equals the whole threshold. Independently verified
+  // against the real scorer: "accuracy threshold", "training run", and
+  // "random seed" all fired alone on these three unrelated prompts before
+  // this fix. The systemic fix removes every remaining phrase keyword from
+  // this entry's frontmatter (with "random seed" replaced by the plain word
+  // "seed", which requires a second co-occurring signal to reach threshold)
+  // rather than patching individual caught phrases -- these three pin the
+  // whole class, not just the caught instances.
+  it("does not fire on prompts containing a former phrase keyword's constituent words but no training/threshold content", () => {
+    const falsePositives = [
+      "use a random seed for the maze generator",
+      "schedule the nightly training run for the CI pipeline image build",
+      "what's the accuracy threshold for this linter's confidence score",
+    ];
+    for (const prompt of falsePositives) {
+      expect(scoreEntry(prompt, entry(keywords)), prompt).toBeLessThan(MIN_SCORE_THRESHOLD);
+    }
+  });
+
+  it("still fires when seed/reproducibility and another entry keyword co-occur", () => {
+    const prompt = "I need to set a seed for my training script but accuracy still varies each run";
+    expect(scoreEntry(prompt, entry(keywords))).toBeGreaterThanOrEqual(MIN_SCORE_THRESHOLD);
+  });
 });
 
 // spec iter1-f00, truth 2: exercises the REAL selection/budget path end to
