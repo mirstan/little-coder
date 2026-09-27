@@ -6,9 +6,11 @@ import setupSkillInject, {
   looksLikeResearchTask,
   looksLikeTemporalTask,
   looksLikeGpt2CheckpointTask,
+  looksLikeRamanFittingTask,
   shouldInjectResearchDirective,
   shouldInjectTemporalDirective,
   shouldInjectGpt2CheckpointDirective,
+  shouldInjectRamanFittingDirective,
 } from "./index.ts";
 import setupKnowledgeInject from "../knowledge-inject/index.ts";
 
@@ -723,6 +725,80 @@ describe("gpt2-checkpoint directive triggers on GPT-2 + raw-TF-checkpoint phrasi
     expect(content).not.toContain("h10");
     expect(content).not.toContain("wpe");
     expect(content).not.toContain("wte");
+  });
+});
+
+// raman-fitting benchmark task shape: the model never converts the raw
+// spectrometer x-axis (wavelength, nm) to the required unit (Raman shift,
+// cm^-1), and then labels its detected peaks by raw-axis rank order -- which
+// mislabels them once correctly converted, since a unit inversion reverses
+// ordering along the axis. The directive corrects both wrong behaviors at
+// the general-principle level, withholding the task's specific expected
+// peak positions and substrate identity.
+describe("raman-fitting directive triggers on Raman + graphene/named-band phrasing", () => {
+  // The real raman-fitting instruction.md text, verified byte-for-byte
+  // against the task package.
+  const REAL_PROMPT =
+    "You are given the output file of a Raman Setup. We used it to measure " +
+    "some graphene sample.\n" +
+    "Fit the G and 2D Peak of the spectrum and return the x0, gamma, " +
+    'amplitude and offset of the peaks and write them to a file called ' +
+    '"/app/results.json".';
+
+  it("fires on the real task prompt and a paraphrase, but not on band language alone", () => {
+    expect(looksLikeRamanFittingTask(REAL_PROMPT)).toBe(true);
+    expect(
+      looksLikeRamanFittingTask(
+        "measure the G-Peak and 2D-Peak position of a graphene Raman spectrum",
+      ),
+    ).toBe(true);
+    // The band-pattern alone, with no "Raman" wording, must not fire on its
+    // own -- confirms the AND-gate requires both co-signals.
+    expect(looksLikeRamanFittingTask("fit the G Peak and 2D Peak of this spectrum")).toBe(false);
+  });
+
+  it("does not fire for Raman mentions with no graphene/named-band language, or an unrelated prompt", () => {
+    expect(
+      looksLikeRamanFittingTask("explain the Raman effect in silicon crystals"),
+    ).toBe(false);
+    expect(looksLikeRamanFittingTask("write a poem about the ocean")).toBe(false);
+    expect(looksLikeRamanFittingTask("")).toBe(false);
+  });
+
+  it("does not inject the directive when no shell tool is available, even though the trigger matches", async () => {
+    const readOnly = new Set(["read", "edit"]);
+    expect(shouldInjectRamanFittingDirective(REAL_PROMPT, readOnly)).toBe(false);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn(REAL_PROMPT);
+    event.systemPromptOptions.littleCoder.allowedTools = ["read", "edit"];
+    const result = await handler(event, ctx);
+
+    expect(result?.message?.content ?? "").not.toContain("## Spectroscopy unit-conversion note");
+  });
+
+  it("injects the corrected general-principle directive when a shell tool is available", async () => {
+    const shellOnly = new Set(["ShellSession", "ShellSessionCwd", "ShellSessionReset"]);
+    expect(shouldInjectRamanFittingDirective(REAL_PROMPT, shellOnly)).toBe(true);
+
+    const handler = handlerFor(setupSkillInject);
+    const event = turn(REAL_PROMPT);
+    event.systemPromptOptions.littleCoder.allowedTools = [
+      "ShellSession",
+      "ShellSessionCwd",
+      "ShellSessionReset",
+    ];
+    const result = await handler(event, ctx);
+    const content: string = result?.message?.content ?? "";
+
+    expect(content).toContain("## Spectroscopy unit-conversion note");
+    expect(content).toContain("convert to the required unit BEFORE detecting or labeling any peak");
+    // Scope stays fixed to the corrected general principle -- the specific
+    // silicon-substrate identity and exact literature G/D/2D wavenumbers are
+    // deliberately withheld; the model must still derive and verify those.
+    expect(content).not.toContain("520.7");
+    expect(content).not.toContain("silicon");
+    expect(content).not.toContain("2670");
   });
 });
 
