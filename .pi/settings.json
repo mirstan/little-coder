@@ -9,6 +9,7 @@
     "default_model_profile": {
       "max_tokens": 4096,
       "thinking_budget": 4096,
+      "thinking_level": "high",
       "skill_token_budget": 300,
       "knowledge_token_budget": 200,
       "system_prompt_budget": 0,
@@ -25,8 +26,7 @@
         "benchmark_overrides": {
           "terminal_bench": {
             "thinking_budget": 3000,
-            "temperature": 0.2,
-            "max_turns": 40
+            "temperature": 0.2
           },
           "gaia": {
             "thinking_budget": 2000,
@@ -45,8 +45,7 @@
         "benchmark_overrides": {
           "terminal_bench": {
             "thinking_budget": 3000,
-            "temperature": 0.2,
-            "max_turns": 40
+            "temperature": 0.2
           },
           "gaia": {
             "thinking_budget": 2000,
@@ -76,6 +75,26 @@
         "skill_token_budget": 300,
         "knowledge_token_budget": 200,
         "temperature": 0.3
+      },
+      "omlx/tiel-coder-oq4e": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
+      },
+      "omlx/tiel-coder-oq6e-fp16": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
+      },
+      "mlx-serve/ddalcu/Qwen3.8-27B-MLX-Serve-4bit": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
+      },
+      "rapidmlx/tiel-coder-oq4e": {
+        "thinking_budget": 32768,
+        "skill_token_budget": 300,
+        "knowledge_token_budget": 200
       }
     }
   }

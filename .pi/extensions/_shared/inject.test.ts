@@ -61,4 +61,23 @@ describe("makeDedupe", () => {
     expect(skills("A")).toBe(true);
     expect(knowledge("A")).toBe(true); // not shadowed by skill-inject's state
   });
+
+  // Compaction can drop the block from the model's live context, so `last`
+  // stops meaning 'still visible'.
+  it("exposes a reset() that clears the remembered block", () => {
+    const should = makeDedupe(messageMode);
+    expect(should("A")).toBe(true);
+    expect(should("A")).toBe(false); // still remembered, still suppressed
+
+    should.reset();
+
+    expect(should("A")).toBe(true);
+  });
+
+  it("still suppresses the ordinary same-block-twice-in-a-row case (regression) even though reset now exists", () => {
+    const should = makeDedupe(messageMode);
+    expect(should("A")).toBe(true);
+    expect(should("A")).toBe(false);
+    expect(should("A")).toBe(false);
+  });
 });

@@ -8,11 +8,11 @@
 #   benchmarks/gaia_pilot.sh <task_id> [<task_id>] # custom set
 #
 # Env:
-#   GAIA_MODEL    — model id (default: llamacpp/qwen3.6-35b-a3b)
+#   GAIA_MODEL    — model id (default: omlx/tiel-coder-oq6e-fp16)
 #   GAIA_TIMEOUT  — per-task timeout seconds (default: 900)
 set -euo pipefail
 
-MODEL="${GAIA_MODEL:-llamacpp/qwen3.6-35b-a3b}"
+MODEL="${GAIA_MODEL:-omlx/tiel-coder-oq6e-fp16}"
 TIMEOUT="${GAIA_TIMEOUT:-900}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
