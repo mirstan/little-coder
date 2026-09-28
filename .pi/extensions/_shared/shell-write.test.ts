@@ -529,7 +529,7 @@ describe("detectDeliverableWrites — commands detectWriteTargets misses", () =>
     ).toEqual([{ path: "/app/out.txt", kind: "interpreter" }]);
     expect(
       detectDeliverableWrites(`perl -e "open(my $fh, '>', '/app/out.txt')"`),
-    ).toEqual([]); // perl's own open() shape isn't the one this heuristic covers -- documented gap, not a false claim
+    ).toEqual([]); // Perl's 3-arg `open(FH, '>', PATH)` is not covered.
   });
 
   it("does not flag a read-only open() call inside an inline script", () => {

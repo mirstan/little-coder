@@ -92,10 +92,8 @@ export function checkerFor(path: string): Checker | null {
  * POSIX single-quote a string for safe interpolation into a shell command
  * line: wraps it in single quotes, closing/reopening around any embedded
  * single quote (`'` -> `'\''`) so the quoted text stays wholly literal no
- * matter what it contains. Exported for tb-finalize-guard's
- * `checkDeliverableSize`, which reuses this rather than reimplementing
- * quoting for a path captured from task-author prose (untrusted as far as
- * the container shell is concerned) before interpolating it into `wc -c`.
+ * matter what it contains. Exported for tb-finalize-guard's deliverable
+ * size check.
  */
 export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;

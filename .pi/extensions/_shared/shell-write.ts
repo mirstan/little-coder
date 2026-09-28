@@ -568,8 +568,7 @@ function hasSedInPlaceFlag(words: string[]): boolean {
 // script tells it to -- with no `-o`/redirect syntax anywhere in the OUTER
 // command for detectWriteTargets, or the cp/mv/sed/compiler cases below, to
 // see. Confirmed gap: `python3 -c "open('/app/gpt2.c','w').write(...)"`
-// produced zero detected writes, so `checkDeliverableSize` was never invoked
-// for a turn that had just rewritten the deliverable this way.
+// produced zero detected writes.
 const INLINE_CODE_RUNNERS = new Set(["python3", "python", "perl", "ruby", "node"]);
 const INLINE_CODE_FLAGS = new Set(["-c", "-e"]);
 

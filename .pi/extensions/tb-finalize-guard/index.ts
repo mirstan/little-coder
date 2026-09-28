@@ -222,17 +222,18 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // every file write happens via an opaque shell command (a heredoc, `sed -i`,
 // a compiler's `-o` flag), so a write's effect on the target file's size is
 // never visible in the tool call's own arguments the way it would be if a
-// Write tool passed full file content directly. Nothing else in this file
-// tracks *how big* the deliverable is, only *whether* something was written
-// and *when* in the budget -- a shrinking-then-growing-again file, or one
-// that simply never gets under the limit, currently passes unnoticed.
+// Write tool passed full file content directly. Triggers A-D track only
+// *whether* something was written and *when* in the budget, never how big
+// it is. Trigger E measures the file itself, so a file that shrinks and
+// grows back -- or never gets under the limit -- is caught.
 //
-// The limit and the deliverable's path are each parsed at most once, from
-// the task prompt, at `before_agent_start` -- mirroring capForRun/
-// deadlineForRun's own once-per-run resolution. Both regexes are
+// The limit and the deliverable's path latch session-wide on the first
+// `before_agent_start` whose prompt resolves them -- unlike capForRun/
+// deadlineForRun, which re-resolve every run. Both regexes are
 // false-negative-biased by design: if either fails to find a single
-// confident match, this trigger stays permanently inert for the run rather
-// than guessing. For both, "a single confident match" also folds in
+// confident match, this trigger stays permanently inert until some later
+// run's prompt resolves one, rather than guessing. For both, "a single
+// confident match" also folds in
 // ambiguity: a prompt stating two DIFFERENT sizes, or naming two DISTINCT
 // candidate deliverable paths (see `parseByteLimit`'s and
 // `parseDeliverablePath`'s own doc comments), is treated the same as no match
@@ -262,8 +263,9 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // -- see `maybeCheckDeliverableSizeAtEnd`'s own comment.
 //
 // The over-budget count is session- rather than run-scoped: it tracks a
-// property of the whole trial's deliverable, so a mid-run compaction
-// continuation must not reset progress already made toward the limit.
+// property of the whole trial's deliverable, not one run segment, so a
+// mid-run compaction continuation must not reset progress already made
+// toward the limit.
 //
 // There is no explicit "finalize" tool call in TB mode to block -- a trial
 // simply runs until the model stops, the deadline hits, or turn-cap aborts
@@ -357,10 +359,9 @@ let byteLimitForRun: number | undefined;
 // means for the comparator sites below.
 let byteLimitInclusiveForRun: boolean | undefined;
 let deliverablePathForRun: string | undefined;
-// Session-scoped: the over-budget count and last known size are properties
-// of the whole trial's deliverable, not one run segment, so a mid-run
-// compaction continuation must not reset progress already made toward the
-// limit.
+// Session-scoped: the over-budget count is a property of the whole trial's
+// deliverable, not one run segment, so a mid-run compaction continuation
+// must not reset progress already made toward the limit.
 let lastKnownSize: number | undefined;
 let consecutiveOverBudgetChecks = 0;
 // Session-scoped fire count for the agent_end end-of-run check, like Trigger
@@ -463,13 +464,10 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // intervening "be" -- "no less than N bytes" AND "must not be less than N
 // bytes" both state a FLOOR, and reading either as this trigger's ceiling
 // would arm the guard backwards (steering the model to shrink a file that
-// has no upper limit at all). Confirmed regression: a lookbehind that only
-// inspected the single token immediately before "less" caught "no less
-// than"/"not less than" but not "not BE less than" -- the token directly
-// before "less" there is "be", not "not"/"no" -- so "must not be less than
-// 5000 bytes" used to parse as a 5000-byte ceiling. The other alternatives
-// don't have a floor-shaped negation in ordinary prose, so only this one
-// needs the guard.
+// has no upper limit at all). "must not be less than N" states a floor: the
+// lookbehind must span "not be", not just the token before "less". The
+// other alternatives don't have a floor-shaped negation in ordinary prose,
+// so only this one needs the guard.
 //
 // The word alternation is its own capture group (group 1) so
 // `byteLimitCandidates` can tell which phrasing actually matched: "at most"
@@ -483,11 +481,10 @@ function writesDeliverablePath(commands: string[], path: string): boolean {
 // against: unlike every alternative above, "must be" carries no bound
 // semantics of its own -- it just introduces ANY size statement, including
 // an exact/fixed size that isn't a limit at all ("the header must be 16
-// bytes" states a fixed size, not a ceiling). Confirmed regression: a bare
-// `must\s+be` alternative here used to arm the guard with a false ceiling
-// on prompts stating an exact size. "must be <5000 bytes" still resolves
-// correctly without it, since the `<\s*` alternative matches the "<5000"
-// half on its own.
+// bytes" states a fixed size, not a ceiling). A bare `must\s+be` alternative
+// would arm the guard with a false ceiling on prompts stating an exact
+// size. "must be <5000 bytes" still resolves correctly without it, since
+// the `<\s*` alternative matches the "<5000" half on its own.
 const BYTE_LIMIT_RE =
   /(?:\b(under|below|(?<!(?:no|not)(?:\s+be)?\s)less\s+than|at\s+most|no\s+more\s+than)\s*|<\s*)<?\s*(\d+)\s*(bytes?|kb|kilobytes?)\b/i;
 
@@ -537,8 +534,8 @@ const PER_ITEM_QUALIFIER_RE = /^\s*(?:each|every|per)\b/i;
 
 // A byte-limit match immediately followed (within the same sentence) by "of
 // output" states a runtime-output-size constraint, not the deliverable
-// file's own size on disk -- confirmed regression: "prints at most 100 bytes
-// of output" used to resolve to 100 as the deliverable's limit.
+// file's own size on disk -- "prints at most 100 bytes of output" does not
+// resolve to 100 as the deliverable's limit.
 const OUTPUT_QUALIFIER_RE = /^\s*(?:of|in)\s+(?:its\s+|the\s+)?output\b/i;
 
 /** The nearest sentence boundary (`.` or `;`) around index `at`, or the string's own edges. */
@@ -598,10 +595,10 @@ function byteLimitCandidates(
  * disqualification -- a genuine ambiguity between two different stated sizes
  * is left unresolved rather than guessed at (the same false-negative bias
  * the module header describes), not silently resolved to whichever the
- * regex reaches first. Confirmed regression this replaces: "each record must
- * be 64 bytes; the program must be under 5000 bytes" used to return 64 (the
- * unrelated per-record constraint). Exported for the smoke test against the
- * real gpt2-codegolf prompt.
+ * regex reaches first. "each record must be 64 bytes; the program must be
+ * under 5000 bytes" resolves to 5000, since the per-record 64 is
+ * disqualified. Exported for the smoke test against the real gpt2-codegolf
+ * prompt.
  *
  * A thin wrapper over `parseByteLimitDetails` that drops the inclusive/
  * exclusive distinction that function also reports -- kept for callers (and
@@ -615,11 +612,9 @@ export function parseByteLimit(prompt: string): number | undefined {
  * Like `parseByteLimit`, but also reports whether the phrasing that resolved
  * `value` is an INCLUSIVE upper bound ("at most N"/"no more than N", where
  * exactly N is compliant) or an EXCLUSIVE one ("under N"/"below N"/"less
- * than N"/"<N", where exactly N is already over budget). Confirmed
- * regression this replaces: every parsed limit used to be enforced as a
- * strict ceiling regardless of phrasing, so "at most 5000 bytes" (where
- * exactly 5000 is compliant) was enforced identically to "<5000 bytes"
- * (where it isn't).
+ * than N"/"<N", where exactly N is already over budget). "at most 5000
+ * bytes" (where exactly 5000 is compliant) is enforced differently from
+ * "<5000 bytes" (where it isn't).
  */
 export function parseByteLimitDetails(
   prompt: string,
@@ -1167,12 +1162,7 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
     if (size === null) return;
     lastKnownSize = size;
 
-    // Strict "<N bytes" for an EXCLUSIVE limit, "<=N" for an INCLUSIVE one
-    // ("at most"/"no more than" -- see `parseByteLimitDetails`): a file of
-    // exactly the stated limit is over budget only under the exclusive
-    // reading. Confirmed regression this replaces: every parsed limit used
-    // to be enforced as a strict exclusive ceiling regardless of phrasing,
-    // so an inclusive "at most N" wrongly flagged an exactly-N-byte file.
+    // Exactly N is over budget only under the exclusive reading.
     const compliant = byteLimitInclusiveForRun ? size <= byteLimitForRun : size < byteLimitForRun;
     if (compliant) {
       consecutiveOverBudgetChecks = 0;
@@ -1215,8 +1205,7 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
     try {
       // The steer above already landed; a stale `ctx` after an await that
       // crossed a session-replacing abort/compaction boundary must not
-      // throw this diagnostic-only notify out of the awaited turn_end
-      // handler.
+      // throw this notify out of the awaited turn_end handler.
       harnessIntervention(
         ctx,
         `deliverable ${deliverablePathForRun} is ${size} bytes, ${overBy} over the ` +
@@ -1234,13 +1223,11 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
 /**
  * The end-of-run counterpart to `maybeCheckDeliverableSize`: an unconditional
  * re-check at `agent_end`, independent of whether the run's own last turn(s)
- * wrote the deliverable at all. Confirmed gap this closes: the only
- * per-turn check is gated on `writesDeliverablePath` finding evidence THAT
- * turn, so a deliverable that regressed over budget on an earlier turn and
- * was then only compiled/run (or never touched again) for the rest of the
- * run reached the run's end with a known-over-budget file on disk and zero
- * corrective steer -- the exact motivating failure shape from the real
- * gpt2-codegolf trial this guard was built for.
+ * wrote the deliverable at all. The per-turn check only fires on a turn
+ * that writes the deliverable path, so this catches a deliverable that
+ * regressed over budget on an earlier turn and was then only compiled/run
+ * (or never touched again) for the rest of the run -- the exact motivating
+ * failure shape from the real gpt2-codegolf trial this guard was built for.
  *
  * A SEPARATE check from `maybeCheckDeliverableSize`'s own
  * OVER_BUDGET_CHECKS_BEFORE_NUDGE-gated escalation, not a replacement for
@@ -1250,10 +1237,10 @@ function maybeCheckDeliverableSize(pi: ExtensionAPI, ctx: any, commands: string[
  * `consecutiveOverBudgetChecks`.
  *
  * Mirrors `maybeFireTriggerC`'s own two stand-downs -- abort check first,
- * then turn-cap -- since both run off the same `agent_end` and this one
- * used to have neither: an aborted run (thinking-budget's abort-then-recover
- * sequencing, a context-watchdog compaction resume) must not receive a
- * second, contradictory steer stacked on the queued recovery message, and a
+ * then turn-cap -- since both run off the same `agent_end`: an aborted run
+ * (thinking-budget's abort-then-recover sequencing, a context-watchdog
+ * compaction resume) must not receive a second, contradictory steer stacked
+ * on the queued recovery message, and a
  * run that ended at its turn-cap has no later turn for a corrective nudge to
  * land on anyway (same reasoning as Trigger C's own turn-cap clause). The
  * `agent_end` handler additionally skips calling this at all when Trigger C
