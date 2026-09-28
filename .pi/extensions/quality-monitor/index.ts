@@ -313,7 +313,7 @@ export default function (pi: ExtensionAPI) {
       // doesn't cluster by content at all, so it reads every result on its
       // own regardless of what fuzzyTracker made of the call that produced it.
       // The return value itself is not read here -- see the `due()` call
-      // below (Member 3) for why the count update is all this loop needs to
+      // below for why the count update is all this loop needs to
       // do for scriptFailureTracker.
       scriptFailureTracker.record({
         input: r.input,
@@ -321,7 +321,7 @@ export default function (pi: ExtensionAPI) {
         isError: r.isError,
       });
     }
-    // Member 3: checked once per ok-verdict turn_end, independent of whether
+    // Checked once per ok-verdict turn_end, independent of whether
     // THIS turn's own results included a new qualifying script-shaped
     // failure. `due()` is computed fresh from the tracker's current
     // count/notifiedThreshold (see its own doc), so a threshold that crossed
@@ -347,8 +347,8 @@ export default function (pi: ExtensionAPI) {
       // is called here, inside the ok-verdict branch, and nowhere in
       // record() itself: a threshold crossed on a turn that turns out
       // non-ok (verdict.ok false, this whole branch skipped) must not
-      // silently burn its one notification -- `due()` (computed above,
-      // Member 3) keeps reporting it on every subsequent ok-verdict turn_end
+      // silently burn its one notification -- `due()` (computed above)
+      // keeps reporting it on every subsequent ok-verdict turn_end
       // until a message actually reaches sendUserMessage, regardless of
       // whether that later turn's own results include a new qualifying
       // script result of their own.

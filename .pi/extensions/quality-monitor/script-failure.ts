@@ -12,14 +12,16 @@
 // `perl solve.pl ... | grep -vE "..."`), and the command-text dedup
 // swallowed the genuine write-rerun repeats. This header intentionally does
 // NOT restate a new count for that historical "8" figure: replaying this
-// trial's actual ShellSession exit codes (see iter2-f00.result.md for what
-// was checked) found the trial's real piped perl/python runs come back
-// exit=0 or the already-excluded exit=-1 (timeout) far more often than a
-// distinguishable non-timeout failure, so a specific new number here would
-// not be a reproduced fact. What IS verified (script-failure.test.ts's
-// "piped real-run attribution" tests, using this trial's own command text
-// verbatim) is that the new logic now recognizes that shape at all, which
-// iteration 1's logic did not for a single one of the trial's real runs.
+// trial's actual ShellSession exit codes found the trial's real piped
+// perl/python runs come back exit=0 or the already-excluded exit=-1
+// (timeout) far more often than a distinguishable non-timeout failure, so a
+// specific new number here would not be a reproduced fact. What IS verified
+// (script-failure.test.ts's "piped real-run attribution" tests, using this
+// trial's own command text verbatim) is that the new logic now recognizes
+// that shape at all, which iteration 1's logic did not for a single one of
+// the trial's real runs. Recognition only: readResult() gates on the
+// chain's reported exit, which a trailing filter masks, so a piped script
+// failure is still not counted until the exit-code fix lands.
 //
 // Monotonic, not a streak or rolling window: the claim is "how many times has
 // this happened at all this trial", true regardless of what ran in between,
@@ -62,14 +64,13 @@ interface ChainSegment {
  * opposite mistake this function exists to prevent, excluding a script whose
  * own failure is exactly what aborted a trailing `&& next_step`.
  *
- * Reuses `_shared/shell-write.ts`'s `stripHeredocBodies` (a heredoc body
- * containing an unbalanced quote character used to leave this module's old
- * hand-rolled quote tracker stuck open, silently swallowing every real
- * separator after it) and its quote/escape-aware `scan` walk, rather than
- * `splitCommandChain` itself -- that function's cut set (`&&`, `||`, `;`,
- * `|`, `&`, newline) is the WRONG set here for the reason above, so this
- * mirrors its internals for the narrower boundary set this module needs
- * instead of composing/re-merging its output.
+ * Reuses shell-write.ts's `stripHeredocBodies` and quote/escape-aware
+ * `scan`: an unbalanced quote inside a heredoc body otherwise leaves the
+ * quote tracker open and swallows every separator after it. Uses these
+ * rather than `splitCommandChain` itself -- that function's cut set
+ * (`&&`, `||`, `;`, `|`, `&`, newline) is the WRONG set here for the reason
+ * above, so this mirrors its internals for the narrower boundary set this
+ * module needs instead of composing/re-merging its output.
  */
 function commandSegments(raw: string): ChainSegment[] {
   const cmd = stripHeredocBodies(raw);
@@ -127,12 +128,12 @@ function isPureFilterSegment(segment: ChainSegment): boolean {
 }
 
 /**
- * Walk back from the chain's final `;`/`|`/newline-delimited segment,
- * skipping over trailing PIPED pure-output-filter segments (`grep`, `head`,
- * `tail`, `sed -n`, `wc`, `cut`) to reach the segment whose own exit the
- * filter is really reporting on the shell's behalf -- the real-trial shape
- * this module exists to catch (`perl solve.pl 2>&1 | grep -vE "..."`, `python3
- * solve.py ... | head -40`) is a script piped to exactly one of these.
+ * Walk back across trailing PIPED pure-output filters (grep, head, tail,
+ * sed -n, wc, cut) to the segment worth attributing a script run to. Shape
+ * matching only -- the chain's reported exit is still the trailing filter's
+ * own. The real-trial shape this module exists to catch (`perl solve.pl
+ * 2>&1 | grep -vE "..."`, `python3 solve.py ... | head -40`) is a script
+ * piped to exactly one of these.
  *
  * Only walks across a `|` boundary. A `;`/newline-separated filter is a
  * wholly INDEPENDENT command with its own unrelated exit code and no
@@ -191,12 +192,9 @@ function looksLikeInvocation(atom: string): boolean {
 /**
  * A shell command chain whose attributed segment (see `attributionSegment`)
  * both names a common interpreter and targets a common script extension, in
- * actual command-invocation position (see `looksLikeInvocation`). Deliberately
- * a small local table, not a cross-extension import of syntax-check/helpers.ts's
- * checkerFor: pi's tool_result handlers for different extensions fire
- * independently in load order (quality-monitor loads alphabetically before
- * syntax-check), so this handler sees the raw result before syntax-check's
- * own marker is ever appended to it.
+ * actual command-invocation position (see `looksLikeInvocation`).
+ * Deliberately a small local table: this needs interpreter+extension shape,
+ * not syntax-check's path→checker map.
  *
  * A `&&`/`||`-joined sub-command within the attributed segment is not split
  * further at the outer level (see `commandSegments`) but IS considered here,
@@ -214,15 +212,15 @@ export function looksLikeScriptRun(input: unknown): boolean {
 
 export interface ScriptFailureDetection {
   count: number;
-  /** Second and final message for this trial. */
+  /** The last message for this trial -- and the only one, if threshold 1 never got delivered. */
   escalated: boolean;
 }
 
 const THRESHOLD_1 = 3;
 const THRESHOLD_2 = 6;
 
-// Tail length fed to failure-signature.ts's `signatureOf` for the Member 2
-// dedup key below -- matches failsigOptionsFromEnv's own default tailLines.
+// Tail length fed to failure-signature.ts's `signatureOf` for the dedup key
+// below -- matches failsigOptionsFromEnv's own default tailLines.
 // This tracker doesn't expose an env override of its own; if that's ever
 // needed it should read the same LITTLE_CODER_FAILSIG_TAIL_LINES knob rather
 // than growing a second one.
@@ -254,7 +252,7 @@ export class ScriptFailureTracker {
    * `count`/`notifiedThreshold` independent of whatever call caused a change,
    * and which the caller (index.ts's `turn_end`) now checks once per
    * ok-verdict turn regardless of whether THIS turn produced a new qualifying
-   * result (Member 3) -- so `record`'s return value here is a convenience for
+   * result -- so `record`'s return value here is a convenience for
    * the many tests that call it directly, not the tracker's only trigger.
    */
   record(obs: { input: unknown; text: string; isError: boolean }): ScriptFailureDetection | null {
@@ -270,8 +268,8 @@ export class ScriptFailureTracker {
     if (!failed) return null;
 
     const command = commandOf(obs.input) ?? null;
-    // Member 2: dedup by (command text, failure signature), not command text
-    // alone. The canonical loop this whole tracker exists to catch is
+    // Dedup by (command text, failure signature), not command text alone:
+    // the canonical loop this whole tracker exists to catch is
     // write->run->fail, REWRITE->run->fail -- the command text is usually
     // byte-identical each retry (`perl solve.pl`), only the FILE changed in
     // between, so a command-text-only key suppressed every one of those
@@ -299,7 +297,7 @@ export class ScriptFailureTracker {
   /**
    * Consume the message slot for whichever threshold `count` currently
    * satisfies. Called by the caller only once a detection has actually been
-   * delivered (see the class doc) -- never from inside `record()` itself.
+   * delivered (see `due()`) -- never from inside `record()` itself.
    */
   markNotified(): void {
     if (this.count >= THRESHOLD_2) this.notifiedThreshold = THRESHOLD_2;
@@ -307,17 +305,17 @@ export class ScriptFailureTracker {
   }
 
   /**
-   * Consume the message slot for whichever threshold `count` currently
-   * satisfies -- computed fresh from `count` and `notifiedThreshold` on
-   * every call, not mutated the instant a threshold is crossed. A crossing
-   * whose message never actually gets sent (the turn it happened on is later
-   * classified non-ok, so the caller never reaches `sendUserMessage`) must
+   * Report whichever threshold `count` currently satisfies and that
+   * `markNotified()` has not yet consumed -- computed fresh on every call,
+   * never mutating. A crossing whose message never actually gets sent (the
+   * turn it happened on is later classified non-ok, so the caller never
+   * reaches `sendUserMessage`) must
    * not be lost: only `markNotified()` advances `notifiedThreshold`, so an
    * unmarked crossing keeps being reported on every subsequent call until it
    * is -- mirroring `FailureSignatureTracker`'s / `FuzzyLoopTracker`'s own
    * due()-computed-fresh + explicit markNotified()-only-when-sent split.
    *
-   * Public (Member 3): `record()` still calls this itself so every existing
+   * Public: `record()` still calls this itself so every existing
    * caller of `record()` keeps getting a detection back the instant a
    * threshold crosses, but `due()` no longer has only that one trigger.
    * `record()` is only reached from inside index.ts's per-result loop, which

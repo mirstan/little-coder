@@ -43,8 +43,8 @@ describe("looksLikeScriptRun", () => {
   });
 
   // Truth: "The interpreter+script-extension match only counts when that
-  // token is in the chain's ATTRIBUTED segment" -- as of iter2-f00 Member 1,
-  // that is the final `;`/`|`/newline-delimited segment UNLESS it's a pure
+  // token is in the chain's ATTRIBUTED segment" -- that is the final
+  // `;`/`|`/newline-delimited segment UNLESS it's a pure
   // output filter piped from an upstream segment, in which case attribution
   // walks back to that upstream segment (see the dedicated "piped real-run
   // attribution" describe block above for that case). A `;`/newline
@@ -75,12 +75,11 @@ describe("looksLikeScriptRun", () => {
     });
   });
 
-  // Truth (iter2-f00, Member 1): a real trial-shaped piped script run is
-  // detected and attributed to the script segment, not the trailing filter.
-  // These are the exact command shapes replayed from the real
-  // overfull-hbox__Mq8QoTa trial (benchmarks/harbor_runs/2026-09-24__21-02-23
-  // in the sibling little-coder-dev checkout) -- see iter2-f00.result.md for
-  // what was actually tested against that trial's log.
+  // Truth: a real trial-shaped piped script run is detected and attributed
+  // to the script segment, not the trailing filter. These are the exact
+  // command shapes replayed from the real overfull-hbox__Mq8QoTa trial
+  // (benchmarks/harbor_runs/2026-09-24__21-02-23 in the sibling
+  // little-coder-dev checkout).
   describe("piped real-run attribution (iter2-f00 Member 1)", () => {
     it("attributes a perl run piped to a filtering grep to the perl segment", () => {
       expect(
@@ -98,9 +97,9 @@ describe("looksLikeScriptRun", () => {
     it("still recognizes the same real command wrapped in `timeout N`", () => {
       // The real trial wraps nearly every long-running script call this way
       // (`timeout 60 perl test6.pl`, `timeout 150 perl lever.pl`, ...) --
-      // without stripping the wrapper, the first-word invocation check below
-      // would reject these the same way it correctly rejects
-      // `ls python3 missing.py`.
+      // without stripping the wrapper, the first-word invocation check in
+      // `looksLikeInvocation` would reject these the same way it correctly
+      // rejects `ls python3 missing.py`.
       expect(
         looksLikeScriptRun({ command: 'timeout 60 perl test6.pl 2>&1 | grep -vE "Uninitialized"' }),
       ).toBe(true);
@@ -116,11 +115,11 @@ describe("looksLikeScriptRun", () => {
     });
   });
 
-  // Truth (iter2-f00, Member 1, Codex): a non-script command whose text
-  // merely CONTAINS interpreter+extension-shaped substrings in unrelated
-  // args does not match -- the interpreter token must be the actual
-  // executable (or a wrapper's argument that becomes one), not just present
-  // somewhere in the string.
+  // Truth: a non-script command whose text merely CONTAINS
+  // interpreter+extension-shaped substrings in unrelated args does not
+  // match -- the interpreter token must be the actual executable (or a
+  // wrapper's argument that becomes one), not just present somewhere in the
+  // string.
   describe("command-invocation-shape requirement (iter2-f00 Member 1, Codex)", () => {
     it("does not match when the interpreter word is another command's argument, not its own executable", () => {
       expect(looksLikeScriptRun({ command: "ls python3 missing.py" })).toBe(false);
@@ -150,18 +149,17 @@ describe("ScriptFailureTracker", () => {
     expect(detections[5]).toEqual({ count: 6, escalated: true });
   });
 
-  // Re-checked per fix-discipline (iter2-f00, Member 2): this fixture's
-  // expected count changes again with the dedup key. Each of the 8 events
-  // below carries a DIFFERENT failure body (`distinct failure ${i}`), i.e.
-  // each is a genuinely distinct failure even where the command text repeats
+  // Re-checked per fix-discipline: this fixture's expected count changes
+  // again with the dedup key. Each of the 8 events below carries a
+  // DIFFERENT failure body (`distinct failure ${i}`), i.e. each is a
+  // genuinely distinct failure even where the command text repeats
   // (`solve.pl`/`net6.pl`/`final.pl` each repeat their own immediately
   // preceding command verbatim, in TEXT only). Iteration 1's command-text-
   // only dedup wrongly suppressed those 3 repeats as "the same attempt seen
-  // twice", losing 3 of the raw 8 -- exactly the defect iter2-f00 Member 2
-  // fixes: dedup is now (command text, failure signature), so a command
-  // rerun that fails DIFFERENTLY is no longer conflated with a truly
-  // identical immediate repeat. All 8 are now counted, crossing both
-  // thresholds.
+  // twice", losing 3 of the raw 8 -- exactly what dedup on (command text,
+  // failure signature) fixes: a command rerun that fails DIFFERENTLY is no
+  // longer conflated with a truly identical immediate repeat. All 8 are now
+  // counted, crossing both thresholds.
   it("mirrors the real trial's event shape: all 8 raw events count once dedup keys on (command, failure signature) rather than command text alone", () => {
     const paths = [
       "solve.pl", "solve.pl", "lever.pl", "test6.pl",
@@ -174,11 +172,11 @@ describe("ScriptFailureTracker", () => {
     ]);
   });
 
-  // Truth (iter2-f00, Member 2): a rewrite-then-rerun of the same command
-  // text, where the SECOND run fails DIFFERENTLY, is not suppressed as a
-  // verbatim repeat -- this is the canonical write->run->fail,
-  // REWRITE->run->fail loop the tracker exists to catch, and the command
-  // text is typically identical across retries (only the file changed).
+  // Truth: a rewrite-then-rerun of the same command text, where the SECOND
+  // run fails DIFFERENTLY, is not suppressed as a verbatim repeat -- this
+  // is the canonical write->run->fail, REWRITE->run->fail loop the tracker
+  // exists to catch, and the command text is typically identical across
+  // retries (only the file changed).
   it("counts an immediate rerun of the identical command text when it fails differently (rewrite happened in between)", () => {
     recordAndDeliver(tracker, scriptResult("lever.pl", 2, "some other bug")); // count 1
     expect(
@@ -237,9 +235,9 @@ describe("ScriptFailureTracker", () => {
     });
   });
 
-  // Truth: "A verbatim-repeated command (same `input` as the immediately
-  // preceding counted event) does not increment the count as a new distinct
-  // failure."
+  // Truth: a re-run with the same command text AND the same failure
+  // signature is the same attempt seen twice, and does not increment the
+  // count.
   describe("verbatim-repeat exclusion", () => {
     it("does not count an exact repeat of the immediately preceding counted command", () => {
       expect(recordAndDeliver(tracker, scriptResult("solve.pl", 2))).toBeNull(); // count 1
@@ -375,9 +373,9 @@ async function fireScriptResultOnNonOkTurn(h: any, path: string, code: number) {
   return fire(h, "turn_end", { message: { stopReason: "stop", content: [] } });
 }
 // A plain ok-verdict turn with no tool calls/results of its own at all --
-// used to prove Member 3's fix: `due()` is checked once per ok-verdict
-// turn_end regardless of whether THIS turn produced a new qualifying script
-// result, not only from inside scriptFailureTracker.record().
+// used to prove `due()` is checked once per ok-verdict turn_end regardless
+// of whether THIS turn produced a new qualifying script result, not only
+// from inside scriptFailureTracker.record().
 async function fireOkTextOnlyTurn(h: any, text: string) {
   return fire(h, "turn_end", {
     message: { stopReason: "stop", content: [{ type: "text", text }] },
@@ -408,10 +406,10 @@ describe("quality-monitor turn_end integration: script-failure tracker", () => {
   });
 
   // Truth: a threshold crossed on a turn later classified non-ok is not
-  // lost -- it re-offers on a later ok-verdict turn. Reproduces Member B's
-  // own scenario: a threshold crosses on a turn whose verdict comes back
-  // non-ok (here, empty_response), so the `if (verdict.ok)` branch that
-  // would have sent the steer and called markNotified() never runs.
+  // lost -- it re-offers on a later ok-verdict turn: a threshold crosses on
+  // a turn whose verdict comes back non-ok (here, empty_response), so the
+  // `if (verdict.ok)` branch that would have sent the steer and called
+  // markNotified() never runs.
   it("does not silently drop a threshold crossed on a non-ok-verdict turn -- it re-offers on the next ok turn", async () => {
     const h = harness();
     await fire(h, "session_start", {});
@@ -430,7 +428,7 @@ describe("quality-monitor turn_end integration: script-failure tracker", () => {
     expect(scriptMsgs[0].msg).toContain("4 different script-write attempts");
   });
 
-  // Truth (iter2-f00, Member 3): the gap the test above does NOT cover --
+  // Truth: the gap the test above does NOT cover --
   // that one still delivers via a new qualifying script result arriving on
   // the later ok turn. Here the later ok-verdict turn has NO ShellSession
   // call/result of its own at all, so `record()` is never invoked for it;
