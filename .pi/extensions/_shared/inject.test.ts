@@ -62,10 +62,8 @@ describe("makeDedupe", () => {
     expect(knowledge("A")).toBe(true); // not shadowed by skill-inject's state
   });
 
-  // Mid-run compaction (session_compact) can rebuild the model's live
-  // conversation and drop the previously-injected block, so `last` is no
-  // longer a reliable signal that the block is still visible to the model.
-  // `reset()` gives a caller an explicit way to clear that stale state.
+  // Compaction can drop the block from the model's live context, so `last`
+  // stops meaning 'still visible'.
   it("exposes a reset() that clears the remembered block", () => {
     const should = makeDedupe(messageMode);
     expect(should("A")).toBe(true);
@@ -73,9 +71,6 @@ describe("makeDedupe", () => {
 
     should.reset();
 
-    // After reset, an identical block must be treated as new again — as if
-    // this were the first turn after a compaction wiped the prior copy out
-    // of the model's live context.
     expect(should("A")).toBe(true);
   });
 
@@ -83,6 +78,6 @@ describe("makeDedupe", () => {
     const should = makeDedupe(messageMode);
     expect(should("A")).toBe(true);
     expect(should("A")).toBe(false);
-    expect(should("A")).toBe(false); // no reset() call in between — still suppressed
+    expect(should("A")).toBe(false);
   });
 });

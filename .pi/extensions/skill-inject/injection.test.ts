@@ -165,13 +165,8 @@ describe("skill-inject still injects after the #73 conversion", () => {
     expect(second).toBeUndefined();
   });
 
-  // Mid-run compaction can drop the previously-injected block out of the
-  // model's actual live conversation (session_compact rebuilds/summarizes
-  // history), while skill-inject's own dedupe still remembers it as "last
-  // sent" and would otherwise wrongly suppress an identical re-send forever.
-  // skill-inject must register a session_compact handler that resets that
-  // dedupe state, so the next before_agent_start re-injects even a
-  // textually-identical block.
+  // Compaction can drop the block from the model's live context, so `last`
+  // stops meaning 'still visible'.
   it("re-injects an identical block after a session_compact event fires", async () => {
     const handlers = handlersFor(setupSkillInject);
     expect(handlers.before_agent_start).toBeDefined();
@@ -837,7 +832,7 @@ describe("raman-fitting directive triggers on Raman + graphene/named-band phrasi
 // contains none of the gpt2/raman trigger language, so without a latch that
 // remembers a positive identification once made, the directive silently
 // stops firing for the rest of a long trial the moment it compacts -- even
-// though iteration 1's session_compact/reset() fix lets an identical block
+// though the session_compact dedupe reset lets an identical block
 // back through the dedupe. These tests pin that the identification itself
 // now survives across turns, and that a session which never trips either
 // predicate still never gets either directive (the latch must not become an
@@ -869,9 +864,9 @@ describe("gpt2-checkpoint/raman-fitting identification latches across turns", ()
     '"[input string here]" and you should continue the output under ' +
     "whatever GPT-2 would print for the next 20 tokens.";
 
-  // The latch is module-level state (like recentToolCalls/lastFailedTool
-  // above), so each test drives a freshly imported copy rather than leaking
-  // a latched identification into its neighbours.
+  // The latch is module-level state (like recentToolCalls/lastFailedTool in
+  // index.ts), so each test drives a freshly imported copy rather than
+  // leaking a latched identification into its neighbours.
   async function freshHandlers(): Promise<Record<string, Handler>> {
     vi.resetModules();
     const mod = await import("./index.ts");
@@ -890,7 +885,7 @@ describe("gpt2-checkpoint/raman-fitting identification latches across turns", ()
     const first = await h.before_agent_start(shellOnlyTurn(RAMAN_PROMPT), ctx);
     expect(first?.message?.content ?? "").toContain("## Spectroscopy unit-conversion note");
 
-    // Mid-run compaction: the dedupe is reset (iteration 1's fix) but the
+    // Mid-run compaction: the dedupe is reset (the session_compact dedupe reset) but the
     // raw per-turn predicate would evaluate false on this turn's own prompt.
     await h.session_compact({}, ctx);
 
@@ -925,27 +920,14 @@ describe("gpt2-checkpoint/raman-fitting identification latches across turns", ()
   });
 });
 
-// Iteration 3 of this PR's own loop. Two distinct regressions introduced by
-// iteration 2's latch (087ee3d), confirmed against that commit:
-//
-// Problem A -- the latches (sawGpt2CheckpointTask / sawRamanFittingTask) and
-// the pre-existing shouldInject dedupe were reset ONLY on session_compact,
-// never on session_start. A `/clear`/`/new` (a session_start event, per
-// clear-command/index.ts:12's documented convention) starts a genuinely new
-// session, but the latch stayed true, so a stale directive kept firing into
-// an unrelated session forever.
-//
-// Problem B -- `sawRamanFittingTask ||= shouldInjectRamanFittingDirective(...)`
-// (and the gpt2-checkpoint equivalent) latched the CONJUNCTION of "this is a
-// raman-fitting session" (durable) and "a shell tool is available THIS turn"
-// (per-turn). Once true, a later turn with no shell tool in its allow-list
-// still got the directive, defeating the capability gate.
+// Two regressions the latch can introduce: (A) a latch reset only on
+// session_compact survives a /clear/new (session_start) and fires a stale
+// directive into an unrelated session; (B) latching the conjunction with the
+// per-turn shell-capability check freezes that check at identification time.
 describe("session_start resets the task-identification latches (Problem A) and the capability gate is re-evaluated every turn (Problem B)", () => {
   const SHELL_ONLY = ["ShellSession", "ShellSessionCwd", "ShellSessionReset"];
   const NO_SHELL = ["read", "edit"];
 
-  // Mirrors benchmarks/rpc_client.py's COMPACTION_CONTINUE_PROMPT verbatim --
-  // no "Raman"/graphene/band language and no GPT-2/.ckpt language.
   const GENERIC_CONTINUATION_PROMPT =
     "Your session context was compacted to free space, which interrupted " +
     "what you were doing. The task is not complete — please continue from " +
@@ -968,8 +950,6 @@ describe("session_start resets the task-identification latches (Problem A) and t
     '"[input string here]" and you should continue the output under ' +
     "whatever GPT-2 would print for the next 20 tokens.";
 
-  // The latch is module-level state, so each test drives a freshly imported
-  // copy rather than leaking a latched identification into its neighbours.
   async function freshHandlers(): Promise<Record<string, Handler>> {
     vi.resetModules();
     const mod = await import("./index.ts");

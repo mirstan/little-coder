@@ -42,11 +42,11 @@ let pinnedSkill: string | null = null;
 // continuation prompt is a generic "please continue" message that will never
 // itself contain the original task-triggering language -- without a latch, the
 // directive silently stops firing for the remainder of a long trial the moment
-// it compacts, which is exactly the scenario the compaction-continuation fix
-// in this PR exists for. Only the raw task-identification predicate latches;
-// the per-turn capability gate (anyShellToolAvailable) is evaluated fresh on
-// every turn from THIS latch, below, not baked into the stored boolean --
-// see the before_agent_start handler for why. Session-scoped like
+// it compacts, which the session_compact reset below cannot fix on its own.
+// Only the raw task-identification predicate latches; the per-turn capability
+// gate (anyShellToolAvailable) is ANDed in fresh on every turn rather than
+// baked into the latch -- see the before_agent_start handler for why.
+// Session-scoped like
 // gaia-finalize-guard's own latch (gaia-finalize-guard/index.ts) -- reset on
 // session_start, below, so a `/clear`/`/new` starts genuinely fresh.
 let sawGpt2CheckpointTask = false;
@@ -589,13 +589,9 @@ export function looksLikeGpt2CheckpointTask(text: string): boolean {
   return TF_TAGGED_CKPT.test(text) || RAW_SHARD_FILENAME.test(text);
 }
 
-/** Should the GPT-2 checkpoint-format directive be injected for this
- *  prompt/allow-list? Exported for unit testing alongside
- *  looksLikeGpt2CheckpointTask.
- *
- *  The directive's own "verify empirically" advice requires a shell to act
- *  on, so gate on the same shell-capability check the temporal directive
- *  uses for its git-log advice. */
+/** Per-prompt (unlatched) form of the gate, kept for unit tests — production
+ *  latches the looksLike* result across turns and re-ANDs anyShellToolAvailable
+ *  fresh; see before_agent_start. */
 export function shouldInjectGpt2CheckpointDirective(
   prompt: string,
   allowed: Set<string> | undefined,
@@ -644,14 +640,9 @@ export function looksLikeRamanFittingTask(text: string): boolean {
   return GRAPHENE_OR_BAND_PATTERN.test(text);
 }
 
-/** Should the raman-fitting unit-conversion directive be injected for this
- *  prompt/allow-list? Exported for unit testing alongside
- *  looksLikeRamanFittingTask.
- *
- *  The directive's own "check the converted value against an expected range"
- *  advice requires a shell to compute and check that value in -- reuse
- *  anyShellToolAvailable for the same reason the gpt2-checkpoint directive
- *  does. */
+/** Per-prompt (unlatched) form of the gate, kept for unit tests — production
+ *  latches the looksLike* result across turns and re-ANDs anyShellToolAvailable
+ *  fresh; see before_agent_start. */
 export function shouldInjectRamanFittingDirective(
   prompt: string,
   allowed: Set<string> | undefined,
@@ -697,40 +688,18 @@ export default function (pi: ExtensionAPI) {
 
   const shouldInject = makeDedupe();
 
-  // Mid-run compaction (session_compact) rebuilds/summarizes the model's
-  // live conversation and can drop the block shouldInject last accepted out
-  // of it (issue: dedupe outlives the hidden message after compaction).
-  // shouldInject has no way to know that on its own -- it only compares
-  // against its own closure state -- so reset it here whenever pi reports a
-  // compaction, unconditionally: resetting a dedupe flag is harmless even
-  // when the compaction was TUI-triggered, unlike context-watchdog's own
-  // resume logic (index.ts:331-338) which gates on `ctx.mode`/`willRetry`
-  // because *that* side effect (queuing a continuation prompt) would be
-  // wrong to duplicate. Worst case here is one redundant re-send of a block
-  // that was already about to be re-selected anyway -- and for the
-  // gpt2-checkpoint/raman-fitting directives specifically, "about to be
-  // re-selected" is true only because that identification is latched
-  // (sawGpt2CheckpointTask / sawRamanFittingTask, declared above) for the
-  // rest of the session once made. This reset does not by itself regenerate
-  // a directive: it only lets an already-current block back through the
-  // dedupe once the model's live context can no longer be assumed to hold
-  // the last copy. The latch is what keeps the directive wanting to fire
-  // every turn; the reset is what lets that resend actually happen
-  // post-compaction.
+  // Compaction can drop the last-accepted block out of the model's live
+  // context; the dedupe can't see that. Resetting unconditionally is safe —
+  // worst case is one redundant re-send — unlike
+  // context-watchdog/index.ts:331-338, which gates its resume because
+  // queueing a duplicate continuation is not.
   pi.on("session_compact", async () => {
     shouldInject.reset();
   });
 
-  // `/clear`/`/new` fires session_start, not session_compact -- and
-  // clear-command/index.ts:12 documents that `/clear`/`/new` "resets every
-  // session_start-scoped extension's module state". Unlike session_compact
-  // above, this is a genuine session BOUNDARY: the task-identification
-  // latches must reset here too, or a Raman/gpt2-checkpoint identification
-  // from the PREVIOUS session keeps injecting into an unrelated new one
-  // forever. Mirrors gaia-finalize-guard/index.ts's own
-  // `pi.on("session_start", ...)` latch-reset pattern. Reuses the same
-  // shouldInject.reset() session_compact already calls -- not a second reset
-  // mechanism -- since a fresh session's dedupe must also start clean.
+  // /clear and /new arrive as session_start (clear-command/index.ts:12), a
+  // genuine session boundary — clear the task latches too, or a previous
+  // session's identification keeps injecting into an unrelated one.
   pi.on("session_start", async () => {
     sawGpt2CheckpointTask = false;
     sawRamanFittingTask = false;
@@ -779,19 +748,7 @@ export default function (pi: ExtensionAPI) {
     const selected = selectSkills(event.prompt ?? "", budget, allowed);
     const researchTask = shouldInjectResearchDirective(event.prompt ?? "", allowed);
     const temporalTask = shouldInjectTemporalDirective(event.prompt ?? "", allowed);
-    // Only the raw task-identification predicate latches -- see
-    // sawGpt2CheckpointTask / sawRamanFittingTask above. Once either has been
-    // true on any turn this session, it stays true for every turn after,
-    // including a generic post-compaction continuation prompt that matches
-    // neither predicate on its own. The capability gate (anyShellToolAvailable)
-    // is deliberately NOT part of what latches: "a shell tool is available"
-    // is a per-turn fact, not a durable one, so it's ANDed in fresh below
-    // rather than baked into the stored boolean the way
-    // shouldInjectGpt2CheckpointDirective/shouldInjectRamanFittingDirective
-    // do -- baking it in would freeze whatever a turn's allow-list looked
-    // like the moment identification first latched, and keep injecting a
-    // directive whose "verify empirically"/"check the converted value"
-    // advice needs a shell even once a later turn has none.
+    // see the latch declaration above
     sawGpt2CheckpointTask ||= looksLikeGpt2CheckpointTask(event.prompt ?? "");
     sawRamanFittingTask ||= looksLikeRamanFittingTask(event.prompt ?? "");
     const gpt2CheckpointTask = sawGpt2CheckpointTask && anyShellToolAvailable(allowed);
@@ -832,10 +789,8 @@ export default function (pi: ExtensionAPI) {
     // current data) beats research, and the two recurring-task-specific
     // notes (gpt2-checkpoint, raman-fitting) — each naming one exact wrong
     // prior for one fixed task — go last, in no particular order relative to
-    // each other. A single prompt can trip only one of the two RAW predicates
-    // (GPT-2 checkpoint parsing and Raman peak-fitting are disjoint tasks),
-    // but the session-scoped latches above mean a session that has visited
-    // both tasks on different turns can have BOTH gpt2CheckpointTask and
+    // each other. The session-scoped latches above mean a session that has
+    // visited both tasks on different turns can have BOTH gpt2CheckpointTask and
     // ramanFittingTask true at once on a later turn — the ordering here still
     // applies when that happens. Delivered at the conversation tail (see
     // _shared/inject.ts), which is later still than the end of the system
@@ -847,8 +802,9 @@ export default function (pi: ExtensionAPI) {
       (ramanFittingTask ? ramanFittingDirective() : "");
     const block = skillBlock + directive;
 
-    // Identical to last turn's block? The previous copy is still in the
-    // conversation, so re-sending it would only burn context.
+    // Identical to last turn's block? Still in the conversation, so
+    // re-sending only burns context — unless a compaction dropped it, which
+    // session_compact's reset above covers.
     if (!shouldInject(block)) return;
 
     // Fire-and-forget notify so the benchmark harness can count per-turn
