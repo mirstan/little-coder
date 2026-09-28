@@ -330,8 +330,14 @@ export default function (pi: ExtensionAPI) {
   // right seam.
   pi.on("session_compact", async (event, ctx) => {
     // The TUI resumes from its own compaction callback; queueing here too would
-    // send the model two continuations for one compaction.
+    // send the model two continuations for one compaction. A manual RPC
+    // compaction is the harness's own request, and it drives its own
+    // continuation (rpc_client.prompt_with_mid_run_compaction). Pi's
+    // threshold/overflow compactions reach RPC mode too, via _checkCompaction,
+    // with nothing else driving them -- so the skip keys on event.reason, not
+    // ctx.mode alone.
     if (canCompactMidRun(ctx.mode)) return;
+    if (ctx.mode === "rpc" && (event as { reason?: string }).reason === "manual") return;
     // Overflow recovery already returns true and retries the aborted turn by
     // itself. A queued message on top of that re-runs work pi is re-running.
     if ((event as { willRetry?: boolean }).willRetry) return;
