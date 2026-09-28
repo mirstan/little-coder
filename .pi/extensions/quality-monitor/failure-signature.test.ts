@@ -48,10 +48,10 @@ describe("readResult", () => {
   it("reads failure from the footer when nothing threw", () => {
     // The Terminal-Bench shell path: gating on isError alone leaves this
     // watchdog silent for every TB failure.
-    expect(readResult(SHELL_FAIL, false, 4)).toEqual({ failed: true, hasContent: true });
+    expect(readResult(SHELL_FAIL, false, 4)).toEqual({ failed: true, hasContent: true, failedBy: "exit" });
   });
   it("reads failure from the thrown-result flag", () => {
-    expect(readResult(BASH_FAIL, true, 4)).toEqual({ failed: true, hasContent: true });
+    expect(readResult(BASH_FAIL, true, 4)).toEqual({ failed: true, hasContent: true, failedBy: "exit" });
   });
   it("does not call a zero exit a failure", () => {
     const ok = "all 42 tests passed in 3 seconds\n[exit=0 cwd=/app timed_out=false backend=subprocess]";
@@ -65,6 +65,7 @@ describe("readResult", () => {
     expect(readResult("[exit=1 cwd=/app timed_out=false backend=subprocess]", false, 4)).toEqual({
       failed: true,
       hasContent: false,
+      failedBy: "exit",
     });
   });
   it("rejects a bare status line as contentless", () => {
@@ -83,6 +84,86 @@ describe("readResult", () => {
   });
   it("accepts a two-line failure that says what went wrong", () => {
     expect(readResult(`Segmentation fault (core dumped)\n${SHELL_FOOTER}`, false, 4).hasContent).toBe(true);
+  });
+});
+
+// A psrn/psm keyword-argument typo repeated across six ShellSession calls.
+// Five piped through `head`, so bash's default (non-pipefail) semantics
+// report [exit=0] over the Python TypeError; only D ran unpiped and failed
+// at the bash level.
+const EXIT0 = "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+const PSRN_TRACE = (n = 1) =>
+  `Traceback (most recent call last):\n  File "<string>", line 5, in <module>\nTypeError: image_to_data() got an unexpected keyword argument 'psrn'`.repeat(n);
+const CALL_A = `${PSRN_TRACE()}\ntry2\n${PSRN_TRACE()}\n${EXIT0}`;
+const CALL_B = `${PSRN_TRACE()}\n${EXIT0}`;
+const CALL_D = `bash: line 7: warning: here-document at line 1 delimited by end-of-file (wanted \`EOF')\nbash: -c: line 8: syntax error: unexpected end of file\n\n[exit=2 cwd=/app timed_out=false backend=harbor-env]`;
+const CALL_E = `written\nTraceback (most recent call last):\n  File "/app/probe.py", line 4, in <module>\n    data = pytesseract.image_to_data(img, psrn=11)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: image_to_data() got an unexpected keyword argument 'psrn'\n${EXIT0}`;
+const CALL_F = `4:data = pytesseract.image_to_data(img, psm=11)\nTraceback (most recent call last):\n  File "/app/probe.py", line 4, in <module>\n    data = pytesseract.image_to_data(img, psm=11)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: image_to_data() got an unexpected keyword argument 'psm'\n${EXIT0}`;
+
+describe("readResult — exit-code masking (Fix 1)", () => {
+  it("calls a piped Python TypeError failed even though the footer reports exit=0", () => {
+    expect(readResult(CALL_A, false, 4).failed).toBe(true);
+    expect(readResult(CALL_E, false, 4).failed).toBe(true);
+    expect(readResult(CALL_F, false, 4).failed).toBe(true);
+  });
+  it("still reads D's genuine bash-level failure from its exit code, unaffected", () => {
+    // D has no recognizable exception line -- it keeps failing via exit=2.
+    expect(readResult(CALL_D, false, 4).failed).toBe(true);
+  });
+
+  it("marks a masked-exit-0 failure as content-only, and D's real exit code as exit-proven (Finding 1)", () => {
+    expect(readResult(CALL_A, false, 4).failedBy).toBe("content");
+    expect(readResult(CALL_D, false, 4).failedBy).toBe("exit");
+  });
+
+  it("recognizes a qualified/dotted exception name as a failure signature (Finding 5)", () => {
+    const dotted =
+      "reading /data/payload.json\n" +
+      "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    // `\w*` before `Error:` cannot match the dots in a qualified type name,
+    // so this used to be neither exit-proven (masked at 0) nor content-proven
+    // -- exactly the blind spot this whole PR exists to close.
+    expect(readResult(dotted, false, 4)).toMatchObject({ failed: true, failedBy: "content" });
+    const httpError =
+      "GET https://api.example.com/v1/items failed\n" +
+      "requests.exceptions.HTTPError: 503 Server Error: Service Unavailable\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(httpError, false, 4).failed).toBe(true);
+  });
+  it("does not call a benign 'errors' mention a failure", () => {
+    const ok = "no errors found, all clear\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(ok, false, 4).failed).toBe(false);
+    const ok2 = "0 errors, 2 warnings\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(ok2, false, 4).failed).toBe(false);
+  });
+
+  it("does not call an exit=0 result failed for a mid-body line-initial Error: or Warning: that is not the last line", () => {
+    // The trailing line only: a mid-body "Error:"/"Warning:" status message
+    // must not flip an otherwise-successful run to failed.
+    const errNotLast =
+      "Error: skipping bad row 7, continuing\nprocessed 41 of 42 rows\nwrote output.csv\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(errNotLast, false, 4).failed).toBe(false);
+    const warnNotLast =
+      "Warning: Permanently added 'github.com' (ED25519) to the list of known hosts.\nclone complete\nbuild finished successfully\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(warnNotLast, false, 4).failed).toBe(false);
+  });
+
+  it("does not call an exit=0 passing pytest run failed because of an exception line inside its captured-log section", () => {
+    // A RuntimeError/ValueError line buried in captured-log output (not the
+    // trailing line) was still enough to flip `failed` to true even though
+    // the run passed and the real trailing line says so.
+    const passingWithCapturedLog =
+      "============================= test session starts ==============================\n" +
+      "collected 3 items\n\n" +
+      "test_foo.py::test_a PASSED\n" +
+      "--- Captured log call ---\n" +
+      "ValueError: bad input during warmup, retried and succeeded\n" +
+      "test_foo.py::test_b PASSED\n" +
+      "test_foo.py::test_c PASSED\n\n" +
+      "============================== 3 passed in 0.12s ==============================\n" +
+      "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
+    expect(readResult(passingWithCapturedLog, false, 4).failed).toBe(false);
   });
 });
 
@@ -339,5 +420,174 @@ describe("FailureSignatureTracker", () => {
     t.record(obs("./run --a", SHELL_FAIL), 1);
     t.record({ toolName: "Bash", input: { command: "./run --b" }, text: BASH_FAIL, isError: true }, 2);
     expect(t.record(obs("./run --c", SHELL_FAIL), 3)).toBeNull();
+  });
+
+  describe("exception-line fallback (Fix 2)", () => {
+    it("continues the streak across A-B and, after D resets it, across E-F -- both pairs score below the 0.95 Jaccard bar (0.9310, 0.7381) and are not byte-identical, so only the exception-line fallback keeps them counted as the same mistake instead of resetting", () => {
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("call-a", CALL_A), 1)).toBeNull();
+      // B continues A's streak (count 2) via the exception-line match --
+      // Jaccard alone (0.9310) falls just short of the 0.95 bar, so without
+      // Fix 2 this pair would already reset instead of combining.
+      expect(t.record(obs("call-b", CALL_B), 2)).toBeNull();
+      // C is a verbatim repeat of B's own command+text in the real log --
+      // deduped by the tracker's own "identical input" rule, count stays 2.
+      expect(t.record(obs("call-b", CALL_B), 3)).toBeNull();
+      // D is a genuinely different failure (no exception line at all) and
+      // correctly resets the streak.
+      expect(t.record(obs("call-d", CALL_D), 4)).toBeNull();
+      expect(t.record(obs("call-e", CALL_E), 5)).toBeNull();
+      // F continues E's streak (count 2) the same way B continued A's --
+      // this pair scores 0.7381 Jaccard, the one whole-tail similarity alone
+      // cannot catch at this text length.
+      expect(t.record(obs("call-f", CALL_F), 6)).toBeNull();
+      // The real trial had only these 6 calls, so the streak never crosses
+      // the default streak=3 firing bar within them -- extend the same
+      // recurring mistake by one more attempt and it fires immediately,
+      // proving the streak that got this far is the live, counting one:
+      const detection = t.record(obs("call-g", CALL_F), 7);
+      expect(detection).toMatchObject({ reason: "repeated_failure_signature", failed: true, count: 3 });
+    });
+
+    it("regression pin: the E-F pair (0.7381 Jaccard, nearest the 0.5 floor) still counts as a match under the conjunctive rule", () => {
+      // The fix must not regress the case the PR was built for. E and F
+      // score below the 0.95 whole-tail threshold but inside the [0.57,
+      // 0.95) band the conjunctive rule admits at the default threshold
+      // (excLineJaccardFloor(0.95) = 0.57) -- jaccard >=
+      // excLineJaccardFloor(threshold) -- distinct from the KeyError test
+      // above, whose ~0.368 score falls below the floor.
+      const eShingles = signatureOf("shellsession", CALL_E, 40).shingles;
+      const fShingles = signatureOf("shellsession", CALL_F, 40).shingles;
+      const score = jaccard(eShingles, fShingles);
+      expect(score).toBeGreaterThanOrEqual(0.5);
+      expect(score).toBeLessThan(0.95);
+
+      const t = new FailureSignatureTracker({ streak: 2 });
+      expect(t.record(obs("call-e", CALL_E), 1)).toBeNull();
+      expect(t.record(obs("call-f", CALL_F), 2)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 2,
+      });
+    });
+
+    it("does not match two different exception types", () => {
+      const t = new FailureSignatureTracker();
+      const valueErr = `Traceback (most recent call last):\n  File "x.py", line 1\nValueError: invalid literal for int() with base 10: 'abc'\n${EXIT0}`;
+      const keyErr = `Traceback (most recent call last):\n  File "x.py", line 1\nKeyError: 'foo'\n${EXIT0}`;
+      t.record(obs("a", valueErr), 1);
+      t.record(obs("b", keyErr), 2);
+      expect(t.record(obs("c", valueErr), 3)).toBeNull();
+    });
+
+    it("does not match two genuinely different TypeErrors", () => {
+      const t = new FailureSignatureTracker();
+      const noneType = `Traceback (most recent call last):\n  File "x.py", line 1\nTypeError: 'NoneType' object is not subscriptable\n${EXIT0}`;
+      t.record(obs("a", CALL_E), 1);
+      t.record(obs("b", noneType), 2);
+      expect(t.record(obs("c", CALL_E), 3)).toBeNull();
+    });
+
+    it("does not let Fix 2 paper over D's genuinely different (exit-code) failure", () => {
+      // D has no recognizable exception line, so the exception-line fallback
+      // simply doesn't apply to it -- it can only match via hash/Jaccard,
+      // same as before this fix.
+      const t = new FailureSignatureTracker();
+      t.record(obs("a", CALL_E), 1);
+      t.record(obs("b", CALL_D), 2);
+      expect(t.record(obs("c", CALL_E), 3)).toBeNull();
+    });
+
+    it("does not accumulate a streak across KeyErrors that share only the exception type, not the underlying cause", () => {
+      // Two KeyErrors differing only in the quoted key are different bugs:
+      // the keys are far apart (edit distance > 2) and the tails score
+      // ~0.368 Jaccard, under the fallback floor.
+      const t = new FailureSignatureTracker();
+      const keyErr = (file: string, line: number, fn: string, expr: string, key: string) =>
+        `Traceback (most recent call last):\n  File "${file}", line ${line}, in ${fn}\n    ${expr}\nKeyError: '${key}'\n${EXIT0}`;
+      expect(
+        t.record(obs("a", keyErr("handlers/users.py", 42, "load_profile", "profile = cache[record_id]", "user_id")), 1),
+      ).toBeNull();
+      expect(
+        t.record(obs("b", keyErr("workers/ingest.py", 118, "flush_batch", "row = batch[cursor]", "timestamp")), 2),
+      ).toBeNull();
+      expect(
+        t.record(obs("c", keyErr("api/routes.py", 7, "handle_request", "ctx = session[token]", "csrf_token")), 3),
+      ).toBeNull();
+      expect(
+        t.record(obs("d", keyErr("jobs/reindex.py", 265, "rebuild", "doc = index[doc_id]", "shard_id")), 4),
+      ).toBeNull();
+    });
+
+    it("does not accumulate a streak across FileNotFoundErrors on two demonstrably different paths (Findings 2+3)", () => {
+      const t = new FailureSignatureTracker();
+      const notFound = (path: string) =>
+        `Traceback (most recent call last):\n  File "probe.py", line 9, in <module>\nFileNotFoundError: [Errno 2] No such file or directory: '${path}'\n${EXIT0}`;
+      expect(t.record(obs("a", notFound("/data/alpha_2023_run_input.csv")), 1)).toBeNull();
+      expect(t.record(obs("b", notFound("/var/lib/reports/beta_final_output.parquet")), 2)).toBeNull();
+      expect(t.record(obs("c", notFound("/srv/cache/gamma_manifest_shard.json")), 3)).toBeNull();
+    });
+
+    it("does not accumulate a streak across AttributeErrors on two unrelated modules (Findings 2+3)", () => {
+      const t = new FailureSignatureTracker();
+      const attrErr = (mod: string, attr: string) =>
+        `Traceback (most recent call last):\n  File "probe.py", line 3, in <module>\nAttributeError: module '${mod}' has no attribute '${attr}'\n${EXIT0}`;
+      expect(t.record(obs("a", attrErr("numpy", "nanstd")), 1)).toBeNull();
+      expect(t.record(obs("b", attrErr("pandas", "read_parquet")), 2)).toBeNull();
+      expect(t.record(obs("c", attrErr("requests", "adapters")), 3)).toBeNull();
+    });
+
+    it("does not let an incidental mid-tail Warning: line supply a false excLine match between unrelated failures (Finding 4)", () => {
+      // excLine comes from the trailing line only, so an incidental mid-tail
+      // "Warning:" supplies none.
+      const attempt = (job: number) =>
+        [
+          "Warning: cache miss, rebuilding index",
+          ...Array.from({ length: 20 }, (_, i) => `processing job ${job * 1000 + i} of 999`),
+          "unexpected worker termination",
+          "[exit=1 cwd=/app timed_out=false backend=subprocess]",
+        ].join("\n");
+      expect(signatureOf("shellsession", attempt(1), 40).excLine).toBeUndefined();
+      expect(signatureOf("shellsession", attempt(9), 40).excLine).toBeUndefined();
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("job-1", attempt(1)), 1)).toBeNull();
+      expect(t.record(obs("job-9", attempt(9)), 2)).toBeNull();
+      expect(t.record(obs("job-42", attempt(42)), 3)).toBeNull();
+    });
+
+    it("lets a qualified/dotted exception name participate in signature matching (Finding 5)", () => {
+      const t = new FailureSignatureTracker();
+      const dotted = (path: string) =>
+        `reading ${path}\njson.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n${EXIT0}`;
+      expect(t.record(obs("a", dotted("/data/a.json")), 1)).toBeNull();
+      expect(t.record(obs("b", dotted("/data/b.json")), 2)).toBeNull();
+      expect(t.record(obs("c", dotted("/data/c.json")), 3)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 3,
+      });
+    });
+
+    it("does not let a masked-exit-0 content-only mismatch clobber a live exit-code-proven streak (Finding 1)", () => {
+      const t = new FailureSignatureTracker();
+      expect(t.record(obs("./run --a", SHELL_FAIL), 1)).toBeNull();
+      expect(t.record(obs("./run --b", SHELL_FAIL), 2)).toBeNull();
+      // Turn 3: the model reruns its own failing command as
+      // `... 2>&1 | tail -1` -- an ordinary debugging move. Still exit 0
+      // (piped), and its one-line tail happens to read as an unrelated
+      // exception, so readResult calls it failed via content alone; its
+      // hash/Jaccard score against the tracked SHELL_FAIL streak is nowhere
+      // near a match.
+      const rerunTail =
+        "TypeError: unrelated_probe() got an unexpected keyword argument 'zzz'\n" +
+        "[exit=0 cwd=/app timed_out=false backend=subprocess]";
+      expect(readResult(rerunTail, false, 4)).toMatchObject({ failed: true, failedBy: "content" });
+      expect(t.record(obs("./run --a 2>&1 | tail -1", rerunTail), 3)).toBeNull();
+      // Turn 4 resumes the ORIGINAL exit-code-proven failure. Pre-fix, turn
+      // 3's mismatch would have forget()-ed the tracked entry and restarted
+      // it at count 1; count is 3, proving the streak survived intact.
+      expect(t.record(obs("./run --c", SHELL_FAIL), 4)).toMatchObject({
+        reason: "repeated_failure_signature",
+        count: 3,
+      });
+    });
   });
 });
