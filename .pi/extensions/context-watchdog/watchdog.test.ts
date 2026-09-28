@@ -315,12 +315,9 @@ describe("shouldCompactNow", () => {
     const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
     setupWatchdog(pi as any);
 
-    // canCompactMidRun("rpc") is false -- unlike the TUI, RPC mode's own
-    // guard above does not skip this handler, so this case needed its own
-    // explicit check next to it. little-coder's benchmark harness requests
-    // this exact compaction itself over RPC and always drives its own
-    // continuation (rpc_client.py's prompt_with_mid_run_compaction) --
-    // queueing a second, unrelated resume here raced that continuation.
+    // canCompactMidRun("rpc") is false, so the guard above does not cover
+    // this; see index.ts's session_compact handler for why RPC+manual is
+    // skipped.
     await handlers.session_compact({ reason: "manual", willRetry: false }, { mode: "rpc" });
     expect(sendUserMessage).not.toHaveBeenCalled();
   });

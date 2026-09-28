@@ -622,7 +622,7 @@ class _CycleRpc:
         #: prompt cannot see that, since it runs before the prompt.
         self._die_on_prompt = die_on_prompt
         #: Models the residual isStreaming window a successful await_compact
-        #: can still leave behind (compaction-continuation-idle-wait-gap.md):
+        #: can still leave behind:
         #: armed on a *successful* await_compact, not at construction, so it
         #: cannot fire before the trial's own first prompt.
         self._busy_for_sec_after_compact = busy_for_sec_after_compact
@@ -986,8 +986,8 @@ def test_a_failed_compaction_still_gets_its_continuation(failure):
 
 
 def test_continuation_gives_up_gracefully_if_pi_stays_busy_past_the_wait_bound():
-    """Regression pin for compaction-continuation-idle-wait-gap.md, both
-    before and after the fix -- it pins an observable shape, not the bug
+    """Regression pin for the post-compaction idle-wait gap, both before
+    and after the fix -- it pins an observable shape, not the bug
     itself. Pre-fix, this demonstrates the bug directly: the continuation's
     first send hits a residual isStreaming window and gives up without ever
     waiting it out (n_error_retries stays 0 -- the tell that the busy
@@ -1113,14 +1113,11 @@ def test_continuation_records_telemetry_when_it_recovers_from_a_busy_retry():
 
 
 def test_continuation_busy_retry_is_bounded_by_max_attempts():
-    """Finding 2, measured at current HEAD against this PR's own regression
-    pin (test_continuation_gives_up_gracefully_if_pi_stays_busy_past_the_
-    wait_bound, with max_attempts raised so it still reaches this same
-    condition): 21 prompt_and_collect sends, 3,614 get_state polls, the fake
-    clock advancing 35,940s of the 36,000s budget -- a genuinely wedged pi
-    burns nearly the ENTIRE remaining budget to reach stop_reason="compacted",
-    since the only exits were a dead pi and the budget floor, and every
-    retry re-enters wait_for_pi_idle (capped at 1800s per call).
+    """A genuinely wedged pi must give up on a count of consecutive busy
+    rejections, not only on the budget floor. Measured without this bound:
+    21 prompt_and_collect sends, 3,614 get_state polls, and 35,940s of the
+    36,000s budget spent before reaching stop_reason="compacted", because
+    every retry re-enters wait_for_pi_idle (capped at 1800s per call).
 
     `busy_on_first_n_continuation_sends` set far higher than any bound this
     test expects to reach models "stays busy on every continuation send,
@@ -1129,10 +1126,10 @@ def test_continuation_busy_retry_is_bounded_by_max_attempts():
     wait_for_pi_idle returns at once, letting this run in real time instead
     of simulating 3,614 polls.
 
-    Bounding on CONSECUTIVE busy-rejections via `max_attempts` (reused from
-    prompt_with_error_retry, the same count bound the sibling helper already
-    applies to its own busy handler) must give up after a small, fixed
-    number of attempts instead -- independent of the deadline."""
+    Bounding on CONSECUTIVE busy-rejections via `max_attempts` -- it bounds
+    this the same way it bounds the busy-retry count in rpc_client.py --
+    must give up after a small, fixed number of attempts instead,
+    independent of the deadline."""
     clock = _Clock()
     rpc = _CycleRpc(
         [([_turn(230_000)], _ok())],

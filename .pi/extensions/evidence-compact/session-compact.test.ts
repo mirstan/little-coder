@@ -1,9 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Drive the actual session_compact handler (not just the pure BRIDGE_TEMPLATE
-// function covered in bridge.test.ts). Mirrors context-watchdog/watchdog.test.ts's
-// pattern of capturing a registered `pi.on` handler off a fake `pi` object and
-// invoking it directly with a synthetic event/ctx.
+// function covered in bridge.test.ts).
 
 const getSessionStoreMock = vi.fn();
 vi.mock("../evidence/index.ts", () => ({

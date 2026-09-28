@@ -1783,7 +1783,8 @@ def prompt_with_mid_run_compaction(
     `PiBusyError` is the one exception NOT ended this way: the same
     rejection prompt_with_error_retry's own attempts>1 path already
     recovers from by waiting and resending, so a continuation's send is
-    retried in place instead, bounded by the same liveness/budget brakes.
+    retried in place instead, bounded by max_attempts consecutive rejections
+    and the same liveness/budget brakes.
     """
     if deadline is None:
         deadline = now() + timeout
@@ -1803,11 +1804,8 @@ def prompt_with_mid_run_compaction(
     last_error = ""
     retry_exception = ""
     n_compactions = 0
-    # Consecutive busy-rejections the `except PiBusyError` branch below has
-    # seen for the CURRENT compaction cycle, bounding that branch's own
-    # retry-in-place the same way `attempts` bounds prompt_with_error_retry's
-    # -- reset to 0 the moment a cycle actually completes (see below), so an
-    # unrelated earlier busy episode can never carry over into a later one.
+    # Consecutive busy rejections in the current cycle; reset when a cycle
+    # completes.
     consecutive_busy_retries = 0
     cycle_message = message
     cycle_timeout = min(timeout, max(0.0, deadline - now()))
@@ -1878,15 +1876,12 @@ def prompt_with_mid_run_compaction(
                     merged, n_error_retries, last_error, detail, n_compactions
                 )
             if (deadline - now()) <= min_remaining_sec:
-                # <=, not <: wait_for_pi_idle's own internal bound is
-                # `deadline - min_remaining_sec` too, so a busy pi that never
-                # goes idle converges exactly to that instant -- landing
-                # exactly ON the floor, not past it -- and each further call
-                # then returns immediately without sleeping (its own
-                # `remaining <= 0` check fires at once). A strict `<` here
-                # would accept that exact instant as "still enough budget",
-                # call wait_for_pi_idle again, get the same instant back, and
-                # spin forever never advancing the clock at all.
+                # <=, not <: wait_for_pi_idle's own bound is `deadline -
+                # min_remaining_sec`, so a pi that never goes idle converges
+                # exactly onto the floor, and each further call then returns
+                # without sleeping. Treating that instant as out of budget is
+                # what keeps the retry loop from spending attempts on waits
+                # that cannot advance the clock.
                 _log(
                     f"not retrying the continuation: only "
                     f"{deadline - now():.0f}s of budget is left, at or below "
@@ -2065,14 +2060,9 @@ def prompt_with_mid_run_compaction(
                 merged, n_error_retries, last_error, retry_exception, n_compactions
             )
 
-        # Unconditional, regardless of why await_compact succeeded or failed
-        # above: pi's own isStreaming can still be true right after a
-        # compaction settles (e.g. a resume turn some other extension fired
-        # in-process), and the continuation below is a brand-new call whose
-        # attempt 1 never goes through prompt_with_error_retry's own
-        # attempts>1 wait. Return value is deliberately ignored -- a stale or
-        # wrong idle reading must never by itself end a recoverable trial;
-        # the continuation is sent regardless of what this returns.
+        # Unconditional, regardless of how await_compact ended: pi can still
+        # report isStreaming right after a compaction settles. Return value
+        # ignored on purpose -- a wrong idle read must not end a live trial.
         wait_for_pi_idle(
             rpc, deadline, min_remaining_sec=min_remaining_sec,
             now=now, sleep=sleep, log=log,
