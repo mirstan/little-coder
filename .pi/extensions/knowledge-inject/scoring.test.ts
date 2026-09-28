@@ -77,12 +77,7 @@ describe("knowledge directory loads from repo", () => {
   });
 });
 
-// Motivating trial: train-fasttext__yewN65G (benchmarks/harbor_runs/
-// 2026-09-24__21-02-23/) scored reward 0.0 at 0.617 accuracy vs a 0.62
-// threshold, inside the model's own measured ~0.019 CV/holdout spread.
-// This entry is scoped to the general train-to-threshold shape, not
-// fastText specifically -- these tests exercise the REAL frontmatter
-// keywords against the REAL scorer, not a hand-copied keyword list.
+// A run scoring 0.617 against a 0.62 threshold sat inside its own ~0.019 spread.
 describe("stochastic-training-variance entry", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const kDir = join(here, "..", "..", "..", "skills", "knowledge");
@@ -101,8 +96,6 @@ describe("stochastic-training-variance entry", () => {
   });
 
   it("fires on a different train-to-threshold prompt that never mentions fastText", () => {
-    // Proves this is a general train-to-threshold entry, not a fastText-only
-    // trigger with extra words attached.
     const prompt = "train an XGBoost classifier to reach at least 0.85 F1 on the validation set";
     expect(scoreEntry(prompt, entry(keywords))).toBeGreaterThanOrEqual(MIN_SCORE_THRESHOLD);
   });
@@ -119,7 +112,7 @@ describe("stochastic-training-variance entry", () => {
     expect(scoreEntry(gpt2Codegolf, entry(keywords))).toBeLessThan(MIN_SCORE_THRESHOLD);
   });
 
-  // spec iter1-f00, truth 4: the test above proves only zero-overlap silence;
+  // the test above proves only zero-overlap silence;
   // it cannot detect the false-positive boundary the old 13-bare-word keyword
   // list actually crossed. These three prompts describe no training run and
   // no metric threshold, but scored >= MIN_SCORE_THRESHOLD under the old list
@@ -128,8 +121,8 @@ describe("stochastic-training-variance entry", () => {
   // "classifier"+"training"). Unlike the gpt2 test, this one can actually
   // fail if a future keyword edit reopens the boundary.
   //
-  // spec iter2-f00, truth 1: two more prompts below pin the phrase-keyword
-  // boundary the iteration-1 fix itself reopened -- `test set` and
+  // Four more prompts below pin the phrase-keyword boundary the
+  // iteration-1 fix itself reopened -- `test set` and
   // `at least 0` were still in the keyword list and, being phrase keywords,
   // fired the entry alone (2.0 >= MIN_SCORE_THRESHOLD) on ANY prompt
   // containing that substring, ML or not (verified by hand against the real
@@ -151,7 +144,7 @@ describe("stochastic-training-variance entry", () => {
     }
   });
 
-  // spec iter3-f00 (post needs-human review): iterations 1-2 fixed 2 specific
+  // iterations 1-2 fixed 2 specific
   // phrase keywords ("test set", "at least 0") caught by name, but left the
   // defect CLASS open -- any remaining phrase keyword still fires the entry
   // alone (2.0 >= MIN_SCORE_THRESHOLD) regardless of ML content, since a
@@ -180,13 +173,11 @@ describe("stochastic-training-variance entry", () => {
   });
 });
 
-// spec iter1-f00, truth 2: exercises the REAL selection/budget path end to
-// end -- not a re-derivation by eye -- on the real train-fasttext prompt.
-// Mirrors index.ts:117-131's score-sort + greedy-budget-fit loop exactly:
-// sort by score descending, PER_ENTRY_CAP = 150 clamp (index.ts:31, not
-// exported so mirrored here as a literal), budget = 200, accumulate `used`,
-// skip an entry that would exceed budget. Re-check this test's mirrored
-// constants against index.ts if that loop, or PER_ENTRY_CAP, ever changes.
+// Re-derives index.ts:117-131's score-sort + greedy-budget-fit against the
+// real entry files. Two deliberate gaps: index.ts:119's requires_tools filter
+// is skipped (all entries loaded with requiresTools: []), and BUDGET mirrors
+// the 200 default, which lc.knowledgeTokenBudget can override. PER_ENTRY_CAP
+// (index.ts:31) is not exported, so it is a literal here.
 describe("knowledge-inject real selection/budget path", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const kDir = join(here, "..", "..", "..", "skills", "knowledge");
@@ -227,11 +218,12 @@ describe("knowledge-inject real selection/budget path", () => {
       (e) => e.topic === "Stochastic Training Variance Near a Threshold",
     );
     expect(stochastic).toBeDefined();
-    // truth 1: token_cost is no longer the 3x+ outlier (90); it is honestly
-    // capped at PER_ENTRY_CAP like its similarly-sized siblings.
+    // truth 1: token_cost was 90, the cheapest tier, for the largest body in
+    // skills/knowledge. It now declares PER_ENTRY_CAP (150), the most the loader
+    // honours.
     expect(stochastic!.tokenCost).toBe(150);
 
-    // Mirror index.ts:117-124's scoring/filter/sort exactly.
+    // Mirror index.ts:117-124's scoring/filter/sort.
     const scored: Array<{ score: number; entry: KnowledgeEntry }> = [];
     for (const e of entries) {
       const s = scoreEntry(prompt, e);
@@ -249,14 +241,14 @@ describe("knowledge-inject real selection/budget path", () => {
     }
 
     // Computed, not assumed: on this prompt the corrected entry's real score
-    // (train + fasttext + accuracy = 3.0, post spec iter2-f00's removal of
-    // the "test set" and "at least 0" phrase keywords that used to inflate
+    // (train + fasttext + accuracy = 3.0, post the removal of
+    // the `test set` and `at least 0` phrase keywords that used to inflate
     // this same score to 7.0) is still >= MIN_SCORE_THRESHOLD and high
     // enough in the sort that it consumes enough of the 200-token budget to
     // keep Workspace Documentation out, even at the honest cost of 150 --
     // the original bug (a false-cheap declared cost) is fixed, but the
-    // greedy budget-fit ALGORITHM is unchanged and out of scope for this fix
-    // (spec iter1-f00). This pins the corrected-cost outcome so a future
+    // greedy budget-fit ALGORITHM is unchanged and out of scope for this fix.
+    // This pins the corrected-cost outcome so a future
     // edit to either file re-computes it rather than silently reintroducing
     // (or silently "fixing") the eviction.
     expect(selected).toContain("Stochastic Training Variance Near a Threshold");
