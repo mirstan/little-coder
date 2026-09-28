@@ -8,6 +8,7 @@ import setupExtension, {
   buildTriggerEMessage,
   parseByteLimit,
   parseDeliverablePath,
+  looksLikeTestInvocation,
 } from "./index.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
@@ -135,8 +136,24 @@ async function newSessionWithPrompt(h: ReturnType<typeof makeHarness>, prompt: s
   await fire(h.pi, "before_agent_start", { systemPromptOptions: {}, prompt }, h.ctx);
 }
 
+// turn() synthesizes one tool_result per toolCall block in the message's
+// array order before firing turn_end. A test that wants to exercise
+// genuinely out-of-array-order sibling completion should fire tool_result
+// directly itself before calling turn().
 async function turn(h: ReturnType<typeof makeHarness>, event: any) {
   await fire(h.pi, "turn_start", {}, h.ctx);
+  const content = event?.message?.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type !== "toolCall") continue;
+      await fire(
+        h.pi,
+        "tool_result",
+        { toolName: block.name, input: block.arguments ?? {} },
+        h.ctx,
+      );
+    }
+  }
   await fire(h.pi, "turn_end", event, h.ctx);
 }
 
@@ -335,7 +352,7 @@ describe("tb-finalize-guard", () => {
       expect(h.sent).toHaveLength(1);
     });
 
-    it("fires at most twice per session", async () => {
+    it("fires at most three times per session", async () => {
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
@@ -343,7 +360,21 @@ describe("tb-finalize-guard", () => {
       await turn(h, assistantTurn({ text: "One." }));
       await turn(h, assistantTurn({ text: "Two." }));
       await turn(h, assistantTurn({ text: "Three." }));
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Four." }));
+      expect(h.sent).toHaveLength(3);
+    });
+
+    it("a real trial's shape (two early pauses, then a real final declaration) now gets a third fire where it previously would have been suppressed", async () => {
+      // Two early pauses then a real final declaration -- the third fire the
+      // old cap of 2 suppressed.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(180);
+      await newSession(h);
+      await turn(h, assistantTurn({ text: "I think I'm done for now." })); // fire #1 (early pause)
+      await turn(h, assistantTurn({ text: "Let me pause here too." })); // fire #2 (early pause)
+      await turn(h, assistantTurn({ text: "That's everything." })); // the real final declaration
+      expect(h.sent).toHaveLength(3);
     });
 
     it("latch survives before_agent_start (no re-arming across runs in one session)", async () => {
@@ -358,8 +389,9 @@ describe("tb-finalize-guard", () => {
       setDeadlineMinutesFromNow(30);
       await startRun(h);
       await turn(h, assistantTurn({ text: "Two." })); // fire #2 this session
-      await turn(h, assistantTurn({ text: "Three." })); // would be #3 — blocked
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Three." })); // fire #3 this session
+      await turn(h, assistantTurn({ text: "Four." })); // would be #4 — blocked
+      expect(h.sent).toHaveLength(3);
     });
 
     it("resets on session_start, allowing fresh fires for a new task", async () => {
@@ -369,12 +401,13 @@ describe("tb-finalize-guard", () => {
       await newSession(h);
       await turn(h, assistantTurn({ text: "One." }));
       await turn(h, assistantTurn({ text: "Two." }));
-      expect(h.sent).toHaveLength(2); // session limit reached
+      await turn(h, assistantTurn({ text: "Three." }));
+      expect(h.sent).toHaveLength(3); // session limit reached
 
       setDeadlineMinutesFromNow(30);
       await newSession(h); // session_start resets the latch
-      await turn(h, assistantTurn({ text: "Three." }));
-      expect(h.sent).toHaveLength(3);
+      await turn(h, assistantTurn({ text: "Four." }));
+      expect(h.sent).toHaveLength(4);
     });
 
     it("does not burn the fire count or notify when sendUserMessage throws", async () => {
@@ -415,6 +448,302 @@ describe("tb-finalize-guard", () => {
       // What a TB1.0 trial gets: same benchmark name, no container-side copy.
       expect(h.sent[0].text).toBe(buildTriggerAMessage(30, undefined));
       expect(h.sent[0].text).not.toContain(INITIAL_SNAPSHOT_APP_DIR);
+    });
+
+    it("strengthens the message when a write happened with no test-invocation since a real test seen earlier this session", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Primes testInvocationEverSeen so the categorical "since your last
+      // test run" claim is warranted -- that claim is gated on having ever
+      // seen a real test this session (see the "honest fallback" tests
+      // below for the zero-ever-seen case).
+      await turn(h, shellTurn(["pytest tests/"]));
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, no test since
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("uses the honest fallback (not the categorical claim) when no test has ever run this session", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // No test invocation anywhere this session — testInvocationEverSeen
+      // stays false, so the strong "since your last test run" claim (which
+      // presupposes a last test run that never happened) must not fire.
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, zero tests ever
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).toContain("You have not run any tests yet this session");
+    });
+
+    it("keeps testInvocationEverSeen across runs in the same session (session_start-scoped, not before_agent_start)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["pytest tests/"])); // a real test, run 1
+      await startRun(h); // new run, SAME session — before_agent_start must not reset it
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // write, no test this run
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+
+      await newSession(h); // session_start DOES reset it
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // write, zero tests this session
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(2);
+      expect(h.sent[1].text).toContain("You have not run any tests yet this session");
+    });
+
+    it("does not add the retest clause when a test-invocation ran after the write", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write
+      await turn(h, shellTurn(["pytest tests/"])); // test-invocation clears the flag
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+
+    it("clears the flag when the write and the test run land in the same turn", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt", "pytest tests/"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+
+    it("does not clear the flag when a heredoc body merely mentions a test framework", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Primes testInvocationEverSeen so this test isolates the heredoc
+      // invariant (dirty stays true) from the separate, session-scoped
+      // categorical-vs-fallback clause choice covered elsewhere.
+      await turn(h, shellTurn(["pytest tests/"]));
+      // A heredoc write whose BODY text contains "pytest" — no test invocation
+      // actually ran, so the flag must stay dirty.
+      await turn(
+        h,
+        shellTurn(["cat > /app/solution.py <<'EOF'\nimport pytest\n\ndef test_x(): ...\nEOF"]),
+      );
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still dirties when a chained write after the SAME command's own test invocation is a genuine edit, not test-output-shaped (iteration 3)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // The carve-out exempts only test-output-shaped writes; an in-place
+      // edit after the same command's test must still dirty.
+      await turn(h, shellTurn(["python -m pytest && sed -i 's/x/y/' /app/main.py"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still dirties when a chained write after the SAME command's own test invocation is a copy onto the deliverable (iteration 3)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Same root cause as the `sed -i` case above, exercised via `cp`
+      // instead of an in-place edit: a copy onto a deliverable path is not
+      // test-output-shaped either, so it must dirty even though it follows
+      // the same command's own test invocation.
+      await turn(h, shellTurn(["make test; cp /tmp/fixed.py /app/main.py"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("still dirties on a write in a DIFFERENT, later command even after the same turn's test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // Guards against over-suppression: the same-command carve-out above
+      // must not silently swallow a write that is its own separate command.
+      await turn(h, shellTurn(["pytest tests/", "echo done > /app/DONE"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+
+    it("does not re-dirty on a pipe to the test's own output (pytest 2>&1 | tee log)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // The pipe's second segment is a non-scratch write, and being last in
+      // execution order, a strict last-wins rule wrongly re-dirtied the flag
+      // even though this is the test's own output being logged, not a
+      // deliverable edit.
+      await turn(h, shellTurn(["pytest 2>&1 | tee /app/test.log"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).not.toContain("You have not run any tests yet this session");
+    });
+
+    it("does not re-dirty on a test chained with a redirect of its own output (pytest && echo done > DONE)", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["pytest && echo done > /app/DONE"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).not.toContain("You have not run any tests yet this session");
+    });
+
+    it("a plain redirect that merely writes the word 'pytest' as file content is not a test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      // `echo pytest > file` must not be read as running pytest — it writes
+      // the word "pytest" as file content. No real test has ever run this
+      // session, so the flag stays dirty AND the message must use the
+      // honest fallback, not the categorical claim.
+      await turn(h, shellTurn(["echo pytest > /app/result.txt"]));
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+      expect(h.sent[0].text).toContain("You have not run any tests yet this session");
+    });
+
+    it("still clears the flag for a real, unquoted, unchained test invocation", async () => {
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+      await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write
+      await turn(h, shellTurn(["python -m pytest"])); // the working case — must not regress
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].text).not.toContain("without re-running your tests");
+    });
+
+    it("judges two SEPARATE same-turn tool calls by real completion order, not by their position in the turn's tool-call array", async () => {
+      // see the tool_result handler for why ordering comes from there.
+      const h = makeHarness();
+      setupExtension(h.pi as any);
+      setDeadlineMinutesFromNow(30);
+      await newSession(h);
+
+      await fire(h.pi, "turn_start", {}, h.ctx);
+      // Real completion order: test result arrives first...
+      await fire(h.pi, "tool_result", { toolName: "ShellSession", input: { command: "pytest tests/" } }, h.ctx);
+      // ...then the write's result arrives second (finished LAST, after the
+      // test already ran) -- even though the message below lists it FIRST.
+      await fire(
+        h.pi,
+        "tool_result",
+        { toolName: "ShellSession", input: { command: "echo done > /app/result.txt" } },
+        h.ctx,
+      );
+      await fire(
+        h.pi,
+        "turn_end",
+        {
+          message: {
+            content: [
+              { type: "toolCall", name: "ShellSession", arguments: { command: "echo done > /app/result.txt" } },
+              { type: "toolCall", name: "ShellSession", arguments: { command: "pytest tests/" } },
+            ],
+            stopReason: undefined,
+          },
+        },
+        h.ctx,
+      );
+
+      await turn(h, assistantTurn({ text: "I think that's everything." }));
+      expect(h.sent).toHaveLength(1);
+      // Real completion order says the write came after the test -> dirty.
+      // The array's own listed order would have said the opposite (test
+      // last, so clean) if array position were still driving this.
+      expect(h.sent[0].text).toContain(
+        "You edited a file since your last test run without re-running your tests",
+      );
+    });
+  });
+
+  describe("looksLikeTestInvocation", () => {
+    it("matches common test-runner invocations across languages", () => {
+      const positives = [
+        "pytest",
+        "python -m pytest tests/",
+        "python3 -m pytest -k foo",
+        "python -m unittest discover",
+        "go test ./...",
+        "cargo test",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "make test",
+        "make check",
+        "rspec spec/",
+        "rake test",
+        "mvn test",
+        "gradle test",
+      ];
+      for (const cmd of positives) expect(looksLikeTestInvocation(cmd)).toBe(true);
+    });
+
+    it("does not match plausible near-misses that merely contain the word 'test'", () => {
+      const negatives = [
+        "cat test_notes.txt",
+        "ls test_data/",
+        "echo 'contest results' > /app/out.txt",
+        "vim test_plan.md",
+        "grep -r test src/",
+        // A quoted/embedded runner name in an unrelated command must not
+        // match — "make test" here sits inside the commit message, not on
+        // the command line.
+        "git commit -m 'make test pass'",
+        // A plain (non-heredoc) redirect that writes the word "pytest" as
+        // file content, unquoted, is not a test invocation — the runner name
+        // must be the command being run, not an argument to an unrelated
+        // command like `echo`.
+        "echo pytest > /app/result.txt",
+      ];
+      for (const cmd of negatives) expect(looksLikeTestInvocation(cmd)).toBe(false);
     });
   });
 
@@ -922,33 +1251,34 @@ describe("tb-finalize-guard", () => {
       await fire(h.pi, "session_start", {}, h.ctx);
       await startRun(h, 10);
 
-      // Exhaust Trigger A's session cap (2 fires).
+      // Exhaust Trigger A's session cap (3 fires).
       await turn(h, assistantTurn({ text: "One." })); // turn 1
       await turn(h, assistantTurn({ text: "Two." })); // turn 2
-      expect(h.sent).toHaveLength(2);
+      await turn(h, assistantTurn({ text: "Two-point-five." })); // turn 2.5
+      expect(h.sent).toHaveLength(3);
 
       // Trigger C fires on a settled run with an errored final message,
       // unaffected by Trigger A's now-exhausted cap.
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 3
       await settle(h);
-      expect(h.sent).toHaveLength(3);
+      expect(h.sent).toHaveLength(4);
 
       // A fresh run, still within the same session — Trigger C fires again.
       await startRun(h, 10);
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of the new run
       await settle(h);
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Trigger C's own session-scoped cap is now exhausted; a 3rd settled
       // error run does not fire.
       await startRun(h, 10);
       await turn(h, assistantTurn({ stopReason: "error" })); // turn 1 of yet another run
       await settle(h);
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Trigger A's cap is still exhausted, unaffected by Trigger C's fires.
       await turn(h, assistantTurn({ text: "Three." })); // turn 2 of this run
-      expect(h.sent).toHaveLength(4);
+      expect(h.sent).toHaveLength(5);
 
       // Drive turns up to Trigger B's arm point (turn 6 for capForRun=10)
       // with no-op shell turns, then two non-compliant turns to fire B —
@@ -959,7 +1289,7 @@ describe("tb-finalize-guard", () => {
       await turn(h, shellTurn(["ls -la"])); // turn 6 — arms
       await turn(h, shellTurn(["ls -la"])); // turn 7 — 1st non-compliant turn
       await turn(h, shellTurn(["ls -la"])); // turn 8 — 2nd non-compliant turn; fires B
-      expect(h.sent).toHaveLength(5);
+      expect(h.sent).toHaveLength(6);
     });
   });
 

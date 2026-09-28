@@ -233,3 +233,24 @@ export function buildFailureSignatureMessage(
     "it and move on rather than seeking another route to the same effect."
   );
 }
+
+// A third watchdog, independent of the two above: repeated script
+// write-run-fail cycles that never cluster by content (a rewrite of a new
+// file, or of the same bug pattern outside the fuzzy tracker's rolling
+// window) so near_duplicate_loop never sees them as similar. Fires
+// alongside fuzzy/failsig, not instead of them -- see
+// quality-monitor/script-failure.ts.
+export function buildScriptFailureMessage(count: number, escalated: boolean): string {
+  const opening = escalated
+    ? `That is now ${count} different script-write attempts that have failed ` +
+      "to run correctly across this trial -- this is costing a large share " +
+      "of your remaining turn budget."
+    : `You've now had ${count} different script-write attempts fail to run ` +
+      "correctly across this trial (not counting near-identical repeats, " +
+      "which the existing near-duplicate detector already flags separately).";
+  return (
+    `${opening} Before your next attempt, isolate and test just the specific ` +
+    "construct that's failing in a minimal standalone script, rather than " +
+    "debugging it inside the full file."
+  );
+}

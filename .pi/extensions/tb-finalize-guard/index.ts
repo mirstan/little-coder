@@ -2,7 +2,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
-import { SHELL_TOOLS, detectDeliverableWrites, isScratchPath } from "../_shared/shell-write.ts";
+import {
+  SHELL_TOOLS,
+  detectDeliverableWrites,
+  isScratchPath,
+  splitCommandChain,
+  scan,
+  type WriteKind,
+} from "../_shared/shell-write.ts";
 import {
   finalizeWarnTurnWindowOpen,
   finalizeWarnWouldFire,
@@ -293,7 +300,9 @@ import { splitFooter } from "../truncated-view/truncation.ts";
 // module's header for why (this constant used to be hand-copied here and in
 // finalize-warn/index.ts with nothing enforcing they stayed in lockstep).
 const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WARN_REMAINING_MS
-const MAX_TRIGGER_A_FIRES = 2; // per session
+// A trial with 3 genuine early-quit patterns still exhausts this cap:
+// a magnitude tweak, not a structural fix.
+const MAX_TRIGGER_A_FIRES = 3; // per session
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
 
@@ -319,6 +328,22 @@ let armedAtTurn = 0;
 let consecutiveNoWriteTurns = 0;
 let triggerBFired = false;
 
+// True from a non-scratch write until a test invocation is seen; reset per run. Strengthens
+// Trigger A's message with an "edited without retesting" clause -- a mechanically-checkable
+// signal, not a claim about the edit's intent. Judged per command segment in
+// advanceDirtyLatchForCommand: a write after that same command's own test invocation is exempt
+// only when every non-scratch write in the segment is test-output-shaped
+// (TEST_OUTPUT_WRITE_KINDS); any other write re-dirties.
+let dirtySinceLastTest = false;
+
+// True once any command THIS TURN has written outside scratch -- reset at
+// turn_start, set incrementally as each tool_result arrives (see the
+// tool_result handler below), read once at turn_end. Split out from
+// dirtySinceLastTest because Trigger B/D's evidence check is turn-scoped
+// ("did THIS turn write"), while dirtySinceLastTest is a standing latch that
+// only clears on a real test run.
+let turnWroteDeliverable = false;
+
 // ---- Trigger C state ----
 // Fire count is session-scoped, like Trigger A's. The message snapshot is
 // run-scoped: AgentSettledEvent carries no messages (unlike agent_end), so
@@ -335,6 +360,19 @@ let lastTurnMessage: any = undefined;
 // not change within a session.
 let milestonesFired = new Set<number>();
 let deliverableWriteEverSeen = false;
+// True once a real, unquoted test invocation has EVER been observed in the
+// session -- session-scoped like deliverableWriteEverSeen (same
+// session_start reset point, never reset by before_agent_start, so a later
+// run in the same session doesn't lose evidence an earlier run established).
+// Gates whether buildTriggerAMessage's dirty clause may assert the
+// categorical "you edited a file since your last test run" claim: that
+// claim presupposes a last test run that may never have happened (no test
+// suite, or one whose only runner is absent from TEST_INVOCATION_PATTERNS).
+// When this is still false, a non-scratch write falls back to the
+// no-tests-yet clause, which drops the "since your last test run" phrasing
+// but still asserts no test ran -- itself wrong when only an unlisted
+// runner was used.
+let testInvocationEverSeen = false;
 let startForRun = 0;
 // Run-scoped: which turn (if any) Trigger D fired at, so Trigger A's own
 // turn_end for that SAME turn can skip -- both are separately queued
@@ -415,14 +453,131 @@ function shellCommandsIn(toolCalls: any[]): string[] {
   return commands;
 }
 
-/** True when at least one command in this turn writes somewhere other than scratch. */
-function hasNonScratchWrite(commands: string[]): boolean {
-  for (const cmd of commands) {
-    for (const w of detectDeliverableWrites(cmd)) {
-      if (!isScratchPath(w.path)) return true;
+// Heuristic, not exhaustive -- a command-name allowlist can't cover every
+// language/framework's test invocation. A false negative here (an unlisted
+// runner -- vitest, jest, tox, ctest, etc. are all absent from the list
+// below, and note this repo's own test command is `npx vitest run`) no
+// longer forces a false accusation the way it once did:
+// `testInvocationEverSeen` (above) gates the categorical "since your last
+// test run" claim, so a session that never triggers a RECOGNIZED runner
+// falls back to the no-tests-yet clause, which drops the "since your last
+// test run" phrasing but still asserts no test ran -- itself wrong when
+// only an unlisted runner was used (see buildTriggerAMessage). One
+// narrower window remains -- a session whose FIRST test run used a
+// recognized runner (so `testInvocationEverSeen` is already true) can
+// still be wrongly accused if a LATER retest used only an unlisted one --
+// but the common, previously-unconditional case (no recognized runner
+// ever seen all session) is fixed.
+//
+// A false positive (matching text that never executed as a test at all --
+// inside a heredoc body, a comment, a quoted string, or as a plain unquoted
+// ARGUMENT to some other command, e.g. `echo pytest > file`) is the
+// direction that gets silently SUPPRESSED instead: the clause simply
+// doesn't fire when it should have. That is also not rare -- `cat > file
+// <<'EOF'` bodies that merely mention a runner name, and a quoted string
+// like `git commit -m 'make test pass'`, both hit it easily. Matching
+// against per-segment, quote-aware text ANCHORED to the start of the
+// segment (see `looksLikeTestInvocation` below, called per
+// `splitCommandChain` segment from `advanceDirtyLatchForCommand`) closes
+// the heredoc/quoting/ordering gaps and the "runner name used only as
+// another command's argument" gap; the pattern LIST itself staying
+// incomplete (the false-negative direction above) is a separate,
+// not-yet-filed concern.
+const TEST_INVOCATION_PATTERNS: RegExp[] = [
+  /^pytest\b/, /^py\.test\b/, /^python3?\s+-m\s+pytest\b/,
+  /^python3?\s+-m\s+unittest\b/,
+  /^go\s+test\b/, /^cargo\s+test\b/,
+  /^npm\s+(run\s+)?test\b/, /^yarn\s+test\b/,
+  /^make\s+(test|check)\b/,
+  /^rspec\b/, /^rake\s+test\b/,
+  /^mvn\s+test\b/, /^gradle\s+test\b/,
+];
+
+// The kinds `detectDeliverableWrites` can report (see `shell-write.ts`'s
+// `WriteKind`) that plausibly represent a TEST'S OWN output-handling rather
+// than a genuine deliverable edit -- a pipe target, a stdout/stderr
+// redirect, or an append. Deliberately excludes `copy`, `move`, `inplace`,
+// and `compile` (an edit, a clobber, or a build artifact landing on a
+// deliverable path -- none of those are the test writing its own output)
+// and also excludes `dd` (block-level copy, same reasoning).
+// Scopes the same-command carve-out in advanceDirtyLatchForCommand.
+const TEST_OUTPUT_WRITE_KINDS: ReadonlySet<WriteKind> = new Set(["redirect", "append", "tee"]);
+
+/**
+ * Blank out every quoted (or escaped) character in `cmd`, preserving length
+ * and position so a regex's `\b` boundaries still land correctly. This is
+ * what keeps `looksLikeTestInvocation` from matching a runner name that only
+ * appears inside a quoted string, e.g. `git commit -m 'make test pass'` --
+ * the quoted span becomes spaces, so `make test` never appears as adjacent,
+ * unquoted words.
+ */
+function maskQuotedText(cmd: string): string {
+  const masked = new Array<boolean>(cmd.length).fill(true);
+  scan(cmd, (_ch, i, quote) => {
+    masked[i] = quote !== null;
+  });
+  let out = "";
+  for (let i = 0; i < cmd.length; i++) out += masked[i] ? " " : cmd[i];
+  return out;
+}
+
+/**
+ * True when `cmd` -- a single already-heredoc-stripped, already-chain-split
+ * command segment (see `splitCommandChain`) -- contains a real, unquoted
+ * test-runner invocation. Quoted/escaped text is masked out first (see
+ * `maskQuotedText`) so a runner name embedded in a string literal, rather
+ * than on the command line itself, cannot match. `TEST_INVOCATION_PATTERNS`
+ * is anchored (`^`) against the masked text with leading whitespace trimmed,
+ * not matched anywhere in the segment -- so a runner name that only appears
+ * as an unquoted ARGUMENT to some other command (`echo pytest >
+ * /app/result.txt`) does not match: the segment must actually START with
+ * the invocation, not merely contain its name somewhere after another
+ * command word.
+ */
+export function looksLikeTestInvocation(cmd: string): boolean {
+  const unquoted = maskQuotedText(cmd).trimStart();
+  return TEST_INVOCATION_PATTERNS.some((re) => re.test(unquoted));
+}
+
+/**
+ * The command-shaped string carried by a single tool call, if any: the
+ * `command` argument for anything in SHELL_TOOLS, plus (for Trigger B's
+ * evidence-of-work purposes only) ShellSend's `text` argument — confirmed
+ * against bg-shell/index.ts's ShellSend tool definition, which takes `text`,
+ * not `command`. Used by the tool_result handler below to extract each
+ * call's command as its own result arrives.
+ */
+function shellCommandOf(name: unknown, args: Record<string, unknown>): string | undefined {
+  if (typeof name !== "string") return undefined;
+  if (SHELL_TOOLS.has(name)) {
+    return typeof args?.command === "string" ? args.command : undefined;
+  }
+  if (EVIDENCE_ONLY_SHELL_TOOLS.has(name)) {
+    return typeof args?.text === "string" ? args.text : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Advance dirtySinceLastTest/testInvocationEverSeen for ONE command string,
+ * in isolation. Pulled out of the old turn_end loop so it can be driven
+ * per-tool_result (real completion order) instead of per-turn_end-aggregate --
+ * see the tool_result handler for why ordering comes from there.
+ */
+function advanceDirtyLatchForCommand(cmd: string): void {
+  let sawRealTestInThisCommand = false;
+  for (const segment of splitCommandChain(cmd)) {
+    const nonScratchWrites = detectDeliverableWrites(segment).filter((w) => !isScratchPath(w.path));
+    if (nonScratchWrites.length > 0) {
+      const allTestOutputShaped = nonScratchWrites.every((w) => TEST_OUTPUT_WRITE_KINDS.has(w.kind));
+      if (!sawRealTestInThisCommand || !allTestOutputShaped) dirtySinceLastTest = true;
+    }
+    if (looksLikeTestInvocation(segment)) {
+      dirtySinceLastTest = false;
+      sawRealTestInThisCommand = true;
+      testInvocationEverSeen = true;
     }
   }
-  return false;
 }
 
 // True when a write target names the same deliverable as `deliverablePath`,
@@ -662,6 +817,7 @@ export default function (pi: ExtensionAPI) {
     byteLimitForRun = undefined;
     byteLimitInclusiveForRun = undefined;
     deliverablePathForRun = undefined;
+    testInvocationEverSeen = false;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -672,6 +828,7 @@ export default function (pi: ExtensionAPI) {
     armed = false;
     armedAtTurn = 0;
     consecutiveNoWriteTurns = 0;
+    dirtySinceLastTest = false;
     lastTurnMessage = undefined;
     triggerDFiredAtTurn = 0;
     // Latch, don't overwrite: a continuation run's prompt is
@@ -690,6 +847,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     turnsThisRun++;
+    turnWroteDeliverable = false;
     if (!isTerminalBench()) return;
     if (!armed && !triggerBFired && finalizeWarnWouldFire({ turnsThisRun, capForRun, deadlineForRun })) {
       armed = true;
@@ -698,6 +856,26 @@ export default function (pi: ExtensionAPI) {
     // After the arming check, so a turn that arms finalize-warn's window is
     // already inside the endgame Trigger D defers to.
     maybeFireTriggerD(pi, ctx);
+  });
+
+  // Drives dirtySinceLastTest/testInvocationEverSeen/turnWroteDeliverable per
+  // individual tool call, in real completion order, since pi runs same-turn
+  // SIBLING tool calls in parallel and turn_end's aggregated array order
+  // isn't a reliable stand-in for execution order (a single command's own
+  // &&/;/| chaining is still sequential -- see advanceDirtyLatchForCommand).
+  pi.on("tool_result", async (event) => {
+    if (!isTerminalBench()) return;
+    const e = event as any;
+    const args = e?.input ?? e?.arguments ?? {};
+    const cmd = shellCommandOf(e?.toolName ?? e?.name, args);
+    if (cmd === undefined) return;
+
+    const nonScratchWrites = detectDeliverableWrites(cmd).filter((w) => !isScratchPath(w.path));
+    if (nonScratchWrites.length > 0) {
+      turnWroteDeliverable = true;
+      deliverableWriteEverSeen = true;
+    }
+    advanceDirtyLatchForCommand(cmd);
   });
 
   pi.on("turn_end", async (event, ctx) => {
@@ -719,17 +897,17 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
-    // Computed for every turn, not just the ones Trigger B is armed for:
-    // Trigger D's evidence flag has to be complete from turn 1, long before
-    // Trigger B starts judging compliance.
+    // turnWroteDeliverable is the tool_result handler's per-turn accumulator,
+    // reset at turn_start. Trigger E's byte-limit check still needs this
+    // turn's actual shell commands, not just the write/no-write boolean, so
+    // it's derived here from the same toolCalls contentShape already
+    // extracted above.
     const commands = shellCommandsIn(toolCalls);
-    const wroteDeliverable = hasNonScratchWrite(commands);
-    if (wroteDeliverable) deliverableWriteEverSeen = true;
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance
 
-    maybeAdvanceTriggerB(pi, ctx, wroteDeliverable);
+    maybeAdvanceTriggerB(pi, ctx, turnWroteDeliverable);
     await maybeCheckDeliverableSize(pi, ctx, commands);
   });
 
@@ -774,10 +952,16 @@ const RESTORE_RESTRAINT =
  *
  * `baseline` is the start-of-trial copy's outcome, or undefined to say
  * nothing about it at all (see _shared/snapshot-paths.ts).
+ *
+ * `testInvocationEverSeen` gates which dirty clause fires (see below): the
+ * categorical "since your last test run" claim presupposes a last test run
+ * that may never have happened.
  */
 export function buildTriggerAMessage(
   minutesLeft: number,
   baseline: InitialSnapshotOutcome | undefined,
+  dirtySinceLastTest: boolean = false,
+  testInvocationEverSeen: boolean = false,
 ): string {
   // (1) names a verification protocol rather than asking for a "spot-check":
   // both observed failures were re-checks incapable of failing. (2)/(3)
@@ -795,6 +979,14 @@ export function buildTriggerAMessage(
         `${INITIAL_SNAPSHOT_APP_DIR}/ (${INITIAL_SNAPSHOT_APP_DIR}/somefile mirrors ` +
         "/app/somefile); it predates every change you made, unlike a backup of your " +
         `own. ${baselineCaveats(baseline)}${RESTORE_RESTRAINT}`;
+
+  const dirtyClause = !dirtySinceLastTest
+    ? ""
+    : testInvocationEverSeen
+      ? "You edited a file since your last test run without re-running your tests " +
+        "afterward — re-run them against this exact change before considering it done. "
+      : "You have not run any tests yet this session — if this task has a test " +
+        "suite, run it before considering this done. ";
 
   return (
     `You stopped without calling a tool, but roughly ${minutesLeft} minutes of budget ` +
@@ -815,6 +1007,7 @@ export function buildTriggerAMessage(
     "(3) if you were ever unsure what's expected, resolve it " +
     "by the most literal reading of the task text. " +
     baselineClause +
+    dirtyClause +
     "If this recheck passes, say so " +
     "explicitly and stop. Otherwise fix what you found — you have plenty of time; " +
     "do not give up early."
@@ -934,7 +1127,12 @@ function maybeFireTriggerA(
   if (capForRun > 0 && turnsThisRun >= capForRun) return false;
 
   const minutesLeft = Math.max(0, Math.round(remainingMs / 60000));
-  const msg = buildTriggerAMessage(minutesLeft, initialSnapshotOutcome());
+  const msg = buildTriggerAMessage(
+    minutesLeft,
+    initialSnapshotOutcome(),
+    dirtySinceLastTest,
+    testInvocationEverSeen,
+  );
 
   try {
     pi.sendUserMessage(msg, { deliverAs: "steer" });

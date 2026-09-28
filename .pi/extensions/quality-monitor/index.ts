@@ -5,6 +5,7 @@ import {
   buildCorrectionMessage,
   buildFailureSignatureMessage,
   buildNearDuplicateLoopMessage,
+  buildScriptFailureMessage,
   BLOCKED_CALL_REASON,
   phraseForUser,
   sameCall,
@@ -16,6 +17,7 @@ import {
   FailureSignatureTracker,
   type FailureSignatureDetection,
 } from "./failure-signature.ts";
+import { ScriptFailureTracker, type ScriptFailureDetection } from "./script-failure.ts";
 import { harnessIntervention, type InterventionCtx } from "../_shared/intervention.ts";
 
 // Port of local/quality.py. Hooks turn_end, inspects the assistant message
@@ -48,6 +50,10 @@ let turnValidatedCalls: ToolCall[] = [];
 // rather than cleared so each reset re-reads the env knobs.
 let fuzzyTracker = new FuzzyLoopTracker();
 let failsigTracker = new FailureSignatureTracker();
+// A third, independent watchdog: script write-run-fail cycles that never
+// content-cluster (see script-failure.ts). Same lifetime rule as the two
+// above -- survives a mid-task compaction, rebuilt on a genuine new prompt.
+let scriptFailureTracker = new ScriptFailureTracker();
 // This turn's tool results. tool_result fires mid-turn, before the calls that
 // produced it have been clustered, so they are correlated at turn_end.
 let turnResults: BufferedResult[] = [];
@@ -114,6 +120,7 @@ interface BufferedResult {
 function resetLoopDetectors(): void {
   fuzzyTracker = new FuzzyLoopTracker();
   failsigTracker = new FailureSignatureTracker();
+  scriptFailureTracker = new ScriptFailureTracker();
   turnResults = [];
   assessedTurns = 0;
 }
@@ -302,15 +309,60 @@ export default function (pi: ExtensionAPI) {
         assessedTurns,
       );
       if (detection) failsigDetection = detection;
+      // Independent of the fuzzy/failsig correlation above: this tracker
+      // doesn't cluster by content at all, so it reads every result on its
+      // own regardless of what fuzzyTracker made of the call that produced it.
+      // The return value itself is not read here -- see the `due()` call
+      // below for why the count update is all this loop needs to
+      // do for scriptFailureTracker.
+      scriptFailureTracker.record({
+        input: r.input,
+        text: r.text,
+        isError: r.isError,
+      });
     }
+    // Checked once per ok-verdict turn_end, independent of whether
+    // THIS turn's own results included a new qualifying script-shaped
+    // failure. `due()` is computed fresh from the tracker's current
+    // count/notifiedThreshold (see its own doc), so a threshold that crossed
+    // on an earlier turn whose delivery never happened (that turn's verdict
+    // came back non-ok, so this whole `if (verdict.ok)` branch never ran)
+    // is picked up here the next time an ok-verdict turn_end fires, even if
+    // that turn produced no ShellSession result of its own at all -- rather
+    // than only ever being re-offered when ANOTHER new qualifying failure
+    // happens to arrive later, which is not guaranteed.
+    const scriptFailureDetection: ScriptFailureDetection | null = scriptFailureTracker.due();
 
     if (verdict.ok) {
       consecutiveFailures = 0;
       blockedCall = null;
       tier2NotifiedKey = null;
-      // An ok verdict deliberately does NOT reset the two trackers: their
+      // An ok verdict deliberately does NOT reset the trackers: their
       // whole subject matter is loops made of individually-ok turns.
       steerLoopDetection(pi, ctx, failsigDetection, fuzzyDetection);
+      // Sent independently of the call above, not folded into
+      // steerLoopDetection's early-return chain: this is a different signal
+      // (no content clustering at all) and can and should fire on the same
+      // turn as a fuzzy/failsig detection, not instead of it. markNotified()
+      // is called here, inside the ok-verdict branch, and nowhere in
+      // record() itself: a threshold crossed on a turn that turns out
+      // non-ok (verdict.ok false, this whole branch skipped) must not
+      // silently burn its one notification -- `due()` (computed above)
+      // keeps reporting it on every subsequent ok-verdict turn_end
+      // until a message actually reaches sendUserMessage, regardless of
+      // whether that later turn's own results include a new qualifying
+      // script result of their own.
+      if (scriptFailureDetection) {
+        scriptFailureTracker.markNotified();
+        harnessIntervention(
+          ctx,
+          `${scriptFailureDetection.count} script write-run-fail attempts this trial — nudging toward isolating the failing construct.`,
+        );
+        pi.sendUserMessage(
+          buildScriptFailureMessage(scriptFailureDetection.count, scriptFailureDetection.escalated),
+          { deliverAs: "steer" },
+        );
+      }
       return;
     }
 

@@ -74,6 +74,38 @@ export interface ResultFacts {
    * WHICH failure this is.
    */
   hasContent: boolean;
+  /**
+   * How `failed` was established, when it was. `"exit"` covers both the
+   * thrown-result flag and a nonzero footer exit -- either one PROVES the
+   * command failed. `"content"` means only the trailing-exception-line check
+   * called it failed while the exit signal (masked, or simply absent) did
+   * not. Keyed on separately by record(), so a content-only MISMATCH cannot
+   * forget() a live exit-code-proven streak (see the key split in record()).
+   */
+  failedBy?: "exit" | "content";
+}
+
+// A trailing exception line, independent of exit code. TB's ShellSession
+// wraps the model's command in `{ command ; } ; __rc=$?` with no `pipefail`
+// (benchmarks/harbor_adapter/little_coder_agent.py's _wrap_command) — under
+// bash's default semantics a piped command (`... | head`) reports the LAST
+// stage's exit code, so `python3 ... | head -40` reports 0 even when python3
+// raised. Content-based detection catches what the (masked) exit code can't.
+//
+// Applied to the trailing line only (see lastNonBlankLine below, used by
+// both readResult and signatureOf). `[\w.]*`, not `\w*`: `\w` does not match
+// `.`, so a qualified type name -- `json.decoder.JSONDecodeError`,
+// `requests.exceptions.HTTPError` -- was invisible to this regex even though
+// it ends in `Error:` like any other, and combined with a masked exit code
+// such a failure went entirely undetected.
+const TRAILING_EXCEPTION_LINE_RE = /^([\w.]*(?:Error|Exception)):\s*(.+)$/;
+
+function lastNonBlankLine(text: string): string {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== "") return lines[i];
+  }
+  return "";
 }
 
 /**
@@ -90,13 +122,22 @@ export interface ResultFacts {
  * only the harness's status line or footer, which is byte-identical across
  * three unrelated no-match greps and would otherwise read as one repeated
  * failure.
+ *
+ * Exit code alone is also not enough: it can itself be wrong (see
+ * TRAILING_EXCEPTION_LINE_RE above), so a recognizable trailing exception
+ * line counts as failed even when the reported exit is 0.
  */
 export function readResult(text: string, isError: boolean, minTokens: number): ResultFacts {
   const { body, footer } = splitFooter(text);
   const exit = footerExit(footer);
+  const stripped = stripStatusLine(body.trimEnd());
+  const looksLikeUncaughtException = TRAILING_EXCEPTION_LINE_RE.test(lastNonBlankLine(stripped));
+  const exitProven = isError === true || (exit !== null && exit !== 0);
+  const failed = exitProven || looksLikeUncaughtException;
   return {
-    failed: isError === true || (exit !== null && exit !== 0),
-    hasContent: tokenize(stripStatusLine(body.trimEnd())).length >= minTokens,
+    failed,
+    hasContent: tokenize(stripped).length >= minTokens,
+    failedBy: failed ? (exitProven ? "exit" : "content") : undefined,
   };
 }
 
@@ -148,16 +189,82 @@ export function boundResultText(text: string): string {
   return text.slice(nl === -1 ? cut : nl + 1);
 }
 
+// Levenshtein distance between the quoted literals of two exception lines --
+// a kwarg name, a dict key or a file path -- short enough for the plain
+// O(n*m) DP.
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+/** A line with each quoted run blanked, so two lines compare equal when
+ * everything outside the quotes matches. Quote pairing is positional, so a
+ * prose apostrophe shifts the pairing. */
+function excLineShape(line: string): string {
+  return line.replace(/'[^']*'/g, "'\0'").replace(/"[^"]*"/g, '"\0"');
+}
+
+/** The contents of each quoted literal, in order. */
+function quotedLiterals(line: string): string[] {
+  return [...line.matchAll(/'([^']*)'|"([^"]*)"/g)].map((m) => m[1] ?? m[2] ?? "");
+}
+
+// A typo'd literal differs from its original by a couple of characters
+// (psrn/psm, the motivating case, is 2); two UNRELATED literals -- a
+// different file path, a different dict key, a different module name --
+// differ by far more than that, however short they are individually.
+const LITERAL_EDIT_DISTANCE_FLOOR = 2;
+
+// Quoted literals are compared, not blanked: equal outside the quotes AND
+// within edit distance 2 inside, so 'psrn'/'psm' matches while KeyError
+// 'user_id'/'timestamp' does not.
+function sameExcLine(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (excLineShape(a) !== excLineShape(b)) return false;
+  const litsA = quotedLiterals(a);
+  const litsB = quotedLiterals(b);
+  return litsA.length === litsB.length && litsA.every((lit, i) => levenshtein(lit, litsB[i]) <= LITERAL_EDIT_DISTANCE_FLOOR);
+}
+
 export interface Signature {
   hash: string;
   shingles: Set<string>;
+  /**
+   * The raw trailing exception line, if the tail has one. Compared by
+   * matches() via sameExcLine's shape-plus-edit-distance rule, never by
+   * plain string equality.
+   */
+  excLine?: string;
 }
 
 export function signatureOf(toolName: string, text: string, tailLines: number): Signature {
   const tail = normalizeTail(text, tailLines);
+  // excLine extraction uses the SAME trailing-line semantics as readResult
+  // -- the footer and any harness status line stripped off first, then only
+  // the last non-blank line of what's left -- rather than scanning the whole
+  // tail for the last match anywhere. Scanning the whole tail let
+  // an incidental mid-tail Warning:/Error: line (a benign log line, a
+  // caught-and-logged exception earlier in otherwise-passing output) supply
+  // an excLine that then matched an unrelated failure via the fallback
+  // below.
+  const { body } = splitFooter(text);
+  const trailingLine = lastNonBlankLine(stripStatusLine(body.trimEnd()));
+  const excMatch = TRAILING_EXCEPTION_LINE_RE.exec(trailingLine);
   return {
     hash: createHash("sha1").update(`${toolName.toLowerCase()}\n${tail}`).digest("hex"),
     shingles: bigrams(tokenize(tail)),
+    excLine: excMatch ? excMatch[0] : undefined,
   };
 }
 
@@ -194,6 +301,8 @@ interface Entry {
   toolName: string;
   /** Constant per entry: failures and passing results take separate keys. */
   failed: boolean;
+  /** How `failed` was established (see ResultFacts.failedBy); undefined for a passing entry. */
+  failedBy?: "exit" | "content";
   sig: Signature;
   count: number;
   lastInput: string;
@@ -205,6 +314,20 @@ interface Entry {
 // Bounded because a long session touches many tools; the least recently
 // updated slot is the least likely to be mid-loop.
 const MAX_TRACKED = 16;
+
+// The floor `matches()` requires alongside an excLine match (see below) used
+// to be a bare constant, so tightening the env-configurable `threshold`
+// never tightened this fallback path at all. Deriving it from `threshold`
+// instead means a stricter threshold genuinely means a stricter watchdog
+// everywhere, not just on the whole-tail check. The 0.6 multiplier keeps the
+// motivating psrn/psm pair matching (0.9310, 0.7381 Jaccard, per the test
+// fixtures) at the 0.95 default, with headroom below the ~0.368 Jaccard two
+// KeyErrors that share only an exception TYPE score; 0.5 is a hard minimum,
+// so loosening threshold cannot drop the similarity requirement this
+// fallback carries.
+function excLineJaccardFloor(threshold: number): number {
+  return Math.max(0.5, threshold * 0.6);
+}
 
 /**
  * Counts how many differing attempts produced the same outcome, per tool.
@@ -235,7 +358,11 @@ export class FailureSignatureTracker {
     if (!facts.failed && !(obs.corroborated && obs.clusterId !== undefined)) return null;
 
     const tool = obs.toolName.toLowerCase();
-    const key = facts.failed ? tool : `${tool}#c${obs.clusterId}`;
+    // Content-only failures take their own key, so a content-only mismatch
+    // can never forget() a live exit-code-proven streak -- a mismatch says
+    // this attempt is not a repeat, not that the streak has ended.
+    const contentKey = `${tool}#content`;
+    const key = !facts.failed ? `${tool}#c${obs.clusterId}` : facts.failedBy === "content" ? contentKey : tool;
     const sig = signatureOf(tool, obs.text, this.opts.tailLines);
     const input = stableStringify(obs.input);
     const prev = this.entries.get(key);
@@ -261,9 +388,17 @@ export class FailureSignatureTracker {
       }
     } else {
       this.forget(key);
+      // An exit-proven failure that does NOT continue its streak clears the
+      // content-only entry too: the strongest available signal that the
+      // situation changed, so a later content-only result starts fresh
+      // rather than resuming a pre-reset streak. (The converse is
+      // deliberately one-way -- a content-only result never touches the
+      // exit-proven entry.)
+      if (key === tool) this.forget(contentKey);
       this.entries.set(key, {
         toolName: obs.toolName,
         failed: facts.failed,
+        failedBy: facts.failedBy,
         sig,
         count: 1,
         lastInput: input,
@@ -284,7 +419,21 @@ export class FailureSignatureTracker {
 
   private matches(a: Signature, b: Signature): boolean {
     if (a.hash === b.hash) return true;
-    return jaccard(a.shingles, b.shingles) >= this.opts.threshold;
+    if (jaccard(a.shingles, b.shingles) >= this.opts.threshold) return true;
+    // OR, not a replacement: a short, information-dense tail (e.g. a 5-line
+    // traceback) can fail the whole-tail Jaccard bar on a single differing
+    // token while still being "the same mistake" by its exception line. But
+    // excLine equality alone is too weak to stand on its own -- sameExcLine
+    // already rejects two failures that only share an exception TYPE, and
+    // requiring a threshold-derived similarity floor alongside it still
+    // catches the motivating psrn/psm-typo pairs (0.9310, 0.7381 Jaccard)
+    // while rejecting unrelated failures on a second, independent axis.
+    return (
+      a.excLine !== undefined &&
+      b.excLine !== undefined &&
+      sameExcLine(a.excLine, b.excLine) &&
+      jaccard(a.shingles, b.shingles) >= excLineJaccardFloor(this.opts.threshold)
+    );
   }
 
   private notifyKey(key: string, sig: Signature): string {
