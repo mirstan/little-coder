@@ -232,11 +232,8 @@ import {
 // module's header for why (this constant used to be hand-copied here and in
 // finalize-warn/index.ts with nothing enforcing they stayed in lockstep).
 const EARLY_QUIT_MIN_REMAINING_MS = 20 * 60 * 1000; // double finalize-warn's WARN_REMAINING_MS
-// Raised from 2: a real trial (cancel-async-tasks__LcJTEba) showed two
-// genuine early-pause fires exhausting the cap before the model's actual
-// final toolless declaration, which then got no re-verification nudge at
-// all. A magnitude tweak, not a structural fix -- a trial with 3 genuine
-// early-quit patterns still exhausts this cap.
+// A trial with 3 genuine early-quit patterns still exhausts this cap:
+// a magnitude tweak, not a structural fix.
 const MAX_TRIGGER_A_FIRES = 3; // per session
 
 const NO_WRITE_TURNS_BEFORE_NUDGE = 2; // consecutive non-compliant turns
@@ -259,15 +256,12 @@ let armedAtTurn = 0;
 let consecutiveNoWriteTurns = 0;
 let triggerBFired = false;
 
-// True from the turn of a non-scratch write until a test-invocation command
-// is seen (or the run resets). Strengthens Trigger A's message with an
-// explicit "you edited without retesting" clause -- a mechanically-checkable
-// signal, not a claim about the edit's intent (see looksLikeTestInvocation).
-// Since iteration 2, a write is judged per COMMAND, not per whole-turn last-
-// wins: a later write in the SAME command as an already-seen real test does
-// not re-set this (see the turn_end loop below) -- only a write in a
-// different command, or one that precedes every test in its own command,
-// does.
+// True from a non-scratch write until a test invocation is seen; reset per run. Strengthens
+// Trigger A's message with an "edited without retesting" clause -- a mechanically-checkable
+// signal, not a claim about the edit's intent. Judged per command segment in
+// advanceDirtyLatchForCommand: a write after that same command's own test invocation is exempt
+// only when every non-scratch write in the segment is test-output-shaped
+// (TEST_OUTPUT_WRITE_KINDS); any other write re-dirties.
 let dirtySinceLastTest = false;
 
 // True once any command THIS TURN has written outside scratch -- reset at
@@ -300,10 +294,12 @@ let deliverableWriteEverSeen = false;
 // run in the same session doesn't lose evidence an earlier run established).
 // Gates whether buildTriggerAMessage's dirty clause may assert the
 // categorical "you edited a file since your last test run" claim: that
-// claim presupposes a last test run that may never have happened (iteration
-// 2, root-cause case 3 -- no test suite, or one whose only runner is absent
-// from TEST_INVOCATION_PATTERNS). When this is still false, a non-scratch
-// write gets the honest fallback clause instead (see buildTriggerAMessage).
+// claim presupposes a last test run that may never have happened (no test
+// suite, or one whose only runner is absent from TEST_INVOCATION_PATTERNS).
+// When this is still false, a non-scratch write falls back to the
+// no-tests-yet clause, which drops the "since your last test run" phrasing
+// but still asserts no test ran -- itself wrong when only an unlisted
+// runner was used.
 let testInvocationEverSeen = false;
 let startForRun = 0;
 // Run-scoped: which turn (if any) Trigger D fired at, so Trigger A's own
@@ -340,30 +336,32 @@ const EVIDENCE_ONLY_SHELL_TOOLS: ReadonlySet<string> = new Set(["ShellSend"]);
 // language/framework's test invocation. A false negative here (an unlisted
 // runner -- vitest, jest, tox, ctest, etc. are all absent from the list
 // below, and note this repo's own test command is `npx vitest run`) no
-// longer forces a false accusation the way it did before iteration 2:
+// longer forces a false accusation the way it once did:
 // `testInvocationEverSeen` (above) gates the categorical "since your last
 // test run" claim, so a session that never triggers a RECOGNIZED runner
-// gets the honest "no tests observed" fallback instead (root-cause case 3;
-// see buildTriggerAMessage). One narrower window remains -- a session whose
-// FIRST test run used a recognized runner (so `testInvocationEverSeen` is
-// already true) can still be wrongly accused if a LATER retest used only an
-// unlisted one -- but the common, previously-unconditional case (no
-// recognized runner ever seen all session) is fixed. The pattern LIST itself
-// staying incomplete is still a separate, not-yet-filed concern.
+// falls back to the no-tests-yet clause, which drops the "since your last
+// test run" phrasing but still asserts no test ran -- itself wrong when
+// only an unlisted runner was used (see buildTriggerAMessage). One
+// narrower window remains -- a session whose FIRST test run used a
+// recognized runner (so `testInvocationEverSeen` is already true) can
+// still be wrongly accused if a LATER retest used only an unlisted one --
+// but the common, previously-unconditional case (no recognized runner
+// ever seen all session) is fixed.
 //
 // A false positive (matching text that never executed as a test at all --
 // inside a heredoc body, a comment, a quoted string, or as a plain unquoted
-// ARGUMENT to some other command, e.g. `echo pytest > file` -- iteration 2
-// root-cause case 2) is the direction that gets silently SUPPRESSED instead:
-// the clause simply doesn't fire when it should have. That is also not rare
-// -- `cat > file <<'EOF'` bodies that merely mention a runner name, and a
-// quoted string like `git commit -m 'make test pass'`, both hit it easily.
-// Matching against per-segment, quote-aware text ANCHORED to the start of
-// the segment (see `looksLikeTestInvocation` below, and where it's called
-// against `splitCommandChain` segments in `turn_end`) closes the
-// heredoc/quoting/ordering gaps and the "runner name used only as another
-// command's argument" gap; the pattern LIST itself staying incomplete (the
-// false-negative direction above) is a separate, not-yet-filed concern.
+// ARGUMENT to some other command, e.g. `echo pytest > file`) is the
+// direction that gets silently SUPPRESSED instead: the clause simply
+// doesn't fire when it should have. That is also not rare -- `cat > file
+// <<'EOF'` bodies that merely mention a runner name, and a quoted string
+// like `git commit -m 'make test pass'`, both hit it easily. Matching
+// against per-segment, quote-aware text ANCHORED to the start of the
+// segment (see `looksLikeTestInvocation` below, called per
+// `splitCommandChain` segment from `advanceDirtyLatchForCommand`) closes
+// the heredoc/quoting/ordering gaps and the "runner name used only as
+// another command's argument" gap; the pattern LIST itself staying
+// incomplete (the false-negative direction above) is a separate,
+// not-yet-filed concern.
 const TEST_INVOCATION_PATTERNS: RegExp[] = [
   /^pytest\b/, /^py\.test\b/, /^python3?\s+-m\s+pytest\b/,
   /^python3?\s+-m\s+unittest\b/,
@@ -374,24 +372,23 @@ const TEST_INVOCATION_PATTERNS: RegExp[] = [
   /^mvn\s+test\b/, /^gradle\s+test\b/,
 ];
 
-// Iteration 3: the kinds `detectDeliverableWrites` can report (see
-// `shell-write.ts`'s `WriteKind`) that plausibly represent a TEST'S OWN
-// output-handling rather than a genuine deliverable edit -- a pipe target, a
-// stdout/stderr redirect, or an append. Deliberately excludes `copy`,
-// `move`, `inplace`, and `compile` (an edit, a clobber, or a build artifact
-// landing on a deliverable path -- none of those are the test writing its
-// own output) and also excludes `dd` (block-level copy, same reasoning).
-// This is the boundary the same-command carve-out below is scoped to; see
-// its comment for why the boundary exists.
+// The kinds `detectDeliverableWrites` can report (see `shell-write.ts`'s
+// `WriteKind`) that plausibly represent a TEST'S OWN output-handling rather
+// than a genuine deliverable edit -- a pipe target, a stdout/stderr
+// redirect, or an append. Deliberately excludes `copy`, `move`, `inplace`,
+// and `compile` (an edit, a clobber, or a build artifact landing on a
+// deliverable path -- none of those are the test writing its own output)
+// and also excludes `dd` (block-level copy, same reasoning).
+// Scopes the same-command carve-out in advanceDirtyLatchForCommand.
 const TEST_OUTPUT_WRITE_KINDS: ReadonlySet<WriteKind> = new Set(["redirect", "append", "tee"]);
 
 /**
  * Blank out every quoted (or escaped) character in `cmd`, preserving length
  * and position so a regex's `\b` boundaries still land correctly. This is
  * what keeps `looksLikeTestInvocation` from matching a runner name that only
- * appears inside a quoted string, e.g. `git commit -m 'make test pass'`
- * (root-cause case (c)) -- the quoted span becomes spaces, so `make test`
- * never appears as adjacent, unquoted words.
+ * appears inside a quoted string, e.g. `git commit -m 'make test pass'` --
+ * the quoted span becomes spaces, so `make test` never appears as adjacent,
+ * unquoted words.
  */
 function maskQuotedText(cmd: string): string {
   const masked = new Array<boolean>(cmd.length).fill(true);
@@ -412,9 +409,9 @@ function maskQuotedText(cmd: string): string {
  * is anchored (`^`) against the masked text with leading whitespace trimmed,
  * not matched anywhere in the segment -- so a runner name that only appears
  * as an unquoted ARGUMENT to some other command (`echo pytest >
- * /app/result.txt` -- iteration 2 root-cause case 2) does not match: the
- * segment must actually START with the invocation, not merely contain its
- * name somewhere after another command word.
+ * /app/result.txt`) does not match: the segment must actually START with
+ * the invocation, not merely contain its name somewhere after another
+ * command word.
  */
 export function looksLikeTestInvocation(cmd: string): boolean {
   const unquoted = maskQuotedText(cmd).trimStart();
@@ -443,13 +440,8 @@ function shellCommandOf(name: unknown, args: Record<string, unknown>): string | 
 /**
  * Advance dirtySinceLastTest/testInvocationEverSeen for ONE command string,
  * in isolation. Pulled out of the old turn_end loop so it can be driven
- * per-tool_result (real completion order) instead of per-turn_end-aggregate
- * (array order, which pi does not guarantee reflects same-turn sibling
- * execution order -- see the tool_result handler). Segment order WITHIN one
- * command string is untouched: splitCommandChain already returns a single
- * command's chained segments in their genuine left-to-right execution
- * order, since `&&`/`;`/`|` chaining inside one string is truly sequential
- * regardless of how pi schedules separate tool calls.
+ * per-tool_result (real completion order) instead of per-turn_end-aggregate --
+ * see the tool_result handler for why ordering comes from there.
  */
 function advanceDirtyLatchForCommand(cmd: string): void {
   let sawRealTestInThisCommand = false;
@@ -503,19 +495,11 @@ export default function (pi: ExtensionAPI) {
     maybeFireTriggerD(pi, ctx);
   });
 
-  // Drives dirtySinceLastTest/testInvocationEverSeen/turnWroteDeliverable
-  // per INDIVIDUAL tool call, in the order pi actually reports each call's
-  // result -- not from turn_end's aggregated message.content array, whose
-  // order is NOT a reliable stand-in for execution order when a turn issues
-  // several SIBLING tool calls: pi runs those in parallel, so "toolCalls[0]
-  // ran before toolCalls[1]" does not hold in general (only a single
-  // command's own internal &&/;/| chaining is genuinely sequential, and
-  // that ordering is untouched here -- see advanceDirtyLatchForCommand).
-  // tool_result fires once per call as it actually completes, which is the
-  // best ordering signal pi exposes for cross-call sequencing; two calls
-  // that finish in the same tick still arrive as two separate events in
-  // whatever order pi's own event loop happens to deliver them, which is a
-  // real (if unspecified) order rather than a guessed one.
+  // Drives dirtySinceLastTest/testInvocationEverSeen/turnWroteDeliverable per
+  // individual tool call, in real completion order, since pi runs same-turn
+  // SIBLING tool calls in parallel and turn_end's aggregated array order
+  // isn't a reliable stand-in for execution order (a single command's own
+  // &&/;/| chaining is still sequential -- see advanceDirtyLatchForCommand).
   pi.on("tool_result", async (event) => {
     if (!isTerminalBench()) return;
     const e = event as any;
@@ -550,13 +534,8 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
-    // dirtySinceLastTest/testInvocationEverSeen/deliverableWriteEverSeen are
-    // no longer derived here from the turn's tool calls in aggregate -- see
-    // the tool_result handler above, which drives them per individual call
-    // in real completion order instead (a turn's own toolCall array order is
-    // not a reliable stand-in for execution order across same-turn SIBLING
-    // calls, which pi runs in parallel). turnWroteDeliverable is that
-    // handler's per-turn accumulator, reset at turn_start and read once here.
+    // turnWroteDeliverable is the tool_result handler's per-turn accumulator,
+    // reset at turn_start.
 
     const firedA = maybeFireTriggerA(pi, ctx, message, text, toolCallCount);
     if (firedA) return; // precedence: a toolless-quit turn is not also judged for Trigger B compliance

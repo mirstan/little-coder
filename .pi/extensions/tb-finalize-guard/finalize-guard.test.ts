@@ -105,16 +105,10 @@ async function newSession(h: ReturnType<typeof makeHarness>, maxTurns?: number) 
   await startRun(h, maxTurns);
 }
 
-// The extension now derives dirtySinceLastTest/testInvocationEverSeen/
-// deliverableWriteEverSeen from tool_result (real per-call completion
-// order), not from turn_end's aggregate message.content array -- see
-// index.ts's tool_result handler. Real pi fires one tool_result per tool
-// call as it completes, then turn_end once the whole turn settles; this
-// helper mirrors that so existing shellTurn/shellSendTurn fixtures (whose
-// array order already encodes the intended logical order for a synthetic
-// single-caller test) keep working unchanged, while a test that wants to
-// exercise genuinely out-of-array-order sibling completion can still fire
-// tool_result directly itself before calling turn().
+// turn() synthesizes one tool_result per toolCall block in the message's
+// array order before firing turn_end. A test that wants to exercise
+// genuinely out-of-array-order sibling completion should fire tool_result
+// directly itself before calling turn().
 async function turn(h: ReturnType<typeof makeHarness>, event: any) {
   await fire(h.pi, "turn_start", {}, h.ctx);
   const content = event?.message?.content;
@@ -339,9 +333,8 @@ describe("tb-finalize-guard", () => {
     });
 
     it("a real trial's shape (two early pauses, then a real final declaration) now gets a third fire where it previously would have been suppressed", async () => {
-      // Replays cancel-async-tasks__LcJTEba's exact shape: two genuine
-      // early-pause fires, then a real final toolless declaration that the
-      // old MAX_TRIGGER_A_FIRES=2 cap left unnudged.
+      // Two early pauses then a real final declaration -- the third fire the
+      // old cap of 2 suppressed.
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(180);
@@ -431,9 +424,9 @@ describe("tb-finalize-guard", () => {
       setDeadlineMinutesFromNow(30);
       await newSession(h);
       // Primes testInvocationEverSeen so the categorical "since your last
-      // test run" claim is warranted (iteration 2: that claim is gated on
-      // having ever seen a real test this session — see the "honest
-      // fallback" tests below for the zero-ever-seen case).
+      // test run" claim is warranted -- that claim is gated on having ever
+      // seen a real test this session (see the "honest fallback" tests
+      // below for the zero-ever-seen case).
       await turn(h, shellTurn(["pytest tests/"]));
       await turn(h, shellTurn(["echo done > /app/result.txt"])); // non-scratch write, no test since
       await turn(h, assistantTurn({ text: "I think that's everything." }));
@@ -514,7 +507,7 @@ describe("tb-finalize-guard", () => {
       // categorical-vs-fallback clause choice covered elsewhere.
       await turn(h, shellTurn(["pytest tests/"]));
       // A heredoc write whose BODY text contains "pytest" — no test invocation
-      // actually ran, so the flag must stay dirty (root-cause case (a)).
+      // actually ran, so the flag must stay dirty.
       await turn(
         h,
         shellTurn(["cat > /app/solution.py <<'EOF'\nimport pytest\n\ndef test_x(): ...\nEOF"]),
@@ -531,18 +524,8 @@ describe("tb-finalize-guard", () => {
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
-      // Iteration 1 made this chain end dirty (strict last-segment-wins).
-      // Iteration 2 introduced a same-command carve-out to fix a real false
-      // positive (a test's own output-handling: `pytest 2>&1 | tee log`,
-      // `pytest && echo done > DONE`) but collapsed the write list to a
-      // boolean before checking it, so the carve-out wrongly exempted EVERY
-      // later write in the command -- including a genuine deliverable edit
-      // like `sed -i` that has nothing to do with the test's own output.
-      // Iteration 3 narrows the carve-out: it only exempts a same-command
-      // write when EVERY non-scratch write in the segment is test-output-
-      // shaped (a pipe target, a stdout/stderr redirect, an append); an
-      // in-place edit like this one must still dirty (see the two tests
-      // below for the writes this fix must NOT re-dirty).
+      // The carve-out exempts only test-output-shaped writes; an in-place
+      // edit after the same command's test must still dirty.
       await turn(h, shellTurn(["python -m pytest && sed -i 's/x/y/' /app/main.py"]));
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
@@ -588,10 +571,10 @@ describe("tb-finalize-guard", () => {
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
-      // Root-cause case 1 (the new regression): the pipe's second segment
-      // is a non-scratch write, and being last in execution order, iteration
-      // 1's strict last-wins rule wrongly re-dirtied the flag even though
-      // this is the test's own output being logged, not a deliverable edit.
+      // The pipe's second segment is a non-scratch write, and being last in
+      // execution order, a strict last-wins rule wrongly re-dirtied the flag
+      // even though this is the test's own output being logged, not a
+      // deliverable edit.
       await turn(h, shellTurn(["pytest 2>&1 | tee /app/test.log"]));
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
@@ -620,10 +603,10 @@ describe("tb-finalize-guard", () => {
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
       await newSession(h);
-      // Root-cause case 2: `echo pytest > file` must not be read as running
-      // pytest — it writes the word "pytest" as file content. No real test
-      // has ever run this session, so the flag stays dirty AND the message
-      // must use the honest fallback, not the categorical claim.
+      // `echo pytest > file` must not be read as running pytest — it writes
+      // the word "pytest" as file content. No real test has ever run this
+      // session, so the flag stays dirty AND the message must use the
+      // honest fallback, not the categorical claim.
       await turn(h, shellTurn(["echo pytest > /app/result.txt"]));
       await turn(h, assistantTurn({ text: "I think that's everything." }));
       expect(h.sent).toHaveLength(1);
@@ -646,17 +629,7 @@ describe("tb-finalize-guard", () => {
     });
 
     it("judges two SEPARATE same-turn tool calls by real completion order, not by their position in the turn's tool-call array", async () => {
-      // pi runs same-turn SIBLING tool calls in parallel -- the array order
-      // a turn_end message reports them in is not a reliable stand-in for
-      // which one actually finished first. This fires tool_result directly,
-      // in the TRUE completion order (test finishes, THEN the write
-      // finishes), while the turn_end message's own array lists them in the
-      // OPPOSITE order (write listed first, test listed second) -- exactly
-      // the case where the old array-order-driven logic and the real
-      // execution order disagree. The correct answer follows real
-      // completion order: a write that finished AFTER the last real test
-      // must still count as dirty, even though it appears BEFORE the test
-      // in the array.
+      // see the tool_result handler for why ordering comes from there.
       const h = makeHarness();
       setupExtension(h.pi as any);
       setDeadlineMinutesFromNow(30);
@@ -728,14 +701,14 @@ describe("tb-finalize-guard", () => {
         "echo 'contest results' > /app/out.txt",
         "vim test_plan.md",
         "grep -r test src/",
-        // Root-cause case (c): a quoted/embedded runner name in an unrelated
-        // command must not match — "make test" here sits inside the commit
-        // message, not on the command line.
+        // A quoted/embedded runner name in an unrelated command must not
+        // match — "make test" here sits inside the commit message, not on
+        // the command line.
         "git commit -m 'make test pass'",
-        // Iteration 2 root-cause case 2: a plain (non-heredoc) redirect that
-        // writes the word "pytest" as file content, unquoted, is not a test
-        // invocation — the runner name must be the command being run, not an
-        // argument to an unrelated command like `echo`.
+        // A plain (non-heredoc) redirect that writes the word "pytest" as
+        // file content, unquoted, is not a test invocation — the runner name
+        // must be the command being run, not an argument to an unrelated
+        // command like `echo`.
         "echo pytest > /app/result.txt",
       ];
       for (const cmd of negatives) expect(looksLikeTestInvocation(cmd)).toBe(false);
