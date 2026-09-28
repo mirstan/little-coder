@@ -87,12 +87,10 @@ describe("readResult", () => {
   });
 });
 
-// Real tool-result texts from extract-moves-from-video__6f2d2Tb's trial log
-// (agent/little_coder.log:781-826) -- a `psrn`/`psm` keyword-argument typo
-// repeated across 6 ShellSession calls, every one piping through `head`, so
-// `[exit=0 ...]` masks the real Python TypeError under bash's default
-// (non-pipefail) semantics. Only D has no pipe and genuinely fails at the
-// bash level.
+// A psrn/psm keyword-argument typo repeated across six ShellSession calls.
+// Five piped through `head`, so bash's default (non-pipefail) semantics
+// report [exit=0] over the Python TypeError; only D ran unpiped and failed
+// at the bash level.
 const EXIT0 = "[exit=0 cwd=/app timed_out=false backend=harbor-env]";
 const PSRN_TRACE = (n = 1) =>
   `Traceback (most recent call last):\n  File "<string>", line 5, in <module>\nTypeError: image_to_data() got an unexpected keyword argument 'psrn'`.repeat(n);
@@ -141,10 +139,8 @@ describe("readResult — exit-code masking (Fix 1)", () => {
   });
 
   it("does not call an exit=0 result failed for a mid-body line-initial Error: or Warning: that is not the last line", () => {
-    // Defect A: EXCEPTION_LINE_RE was scanned over the whole body via
-    // lastMatch, not just the trailing line, so a status message that merely
-    // starts with "Error:"/"Warning:" earlier in the output flipped this to
-    // true even though the command otherwise succeeded and said so last.
+    // The trailing line only: a mid-body "Error:"/"Warning:" status message
+    // must not flip an otherwise-successful run to failed.
     const errNotLast =
       "Error: skipping bad row 7, continuing\nprocessed 41 of 42 rows\nwrote output.csv\n[exit=0 cwd=/app timed_out=false backend=harbor-env]";
     expect(readResult(errNotLast, false, 4).failed).toBe(false);
@@ -154,9 +150,9 @@ describe("readResult — exit-code masking (Fix 1)", () => {
   });
 
   it("does not call an exit=0 passing pytest run failed because of an exception line inside its captured-log section", () => {
-    // Defect A: a RuntimeError/ValueError line buried in captured-log output
-    // (not the trailing line) was still enough to flip `failed` to true even
-    // though the run passed and the real trailing line says so.
+    // A RuntimeError/ValueError line buried in captured-log output (not the
+    // trailing line) was still enough to flip `failed` to true even though
+    // the run passed and the real trailing line says so.
     const passingWithCapturedLog =
       "============================= test session starts ==============================\n" +
       "collected 3 items\n\n" +
@@ -442,8 +438,8 @@ describe("FailureSignatureTracker", () => {
       expect(t.record(obs("call-d", CALL_D), 4)).toBeNull();
       expect(t.record(obs("call-e", CALL_E), 5)).toBeNull();
       // F continues E's streak (count 2) the same way B continued A's --
-      // this is the pair the plan's evidence measured at 0.7381 Jaccard,
-      // the one whole-tail similarity alone cannot catch at this text length.
+      // this pair scores 0.7381 Jaccard, the one whole-tail similarity alone
+      // cannot catch at this text length.
       expect(t.record(obs("call-f", CALL_F), 6)).toBeNull();
       // The real trial had only these 6 calls, so the streak never crosses
       // the default streak=3 firing bar within them -- extend the same
@@ -454,12 +450,12 @@ describe("FailureSignatureTracker", () => {
     });
 
     it("regression pin: the E-F pair (0.7381 Jaccard, nearest the 0.5 floor) still counts as a match under the conjunctive rule", () => {
-      // Acceptance criterion: the fix must not regress the case the PR was
-      // built for. E and F score below the 0.95 whole-tail threshold but
-      // inside the [0.5, 0.95) fallback band the conjunctive rule (excLine
-      // equality AND jaccard >= EXC_LINE_JACCARD_FLOOR) is meant to admit --
-      // distinct from the KeyError test above, whose ~0.368 score falls
-      // below the floor.
+      // The fix must not regress the case the PR was built for. E and F
+      // score below the 0.95 whole-tail threshold but inside the [0.57,
+      // 0.95) band the conjunctive rule admits at the default threshold
+      // (excLineJaccardFloor(0.95) = 0.57) -- jaccard >=
+      // excLineJaccardFloor(threshold) -- distinct from the KeyError test
+      // above, whose ~0.368 score falls below the floor.
       const eShingles = signatureOf("shellsession", CALL_E, 40).shingles;
       const fShingles = signatureOf("shellsession", CALL_F, 40).shingles;
       const score = jaccard(eShingles, fShingles);
@@ -502,15 +498,9 @@ describe("FailureSignatureTracker", () => {
     });
 
     it("does not accumulate a streak across KeyErrors that share only the exception type, not the underlying cause", () => {
-      // Defect B: normalizeExceptionLine collapses the quoted literal that is
-      // the ONLY thing distinguishing these failures ('user_id' vs
-      // 'timestamp' vs ...), and matches() previously accepted excLine
-      // equality alone, independent of the whole-tail Jaccard check. These
-      // four tails share only "Traceback (most recent call last):", the
-      // "KeyError: '<TOK>'" shape and the EXIT0 footer -- everything else
-      // (file, line, function, expression) differs, scoring ~0.368 Jaccard,
-      // well under the 0.5 floor -- so none of them should count as a repeat
-      // of its predecessor.
+      // Two KeyErrors differing only in the quoted key are different bugs:
+      // the keys are far apart (edit distance > 2) and the tails score
+      // ~0.368 Jaccard, under the fallback floor.
       const t = new FailureSignatureTracker();
       const keyErr = (file: string, line: number, fn: string, expr: string, key: string) =>
         `Traceback (most recent call last):\n  File "${file}", line ${line}, in ${fn}\n    ${expr}\nKeyError: '${key}'\n${EXIT0}`;
@@ -547,13 +537,8 @@ describe("FailureSignatureTracker", () => {
     });
 
     it("does not let an incidental mid-tail Warning: line supply a false excLine match between unrelated failures (Finding 4)", () => {
-      // Defect: signatureOf's excLine extraction used to scan the WHOLE tail
-      // (lastMatch(EXCEPTION_LINE_RE, tail), Warning included) for the last
-      // match anywhere, so an incidental "Warning:" line sitting mid-tail --
-      // not the line the run actually ended on -- supplied excLine even
-      // though the real trailing line is not a recognizable exception at
-      // all. Two unrelated failures that both happen to log the same benign
-      // warning earlier would then match on that alone.
+      // excLine comes from the trailing line only, so an incidental mid-tail
+      // "Warning:" supplies none.
       const attempt = (job: number) =>
         [
           "Warning: cache miss, rebuilding index",
