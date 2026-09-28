@@ -88,7 +88,14 @@ export function checkerFor(path: string): Checker | null {
   return CHECKERS[name.slice(dot)] ?? null;
 }
 
-function shellQuote(s: string): string {
+/**
+ * POSIX single-quote a string for safe interpolation into a shell command
+ * line: wraps it in single quotes, closing/reopening around any embedded
+ * single quote (`'` -> `'\''`) so the quoted text stays wholly literal no
+ * matter what it contains. Exported for tb-finalize-guard's deliverable
+ * size check.
+ */
+export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 

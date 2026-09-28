@@ -1,12 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execSync } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
 import setupExtension, {
   buildTriggerAMessage,
   buildTriggerCRecoveryMessage,
   buildTriggerDMessage,
+  buildTriggerEMessage,
+  parseByteLimit,
+  parseDeliverablePath,
   looksLikeTestInvocation,
 } from "./index.ts";
 import { resolveFinalizeMessage } from "../_shared/finalize-message.ts";
 import { INITIAL_SNAPSHOT_APP_DIR } from "../_shared/snapshot-paths.ts";
+import { TB_PROXY_PREFIX } from "../_shared/tb-proxy.ts";
 
 interface Handler {
   (event: any, ctx: any): Promise<unknown> | unknown;
@@ -16,8 +22,14 @@ function makeHarness() {
   const calls: string[] = [];
   const sent: { text: string; options: any }[] = [];
   const notifies: string[] = [];
+  // Every title `ctx.ui.input` was called with, in call order — lets a test
+  // inspect the actual `__LC_TB_SHELL__` payload (and so the actual command
+  // string) a proxy call carried, not just that a call happened.
+  const inputs: string[] = [];
   const handlers: Record<string, Handler[]> = {};
-  const state = { sendThrows: false };
+  // Queued `ui.input` replies for Trigger E's proxy calls; an empty queue is
+  // a proxy that gave nothing usable.
+  const state = { sendThrows: false, tbProxyResponses: [] as (string | null)[] };
   const pi = {
     handlers,
     state,
@@ -36,9 +48,19 @@ function makeHarness() {
         notifies.push(m);
         calls.push("notify");
       },
+      async input(title: string, _initial?: string) {
+        inputs.push(title);
+        calls.push("proxy-input");
+        return state.tbProxyResponses.length > 0 ? (state.tbProxyResponses.shift() ?? null) : null;
+      },
     },
   };
-  return { pi, ctx, calls, sent, notifies, state };
+  return { pi, ctx, calls, sent, notifies, inputs, state };
+}
+
+/** A `wc -c`-shaped proxy response with a well-formed exit-0 footer. */
+function wcResult(bytes: number, path: string, cwd = "/app"): string {
+  return `${bytes} ${path}\n[exit=0 cwd=${cwd} timed_out=false]`;
 }
 
 async function fire(pi: any, name: string, event: any, ctx: any) {
@@ -103,6 +125,15 @@ async function startRun(h: ReturnType<typeof makeHarness>, maxTurns?: number) {
 async function newSession(h: ReturnType<typeof makeHarness>, maxTurns?: number) {
   await fire(h.pi, "session_start", {}, h.ctx);
   await startRun(h, maxTurns);
+}
+
+// Trigger E parses its limit/path from the task prompt at before_agent_start
+// — every other trigger's `startRun`/`newSession` fire with no `prompt` at
+// all, which is exactly the "no confident match" shape those triggers stay
+// silent under.
+async function newSessionWithPrompt(h: ReturnType<typeof makeHarness>, prompt: string) {
+  await fire(h.pi, "session_start", {}, h.ctx);
+  await fire(h.pi, "before_agent_start", { systemPromptOptions: {}, prompt }, h.ctx);
 }
 
 // turn() synthesizes one tool_result per toolCall block in the message's
@@ -170,6 +201,7 @@ describe("tb-finalize-guard", () => {
     // test also covers the no-baseline path a TB1.0 trial actually runs.
     delete process.env.LITTLE_CODER_INITIAL_SNAPSHOT;
     delete process.env.LITTLE_CODER_BUDGET_START_EPOCH_MS;
+    delete process.env.LITTLE_CODER_TB_MODE;
     Date.now = REAL_NOW;
   });
 
@@ -1618,6 +1650,581 @@ describe("tb-finalize-guard", () => {
       // continuation each supplied a sentence-ending period independently.
       expect(buildTriggerCRecoveryMessage("succeeded")).not.toMatch(/\.\.\s/);
       expect(buildTriggerCRecoveryMessage(undefined)).not.toMatch(/\.\.\s/);
+    });
+  });
+
+  describe("Trigger E — byte-limit-aware finalize guard", () => {
+    const REAL_PROMPT =
+      "I have downloaded the gpt-2 weights stored as a TF .ckpt. Write me a " +
+      "dependency-free C file that samples from the model with arg-max " +
+      "sampling. Call your program /app/gpt2.c, I will compile with gcc -O3 " +
+      "-lm. It should read the .ckpt and the .bpe file. Your c program must " +
+      'be <5000 bytes. I will run it /app/a.out gpt2-124M.ckpt vocab.bpe ' +
+      '"[input string here]" and you should continue the output under ' +
+      "whatever GPT-2 would print for the next 20 tokens.";
+
+    describe("limit parsing", () => {
+      it("resolves the real gpt2-codegolf prompt's limit to 5000 bytes", () => {
+        expect(parseByteLimit(REAL_PROMPT)).toBe(5000);
+      });
+
+      it("resolves kb/kilobytes to bytes and other phrasings", () => {
+        expect(parseByteLimit("under 2KB")).toBe(2048);
+        expect(parseByteLimit("must be at most 10000 bytes")).toBe(10000);
+      });
+
+      it("finds nothing in a prompt with no size language — false-negative bias", () => {
+        expect(parseByteLimit("Write a function that reverses a string.")).toBeUndefined();
+      });
+
+      it("does not misread a floor ('no/not less than') as this trigger's ceiling", () => {
+        expect(parseByteLimit("The file must be no less than 5000 bytes.")).toBeUndefined();
+        expect(parseByteLimit("Output should be not less than 2KB.")).toBeUndefined();
+        // The un-negated phrase still fires — only the floor-shaped negation
+        // is excluded.
+        expect(parseByteLimit("Output should be less than 2KB.")).toBe(2048);
+      });
+
+      it("does not misread a floor stated as 'must/should not BE less than' either — confirmed regression", () => {
+        // Confirmed by execution: the old lookbehind only inspected the
+        // single token immediately before "less" ("be", not "not"/"no"), so
+        // both of these parsed as a 5000-byte CEILING despite stating a
+        // floor.
+        expect(parseByteLimit("The file must not be less than 5000 bytes.")).toBeUndefined();
+        expect(parseByteLimit("The file should not be less than 5000 bytes.")).toBeUndefined();
+      });
+
+      it("does not silently pick the wrong constraint when the prompt states two distinct sizes", () => {
+        // Confirmed by execution: first-match-with-no-ambiguity-check used to
+        // return 64 here (an unrelated per-record constraint), not 5000 (the
+        // deliverable's own limit).
+        expect(
+          parseByteLimit("each record must be 64 bytes; the program must be under 5000 bytes"),
+        ).not.toBe(64);
+      });
+
+      it("does not mistake an output-size constraint for the deliverable's own limit", () => {
+        // Confirmed by execution: used to return 100 (the output-size cap),
+        // not the deliverable's own (unstated, here) byte limit.
+        expect(
+          parseByteLimit(
+            "Write a program that prints at most 100 bytes of output. Call your program /app/gpt2.c.",
+          ),
+        ).toBeUndefined();
+      });
+
+      it("does not arm a bare 'must be N bytes' as a limit — an exact/fixed size states no bound", () => {
+        // Confirmed by execution: a bare "must be" alongside no other bound
+        // word used to parse as a false ceiling ({value: 16, inclusive:
+        // false}), arming the guard against a file with no real size
+        // constraint at all -- "must be" only introduces a size statement,
+        // it doesn't say which direction it bounds.
+        expect(parseByteLimit("Save your output to /app/header.bin. The header must be 16 bytes.")).toBeUndefined();
+      });
+    });
+
+    describe("path parsing", () => {
+      it("resolves the real gpt2-codegolf prompt's path to /app/gpt2.c", () => {
+        expect(parseDeliverablePath(REAL_PROMPT)).toBe("/app/gpt2.c");
+      });
+
+      it("stays inert (never calls the proxy) when a limit exists but no path confidently resolves", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, "Your output must be under 5000 bytes total.");
+        await turn(h, shellTurn(["gcc -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("does not silently latch an input path when the prompt also names a distinct output path", () => {
+        // Confirmed by execution: first-match-with-no-disambiguation used to
+        // resolve to /app/in (the "write ... to" trigger reaches the input
+        // clause first), not /app/out (the actual deliverable) -- neither
+        // path is more textually "the deliverable" than the other from the
+        // regex's own point of view, so it must not guess.
+        expect(
+          parseDeliverablePath("Write your input to /app/in, save your output to /app/out."),
+        ).not.toBe("/app/in");
+        expect(
+          parseDeliverablePath("Write your input to /app/in, save your output to /app/out."),
+        ).toBeUndefined();
+      });
+
+      it("resolves a single quoted or backticked path instead of failing to match or corrupting the capture", () => {
+        expect(parseDeliverablePath("Save it as `/app/out.c`.")).toBe("/app/out.c");
+        expect(parseDeliverablePath('Call your program "/app/gpt2.c".')).toBe("/app/gpt2.c");
+      });
+    });
+
+    describe("size-check triggering", () => {
+      it("checks size exactly once when a command writes the deliverable path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+
+      it("does not check size when the command touches an unrelated file", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["cat /app/vocab.bpe > /tmp/scratch.txt"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("over-budget escalation", () => {
+      async function driveOverBudget(h: ReturnType<typeof makeHarness>, checks: number) {
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        for (let i = 0; i < checks; i++) {
+          h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+      }
+
+      it("does not escalate on the 1st or 2nd consecutive over-budget check", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await driveOverBudget(h, 2);
+        expect(h.calls.filter((c) => c === "send")).toHaveLength(0);
+      });
+
+      it("escalates on the 3rd consecutive over-budget check with the right byte-delta text", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await driveOverBudget(h, 3);
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(1927, 5000));
+        expect(h.notifies.some((n) => n.startsWith("harness intervention:"))).toBe(true);
+      });
+
+      it("resets the count on a check that comes back under the limit", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        h.state.tbProxyResponses.push(wcResult(4500, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        // Only 2 consecutive over-budget checks since the under-budget reset
+        // (turns 3-4), not 3 — must not have escalated yet.
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("treats a file of exactly the stated limit as over budget, not compliant (strict <N, not <=N)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        // REAL_PROMPT's limit is 5000 bytes — a file of EXACTLY 5000 bytes
+        // must be judged over budget (the real constraint is a strict "<5000
+        // bytes" ceiling), so 3 consecutive at-exactly-limit checks must
+        // still escalate.
+        await driveOverBudget(h, 0); // just resolves the prompt's limit/path
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5000, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(0, 5000));
+      });
+
+      it("does NOT flag a file at exactly an inclusive limit ('at most N') as over budget", async () => {
+        // "at most 5000 bytes" is an INCLUSIVE upper bound -- exactly 5000 is
+        // compliant, unlike REAL_PROMPT's exclusive "<5000 bytes" (covered by
+        // the strict-comparator test above, which must keep failing at
+        // exactly the limit).
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(
+          h,
+          "Your program must be at most 5000 bytes. Call your program /app/gpt2.c.",
+        );
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5000, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("still flags a file one byte over an inclusive limit ('no more than N')", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(
+          h,
+          "Your program must be no more than 5000 bytes. Call your program /app/gpt2.c.",
+        );
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(5001, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(1, 5000));
+      });
+    });
+
+    describe("near-deadline degrade", () => {
+      it("switches to resolveFinalizeMessage's save-what-you-have framing instead of the escalation text", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        // Inside Trigger A/B/D's own near-deadline window (finalize-warn's
+        // WARN_REMAINING_MS), so `armed`/`finalizeWarnWouldFire` reads true.
+        setDeadlineMinutesFromNow(5);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(resolveFinalizeMessage("terminal_bench"));
+        expect(h.sent[0].text).not.toBe(buildTriggerEMessage(1927, 5000));
+      });
+    });
+
+    describe("proxy failure modes — every one is silence", () => {
+      it("does not escalate when the proxy call throws", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.ctx.ui.input = async () => {
+          throw new Error("proxy unreachable");
+        };
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        for (let i = 0; i < 3; i++) {
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("does not escalate on a timed-out check", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push("6927 /app/gpt2.c\n[exit=0 cwd=/app timed_out=true]");
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("does not escalate on a non-numeric response", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        for (let i = 0; i < 3; i++) {
+          h.state.tbProxyResponses.push("wc: /app/gpt2.c: No such file\n[exit=1 cwd=/app timed_out=false]");
+          await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        }
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("never checks size at all when not in TB mode", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        // LITTLE_CODER_TB_MODE deliberately left unset.
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("continuation-prompt latching", () => {
+      // Regression: a mid-run-compaction or error-retry continuation re-fires
+      // before_agent_start with COMPACTION_CONTINUE_PROMPT/ERROR_RETRY_PROMPT
+      // (rpc_client.py), not the task text. Re-parsing unconditionally on
+      // every run used to silently wipe an already-resolved limit/path the
+      // first time either fired — this trigger going dark for the rest of
+      // the trial with no signal that it happened.
+      const COMPACTION_CONTINUE_PROMPT =
+        "Your session context was compacted to free space, which interrupted " +
+        "what you were doing. The task is not complete — please continue from " +
+        "where you left off. If the task is actually already complete and " +
+        "verified, say so explicitly and stop.";
+
+      it("keeps the limit/path resolved from the first run across a continuation run's own before_agent_start", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // Simulate the harness re-firing before_agent_start for a
+        // post-compaction continuation — same session, no session_start.
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: {}, prompt: COMPACTION_CONTINUE_PROMPT },
+          h.ctx,
+        );
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        // Still checks size — the limit/path survived the continuation's
+        // own before_agent_start instead of being wiped to undefined.
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+
+      it("clears the latch at session_start so a later trial doesn't inherit a stale limit/path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // A fresh session with no size language at all — the module-level
+        // latch must not carry the previous session's resolved values over.
+        await fire(h.pi, "session_start", {}, h.ctx);
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: {}, prompt: "Write a function that reverses a string." },
+          h.ctx,
+        );
+        await turn(h, shellTurn(["gcc -O3 -o /app/gpt2.c gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("relative-path deliverable writes", () => {
+      // Regression: the harness's own prompt prefix ("Default working
+      // directory is /app", "cd <path> persists") teaches exactly the
+      // relative command forms strict path equality never matched — the
+      // real gpt2-codegolf trial's own `sed -i ... gpt2.c` pass on the file
+      // it had just written was one of them.
+      it("checks size when the write targets the deliverable via a relative path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["cd /app && sed -i 's/foo/bar/g' gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+
+      it("does not check size for an unrelated file sharing the deliverable's basename at a different absolute path", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["cat /app/vocab.bpe > /tmp/gpt2.c"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("still does not check size for a genuinely different filename (e.g. the compiled binary)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, shellTurn(["gcc -O3 -lm gpt2.c -o a.out"]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+    });
+
+    describe("interpreter-driven writes (previously undetected)", () => {
+      // Confirmed gap: a write via `python3 -c "open(path,'w').write(...)"`
+      // produced zero detected writes, so this check never ran for that
+      // turn even though the deliverable had just been rewritten.
+      it("checks size when the deliverable is written via a python3 -c inline script", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(
+          h,
+          shellTurn([`python3 -c "open('/app/gpt2.c','w').write('int main(){}')"`]),
+        );
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+      });
+    });
+
+    describe("path quoting — the deliverable path can carry shell metacharacters (task-prompt injection)", () => {
+      // Confirmed gap: `checkDeliverableSize` interpolated the parsed
+      // deliverable path directly into `wc -c ${path}` with no quoting, so a
+      // task prompt (untrusted, task-author-controlled text) whose path
+      // capture contained shell metacharacters could inject a second command
+      // into the container shell that runs `wc -c`.
+      const MARKER = `/tmp/tb-finalize-guard-injection-marker-${process.pid}`;
+      // `${IFS}` spells a word break with no literal space; `touch` keeps the
+      // live-shell run below offline.
+      const MALICIOUS_PATH = `/app/gpt2.c;touch\${IFS}${MARKER};true`;
+
+      afterEach(() => {
+        try {
+          unlinkSync(MARKER);
+        } catch {
+          // Nothing to clean up — the point of the test.
+        }
+      });
+
+      it("quotes the deliverable path before it reaches tbProxyRun, proven by actually running the captured command in a real shell", async () => {
+        expect(existsSync(MARKER)).toBe(false);
+
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        h.state.tbProxyResponses.push(wcResult(3000, MALICIOUS_PATH));
+        await newSessionWithPrompt(
+          h,
+          `Your program must be under 5000 bytes. Call your program ${MALICIOUS_PATH}`,
+        );
+        await turn(h, shellTurn([`gcc -O3 -o "${MALICIOUS_PATH}" gpt2.c`]));
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(1);
+
+        const payload = JSON.parse(h.inputs[0].slice(TB_PROXY_PREFIX.length));
+        const command: string = payload.command;
+        expect(command.startsWith("wc -c ")).toBe(true);
+
+        // Live-code proof: actually run the exact command tbProxyRun was
+        // handed, in a real shell — an unquoted interpolation would run the
+        // injected `touch` (and create MARKER); a quoted one can't.
+        try {
+          execSync(command, { shell: "/bin/bash", stdio: "pipe" });
+        } catch {
+          // `wc -c` on a made-up filename exits non-zero — expected, not a
+          // signal of anything.
+        }
+        expect(existsSync(MARKER)).toBe(false);
+      });
+    });
+
+    describe("agent_end / no-write-this-turn corrective check", () => {
+      // Confirmed gap: the only check at agent_end was maybeFireTriggerC;
+      // an over-budget deliverable that wasn't rewritten on the run's final
+      // turn(s) (only compiled/run, or simply never touched again) reached
+      // the run's end with zero corrective steer.
+      it("produces a corrective nudge at agent_end even when no write happened this run", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        // No turn_start/turn_end at all this run — no write evidence, and
+        // the per-turn escalation's 3-consecutive-checks counter never even
+        // starts.
+        await settle(h);
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toBe(buildTriggerEMessage(1927, 5000));
+      });
+
+      it("does not fire when the deliverable is at or under the limit at agent_end", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(3000, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("does not fire when no limit/path resolved at all", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        await newSession(h);
+        await settle(h);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+        expect(h.sent).toHaveLength(0);
+      });
+
+      it("stands down on an aborted run instead of stacking a steer on thinking-budget's own abort-recovery", async () => {
+        // Confirmed gap: this check had neither of maybeFireTriggerC's two
+        // guards, so an aborted run (thinking-budget abort-then-recover,
+        // context-watchdog compaction resume) still got Trigger E's own
+        // steer stacked on top of whatever recovery message the abort
+        // already queued.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, assistantTurn({ thinking: "let me think...", stopReason: "aborted" }));
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("stands down at the turn cap (no later turn for a corrective nudge to land on)", async () => {
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await fire(h.pi, "session_start", {}, h.ctx);
+        await fire(
+          h.pi,
+          "before_agent_start",
+          { systemPromptOptions: { littleCoder: { maxTurns: 2 } }, prompt: REAL_PROMPT },
+          h.ctx,
+        );
+        await turn(h, shellTurn(["ls -la"])); // turn 1
+        await turn(h, shellTurn(["ls -la"])); // turn 2 == capForRun
+        await settle(h);
+        expect(h.sent).toHaveLength(0);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("does not also fire (a second, redundant nudge) when Trigger C already fired on this same agent_end", async () => {
+        // Trigger C already told the model the run died/errored; stacking
+        // Trigger E's own over-budget nudge on the same agent_end would be a
+        // second contradictory steer for one event.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        await turn(h, assistantTurn({ stopReason: "error" })); // qualifies Trigger C
+        await settle(h);
+        expect(h.sent).toHaveLength(1);
+        expect(h.sent[0].text).toMatch(/previous turn ended with an error or an empty response/i);
+        expect(h.calls.filter((c) => c === "proxy-input")).toHaveLength(0);
+      });
+
+      it("does not throw out of agent_end when ctx.ui.notify fails on the post-await harnessIntervention call", async () => {
+        // Confirmed gap: only the pi.sendUserMessage call was try/caught;
+        // harnessIntervention's own ctx.ui.notify right after it was not, so
+        // a stale ctx after an await that crossed a session-replacing
+        // abort/compaction boundary would throw unhandled out of agent_end.
+        const h = makeHarness();
+        setupExtension(h.pi as any);
+        process.env.LITTLE_CODER_TB_MODE = "1";
+        setDeadlineMinutesFromNow(120);
+        h.state.tbProxyResponses.push(wcResult(6927, "/app/gpt2.c"));
+        await newSessionWithPrompt(h, REAL_PROMPT);
+        let notifyCalls = 0;
+        h.ctx.ui.notify = () => {
+          notifyCalls++;
+          throw new Error("ctx.ui is stale after the await");
+        };
+        await expect(settle(h)).resolves.toBeUndefined();
+        expect(h.sent).toHaveLength(1); // the steer itself still went out
+        expect(notifyCalls).toBeGreaterThan(0);
+      });
     });
   });
 

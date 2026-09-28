@@ -56,7 +56,8 @@ export type WriteKind =
   | "copy"
   | "move"
   | "inplace"
-  | "compile";
+  | "compile"
+  | "interpreter";
 
 export interface ShellWrite {
   /** The (possibly relative) path the command writes to. */
@@ -510,8 +511,9 @@ export function hasWriteRedirection(cmd: string): boolean {
 // destroy a file I haven't snapshotted yet" (pre-write backup) — both are
 // non-gating, best-effort consumers where over-detection is acceptable, unlike
 // the two write-permission gates above. For those purposes `cp`/`mv`/
-// `install`/`sed -i`/a compiler's `-o` are all evidence of a write, so this
-// function layers detection for those on top of `detectWriteTargets`.
+// `install`/`sed -i`/a compiler's `-o`/an inline-code interpreter's
+// `open(path, 'w'/'a')` call are all evidence of a write, so this function
+// layers detection for those on top of `detectWriteTargets`.
 // Short flags of `cp`/`mv`/`install` whose value is a SEPARATE word, so the
 // value must be consumed rather than read as an operand: install's `-m` mode,
 // `-o` owner and `-g` group, and the `-S` backup suffix. Skipping only the
@@ -561,15 +563,39 @@ function hasSedInPlaceFlag(words: string[]): boolean {
   );
 }
 
+// Interpreters commonly invoked with an inline script argument (`-c`/`-e`)
+// that can write anywhere an `open(path, mode)`-style call inside that
+// script tells it to -- with no `-o`/redirect syntax anywhere in the OUTER
+// command for detectWriteTargets, or the cp/mv/sed/compiler cases below, to
+// see. Confirmed gap: `python3 -c "open('/app/gpt2.c','w').write(...)"`
+// produced zero detected writes.
+const INLINE_CODE_RUNNERS = new Set(["python3", "python", "perl", "ruby", "node"]);
+const INLINE_CODE_FLAGS = new Set(["-c", "-e"]);
+
+// An `open(PATH, MODE)`-shaped call inside an inline script's text -- PATH
+// and MODE each in matching quotes, MODE starting with 'w' or 'a' (a 'r'
+// mode is read-only and must not count as evidence). This is the shape the
+// confirmed gap's own repro used (Python's two-argument `open`, and
+// Ruby/Node code written the same way); `\bopen\(` still matches embedded as
+// `File.open(...)` since `.` is a non-word character, so no separate
+// per-language pattern is needed for that spelling. Heuristic and
+// best-effort like the rest of this function: a script that builds the path
+// or mode from a variable rather than a literal is invisible to it, and
+// Perl's own three-argument `open(FH, '>', PATH)` shape is a different
+// enough call signature that this pattern does not attempt to cover it --
+// documented gap, not a false claim of full interpreter coverage.
+const INLINE_OPEN_WRITE_RE = /\bopen\(\s*(['"])([^'"]+)\1\s*,\s*(['"])[wa][^'"]*\3\s*\)/;
+
 /**
  * `detectWriteTargets` plus command-shape coverage that only matters for
  * non-gating consumers (tb-finalize-guard's evidence-of-work check, and
  * checkpoint's pre-write backup), never for permission-gating: `cp`/`mv`/
  * `install` (last non-flag operand, or the `-t DIR` argument), `sed -i`/
- * `--in-place` (every non-flag operand after the script), and a compiler's
- * `-o` output flag (`gcc -o`, `cc -o`, `ld -o`). See the block comment above
- * for why this is a separate function rather than a change to
- * `detectWriteTargets` itself.
+ * `--in-place` (every non-flag operand after the script), a compiler's
+ * `-o` output flag (`gcc -o`, `cc -o`, `ld -o`), and an inline-code
+ * interpreter's (`python3`/`python`/`ruby`/`node`, via `-c`/`-e`)
+ * `open(path, 'w'/'a')` call. See the block comment above for why this is a
+ * separate function rather than a change to `detectWriteTargets` itself.
  */
 export function detectDeliverableWrites(raw: string): ShellWrite[] {
   const writes = [...detectWriteTargets(raw)];
@@ -579,6 +605,22 @@ export function detectDeliverableWrites(raw: string): ShellWrite[] {
     const words = splitWords(segment);
     if (words.length === 0) continue;
     const name = words[0];
+    // Basename only for the interpreter-runner check, since a model or task
+    // script is just as likely to invoke one via its full path
+    // (`/usr/bin/python3`) as bare -- the other branches below stay on the
+    // raw word, unchanged, since none of their target tests exercise a
+    // path-qualified invocation and widening them isn't this fix's job.
+    const runnerName = name.split("/").pop() ?? name;
+
+    if (INLINE_CODE_RUNNERS.has(runnerName)) {
+      const flagIndex = words.findIndex((w) => INLINE_CODE_FLAGS.has(w));
+      if (flagIndex !== -1 && flagIndex + 1 < words.length) {
+        const code = unquote(words[flagIndex + 1]);
+        const m = INLINE_OPEN_WRITE_RE.exec(code);
+        if (m) writes.push({ path: m[2], kind: "interpreter" });
+      }
+      continue;
+    }
 
     if (name === "cp" || name === "mv" || name === "install") {
       const { target, sources } = lastOperandOrTargetFlag(words);

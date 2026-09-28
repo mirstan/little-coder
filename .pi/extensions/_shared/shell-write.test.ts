@@ -510,6 +510,38 @@ describe("detectDeliverableWrites — commands detectWriteTargets misses", () =>
     expect(detectWriteTargets("sed -i 's/a/b/' /app/result.txt")).toEqual([]);
     expect(detectWriteTargets("gcc main.c -o /app/main")).toEqual([]);
   });
+
+  it("catches a python3 -c inline script's open(path, 'w') as a write (confirmed gap: previously undetected)", () => {
+    expect(
+      detectDeliverableWrites(`python3 -c "open('/app/gpt2.c','w').write('int main(){}')"`),
+    ).toEqual([{ path: "/app/gpt2.c", kind: "interpreter" }]);
+  });
+
+  it("recognizes the other inline-code interpreters and both -c/-e flags", () => {
+    expect(detectDeliverableWrites(`python -c "open('/app/out.txt','w').write('x')"`)).toEqual([
+      { path: "/app/out.txt", kind: "interpreter" },
+    ]);
+    expect(
+      detectDeliverableWrites(`ruby -e "File.open('/app/out.txt', 'w')"`),
+    ).toEqual([{ path: "/app/out.txt", kind: "interpreter" }]);
+    expect(
+      detectDeliverableWrites(`node -e "open('/app/out.txt','w')"`),
+    ).toEqual([{ path: "/app/out.txt", kind: "interpreter" }]);
+    expect(
+      detectDeliverableWrites(`perl -e "open(my $fh, '>', '/app/out.txt')"`),
+    ).toEqual([]); // Perl's 3-arg `open(FH, '>', PATH)` is not covered.
+  });
+
+  it("does not flag a read-only open() call inside an inline script", () => {
+    expect(
+      detectDeliverableWrites(`python3 -c "open('/app/gpt2.c','r').read()"`),
+    ).toEqual([]);
+  });
+
+  it("does not flag an interpreter invocation with no inline write", () => {
+    expect(detectDeliverableWrites("python3 /app/build.py")).toEqual([]);
+    expect(detectDeliverableWrites("python3 -c \"print('hello')\"")).toEqual([]);
+  });
 });
 
 describe("isScratchPath", () => {
