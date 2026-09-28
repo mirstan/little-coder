@@ -3,6 +3,9 @@ import setupPermissionGate, {
   isSafeBash,
   parseExtraPrefixes,
   getSafePrefixes,
+  tokenizeSegment,
+  unsafeInvocation,
+  firstUnsafeInvocation,
 } from "./index.ts";
 
 describe("isSafeBash", () => {
@@ -93,6 +96,13 @@ describe("permission-gate tool_call interceptor", () => {
     } as any);
     if (!handler) throw new Error("permission-gate registered no tool_call handler");
     return handler;
+  }
+
+  // Fresh handler that owns its own edit-confirmer instance. Used by the
+  // write/edit "apply-all" tests so the latch does not leak into the shell
+  // tests or across randomized ordering.
+  function freshEditHandler() {
+    return getHandler();
   }
 
   async function withMode<T>(mode: string | undefined, fn: () => T | Promise<T>): Promise<T> {
@@ -197,6 +207,149 @@ describe("permission-gate tool_call interceptor", () => {
     });
   });
 
+  describe("manual mode prompts for write/edit tools (apply/deny/apply-all)", () => {
+    // One shared handler for the whole block so the "Apply all" latch (a
+    // per-instance flag inside createEditConfirmer) persists across the
+    // sequential tests — matching a single pi session. The handler is created
+    // once for this describe, not via the global getHandler(), so it cannot
+    // leak into other describes via caching or random test order.
+    const sharedHandler = freshEditHandler();
+    function handler() {
+      return sharedHandler;
+    }
+
+    it("prompts on a write of a new file and applies when user picks Apply", async () => {
+      await withMode("manual", async () => {
+        let prompted = false;
+        const result = await handler()(
+          { toolName: "write", input: { path: "/tmp/new.ts", content: "x" } },
+          {
+            ui: {
+              select: async () => {
+                prompted = true;
+                return "Apply";
+              },
+            },
+          },
+        );
+        expect(prompted).toBe(true);
+        expect(result).toBeUndefined();
+      });
+    });
+
+    it("prompts on an edit and blocks when user picks Deny", async () => {
+      await withMode("manual", async () => {
+        let prompted = false;
+        const result = await handler()(
+          { toolName: "edit", input: { path: "/tmp/exists.ts", edits: [] } },
+          {
+            ui: {
+              select: async () => {
+                prompted = true;
+                return "Deny";
+              },
+            },
+          },
+        );
+        expect(prompted).toBe(true);
+        expect(result?.block).toBe(true);
+        expect(result.reason).toBe("edit cancelled by user");
+      });
+    });
+
+    it("does not throw when notify is absent (headless manual)", async () => {
+      await withMode("manual", async () => {
+        const result = await handler()(
+          { toolName: "write", input: { path: "/tmp/new.ts", content: "x" } },
+          { ui: {} },
+        );
+        expect(result?.block).toBe(true);
+      });
+    });
+
+    it("reads file_path when path is absent", async () => {
+      await withMode("manual", async () => {
+        let prompted = false;
+        const result = await handler()(
+          { toolName: "write", input: { file_path: "/tmp/legacy.ts", content: "x" } },
+          {
+            ui: {
+              select: async () => {
+                prompted = true;
+                return "Apply";
+              },
+            },
+          },
+        );
+        expect(prompted).toBe(true);
+        expect(result).toBeUndefined();
+      });
+    });
+
+    it("blocks edits when no select UI is available (headless manual)", async () => {
+      await withMode("manual", async () => {
+        const result = await handler()(
+          { toolName: "write", input: { path: "/tmp/new.ts", content: "x" } },
+          { ui: {} },
+        );
+        expect(result?.block).toBe(true);
+        expect(result.reason).toBe("edit cancelled by user");
+      });
+    });
+
+    it("does not prompt for write/edit in auto mode (write-guard owns it)", async () => {
+      await withMode("auto", async () => {
+        let prompted = false;
+        const result = await handler()(
+          { toolName: "write", input: { path: "/tmp/new.ts", content: "x" } },
+          { ui: { select: async () => { prompted = true; return "Apply"; } } },
+        );
+        expect(prompted).toBe(false);
+        expect(result).toBeUndefined();
+      });
+    });
+
+    it("does not prompt for write/edit in accept-all mode", async () => {
+      await withMode("accept-all", async () => {
+        let prompted = false;
+        const result = await handler()(
+          { toolName: "edit", input: { path: "/tmp/x.ts", edits: [] } },
+          { ui: { select: async () => { prompted = true; return "Deny"; } } },
+        );
+        expect(prompted).toBe(false);
+        expect(result).toBeUndefined();
+      });
+    });
+
+    it("Apply all skips the prompt for every later edit in the session", async () => {
+      await withMode("manual", async () => {
+        let prompts = 0;
+        const ctx = {
+          ui: {
+            select: async () => {
+              prompts++;
+              return "Apply all (this session)";
+            },
+          },
+        };
+        const first = await handler()(
+          { toolName: "write", input: { path: "/tmp/a.ts", content: "x" } },
+          ctx,
+        );
+        expect(first).toBeUndefined();
+        expect(prompts).toBe(1);
+
+        // A subsequent edit must NOT prompt again.
+        const second = await handler()(
+          { toolName: "edit", input: { path: "/tmp/b.ts", edits: [] } },
+          ctx,
+        );
+        expect(second).toBeUndefined();
+        expect(prompts).toBe(1);
+      });
+    });
+  });
+
   it("manual mode prompts for whitelisted commands too", async () => {
     const handler = getHandler();
     let promptShown = false;
@@ -249,5 +402,117 @@ describe("getSafePrefixes", () => {
       if (prev === undefined) delete process.env.LITTLE_CODER_BASH_ALLOW;
       else process.env.LITTLE_CODER_BASH_ALLOW = prev;
     }
+  });
+});
+
+// ── issue #94: the interpreter hole ────────────────────────────────────────
+describe("inline-code invocations of whitelisted binaries (issue #94)", () => {
+  describe("tokenizeSegment", () => {
+    it("splits on whitespace", () => {
+      expect(tokenizeSegment("python3 app.py --fast")).toEqual(["python3", "app.py", "--fast"]);
+    });
+
+    it("keeps a quoted string as one word, flags inside it and all", () => {
+      // Without this, `python3 app.py "--dry-run -c"` would look like a -c call.
+      expect(tokenizeSegment('python3 app.py "--dry-run -c"')).toEqual([
+        "python3",
+        "app.py",
+        "--dry-run -c",
+      ]);
+    });
+
+    it("handles single quotes and backslash escapes", () => {
+      expect(tokenizeSegment("perl -e 'print 1'")).toEqual(["perl", "-e", "print 1"]);
+      expect(tokenizeSegment("cat my\\ file.txt")).toEqual(["cat", "my file.txt"]);
+    });
+
+    it("returns nothing for an empty or blank segment", () => {
+      expect(tokenizeSegment("   ")).toEqual([]);
+    });
+  });
+
+  describe("the exact commands reported in the thread", () => {
+    const REPORTED = [
+      'python3 -c "import os; os.remove(\'synthwave.html\')"',
+      'node -e "require(\'fs\').unlinkSync(\'synthwave.html\')"',
+      "perl -e 'unlink \"synthwave.html\"'",
+      "ruby -e 'File.delete(\"synthwave.html\")'",
+      "find . -name synthwave.html -exec rm {} \;",
+      "find . -name synthwave.html -delete",
+      "env bash -c 'rm synthwave.html'",
+      'python3 -c "import subprocess; subprocess.run([\'./build.sh\'])"',
+    ];
+
+    for (const cmd of REPORTED) {
+      it(`refuses: ${cmd}`, () => {
+        expect(unsafeInvocation(cmd)).not.toBeNull();
+        expect(isSafeBash(cmd)).toBe(false);
+      });
+    }
+  });
+
+  describe("what the interpreters are actually on the whitelist for", () => {
+    const ALLOWED = [
+      "python3 solution.py",
+      "python3 solution.py --verbose -c config.yaml",
+      "node server.js",
+      "python3 -u run.py",
+      "ruby script.rb",
+      "perl script.pl",
+      "find . -name '*.py'",
+      "find . -type f -name '*.ts' | head -20",
+      "sed -n '1,20p' file.ts",
+      "env",
+      "env FOO=1",
+    ];
+
+    for (const cmd of ALLOWED) {
+      it(`still allows: ${cmd}`, () => {
+        expect(unsafeInvocation(cmd)).toBeNull();
+        expect(isSafeBash(cmd)).toBe(true);
+      });
+    }
+  });
+
+  it("a flag AFTER the script path belongs to the script, not the interpreter", () => {
+    // `-c config.yaml` here is the program's own flag. Refusing it would break
+    // ordinary script runs, which is the whole reason the interpreters are on
+    // the list.
+    expect(unsafeInvocation("python3 train.py -c config.yaml")).toBeNull();
+  });
+
+  it("matches the interpreter by basename, so an absolute path is not a bypass", () => {
+    expect(unsafeInvocation('/usr/bin/python3 -c "import os"')).not.toBeNull();
+  });
+
+  it("refuses sed -i, which rewrites a file with no redirect for write-guard to see", () => {
+    expect(unsafeInvocation("sed -i 's/a/b/' app.py")).not.toBeNull();
+    expect(unsafeInvocation("sed -i.bak 's/a/b/' app.py")).not.toBeNull();
+    expect(unsafeInvocation("sed --in-place 's/a/b/' app.py")).not.toBeNull();
+  });
+
+  it("refuses env used to launch a command, not env used to print", () => {
+    expect(unsafeInvocation("env bash -c 'rm x'")).not.toBeNull();
+    expect(unsafeInvocation("env FOO=1 python3 -c 'import os'")).not.toBeNull();
+    expect(unsafeInvocation("env")).toBeNull();
+    expect(unsafeInvocation("env FOO=1 BAR=2")).toBeNull();
+  });
+
+  it("catches the inline call in ANY segment of a chain, not just the first", () => {
+    expect(isSafeBash('ls && python3 -c "import os; os.remove(\'x\')"')).toBe(false);
+  });
+
+  it("the refusal explains the distinction rather than just saying no", () => {
+    // v1.16.0's lesson: a refusal the model cannot act on gets worked around.
+    // It has to say the binary is fine and this USE of it is not.
+    const reason = firstUnsafeInvocation('python3 -c "import os"')!;
+    expect(reason).toContain("script.py");
+    expect(reason).toContain("whitelist");
+  });
+
+  it("`|| true` is no longer refused, because the no-ops are whitelisted", () => {
+    // @guppy42 on #94: refusing `true` made the model conclude `ls` was the
+    // problem and switch to glob.
+    expect(isSafeBash("ls /var/www 2>/dev/null || true")).toBe(true);
   });
 });
