@@ -423,7 +423,7 @@ It implements the same interface as `PolyglotLiveRunner`:
 2. **Launch.** `harbor run …` (H3) as a subprocess with `cwd=worktree.path`, `PYTHONPATH=worktree.path`, `LITTLE_CODER_PI_BIN_OVERRIDE`, `start_new_session=True`, a deterministic `--job-name` (candidate hash + batch), and **`--jobs-dir` outside the worktree**, because `reset()` runs `git clean -fdx`. Drop `--force-build` after the first build of each image.
 3. **Parse** `<jobs>/<job>/<trial>/result.json` (H4):
    - strip the `terminal-bench/` prefix;
-   - `exception_info` → `harness_error` (uncached, re-queued, never 0);
+   - `exception_info` → `harness_error`, handled exactly as §7.1 says (never scored or cached; retried in place, then the run stops);
    - reward, `stop_reason`, tokens (input/cache/output feed §7.1 efficiency and the cache-ratio ops metric), agent duration;
    - feedback paths: `verifier/test-stdout.txt`, `agent/little_coder.log`.
 4. **Timeouts.** Kill the process group **and** remove the trial's Docker containers (Harbor's `environment.delete` runs only on a clean exit). Label containers via the job name, then `docker ps --filter` → `docker rm -f`.
@@ -457,5 +457,5 @@ This gets its own manifest and budget. **Do not start it** until the following h
 - §14 phase 1 gains item 18: H8 ingest fixes, `HarborLiveRunner` (minimal), and canary wiring.
 - §17 risks gain three items:
   - oMLX contention when the canary runs concurrently with Polyglot work. Never run them concurrently in a comparison; the canary runs after GEPA stops.
-  - About 9% harness crashes on TB (re-queue with a cap of 2).
+  - About 9% harness crashes on TB. Under §7.1 each is retried in place and a persistent one stops the run, so at that rate a canary pass can stop early; measure this on the first canary baseline.
   - Docker VM memory: 8.3 GB, and some tasks request 8 GB. Keep `--n-concurrent` ≤ 2 for canary tasks.

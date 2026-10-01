@@ -148,9 +148,8 @@ def test_write_components_back_token_cost_rewrite_touches_only_that_one_line(tmp
     # Order-sensitive comparison (not membership) -- catches reordering, a
     # duplicated line, an appended extra field, or a YAML re-dump reformatting
     # keys/quotes, none of which a plain "each line is somewhere in there"
-    # Membership check would notice. this was
-    # the only test covering the token_cost rewrite path, so any of those
-    # would have gone unflagged.
+    # membership check would notice. This was the only test covering the
+    # token_cost rewrite path, so any of those would have gone unflagged.
     written_lines = [line for line in written_frontmatter.splitlines() if not line.startswith("token_cost:")]
     original_lines = [line for line in original_frontmatter.splitlines() if not line.startswith("token_cost:")]
     assert written_lines == original_lines

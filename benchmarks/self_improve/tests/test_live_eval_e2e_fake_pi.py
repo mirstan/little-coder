@@ -922,10 +922,10 @@ def test_a_stale_results_file_is_not_read_back_as_this_runs_outcome(runner_facto
     assert "results file missing" in result.error
 
 
-def test_live_run_result_from_dict_ignores_a_field_it_no_longer_has():
-    """A memo entry written by a build that carried an extra field (e.g.
-    the removed "probe" flag) must still load rather than raise TypeError."""
+def test_live_run_result_from_dict_ignores_an_unknown_key():
+    """A stray key in a cache entry must load, not raise TypeError -- a cache
+    read can't be allowed to kill an in-flight run."""
     entry = _canned(ExerciseSpec("wordy"), "fail").to_dict()
-    entry["probe"] = False
+    entry["unexpected"] = False
     loaded = live_eval.LiveRunResult.from_dict(entry)
     assert loaded == live_eval.LiveRunResult.from_dict(_canned(ExerciseSpec("wordy"), "fail").to_dict())

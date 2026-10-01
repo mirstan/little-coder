@@ -286,8 +286,11 @@ class LiveRunResult:
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LiveRunResult":
-        # Unknown keys (a field an older build wrote and this one dropped)
-        # are ignored rather than raising TypeError.
+        # Unknown keys are ignored rather than raising TypeError, for the same
+        # reason live_cache.get() treats a malformed entry as a miss: a stray
+        # key in a cache file must not kill an in-flight run. (Entries from a
+        # build with different fields never get here: run_config hashes this
+        # file, so they sit under another cfg_hash.)
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
 

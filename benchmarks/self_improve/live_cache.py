@@ -75,8 +75,10 @@ class LiveResultCache:
 
     def _path_for(self, cand_hash: str, cfg_hash: str, exercise_id: str, sample_index: int = 0) -> Path:
         safe_exercise = exercise_id.replace("/", "__")
-        # Sample 0 keeps the pre-sample_index filename so an existing memo
-        # (for any candidate with no frontmatter to sanitize away) stays warm.
+        # Sample 0 keeps the unsuffixed filename. That only preserves a memo
+        # across changes that leave cfg_hash alone: run_config hashes the
+        # harness files (live_eval.py included), so editing them starts a
+        # fresh cfg_hash directory regardless of the filename.
         suffix = "" if sample_index == 0 else f".sample{int(sample_index)}"
         return self.root / cfg_hash[:12] / cand_hash[:16] / f"{safe_exercise}{suffix}.json"
 
@@ -94,8 +96,8 @@ class LiveResultCache:
             # a cache read must not be able to kill an expensive in-flight run.
             return None
         # Valid JSON that isn't an object (e.g. a bare list or number) would
-        # otherwise be returned as-is and later blow up far from here, deep
-        # inside LiveRunResult.from_dict()'s **dict(d) -- treat it as a miss
+        # otherwise be returned as-is and later blow up far from here, inside
+        # LiveRunResult.from_dict() -- treat it as a miss
         # at the point where it's actually detected instead.
         return payload if isinstance(payload, dict) else None
 
