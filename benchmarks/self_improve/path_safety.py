@@ -16,12 +16,10 @@ def resolve_contained_path(base: Path, rel_path: str) -> Path:
 
     An absolute rel_path is rejected outright, even one that happens to
     resolve inside base: pathlib's `/` discards the left side entirely for
-    an absolute right side, and callers build a second path from the same
-    inputs a different way (aider_polyglot_ingest.py's _build_trajectory()
-    joins `log_root / lang / exercise` as separate components, not the
-    combined string validated here), so an absolute value can validate
-    against one construction and resolve elsewhere under the other --
-    detail files silently going missing instead of a clean rejection.
+    an absolute right side. That only covers the string checked here, so
+    callers must use the RETURNED path rather than re-joining the same
+    inputs another way: a key like "python//abs/dir" is relative as one
+    string, but `base / "python" / "/abs/dir"` is "/abs/dir".
     A relative rel_path can still escape via `../`, rejected below.
     """
     if Path(rel_path).is_absolute():

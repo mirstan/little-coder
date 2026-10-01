@@ -102,17 +102,20 @@ def load(
         # would otherwise let ex_dir escape log_root entirely -- cheap to
         # validate, so validate it (shared with components.py's identical
         # check -- see path_safety.py).
+        # The guard's resolved path is the one read below: re-joining
+        # log_root / lang / exercise would let an absolute exercise part
+        # ("python//abs/dir") discard log_root after validating clean.
         try:
-            resolve_contained_path(log_root, f"{lang}/{exercise}")
+            ex_dir = resolve_contained_path(log_root, f"{lang}/{exercise}")
         except ValueError:
             logger.warning("aider_polyglot_ingest: skipping %r, escapes log_root", key)
             continue
-        trajectories.append(_build_trajectory(log_root, lang, exercise, key, record, knowledge_topic_index))
+        trajectories.append(_build_trajectory(ex_dir, lang, exercise, key, record, knowledge_topic_index))
     return trajectories
 
 
 def _build_trajectory(
-    log_root: Path, lang: str, exercise: str, key: str, record: dict,
+    ex_dir: Path, lang: str, exercise: str, key: str, record: dict,
     knowledge_topic_index: dict[str, str] | None = None,
 ) -> NormalizedTrajectory:
     status = record.get("status", "fail")
@@ -126,7 +129,6 @@ def _build_trajectory(
         # stop_reasons list and only has these two fixed fields.
         stop_reason = record.get("stop_reason_2") or record.get("stop_reason_1") or "unknown"
 
-    ex_dir = log_root / lang / exercise
     assistant_text = ""
     tool_calls: list[dict] = []
     raw_paths: dict[str, str] = {}

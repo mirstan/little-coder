@@ -218,8 +218,7 @@ def test_load_falls_back_to_old_stop_reason_fields_when_stop_reasons_absent(tmp_
     ("pass_10", 0.4),
 ])
 def test_load_generalizes_pass_n_scoring_beyond_pass_2(tmp_path, status, expected_score):
-    """attempt
-    can now be pass_3, pass_4, ... for higher --max-attempts, not just
+    """A status can now be pass_3, pass_4, ... for higher --max-attempts, not just
     pass_1/pass_2. A hardcoded 2-entry lookup silently treated any pass_3+
     as a FAILURE (score 0.0, success=False) -- scoring a genuine pass as a
     loss. Must generalize to any pass_N while still exactly preserving the
@@ -319,3 +318,24 @@ def test_load_skips_exercise_key_that_would_escape_log_root(tmp_path):
     }}))
     trajs = aider_polyglot_ingest.load(log_root, results_json)
     assert trajs == []
+
+
+def test_load_never_reads_outside_log_root_via_an_absolute_exercise_part(tmp_path):
+    """A "lang//abs/dir" key validates as a relative combined string, but a
+    second `log_root / lang / exercise` join would let pathlib discard
+    log_root for the absolute exercise part and read that directory's
+    trajectory files. The guard's own resolved path must be the one used."""
+    log_root = tmp_path / "logs"
+    log_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "trajectory_1.json").write_text(json.dumps({"assistant_text": "OUTSIDE-SECRET"}))
+    results_json = tmp_path / "results_full_polyglot.json"
+    results_json.write_text(json.dumps({"exercises": {
+        f"python/{outside}": {"status": "pass_1", "stop_reasons": ["agent_end"], "turn_count": 1},
+    }}))
+    trajs = aider_polyglot_ingest.load(log_root, results_json)
+    for traj in trajs:
+        assert "OUTSIDE-SECRET" not in json.dumps(traj.model_dump(), default=str)
+        for p in traj.raw_paths.values():
+            assert Path(p).resolve().is_relative_to(log_root.resolve())
