@@ -98,8 +98,8 @@ def _no_stray_real_worktrees():
     creates/destroys REAL git worktrees, and this repo keeps several other
     real worktrees checked out. Every scratch-worktree test must operate
     against a THROWAWAY `git init` repo, never the real checkout -- this
-    snapshots `git worktree list` on the REAL repo before and after the
-    whole test session and fails loudly if it ever changes.
+    snapshots this process's gepa-scratch worktrees on the REAL repo before
+    and after the whole test session and fails loudly if they differ.
 
     Limitation: this only detects a NET change across
     the whole session. A test that calls `scratch_worktree(REAL_REPO_ROOT,
@@ -114,19 +114,30 @@ def _no_stray_real_worktrees():
     real model call, but neither one closes this specific gap."""
     repo_root = Path(__file__).resolve().parents[3]
 
-    def _snapshot() -> str:
-        return subprocess.run(
+    # Only worktrees THIS pytest process could have made count:
+    # scratch_worktree() names them gepa-scratch-<pid>-<hex>. Other sessions
+    # add, remove and move worktrees in the same repo concurrently, so
+    # comparing the whole list (HEAD lines included) failed on their work.
+    ours = f"gepa-scratch-{os.getpid()}-"
+
+    def _snapshot() -> set[str]:
+        out = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=repo_root, capture_output=True, text=True, check=True,
         ).stdout
+        return {
+            line.removeprefix("worktree ")
+            for line in out.splitlines()
+            if line.startswith("worktree ") and Path(line.removeprefix("worktree ")).name.startswith(ours)
+        }
 
     before = _snapshot()
     yield
     after = _snapshot()
     assert after == before, (
-        "REAL git worktree list changed during the test session -- a test "
-        "touched the real repo's worktrees instead of a throwaway fixture "
-        f"repo.\nbefore:\n{before}\nafter:\n{after}"
+        "a gepa-scratch worktree from this test session was left on the REAL "
+        "repo -- a test touched the real repo's worktrees instead of a "
+        f"throwaway fixture repo.\nbefore: {sorted(before)}\nafter: {sorted(after)}"
     )
 
 
