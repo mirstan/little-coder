@@ -352,8 +352,8 @@ class NoProgressStopper:
     """GEPA stop callback: trips after max_idle_iterations iterations in a row
     with state.total_num_evals unchanged. A parent minibatch of perfect cache
     hits charges no metric call (PolyglotGEPAAdapter.evaluate) and
-    skip_perfect_score then skips reflection, so without this only the
-    wall-clock timeout would end that loop. Counts per state.i, so a repeat
+    skip_perfect_score then skips reflection, so no metric-call budget
+    stopper would end that loop. Counts per state.i, so a repeat
     check within one iteration is not a second idle iteration."""
     def __init__(self, max_idle_iterations: int = NO_PROGRESS_MAX_IDLE_ITERATIONS) -> None:
         self.max_idle_iterations = max_idle_iterations
