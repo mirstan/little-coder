@@ -272,9 +272,13 @@ def _list_tagged_pids(token: str) -> set[int]:
     run's token. Raises if the process list cannot be read at all.
 
     What it cannot see: a process that cleared or rewrote its environment,
-    one owned by another user, and on macOS any Apple platform binary
+    one owned by another user, on Linux a same-user process whose
+    /proc/<pid>/environ the kernel refuses to read (non-dumpable or with
+    changed credentials: ssh-agent, anything run through sudo, a setuid or
+    file-capability binary), and on macOS any Apple platform binary
     (/bin/sh, /bin/bash, /bin/zsh, sleep, tail, perl and the rest), whose
-    environment ps -E does not show."""
+    environment ps -E does not show. Unreadable processes are skipped
+    silently."""
     if _USE_PROC:
         needle = f"{_RUN_TOKEN_ENV}={token}".encode()
         pids = set()
@@ -284,7 +288,7 @@ def _list_tagged_pids(token: str) -> set[int]:
             try:
                 with open(f"/proc/{name}/environ", "rb") as fh:
                     environ = fh.read()
-            except OSError:  # gone, another user's, or a kernel thread
+            except OSError:  # gone, another user's, unreadable (see above), or a kernel thread
                 continue
             if needle in environ.split(b"\0"):
                 pids.add(int(name))
@@ -693,7 +697,11 @@ class PolyglotLiveRunner:
     def _prepare_clean_tree(self, sanitized: Mapping[str, str]) -> None:
         """Before every live run, retries included: back to the pinned base
         commit (reset() also verifies the checkout), then the candidate's
-        text, so no run sees what an earlier run's agent left in the tree."""
+        text, so no run sees what an earlier run's agent left in the tree --
+        except `node_modules` directories, which reset() keeps (`clean -e
+        node_modules`). Nothing a later run executes reads them today: pi
+        is the source checkout's (resolve_pi_bin) and the exercise works in
+        a temp dir outside the tree (aider_polyglot.py)."""
         self.worktree.reset()
         self._write_sanitized(sanitized)
 
@@ -726,7 +734,8 @@ class PolyglotLiveRunner:
         and before every run, retries included, the tree is reset to the
         base commit and the candidate written again (_prepare_clean_tree):
         an agent can change anything in the tree, and no run may be scored
-        against what an earlier one left there. Returns results in the SAME order as
+        against what an earlier one left there (`node_modules` directories
+        survive the reset; see _prepare_clean_tree). Returns results in the SAME order as
         `specs` (a hard requirement for the GEPA adapter built on top of
         this -- EvaluationBatch.scores must align index-for-index with the
         batch).

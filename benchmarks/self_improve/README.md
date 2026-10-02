@@ -485,8 +485,12 @@ What this does not close:
      `/bin/bash`, so a plain shell loop the agent backgrounds is exactly
      this case. `test_a_setsid_shell_only_background_writer_is_killed` is
      marked as an expected failure on macOS for this reason.
-   - **Linux** reads `/proc/<pid>/environ`, which shows every process of
-     the same user, so for those the sweep is complete.
+   - **Linux: same-user processes whose environ is unreadable.** The
+     sweep reads `/proc/<pid>/environ`, and the kernel refuses that read
+     (EACCES) for a process of the same user that is non-dumpable or has
+     changed credentials: `ssh-agent`, anything started through `sudo`,
+     a setuid or file-capability binary. Those are skipped without a
+     warning, as if they carried no token.
    - **Anywhere:** a process that clears or rewrites its environment
      (`env -i`, an exec with an explicit environment), or that runs as
      another user.
