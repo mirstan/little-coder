@@ -576,6 +576,9 @@ class PolyglotLiveRunner:
         log_root = self.worktree.path / "benchmarks" / "full_polyglot_logs"
         env["POLYGLOT_RESULTS_FILE"] = str(results_file)
         env["POLYGLOT_LOG_ROOT"] = str(log_root)
+        # Off by default in aider_polyglot.py (it changes the retry prompt);
+        # self-improve needs the LESSON: lines for self_reported_lessons.
+        env["POLYGLOT_REQUEST_LESSONS"] = "1"
         if self.benchmark_root:
             env["POLYGLOT_BENCHMARK_ROOT"] = str(self.benchmark_root)
 

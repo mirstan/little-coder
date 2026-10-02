@@ -84,6 +84,19 @@ _LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\**\s*(.+)$")
 #: LM prompt, so it needs the same cap every other free-text field on this
 #: path already has (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpts).
 LESSON_MAX_CHARS = 500
+#: Opt-in, because asking for a LESSON: line changes the retry prompt and so
+#: the benchmark protocol: without it a plain run's pass@2 stays comparable
+#: with published results. live_eval sets it for self-improve runs.
+REQUEST_LESSONS_ENV = "POLYGLOT_REQUEST_LESSONS"
+_LESSON_ASK = ("Before continuing: on a single line starting with 'LESSON:', "
+               "state in one sentence what tool, skill, or information would "
+               "have most helped you get here faster or more reliably. Then "
+               "fix the implementation and try again.")
+
+
+def _request_lessons() -> bool:
+    """Read at call time, not import, so a test can toggle it."""
+    return os.environ.get(REQUEST_LESSONS_ENV) == "1"
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -512,7 +525,7 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
     blind to exactly the kind of change (a different per-attempt budget)
     this function exists to catch.
     """
-    return {
+    params = {
         "agent": agent,
         "model": model,
         "language": language,
@@ -525,6 +538,13 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
         "allowed_tools": sorted(set(ALLOWED_TOOLS)) if agent == "pi" else None,
         "env": {k: os.environ[k] for k in _ENV_KNOBS if k in os.environ} if agent == "pi" else {},
     }
+    # Only when on, so a default run's params match every results file
+    # written before the LESSON: request was gated, and --resume refuses to
+    # blend runs made under the two retry prompts. Not an _ENV_KNOBS entry:
+    # those are pi-only, and this changes codex's prompt too.
+    if _request_lessons():
+        params["request_lessons"] = True
+    return params
 
 
 def _param_mismatches(recorded: dict, current: dict) -> list[str]:
@@ -1002,8 +1022,8 @@ def _run_exercise(
             turn_total += r.turn_count
             compaction_total += getattr(r, "compaction_events", 0) or 0
             attempt_usage.append(_usage_tokens(r))
-            # Only an attempt whose prompt actually asked for one can have a
-            # LESSON: line, and the ask lives in the retry prompt built at the
+            # Only a retry prompt asks for a LESSON: line, and only under
+            # POLYGLOT_REQUEST_LESSONS=1; extraction is not gated on that.
             # Gated on i > 1 explicitly, not just by where the retry prompt
             # asking for a LESSON: line happens to live: attempt 1's
             # assistant_text is all of the model's unprompted output, where a
@@ -1070,10 +1090,9 @@ def _run_exercise(
                       "your previous attempt's code (read the current state "
                       "before editing). The tests failed with this output:\n\n```\n"
                     + out[-4000:]
-                    + "\n```\n\nBefore continuing: on a single line starting with "
-                      "'LESSON:', state in one sentence what tool, skill, or "
-                      "information would have most helped you get here faster or "
-                      "more reliably. Then fix the implementation and try again."
+                    + "\n```\n\n"
+                    + (_LESSON_ASK if _request_lessons()
+                       else "Fix the implementation and try again.")
                 )
             else:
                 # codex resumes its own session (see above), so it already
@@ -1088,11 +1107,9 @@ def _run_exercise(
                     "The tests failed. Output:\n\n```\n"
                     + out[-4000:]
                     + "\n```\n\nThe test file(s) are for reference only -- "
-                      "do not edit them. Before continuing: on a single line "
-                      "starting with 'LESSON:', state in one sentence what tool, "
-                      "skill, or information would have most helped you get here "
-                      "faster or more reliably. Then fix the implementation and "
-                      "try again."
+                      "do not edit them. "
+                    + (_LESSON_ASK if _request_lessons()
+                       else "Fix the implementation and try again.")
                 )
 
         elapsed = time.time() - t0

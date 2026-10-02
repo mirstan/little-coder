@@ -245,6 +245,28 @@ def test_self_reported_lesson_is_captured_end_to_end(runner_factory, tmp_path, m
     assert result.self_reported_lessons == ["needed clearer guidance"]
 
 
+def test_exercise_subprocess_is_asked_to_request_lessons(runner_factory, monkeypatch):
+    """aider_polyglot.py only asks retries for a LESSON: line under
+    POLYGLOT_REQUEST_LESSONS=1, so live_eval must set it on the child even
+    when the orchestrator's own environment says otherwise."""
+    monkeypatch.setenv("POLYGLOT_REQUEST_LESSONS", "0")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    real_popen = subprocess.Popen
+    child_envs = []
+
+    def spy(cmd, *a, **kw):
+        if any(str(part).endswith("aider_polyglot.py") for part in cmd):
+            child_envs.append(kw.get("env"))
+        return real_popen(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    for runner in runner_factory():
+        runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    assert len(child_envs) == 1
+    assert child_envs[0]["POLYGLOT_REQUEST_LESSONS"] == "1"
+
+
 def test_materialize_writes_candidate_text_preserving_frontmatter(runner_factory):
     for runner in runner_factory():
         runner.materialize({"skills_tools_bash": "Brand new guidance body.\n"})
