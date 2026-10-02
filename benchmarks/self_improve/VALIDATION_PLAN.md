@@ -216,12 +216,16 @@ independent of Layer 4's own pool.
    `dev`, not `main`, not the `self-improve/gepa-loop` worktree itself — a fourth,
    disposable one), so the live re-run doesn't collide with ongoing implementation
    work.
-2. Identify the specific exercises/tasks that were in Layer 4's **validation
-   split** (not the training split) — these are held-out examples GEPA did not use
-   to shape the rewrite.
-3. Re-run those specific exercises for real, through the actual harness
-   (`aider_polyglot.py --exercise <name>` per exercise, or the equivalent gaia
-   task-id filtering), once with the OLD `bash.md` (checked out from `dev`) and
+2. Identify the exercises in the **`splits.test`** list of the Layer 4 run's
+   `<new-out-dir>/manifest.yaml` (e.g. `yq '.splits.test[]'
+   <new-out-dir>/manifest.yaml`). That split is drawn disjoint from the search
+   split GEPA's trainset and valset both come from, and GEPA never sees it. Do
+   **not** use Layer 4's validation split here: it is not held out, because GEPA
+   scores every candidate on the valset and picks the best one from those scores,
+   so a pass rate measured on it is selection-biased.
+3. Re-run those test-split exercises for real, through the actual harness
+   (`aider_polyglot.py --exercise <name> --language <manifest's language>` per
+   exercise), once with the OLD `bash.md` (checked out from `dev`) and
    once with the NEW `bash.md` (from the PR branch) — same model, same seed/params
    where controllable, to isolate the skill-file change as the only variable.
 4. Compare live pass/fail outcomes before vs. after on this held-out set. This is
