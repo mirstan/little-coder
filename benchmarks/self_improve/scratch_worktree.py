@@ -28,6 +28,7 @@ Design choices, all deliberate:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -52,6 +53,17 @@ ALWAYS_ORCHESTRATOR_ONLY_ENV = frozenset({REFLECTION_LM_API_KEY_ENV, "SELF_IMPRO
 #: Written into every scratch worktree's root immediately after creation.
 #: gepa_scratch_gc.py refuses to remove anything lacking this marker.
 SCRATCH_MARKER_NAME = ".self-improve-scratch.json"
+
+
+def scratch_lock_path(scratch_path: Path) -> Path:
+    """Sibling lock file, OUTSIDE the worktree, that scratch_worktree() holds
+    an exclusive flock on for the worktree's lifetime. gepa_scratch_gc.py
+    derives it from the worktree path (never from the marker) and treats a
+    held lock as a live owner: the marker sits in the agent's cwd and can be
+    rewritten to look dead, but a lock held by the orchestrator cannot be
+    released by editing a file."""
+    scratch_path = Path(scratch_path)
+    return scratch_path.with_name(scratch_path.name + ".lock")
 
 
 def _write_marker_atomic(marker_path: Path, marker: dict) -> None:
@@ -289,7 +301,24 @@ def scratch_worktree(
     if scratch_path.exists():
         raise ScratchWorktreeError(f"scratch path already exists, refusing to reuse: {scratch_path}")
 
-    _run_git(["worktree", "add", "--detach", str(scratch_path), base_commit], cwd=source_repo_root)
+    # Taken before `worktree add` so the worktree never exists unlocked. The
+    # fd is non-inheritable (PEP 446), so only this process holds the lock.
+    lock_path = scratch_lock_path(scratch_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+
+    def _release_lock() -> None:
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _run_git(["worktree", "add", "--detach", str(scratch_path), base_commit], cwd=source_repo_root)
+    except BaseException:
+        _release_lock()
+        raise
 
     # If anything between here and the marker write raises (disk full, an
     # injected KeyboardInterrupt, ...), the worktree registration must not be
@@ -304,6 +333,8 @@ def scratch_worktree(
             "created_at": time.time(),
             "base_commit": base_commit,
             "repo_root": str(source_repo_root),
+            # Informational only: the GC derives the lock path itself.
+            "lock_path": str(lock_path),
         }
         _write_marker_atomic(scratch_path / SCRATCH_MARKER_NAME, marker)
     except BaseException:
@@ -312,6 +343,7 @@ def scratch_worktree(
         except ScratchWorktreeError:
             shutil.rmtree(scratch_path, ignore_errors=True)
             prune_stale(source_repo_root)
+        _release_lock()
         raise
 
     worktree = ScratchWorktree(
@@ -335,3 +367,6 @@ def scratch_worktree(
             except ScratchWorktreeError:
                 shutil.rmtree(scratch_path, ignore_errors=True)
                 prune_stale(source_repo_root)
+        # Released even with keep=True: no live owner remains, so the GC
+        # falls back to the marker for a preserved worktree.
+        _release_lock()

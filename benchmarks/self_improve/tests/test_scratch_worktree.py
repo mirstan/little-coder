@@ -2,7 +2,9 @@
 tmp_path -- NEVER the real checkout. The session-scoped _no_stray_real_worktrees
 fixture in conftest.py is the backstop that fails the whole session if that
 invariant is ever violated."""
+import fcntl
 import json
+import os
 import subprocess
 import time
 
@@ -15,6 +17,7 @@ from benchmarks.self_improve.scratch_worktree import (
     SCRATCH_MARKER_NAME,
     prune_stale,
     resolve_pi_bin,
+    scratch_lock_path,
     scratch_worktree,
 )
 
@@ -351,3 +354,19 @@ def test_env_from_os_environ_strips_the_key_without_touching_os_environ(source_r
         env = wt.env()
     assert "REFLECTION_LM_API_KEY" not in sorted(env)  # names only: env holds real values
     assert os.environ["REFLECTION_LM_API_KEY"] == "sk-sentinel"
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_lock_file_is_held_outside_the_worktree_and_removed_on_exit(source_repo, tmp_path, keep):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=keep) as wt:
+        lock_path = scratch_lock_path(wt.path)
+        assert lock_path.parent == wt.path.parent
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+    assert not lock_path.exists()
+    if keep:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt.path)], cwd=source_repo, check=True)

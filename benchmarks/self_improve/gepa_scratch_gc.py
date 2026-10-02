@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -25,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, prune_stale
+from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, prune_stale, scratch_lock_path
 
 #: scratch_worktree.py's own real naming scheme: f"gepa-scratch-{pid}-{uuid4().hex[:8]}".
 #: Second piece of evidence, alongside --scratch-root containment, before
@@ -46,6 +47,26 @@ def _pid_alive(pid: object) -> bool:
     except OSError:
         return False
     return True
+
+
+def _lock_held(path: Path) -> bool:
+    """Whether a live process holds the worktree's owner lock
+    (scratch_lock_path). The lock path is derived from the worktree path,
+    never read from the agent-writable marker. A missing lock file is not
+    held; any other failure to probe it counts as held (fail closed)."""
+    try:
+        fd = os.open(scratch_lock_path(path), os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 def _parse_worktree_list(repo_root: Path) -> list[dict]:
@@ -96,6 +117,14 @@ def find_scratch_worktrees(repo_root: Path, scratch_root: Optional[Path] = None)
 
         if not entry["detached"]:
             info["reason"] = f"has a branch checked out ({entry['branch']}) -- never touch"
+            results.append(info)
+            continue
+
+        # Checked before anything the marker says: the agent can rewrite the
+        # marker's pid fields to look dead, but cannot release the owner's
+        # flock. Applies to a directory-gone entry too.
+        if _lock_held(path):
+            info["reason"] = f"still running (owner lock {scratch_lock_path(path).name} is held)"
             results.append(info)
             continue
 
@@ -194,6 +223,12 @@ def _remove_worktree(repo_root: Path, path: Path) -> None:
     if result.returncode != 0:
         shutil.rmtree(path, ignore_errors=True)
         prune_stale(repo_root)
+    # Only removable entries get here, so the lock is not held: it was left
+    # by an owner that never reached its own cleanup.
+    try:
+        scratch_lock_path(path).unlink()
+    except OSError:
+        pass
 
 
 def _format_entry(entry: dict) -> str:

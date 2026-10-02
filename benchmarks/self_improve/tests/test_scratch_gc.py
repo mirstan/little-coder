@@ -9,7 +9,7 @@ import time
 import pytest
 
 from benchmarks.self_improve.gepa_scratch_gc import find_scratch_worktrees, main
-from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, scratch_worktree
+from benchmarks.self_improve.scratch_worktree import SCRATCH_MARKER_NAME, scratch_lock_path, scratch_worktree
 
 
 @pytest.fixture
@@ -354,3 +354,55 @@ def test_cli_list_prints_something_for_every_worktree(source_repo, tmp_path, cap
         assert str(branch_wt) in out
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(branch_wt)], cwd=source_repo, check=True)
+
+
+def _forge_dead_marker(scratch_path):
+    """What an agent with write access to its own cwd can do: make every
+    marker-based liveness signal say "dead"."""
+    marker = json.loads((scratch_path / SCRATCH_MARKER_NAME).read_text())
+    marker["pid"] = 999999999
+    marker["active_pid"] = 999999998
+    marker.pop("spawn_pending_at", None)
+    (scratch_path / SCRATCH_MARKER_NAME).write_text(json.dumps(marker))
+
+
+def test_forged_dead_marker_does_not_make_a_locked_worktree_removable(source_repo, tmp_path, capsys):
+    """The marker lives inside the worktree, so the agent can rewrite it.
+    The lock held by the live scratch_worktree() owner sits outside it and
+    must win over a marker that says everything is dead."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
+        scratch_path = wt.path
+        _forge_dead_marker(scratch_path)
+
+        entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
+        matching = [e for e in entries if e["path"] == scratch_path]
+        assert len(matching) == 1
+        assert matching[0]["removable"] is False
+        assert "lock" in matching[0]["reason"]
+
+        code = main(["--repo-root", str(source_repo), "--scratch-root", str(tmp_path), "--clean", "--yes"])
+        assert code == 0
+        assert "Nothing to clean" in capsys.readouterr().out
+        assert scratch_path.is_dir()
+
+    # Lock released on exit: the same forged marker now reads as an orphan.
+    entries = find_scratch_worktrees(source_repo, scratch_root=tmp_path)
+    matching = [e for e in entries if e["path"] == scratch_path]
+    assert matching[0]["removable"] is True
+
+    subprocess.run(["git", "worktree", "remove", "--force", str(scratch_path)], cwd=source_repo, check=True)
+
+
+def test_leftover_unheld_lock_file_does_not_block_removal_and_is_cleaned(source_repo, tmp_path):
+    """A SIGKILLed owner leaves its lock file behind, unheld. That is not
+    evidence of a live owner, and --clean removes it with the worktree."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi", keep=True) as wt:
+        scratch_path = wt.path
+    lock_path = scratch_lock_path(scratch_path)
+    lock_path.touch()
+    _forge_dead_marker(scratch_path)
+
+    code = main(["--repo-root", str(source_repo), "--scratch-root", str(tmp_path), "--clean", "--yes"])
+    assert code == 0
+    assert not scratch_path.exists()
+    assert not lock_path.exists()
