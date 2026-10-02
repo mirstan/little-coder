@@ -370,20 +370,26 @@ in a tree the harness builds itself (`_score_gated` in `aider_polyglot.py`):
   JavaScript runs jest directly rather than through `npm test`. Each writes
   its report outside the scored tree. A pass needs that report to show
   every expected test passing; exit code 0 alone is not enough.
-- an attempt that changed a test or runner-config file, or whose solution
-  file is not a regular file or trips the python import tripwire, is scored
-  as a failure by policy. The record sets `tests_tampered`, and
-  `tamper_reasons` says why. Added hook files (`conftest.py`,
-  `package-lock.json` and so on) and edited docs are only reported, because
-  they cannot reach the scored tree.
+- an attempt that changed a test or runner-config file is scored as a
+  failure by policy. The record sets `tests_tampered`, and `tamper_reasons`
+  says why.
+- an attempt whose solution file is not a regular file, or trips the python
+  import tripwire, is also scored as a failure by policy, but it is not
+  test tampering: the record sets `solution_rejected`, and
+  `rejection_reasons` says why.
+- added hook files (`conftest.py`, `package-lock.json` and so on) and edited
+  docs are only reported, in `tamper_reasons` marked `info:`, because they
+  cannot reach the scored tree.
 
 What this does not close:
 
 - **In-process forging.** Code in the solution runs inside the test process
   and can still write a passing report and exit. The python tripwire
   (`_python_tripwire`) rejects the imports and names such code usually
-  needs, which raises the bar but does not rule it out. JavaScript has no
-  tripwire.
+  needs, which raises the bar but does not rule it out: it matches names
+  only, so code that reaches the same things without naming them
+  (`getattr`, `sys.orig_argv`, `threading._register_atexit`) gets past it.
+  JavaScript has no tripwire.
 - **A writable interpreter environment.** The agent runs as the same user
   as the scorer, so it can write to the scoring interpreter's
   `site-packages` (a `.pth` file runs at startup even under `-I`), to the

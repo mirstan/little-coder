@@ -447,3 +447,44 @@ def test_feedback_shows_information_only_findings_without_claiming_a_penalty():
 def test_scoring_rule_states_the_tamper_policy():
     record = _tamper_feedback()
     assert "Changing test files or test-runner configuration scores 0.00" in record["Feedback"]
+
+
+def test_feedback_reports_a_solution_rejection_as_not_tampering():
+    record = _tamper_feedback(solution_rejected=True, rejection_reasons=[
+        "solution file 'a.py' uses atexit, which the scorer disallows in solution code",
+    ])
+    feedback = record["Feedback"]
+    assert "disallows" in feedback and "This is not test tampering." in feedback
+    assert "scored 0.00" in feedback and "untrusted" in feedback
+    assert "```\nsolution file 'a.py' uses atexit" in feedback
+    assert "changing files it protects" not in feedback
+    assert record["Generated Outputs"]["solution_rejected"] is True
+    assert record["Generated Outputs"]["tests_tampered"] is False
+
+
+def test_feedback_with_both_tampering_and_a_rejection_states_both():
+    record = _tamper_feedback(
+        tests_tampered=True, tamper_reasons=["protected file 'a_test.py' was modified"],
+        solution_rejected=True,
+        rejection_reasons=["solution file 'a.py' uses argv, which the scorer disallows in solution code"])
+    feedback = record["Feedback"]
+    assert "changing files it protects" in feedback
+    assert "disallows" in feedback
+    assert "This is not test tampering." not in feedback
+    assert "protected file 'a_test.py' was modified" in feedback
+    assert "solution file 'a.py' uses argv" in feedback
+
+
+def test_feedback_with_a_penalty_marks_info_findings_as_not_scored():
+    record = _tamper_feedback(
+        solution_rejected=True,
+        rejection_reasons=["solution file 'a.py' uses atexit, which the scorer disallows in solution code"],
+        tamper_reasons=["info: added 'pyproject.toml' is a test-runner hook file"])
+    feedback = record["Feedback"]
+    assert "Findings marked info: did not affect the score." in feedback
+    assert "'pyproject.toml'" in feedback
+
+
+def test_scoring_rule_states_the_solution_policy():
+    feedback = _tamper_feedback()["Feedback"]
+    assert "test-runner internals (e.g." in feedback

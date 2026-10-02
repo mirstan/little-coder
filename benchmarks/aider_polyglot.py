@@ -34,6 +34,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import (  # noqa: E402
@@ -1189,19 +1190,29 @@ def _parent_unsafe(root: Path, rel: str) -> bool:
     return False
 
 
-def _inspect(work: Path, m: _Manifest, desc):
+class _Inspection(NamedTuple):
+    """What _inspect found. `tampered` and `rejected` force a fail."""
+    tampered: list
+    rejected: list
+    notes: list
+    added: list
+    solution_bytes: dict
+
+
+def _inspect(work: Path, m: _Manifest, desc) -> _Inspection:
     """Compare the agent's tree with the manifest.
 
-    Returns (reasons, notes, added, solution_bytes). `reasons` force the
-    attempt to fail: a changed test or runner-config file, or a solution
-    file that is not a regular file of at most _SAFE_READ_LIMIT bytes or
-    trips the descriptor's tripwire. `notes` are information only: other
-    prepared files that changed, and added files named like runner hooks.
-    Neither can change the score, because the scored tree is built from
-    prepared bytes and leaves added files out. All strings are fixed
-    templates around repr()'d, clipped paths.
+    `tampered`: a changed test or runner-config file (protected). `rejected`:
+    a solution file that is not a regular file of at most _SAFE_READ_LIMIT
+    bytes, or trips the descriptor's tripwire. Both force the attempt to
+    fail. `notes` are information only: other prepared files that changed,
+    and added files named like runner hooks. Neither can change the score,
+    because the scored tree is built from prepared bytes and leaves added
+    files out. All strings are fixed templates around repr()'d, clipped
+    paths.
     """
-    reasons: list[str] = []
+    tampered: list[str] = []
+    rejected: list[str] = []
     notes: list[str] = []
 
     def shown(rel):
@@ -1209,7 +1220,7 @@ def _inspect(work: Path, m: _Manifest, desc):
 
     def problem(rel, what):
         if rel in m.protected:
-            reasons.append(f"protected file {shown(rel)} {what}")
+            tampered.append(f"protected file {shown(rel)} {what}")
         else:
             notes.append(f"info: {shown(rel)} {what} (the scored tree uses the prepared version)")
 
@@ -1232,14 +1243,14 @@ def _inspect(work: Path, m: _Manifest, desc):
     for rel in sorted(m.solution):
         data = None if _parent_unsafe(work, rel) else _read_regular(work / rel)
         if data is None:
-            reasons.append(f"solution file {shown(rel)} is missing, not a regular file, "
+            rejected.append(f"solution file {shown(rel)} is missing, not a regular file, "
                            f"under a symlinked directory, or over {_SAFE_READ_LIMIT >> 20} MiB")
             continue
         solution_bytes[rel] = data
         hits = tripwire(data) if tripwire else []
         if hits:
-            reasons.append(f"solution file {shown(rel)} uses {', '.join(hits)[:120]}, "
-                           f"which reach into the test runner")
+            rejected.append(f"solution file {shown(rel)} uses {', '.join(hits)[:120]}, "
+                            f"which the scorer disallows in solution code")
 
     known = set(m.files) | set(m.links) | m.dirs | m.solution
     hook_names = desc.get("hook_names", frozenset())
@@ -1267,7 +1278,7 @@ def _inspect(work: Path, m: _Manifest, desc):
         if seen > _MAX_WALK_ENTRIES:
             notes.append(f"info: stopped listing added files after {_MAX_WALK_ENTRIES} entries")
             break
-    return reasons, notes, added, solution_bytes
+    return _Inspection(tampered, rejected, notes, added, solution_bytes)
 
 
 def _build_scoring_tree(target: Path, m: _Manifest, solution_bytes: dict) -> None:
@@ -1286,14 +1297,24 @@ def _build_scoring_tree(target: Path, m: _Manifest, solution_bytes: dict) -> Non
         (target / rel).write_bytes(data)
 
 
-def _score_gated(desc, work: Path, timeout: int, m: _Manifest):
+class _GatedScore(NamedTuple):
+    passed: bool
+    out: str
+    tampered: list
+    rejected: list
+    notes: list
+    added: list
+
+
+def _score_gated(desc, work: Path, timeout: int, m: _Manifest) -> _GatedScore:
     """Score one attempt from a tree the harness builds (see _Manifest).
 
-    Returns (passed, out, reasons, notes, added). `score_in_copy` does not
-    apply: the scored tree is always a fresh harness-built copy. Notes go at
-    the END of `out`, because the retry prompt keeps only out[-4000:].
+    `tampered` and `rejected` are _inspect's. `score_in_copy` does not
+    apply: the scored tree is always a fresh harness-built copy. Notes and
+    the policy trailers go at the END of `out`, because the retry prompt
+    keeps only out[-4000:].
     """
-    reasons, notes, added, solution_bytes = _inspect(work, m, desc)
+    tampered, rejected, notes, added, solution_bytes = _inspect(work, m, desc)
     with tempfile.TemporaryDirectory() as scratch:
         target = Path(scratch) / "tree" / work.name
         _build_scoring_tree(target, m, solution_bytes)
@@ -1305,12 +1326,19 @@ def _score_gated(desc, work: Path, timeout: int, m: _Manifest):
     if notes:
         out += ("\n[scorer] note: " + "; ".join(n.removeprefix("info: ") for n in notes[:5])
                 + ". Only the solution file(s) are scored.")
-    if reasons:
+    if tampered:
         passed = False
-        out += ("\n[scorer] scored as a failure, by policy: " + "; ".join(reasons[:5])
+        out += ("\n[scorer] scored as a failure, by policy: " + "; ".join(tampered[:5])
                 + ". Tests and runner configuration are scored from their original bytes, "
                 "so revert any change to them and edit only the solution file(s).")
-    return passed, out, reasons, notes, added
+    if rejected:
+        passed = False
+        out += ("\n[scorer] scored as a failure, by policy: " + "; ".join(rejected[:5])
+                + ". Solution code must not use these, because they can reach into the test "
+                "runner: remove them (e.g. remove sys.argv; take input through function "
+                "arguments). Each solution file must be a regular file of at most "
+                f"{_SAFE_READ_LIMIT >> 20} MiB.")
+    return _GatedScore(passed, out, tampered, rejected, notes, added)
 
 
 def _extend_unique(dst: list, items) -> None:
@@ -1525,6 +1553,7 @@ def _run_exercise(
         # Unions across attempts, for feedback. Each attempt is scored on its
         # own: one that reverts an earlier edit and passes is an honest pass.
         tamper_reasons: list[str] = []
+        rejection_reasons: list[str] = []
         tamper_notes: list[str] = []
         added_files: list[str] = []
         prompt = _build_prompt(ex_name, stubs, tests, desc["syntax_hint"])
@@ -1659,10 +1688,12 @@ def _run_exercise(
             # sent, so the artifact reflects what THIS attempt produced.
             _dump_trajectory(log_dir, str(i), r, work, notifications=attempt_notifications)
             if manifest is not None:
-                passed, out, reasons, notes, added = _score_gated(desc, work, desc["timeout_s"], manifest)
-                _extend_unique(tamper_reasons, reasons)
-                _extend_unique(tamper_notes, notes)
-                _extend_unique(added_files, added)
+                scored = _score_gated(desc, work, desc["timeout_s"], manifest)
+                passed, out = scored.passed, scored.out
+                _extend_unique(tamper_reasons, scored.tampered)
+                _extend_unique(rejection_reasons, scored.rejected)
+                _extend_unique(tamper_notes, scored.notes)
+                _extend_unique(added_files, scored.added)
             else:
                 passed, out = _score(desc, work, desc["timeout_s"])
             (log_dir / f"final_output_{i}.txt").write_text(out)
@@ -1752,10 +1783,14 @@ def _run_exercise(
             },
         }
         if manifest is not None:
-            # tests_tampered: some attempt was forced to fail by policy (see
+            # tests_tampered: some attempt changed a protected file;
+            # solution_rejected: some attempt's solution file broke the
+            # solution policy. Either forced that attempt to fail (see
             # _inspect). Notes ride along in tamper_reasons, marked "info:".
             record["tests_tampered"] = bool(tamper_reasons)
+            record["solution_rejected"] = bool(rejection_reasons)
             record["tamper_reasons"] = [r[:200] for r in (tamper_reasons + tamper_notes)[:10]]
+            record["rejection_reasons"] = [r[:200] for r in rejection_reasons[:10]]
             record["added_files"] = [a[:200] for a in added_files[:20]]
         return record
 

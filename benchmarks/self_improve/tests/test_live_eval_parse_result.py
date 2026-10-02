@@ -275,3 +275,29 @@ def test_scoring_preflight_failures_are_config_errors(monkeypatch, tmp_path):
         result = LiveRunResult(task_id="python/wordy", exercise="wordy", language="python",
                                status="error", score=0.0, success=False, error=reason)
         assert _is_config_error(result), reason
+
+
+def test_parse_result_carries_solution_rejection_separately(tmp_path):
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    rejections = [f"solution file 'x{i}.py' uses atexit " + "y" * 300 for i in range(15)]
+    _write_results(results_file, "pi/python/wordy",
+                   {"status": "fail", "tests_tampered": False, "tamper_reasons": [],
+                    "solution_rejected": True, "rejection_reasons": rejections})
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+    assert result.tests_tampered is False and result.tamper_reasons == []
+    assert result.solution_rejected is True
+    assert len(result.rejection_reasons) == 10
+    assert all(len(r) <= 200 for r in result.rejection_reasons)
+    assert result.rejection_reasons[0].startswith("solution file 'x0.py'")
+
+    _write_results(results_file, "pi/python/wordy",
+                   {"status": "fail", "solution_rejected": "yes", "rejection_reasons": ["ok", 3, None]})
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+    assert result.solution_rejected is False and result.rejection_reasons == ["ok"]
+
+    _write_results(results_file, "pi/python/wordy", {"status": "fail", "rejection_reasons": "x"})
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+    assert result.solution_rejected is False and result.rejection_reasons == []

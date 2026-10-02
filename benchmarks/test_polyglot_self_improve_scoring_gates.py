@@ -264,14 +264,14 @@ def _add(name, text, honest=False):
 
 
 def test_honest_solution_passes(tmp_path):
-    passed, out, reasons, notes, added = _gated(tmp_path, _honest)
+    passed, out, tampered, rejected, notes, added = _gated(tmp_path, _honest)
     assert passed, out
-    assert reasons == [] and notes == [] and added == []
+    assert tampered == [] and rejected == [] and notes == [] and added == []
 
 
 def test_untouched_stub_fails(tmp_path):
-    passed, _, reasons, _, _ = _gated(tmp_path)
-    assert not passed and reasons == []
+    passed, _, tampered, rejected, _, _ = _gated(tmp_path)
+    assert not passed and tampered == [] and rejected == []
 
 
 def test_snapshot_keeps_tests_pristine_and_names_the_solution(tmp_path):
@@ -303,26 +303,26 @@ def test_snapshot_keeps_tests_pristine_and_names_the_solution(tmp_path):
 def test_added_runner_hooks_cannot_pass_a_stub(tmp_path, name, text):
     """They are left out of the scoring tree, and reported for information
     only (A4): an added hook file cannot change the score either way."""
-    passed, _, reasons, notes, added = _gated(tmp_path, _add(name, text))
+    passed, _, tampered, rejected, notes, added = _gated(tmp_path, _add(name, text))
     assert not passed
-    assert reasons == []
+    assert tampered == [] and rejected == []
     assert added == [name]
     assert any(repr(name) in n for n in notes)
 
 
 def test_an_added_hook_file_does_not_fail_an_honest_solution(tmp_path):
     """A4: e.g. a pyproject.toml added for a linter is not a forced fail."""
-    passed, out, reasons, notes, added = _gated(
+    passed, out, tampered, rejected, notes, added = _gated(
         tmp_path, _add("pyproject.toml", "[tool.ruff]\n", honest=True))
     assert passed, out
-    assert reasons == [] and added == ["pyproject.toml"]
+    assert tampered == [] and rejected == [] and added == ["pyproject.toml"]
     assert notes and all(n.startswith("info:") for n in notes)
 
 
 def test_an_added_scratch_file_is_listed_but_harmless(tmp_path):
-    passed, out, reasons, notes, added = _gated(tmp_path, _add("debug.py", "print(1)\n", honest=True))
+    passed, out, tampered, rejected, notes, added = _gated(tmp_path, _add("debug.py", "print(1)\n", honest=True))
     assert passed, out
-    assert added == ["debug.py"] and reasons == [] and notes == []
+    assert added == ["debug.py"] and tampered == [] and rejected == [] and notes == []
 
 
 def test_pycache_and_pytest_cache_are_noise(tmp_path):
@@ -332,17 +332,17 @@ def test_pycache_and_pytest_cache_are_noise(tmp_path):
         (work / "__pycache__" / "two_fer.cpython-311.pyc").write_bytes(b"x")
         (work / ".pytest_cache").mkdir()
         (work / ".DS_Store").write_bytes(b"x")
-    passed, out, reasons, notes, added = _gated(tmp_path, mutate)
+    passed, out, tampered, rejected, notes, added = _gated(tmp_path, mutate)
     assert passed, out
-    assert added == [] and reasons == [] and notes == []
+    assert added == [] and tampered == [] and rejected == [] and notes == []
 
 
 def test_an_exit_before_pytest_finishes_needs_a_report(tmp_path):
     """No tripwire word in sight, so only the missing report catches it."""
     stub = "import os as o\ngetattr(o, '_e' + 'xit')(0)\n"
-    passed, out, reasons, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
+    passed, out, tampered, rejected, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
     assert not passed
-    assert reasons == []
+    assert tampered == [] and rejected == []
     assert "no JUnit report" in out
 
 
@@ -350,7 +350,7 @@ def test_an_exit_inside_the_solution_needs_a_report(tmp_path):
     stub = ("import os as o\n"
             "def two_fer(name='you'):\n"
             "    getattr(o, '_e' + 'xit')(0)\n")
-    passed, out, reasons, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
+    passed, out, tampered, rejected, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
     assert not passed and "no JUnit report" in out
 
 
@@ -372,17 +372,18 @@ def test_an_exit_inside_the_solution_needs_a_report(tmp_path):
     "__import__('os')\n" + _STUB,
 ])
 def test_the_solution_tripwire_forces_a_fail(tmp_path, stub):
-    passed, out, reasons, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
+    passed, out, tampered, rejected, _, _ = _gated(tmp_path, _add("two_fer.py", stub))
     assert not passed
-    assert any("two_fer.py" in r and "uses" in r for r in reasons), reasons
+    assert tampered == []
+    assert any("two_fer.py" in r and "uses" in r for r in rejected), rejected
 
 
 def test_the_tripwire_ignores_words_in_comments_and_strings(tmp_path):
     """A6: an AST check, so prose that mentions pytest is no hit."""
     text = '"""Run with pytest; see unittest docs."""\n# conftest, sys.argv, os._exit\n' + _EXAMPLE
-    passed, out, reasons, _, _ = _gated(tmp_path, _add("two_fer.py", text))
+    passed, out, tampered, rejected, _, _ = _gated(tmp_path, _add("two_fer.py", text))
     assert passed, out
-    assert reasons == []
+    assert tampered == [] and rejected == []
 
 
 def test_an_edited_test_fails_and_the_agents_tree_is_left_alone(tmp_path):
@@ -397,36 +398,50 @@ def test_an_edited_test_fails_and_the_agents_tree_is_left_alone(tmp_path):
     stubs, tests = AP._prepare_python(src, work)
     m = AP._snapshot(src, work, stubs, tests, AP.LANG_DESCRIPTORS["python"])
     mutate(work)
-    passed, out, reasons, _, _ = AP._score_gated(AP.LANG_DESCRIPTORS["python"], work, 60, m)
+    passed, out, tampered, rejected, _, _ = AP._score_gated(AP.LANG_DESCRIPTORS["python"], work, 60, m)
     seen["after"] = (work / "two_fer_test.py").read_text()
     assert not passed
-    assert any("two_fer_test.py" in r and "modified" in r for r in reasons)
+    assert any("two_fer_test.py" in r and "modified" in r for r in tampered)
+    assert rejected == []
     assert seen["after"] == edited
     # A2: the note is the LAST thing in the output, so out[-4000:] keeps it
     assert out.rstrip().splitlines()[-1].startswith("[scorer] scored as a failure")
 
 
+def test_a_tripwire_hit_and_an_edited_test_get_both_trailers(tmp_path):
+    def mutate(work):
+        (work / "two_fer.py").write_text("import atexit\n" + _EXAMPLE)
+        (work / "two_fer_test.py").write_text("def test_ok():\n    assert True\n")
+    passed, out, tampered, rejected, _, _ = _gated(tmp_path, mutate)
+    assert not passed
+    assert any("two_fer_test.py" in r for r in tampered)
+    assert any("two_fer.py" in r and "atexit" in r for r in rejected)
+    assert "revert any change to them" in out
+    assert "take input through function arguments" in out
+    assert out.rstrip().splitlines()[-1].startswith("[scorer] scored as a failure")
+
+
 def test_an_edited_test_cannot_pass_a_stub(tmp_path):
-    passed, _, reasons, _, _ = _gated(
+    passed, _, tampered, rejected, _, _ = _gated(
         tmp_path, _add("two_fer_test.py", "def test_ok():\n    assert True\n"))
-    assert not passed and reasons
+    assert not passed and tampered
 
 
 def test_a_removed_test_is_a_forced_fail(tmp_path):
     def mutate(work):
         _honest(work)
         (work / "two_fer_test.py").unlink()
-    passed, _, reasons, _, _ = _gated(tmp_path, mutate)
-    assert not passed and any("two_fer_test.py" in r for r in reasons)
+    passed, _, tampered, rejected, _, _ = _gated(tmp_path, mutate)
+    assert not passed and any("two_fer_test.py" in r for r in tampered)
 
 
 def test_an_edited_doc_is_information_only(tmp_path):
     def mutate(work):
         _honest(work)
         (work / ".docs" / "instructions.md").write_text("notes\n")
-    passed, out, reasons, notes, _ = _gated(tmp_path, mutate)
+    passed, out, tampered, rejected, notes, _ = _gated(tmp_path, mutate)
     assert passed, out
-    assert reasons == [] and any("instructions.md" in n for n in notes)
+    assert tampered == [] and rejected == [] and any("instructions.md" in n for n in notes)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
@@ -441,8 +456,8 @@ def test_a_fifo_in_place_of_the_stub_does_not_hang(tmp_path):
     t.start()
     t.join(30)
     assert not t.is_alive(), "scoring hung on a FIFO"
-    passed, _, reasons, _, _ = box["r"]
-    assert not passed and any("two_fer.py" in r for r in reasons)
+    passed, _, tampered, rejected, _, _ = box["r"]
+    assert not passed and tampered == [] and any("two_fer.py" in r for r in rejected)
 
 
 def test_a_symlink_in_place_of_the_stub_is_not_followed(tmp_path):
@@ -454,8 +469,8 @@ def test_a_symlink_in_place_of_the_stub_is_not_followed(tmp_path):
     t.start()
     t.join(30)
     assert not t.is_alive(), "scoring followed a symlink to /dev/zero"
-    passed, _, reasons, _, _ = box["r"]
-    assert not passed and any("two_fer.py" in r for r in reasons)
+    passed, _, tampered, rejected, _, _ = box["r"]
+    assert not passed and tampered == [] and any("two_fer.py" in r for r in rejected)
 
 
 # ── report verification (unit) ──────────────────────────────────────────
@@ -550,10 +565,10 @@ def test_a_symlinked_test_directory_is_never_written_through(tmp_path, monkeypat
     (victim / "ex_test.py").write_text("victim")
     shutil.rmtree(work / "sub")
     (work / "sub").symlink_to(victim)
-    passed, out, reasons, _, _ = AP._score_gated(desc, work, 5, m)
+    passed, out, tampered, rejected, _, _ = AP._score_gated(desc, work, 5, m)
     assert (victim / "ex_test.py").read_text() == "victim"
     assert not passed
-    assert any("symlink" in r and "sub" in r for r in reasons)
+    assert any("symlink" in r and "sub" in r for r in tampered)
     assert seen["files"]["sub/ex_test.py"] == "tests"
 
 
@@ -566,9 +581,9 @@ def test_a_js_shaped_tree_scores_pristine_config_and_relinks_node_modules(tmp_pa
         stubs=["ex.js"], tests=["ex.spec.js"], links=[("node_modules", str(shared))],
         protected={"package.json"})
     (work / "package.json").write_text('{"scripts":{"test":"true"}}')
-    passed, _, reasons, _, _ = AP._score_gated(desc, work, 5, m)
+    passed, _, tampered, rejected, _, _ = AP._score_gated(desc, work, 5, m)
     assert not passed
-    assert any("package.json" in r for r in reasons)
+    assert any("package.json" in r for r in tampered) and rejected == []
     assert seen["files"]["package.json"] == '{"scripts":{"test":"jest ./*"}}'
     assert seen["files"]["node_modules"] == "->" + str(shared)
 
@@ -587,8 +602,8 @@ def test_npm_install_droppings_are_information_only(tmp_path, monkeypatch):
     (work / "node_modules").unlink()
     (work / "node_modules").mkdir()
     (work / "package-lock.json").write_text("{}")
-    passed, _, reasons, notes, added = AP._score_gated(desc, work, 5, m)
-    assert passed and reasons == []
+    passed, _, tampered, rejected, notes, added = AP._score_gated(desc, work, 5, m)
+    assert passed and tampered == [] and rejected == []
     assert "package-lock.json" in added
     assert any("node_modules" in n for n in notes)
     assert seen["files"]["node_modules"] == "->" + str(shared)
@@ -635,7 +650,47 @@ def test_a_reverted_edit_scores_on_the_next_attempt(monkeypatch, tmp_path):
                               retry=True, max_attempts=2)
     assert record["status"] == "pass_2"
     assert record["tests_tampered"] is True
+    assert record["solution_rejected"] is False and record["rejection_reasons"] == []
     assert "[scorer] scored as a failure" in prompts[1]
+
+
+def test_a_solution_policy_failure_is_not_test_tampering(monkeypatch, tmp_path):
+    """A tripwire hit in the solution is a rejection, recorded apart from
+    protected-file edits, and its retry text says what to change."""
+    monkeypatch.setenv("POLYGLOT_RESTORE_TESTS", "1")
+    _real_python(monkeypatch, tmp_path)
+    prompts = []
+
+    class FakeRpc:
+        def __init__(self, *a, cwd=None, session_id="", **kw):
+            self.cwd = Path(cwd)
+            self.n = int(session_id.rsplit("attempt", 1)[-1])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def notifications(self):
+            return []
+
+        def prompt_and_collect(self, message, timeout=900):
+            prompts.append(message)
+            prefix = "import atexit\n" if self.n == 1 else ""
+            (self.cwd / "two_fer.py").write_text(prefix + _EXAMPLE)
+            return AP.PromptResult(turn_count=2, agent_ended=True, stop_reason="agent_end",
+                                   assistant_text="x", tool_calls=[{"name": "edit"}])
+
+    monkeypatch.setattr(AP, "PiRpc", FakeRpc)
+    record = AP._run_exercise("python", "two-fer", "fake/model", agent="pi", verbose=False,
+                              retry=True, max_attempts=2)
+    assert record["status"] == "pass_2"
+    assert record["tests_tampered"] is False and record["tamper_reasons"] == []
+    assert record["solution_rejected"] is True
+    assert any("two_fer.py" in r and "atexit" in r for r in record["rejection_reasons"])
+    assert "take input through function arguments" in prompts[1]
+    assert "revert any change" not in prompts[1]
 
 
 def test_the_plain_protocol_is_unchanged(monkeypatch, tmp_path):
@@ -671,7 +726,8 @@ def test_the_plain_protocol_is_unchanged(monkeypatch, tmp_path):
                               retry=False)
     assert cmds == [["python3", "-m", "pytest", "-x", "-q"]]
     assert record["status"] == "fail"
-    for key in ("tests_tampered", "tamper_reasons", "added_files"):
+    for key in ("tests_tampered", "tamper_reasons", "added_files",
+                "solution_rejected", "rejection_reasons"):
         assert key not in record
 
 

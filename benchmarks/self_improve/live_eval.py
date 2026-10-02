@@ -419,10 +419,16 @@ class LiveRunResult:
     usage: dict | None = None
     #: From aider_polyglot.py's gated scoring (POLYGLOT_RESTORE_TESTS):
     #: True when some attempt was forced to fail for changing files the
-    #: scorer protects. tamper_reasons also carries information-only
-    #: findings, marked "info:". The paths in them are chosen by the agent.
+    #: scorer protects (tests, runner configuration). tamper_reasons also
+    #: carries information-only findings, marked "info:". The paths in them
+    #: are chosen by the agent.
     tests_tampered: bool = False
     tamper_reasons: list = field(default_factory=list)
+    #: Same source: True when some attempt was forced to fail because a
+    #: solution file broke the solution policy (not a regular file, or a
+    #: tripwire hit). Not test tampering; the paths are chosen by the agent.
+    solution_rejected: bool = False
+    rejection_reasons: list = field(default_factory=list)
     error: str | None = None
     from_cache: bool = False
     exit_code: int | None = None
@@ -1109,11 +1115,11 @@ class PolyglotLiveRunner:
                 self_reported_lessons.append(clipped)
                 remaining -= len(clipped)
 
-        raw_reasons = record.get("tamper_reasons")
-        tamper_reasons = (
-            [r[:200] for r in raw_reasons if isinstance(r, str)][:10]
-            if isinstance(raw_reasons, list) else []
-        )
+        def _clip_reasons(raw) -> list:
+            return [r[:200] for r in raw if isinstance(r, str)][:10] if isinstance(raw, list) else []
+
+        tamper_reasons = _clip_reasons(record.get("tamper_reasons"))
+        rejection_reasons = _clip_reasons(record.get("rejection_reasons"))
 
         usage = None
         raw_usage = record.get("usage")
@@ -1178,6 +1184,8 @@ class PolyglotLiveRunner:
             reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
             diff_summary=diff_summary, notifications=notifications, usage=usage,
             tests_tampered=record.get("tests_tampered") is True, tamper_reasons=tamper_reasons,
+            solution_rejected=record.get("solution_rejected") is True,
+            rejection_reasons=rejection_reasons,
             error=reason if isinstance(reason := record.get("reason"), str) else None, **base_kwargs,
         )
 
