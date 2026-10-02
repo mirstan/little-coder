@@ -6,8 +6,9 @@
 #   benchmarks/harbor_pilot.sh task-a terminal-bench/task-b
 #
 # Task names may be bare (as in tb21_splits.json) or dataset-prefixed; bare
-# names get the dataset's org prefix. (hello-world is not in the TB2.1
-# dataset.)
+# names get the dataset's org prefix when TB_DATASET is an org/name registry
+# id, and pass through unchanged for a legacy name@version one. (hello-world
+# is not in the TB2.1 dataset.)
 #
 # Runbook note: a running Harbor job never reloads code -- it imports
 # LittleCoderAgent once at job start and keeps running that frozen module
@@ -96,8 +97,9 @@ for t in "$@"; do
   # --include-task-name against that full name, so a bare "fix-git" matches
   # nothing ("No tasks matched the filter(s)"). Bare names -- the form
   # tb21_splits.json uses -- get the dataset's org prefix; already-prefixed
-  # names pass through unchanged.
-  if [[ "$t" != */* ]]; then
+  # names pass through unchanged. A legacy name@version dataset (e.g.
+  # terminal-bench@2.0) has no org, so its bare names are left alone.
+  if [[ "$t" != */* && "$DATASET" == */* ]]; then
     t="${DATASET%%/*}/$t"
   fi
   TASK_FLAGS+=(--include-task-name "$t")
