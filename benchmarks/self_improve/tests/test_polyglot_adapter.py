@@ -405,3 +405,45 @@ def test_reflective_dataset_runtime_unscoreable_names_both_environment_and_candi
     assert "provider said no" in feedback
     assert "harness itself failed" not in feedback
     assert "do not rewrite" not in feedback
+
+
+def _tamper_feedback(**kw):
+    specs = [ExerciseSpec("a")]
+    runner = FakeRunner({"python/a": _result("python/a", "a", status="fail", score=0.0,
+                                              success=False, **kw)})
+    adapter = _adapter(runner)
+    batch = adapter.evaluate(specs, {"skills_tools_bash": "text"}, capture_traces=True)
+    record = adapter.make_reflective_dataset({"skills_tools_bash": "text"}, batch,
+                                             ["skills_tools_bash"])["skills_tools_bash"][0]
+    return record
+
+
+def test_feedback_reports_tampering_inside_an_untrusted_fence():
+    record = _tamper_feedback(tests_tampered=True, tamper_reasons=[
+        "protected file 'a_test.py' was modified",
+        "info: added 'conftest.py' is a test-runner hook file; it is not part of the scored tree",
+    ])
+    feedback = record["Feedback"]
+    assert "scored 0.00" in feedback and "policy" in feedback
+    assert "untrusted" in feedback
+    assert "```\nprotected file 'a_test.py' was modified" in feedback
+    assert "'conftest.py'" in feedback
+    assert record["Generated Outputs"]["tests_tampered"] is True
+
+
+def test_feedback_has_no_tamper_section_when_clean():
+    record = _tamper_feedback()
+    assert "scorer found" not in record["Feedback"]
+    assert record["Generated Outputs"]["tests_tampered"] is False
+
+
+def test_feedback_shows_information_only_findings_without_claiming_a_penalty():
+    record = _tamper_feedback(tamper_reasons=["info: added 'pyproject.toml' is a test-runner hook file"])
+    feedback = record["Feedback"]
+    assert "'pyproject.toml'" in feedback and "untrusted" in feedback
+    assert "did not affect the score" in feedback
+
+
+def test_scoring_rule_states_the_tamper_policy():
+    record = _tamper_feedback()
+    assert "Changing test files or test-runner configuration scores 0.00" in record["Feedback"]

@@ -176,6 +176,8 @@ class LiveEvalHarnessError(RuntimeError):
 _MAX_TAIL_CHARS = 4_000
 _MAX_TRANSCRIPT_CHARS = 4_000
 _MAX_DIFF_CHARS = 6_000
+#: Mirrors aider_polyglot.py's _SAFE_READ_LIMIT.
+_MAX_SNAPSHOT_FILE_BYTES = 4 << 20
 #: Reasoning traces run long (one real bowling attempt filled the 200-entry
 #: non_text_deltas cap in aider_polyglot.py's trajectory dump, nearly all
 #: thinking_delta) -- truncated from the TAIL so reflection sees the
@@ -277,6 +279,12 @@ class LiveRunResult:
     #: (a results file or memo entry from before usage was carried, or a
     #: harness_error with no results), distinct from a genuine zero.
     usage: dict | None = None
+    #: From aider_polyglot.py's gated scoring (POLYGLOT_RESTORE_TESTS):
+    #: True when some attempt was forced to fail for changing files the
+    #: scorer protects. tamper_reasons also carries information-only
+    #: findings, marked "info:". The paths in them are chosen by the agent.
+    tests_tampered: bool = False
+    tamper_reasons: list = field(default_factory=list)
     error: str | None = None
     from_cache: bool = False
     exit_code: int | None = None
@@ -419,7 +427,32 @@ class PolyglotLiveRunner:
             # an `npm install` bumping the real pi binary mid-project.
             "pi_bin": str(pi_bin),
             "pi_bin_mtime": pi_bin_mtime,
+            # The child runs under this interpreter, and its gated scoring
+            # runs pytest under it too (aider_polyglot._run_python_gated).
+            **self._interpreter_info(),
         }
+
+    def _interpreter_info(self) -> dict:
+        """python_executable plus its Python and pytest versions, probed
+        once per runner. A failed probe records None rather than raising."""
+        cached = getattr(self, "_interpreter_info_cache", None)
+        if cached is None:
+            python_version = pytest_version = None
+            try:
+                r = subprocess.run(
+                    [self.python_executable, "-I", "-c",
+                     "import sys, pytest; print(sys.version.split()[0], pytest.__version__)"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                parts = r.stdout.split()
+                if r.returncode == 0 and len(parts) == 2:
+                    python_version, pytest_version = parts
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            cached = {"python_executable": str(self.python_executable),
+                      "python_version": python_version, "pytest_version": pytest_version}
+            self._interpreter_info_cache = cached
+        return dict(cached)
 
     def materialize(self, candidate: Mapping[str, str]) -> list[Path]:
         """Reset the worktree to its pinned base commit, then write only the
@@ -581,7 +614,8 @@ class PolyglotLiveRunner:
         env["POLYGLOT_REQUEST_LESSONS"] = "1"
         # Also off by default there. A pi crash on a later attempt would
         # otherwise record "fail", which is scored and cached; and an agent
-        # that edits its test file could score a pass.
+        # that edits its tests or adds a runner hook could score a pass
+        # (RESTORE_TESTS scores a harness-built tree with verified reports).
         env["POLYGLOT_CRASH_IS_ERROR"] = "1"
         env["POLYGLOT_RESTORE_TESTS"] = "1"
         if self.benchmark_root:
@@ -741,6 +775,12 @@ class PolyglotLiveRunner:
                 self_reported_lessons.append(clipped)
                 remaining -= len(clipped)
 
+        raw_reasons = record.get("tamper_reasons")
+        tamper_reasons = (
+            [r[:200] for r in raw_reasons if isinstance(r, str)][:10]
+            if isinstance(raw_reasons, list) else []
+        )
+
         usage = None
         raw_usage = record.get("usage")
         if isinstance(raw_usage, dict):
@@ -803,6 +843,7 @@ class PolyglotLiveRunner:
             test_output_tail=test_output_tail, transcript_excerpt=transcript_excerpt,
             reasoning_excerpt=reasoning_excerpt, summarized_transcript=summarized_transcript,
             diff_summary=diff_summary, notifications=notifications, usage=usage,
+            tests_tampered=record.get("tests_tampered") is True, tamper_reasons=tamper_reasons,
             error=reason if isinstance(reason := record.get("reason"), str) else None, **base_kwargs,
         )
 
@@ -829,6 +870,10 @@ class PolyglotLiveRunner:
         parts = []
         for py_file in sorted(workdir.glob("*.py")):
             if py_file.name.endswith("_test.py"):
+                continue
+            # The snapshot keeps the agent's symlinks as symlinks; following
+            # one (to /dev/zero, say) would hang this process.
+            if py_file.is_symlink() or not py_file.is_file() or py_file.stat().st_size > _MAX_SNAPSHOT_FILE_BYTES:
                 continue
             pristine_file = pristine_dir / py_file.name
             pristine_lines = pristine_file.read_text().splitlines(keepends=True) if pristine_file.exists() else []

@@ -379,6 +379,16 @@ def test_run_config_includes_the_pi_binary(runner_factory):
         assert runner.run_config["pi_bin"] == str(FAKE_PI)
 
 
+def test_run_config_includes_the_scoring_interpreter(runner_factory):
+    """Gated scoring runs pytest under python_executable, so a different
+    interpreter or pytest must not reuse cached scores."""
+    for runner in runner_factory():
+        config = runner.run_config
+        assert config["python_executable"] == runner.python_executable
+        assert config["python_version"] == sys.version.split()[0]
+        assert config["pytest_version"] == pytest.__version__
+
+
 def test_run_config_pi_bin_changes_with_a_different_binary(runner_factory, tmp_path):
     """The pi binary IS the agent under
     test -- omitting it from run_config meant a cache entry produced via

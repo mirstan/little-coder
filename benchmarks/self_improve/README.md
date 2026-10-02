@@ -267,6 +267,39 @@ the `--baseline-only` section). Apply results from the out-dir of the run you
 mean; start any further run in a new `--out-dir`, reusing the warm cache with
 `--live-cache-dir <earlier-out-dir>/live_cache`.
 
+### How self-improve runs are scored
+
+`live_eval.py` runs `aider_polyglot.py` with `POLYGLOT_RESTORE_TESTS=1` and
+`POLYGLOT_CRASH_IS_ERROR=1`. A plain benchmark run sets neither and scores
+exactly as before. With `POLYGLOT_RESTORE_TESTS=1`, each attempt is scored
+in a tree the harness builds itself (`_score_gated` in `aider_polyglot.py`):
+
+- the solution files hold the agent's bytes, and every other prepared file
+  holds its prepared bytes. Files the agent added are left out.
+- python runs `sys.executable -I -m pytest --noconftest -c /dev/null`, and
+  JavaScript runs jest directly rather than through `npm test`. Each writes
+  its report outside the scored tree. A pass needs that report to show
+  every expected test passing; exit code 0 alone is not enough.
+- an attempt that changed a test or runner-config file, or whose solution
+  file is not a regular file or trips the python import tripwire, is scored
+  as a failure by policy. The record sets `tests_tampered`, and
+  `tamper_reasons` says why. Added hook files (`conftest.py`,
+  `package-lock.json` and so on) and edited docs are only reported, because
+  they cannot reach the scored tree.
+
+What this does not close:
+
+- **In-process forging.** Code in the solution runs inside the test process
+  and can still write a passing report and exit. The python tripwire
+  (`_python_tripwire`) rejects the imports and names such code usually
+  needs, which raises the bar but does not rule it out. JavaScript has no
+  tripwire.
+- **A writable interpreter environment.** The agent runs as the same user
+  as the scorer, so it can write to the scoring interpreter's
+  `site-packages` (a `.pth` file runs at startup even under `-I`), to the
+  shared JS `node_modules`, and to `$HOME`. Closing that needs a separate
+  user or a sandbox.
+
 ## Current validation status (see VALIDATION_PLAN.md for the full picture)
 
 - **Layer 2** (real-data ingestion): passing for **aider_polyglot**, **tb**,

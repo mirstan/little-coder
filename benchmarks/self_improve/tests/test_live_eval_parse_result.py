@@ -94,3 +94,54 @@ def test_parse_result_leaves_error_unset_when_the_record_has_no_reason(tmp_path)
     result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
 
     assert result.error is None
+
+
+def test_parse_result_carries_the_tamper_flag_and_capped_reasons(tmp_path):
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    reasons = [f"protected file 'x{i}_test.py' was modified " + "y" * 300 for i in range(15)]
+    _write_results(results_file, "pi/python/wordy",
+                   {"status": "fail", "tests_tampered": True, "tamper_reasons": reasons})
+
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+
+    assert result.tests_tampered is True
+    assert len(result.tamper_reasons) == 10
+    assert all(len(r) <= 200 for r in result.tamper_reasons)
+    assert result.tamper_reasons[0].startswith("protected file 'x0_test.py'")
+
+
+def test_parse_result_ignores_malformed_tamper_fields(tmp_path):
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    _write_results(results_file, "pi/python/wordy",
+                   {"status": "fail", "tests_tampered": "yes", "tamper_reasons": ["ok", 3, None]})
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+    assert result.tests_tampered is False
+    assert result.tamper_reasons == ["ok"]
+
+    _write_results(results_file, "pi/python/wordy", {"status": "fail", "tamper_reasons": "x"})
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+    assert result.tests_tampered is False and result.tamper_reasons == []
+
+
+def test_compute_diff_does_not_follow_a_symlink_in_the_snapshot(tmp_path):
+    """aider_polyglot's trajectory snapshot keeps symlinks as symlinks; one
+    pointing at /dev/zero must not be read here."""
+    runner = _bare_runner()
+    root = tmp_path / "bench"
+    pristine = root / "python" / "exercises" / "practice" / "wordy"
+    pristine.mkdir(parents=True)
+    (pristine / "wordy.py").write_text("stub\n")
+    runner.benchmark_root = root
+    workdir = tmp_path / "workdir_1"
+    workdir.mkdir()
+    (workdir / "wordy.py").write_text("solved\n")
+    (workdir / "zero.py").symlink_to("/dev/zero")
+    diff = runner._compute_diff(ExerciseSpec("wordy"), workdir)
+    assert "+solved" in diff
+    assert "zero.py" not in diff
