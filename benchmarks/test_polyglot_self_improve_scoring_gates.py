@@ -512,16 +512,102 @@ def test_junit_ok_needs_a_regular_file(tmp_path):
 
 
 def test_python_test_names_follow_pytest_collection():
-    src = (b"def test_top(): pass\n"
+    src = (b"import unittest\n"
+           b"import unittest as ut\n"
+           b"from unittest import TestCase as TC, IsolatedAsyncioTestCase\n"
+           b"def test_top(): pass\n"
            b"def helper(): pass\n"
            b"class TestPlain:\n    def test_p(self): pass\n"
+           b"class TestObj(object):\n    def test_o(self): pass\n"
            b"class Base:\n    def test_inherited_only(self): pass\n"
+           b"class Helper(Base):\n    def test_helper(self): pass\n"
+           b"class TestInit:\n    def __init__(self): pass\n    def test_i(self): pass\n"
            b"class Real(unittest.TestCase):\n"
-           b"    def test_r(self):\n        def test_nested(): pass\n")
+           b"    def test_r(self):\n        def test_nested(): pass\n"
+           b"class Aliased(ut.TestCase):\n    def test_u(self): pass\n"
+           b"class Imported(TC):\n    def test_tc(self): pass\n"
+           b"class Sub(Real):\n    def test_s(self): pass\n"
+           b"class Off(unittest.TestCase):\n    __test__ = False\n    def test_off(self): pass\n"
+           b"class OffSub(Off):\n    def test_off_sub(self): pass\n"
+           b"class Async(IsolatedAsyncioTestCase):\n    async def test_a(self): pass\n")
     names = AP._python_test_names({"sub/x_test.py": src}, ["sub/x_test.py"])
-    assert names == frozenset({("sub.x_test", "test_top"), ("sub.x_test.TestPlain", "test_p"),
-                               ("sub.x_test.Real", "test_r")})
+    m = "sub.x_test"
+    assert names == frozenset({
+        (m, "test_top"), (f"{m}.TestPlain", "test_p"), (f"{m}.TestObj", "test_o"),
+        (f"{m}.Real", "test_r"), (f"{m}.Aliased", "test_u"), (f"{m}.Imported", "test_tc"),
+        (f"{m}.Sub", "test_s"), (f"{m}.Async", "test_a"),
+    })
     assert AP._python_test_names({"x_test.py": b"def ("}, ["x_test.py"]) is None
+
+
+_COLLECTION_CASES = {
+    "x_test.py": (
+        "import unittest\n"
+        "import unittest as ut\n"
+        "from unittest import TestCase\n"
+        "from unittest import TestCase as TC\n"
+        "class Base:\n    def test_helper(self): pass\n"
+        "class Helper(Base):\n    def test_x(self): pass\n"
+        "class A(unittest.TestCase):\n    def test_a(self): pass\n"
+        "class B(ut.TestCase):\n    def test_b(self): pass\n"
+        "class C(TestCase):\n    def test_c(self): pass\n"
+        "class D(TC):\n    def test_d(self): pass\n"
+        "class E(A):\n    def test_e(self): pass\n"
+        "class Mixin:\n    def test_m(self): pass\n"
+        "class F(Mixin, unittest.TestCase):\n    def test_f(self): pass\n"
+        "class TestG:\n    def test_g(self): pass\n"
+        "class TestObj(object):\n    def test_o(self): pass\n"
+        "class TestInit:\n    def __init__(self): pass\n    def test_i(self): pass\n"
+        "class G(unittest.IsolatedAsyncioTestCase):\n    async def test_async(self): pass\n"
+        "def test_top(): pass\n"),
+    # an abstract TestCase base: pytest collects neither class
+    "a_test.py": (
+        "import unittest\n"
+        "class Base(unittest.TestCase):\n    __test__ = False\n    def test_base(self): pass\n"
+        "class Sub(Base):\n    def test_sub(self): pass\n"),
+}
+
+
+def test_python_test_names_match_real_pytest_collection(tmp_path):
+    """Never more than pytest collects with the scoring flags: an expected
+    name pytest does not report fails an honest run."""
+    for name, text in _COLLECTION_CASES.items():
+        (tmp_path / name).write_text(text)
+    r = subprocess.run([sys.executable, "-I", "-m", "pytest", "--collect-only", "-q", "--noconftest",
+                        "-c", os.devnull, "--rootdir", ".", "-p", "no:cacheprovider"],
+                       cwd=tmp_path, env=AP._gated_python_env(), capture_output=True, text=True,
+                       timeout=120)
+    collected = set()
+    for line in r.stdout.splitlines():
+        parts = line.strip().split("::")
+        if len(parts) >= 2 and parts[0].endswith(".py"):
+            module = parts[0][:-3].replace("/", ".")
+            collected.add((".".join([module, *parts[1:-1]]), parts[-1]))
+    assert ("x_test", "test_top") in collected, r.stdout + r.stderr
+    files = {name: text.encode() for name, text in _COLLECTION_CASES.items()}
+    names = AP._python_test_names(files, sorted(files))
+    assert names <= collected, sorted(names - collected)
+    assert {c for c, _ in names} >= {"x_test.A", "x_test.B", "x_test.C", "x_test.D", "x_test.E",
+                                     "x_test.F", "x_test.G", "x_test.TestG", "x_test.TestObj"}
+    assert not [n for n in names if n[0] in ("x_test.Helper", "x_test.TestInit") or n[0].startswith("a_test")]
+
+
+def test_a_helper_class_with_test_methods_does_not_fail_an_honest_run(tmp_path):
+    helper = ("\n\nclass Base:\n    pass\n\n\n"
+              "class Helper(Base):\n    def test_x(self):\n        pass\n")
+
+    def mutate(work):
+        _honest(work)
+    src = _py_exercise(tmp_path)
+    (src / "two_fer_test.py").write_text(_TEST + helper)
+    work = tmp_path / "work" / "two-fer"
+    desc = AP.LANG_DESCRIPTORS["python"]
+    stubs, tests = AP._prepare_python(src, work)
+    m = AP._snapshot(src, work, stubs, tests, desc)
+    mutate(work)
+    r = AP._score_gated(desc, work, 60, m)
+    assert r.passed, r.out
+    assert r.tampered == [] and r.rejected == []
 
 
 # ── generic manifest behaviour (fake descriptor) ─────────────────────────

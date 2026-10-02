@@ -408,13 +408,40 @@ def _junit_ok(report: Path, expected) -> tuple[bool, str]:
     return True, ""
 
 
+_TESTCASE_BASES = frozenset({"TestCase", "IsolatedAsyncioTestCase"})
+
+
+def _sets_test_dunder(cls: ast.ClassDef) -> bool:
+    for item in cls.body:
+        targets = (item.targets if isinstance(item, ast.Assign)
+                   else [item.target] if isinstance(item, ast.AnnAssign) else [])
+        if any(isinstance(t, ast.Name) and t.id == "__test__" for t in targets):
+            return True
+    return False
+
+
 def _python_test_names(files: dict, tests) -> frozenset | None:
     """The (classname, name) pairs pytest reports for the pristine tests.
 
-    Counts what pytest collects: module-level test* functions, and test*
-    methods of module-level classes named Test* or with a base class
-    (unittest.TestCase). Nested helpers are not counted. Only files pytest's
-    default patterns pick up. None when a test file does not parse.
+    Approximates pytest's collection rules, erring towards counting less
+    (an expected name pytest does not report fails an honest run; one it
+    reports but this leaves out only weakens _junit_ok's subset check):
+
+    - module-level test* functions;
+    - test* methods defined in the body of a module-level class that
+      subclasses unittest's TestCase or IsolatedAsyncioTestCase (through
+      `import unittest [as x]`, `from unittest import TestCase [as y]`, or
+      an earlier such class in the same file), or that is named Test*, has
+      no base but `object`, and defines no __init__/__new__;
+    - a class that assigns __test__ in its body is skipped, and so are its
+      subclasses here.
+
+    Not counted: inherited methods, nested classes, and bases imported from
+    other modules. Still counted although pytest skips them: a module-level
+    `__test__ = False`, @property test methods, a method-level __test__,
+    @dataclass Test* classes, and names that are later rebound, deleted or
+    defined twice. Only files pytest's default patterns pick up. None when a
+    test file does not parse.
     """
     names = set()
     for rel in sorted(tests):
@@ -427,14 +454,35 @@ def _python_test_names(files: dict, tests) -> frozenset | None:
         except (SyntaxError, ValueError):
             return None
         module = rel[:-3].replace("/", ".")
+        ut_mods: set[str] = set()
+        tc_names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                ut_mods.update(a.asname or a.name for a in node.names if a.name == "unittest")
+            elif isinstance(node, ast.ImportFrom) and node.module == "unittest" and not node.level:
+                tc_names.update(a.asname or a.name for a in node.names if a.name in _TESTCASE_BASES)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
                 names.add((module, node.name))
-            elif isinstance(node, ast.ClassDef) and (node.name.startswith("Test") or node.bases):
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                            and item.name.startswith("test"):
-                        names.add((f"{module}.{node.name}", item.name))
+                continue
+            if not isinstance(node, ast.ClassDef) or _sets_test_dunder(node):
+                continue
+            is_testcase = any(
+                (isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name)
+                 and b.value.id in ut_mods and b.attr in _TESTCASE_BASES)
+                or (isinstance(b, ast.Name) and b.id in tc_names)
+                for b in node.bases)
+            if is_testcase:
+                tc_names.add(node.name)
+            elif not (node.name.startswith("Test")
+                      and all(isinstance(b, ast.Name) and b.id == "object" for b in node.bases)
+                      and not any(isinstance(i, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                  and i.name in ("__init__", "__new__") for i in node.body)):
+                continue
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and item.name.startswith("test"):
+                    names.add((f"{module}.{node.name}", item.name))
     return frozenset(names)
 
 
