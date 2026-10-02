@@ -32,6 +32,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import os
 import signal
 import stat
@@ -342,25 +343,52 @@ def _resolve_components_yaml(repo_root: Path, components_config: str) -> tuple[P
     return repo_root / rel, rel
 
 
-#: An idle iteration costs only cache reads and a gepa_state save, so this
-#: errs long rather than cutting off a run whose next minibatch would have
-#: had something to reflect on.
+#: An iteration charges no metric call when the parent minibatch is all
+#: cache hits and then (a) skip_perfect_score skips reflection, (b) GEPA
+#: swallows a reflection exception (reflective_mutation.py
+#: _propose_texts_batch_safe), (c) reflection proposes no text change, or
+#: (d) the child minibatch is all cache hits too. (b)-(d) still pay for
+#: reflection LM calls, so this errs long only for (a)'s sake: a run whose
+#: next minibatch would have had something to reflect on.
 NO_PROGRESS_MAX_IDLE_ITERATIONS = 20
 
 
 class NoProgressStopper:
     """GEPA stop callback: trips after max_idle_iterations iterations in a row
-    with state.total_num_evals unchanged. A parent minibatch of perfect cache
-    hits charges no metric call (PolyglotGEPAAdapter.evaluate) and
-    skip_perfect_score then skips reflection, so no metric-call budget
-    stopper would end that loop. Counts per state.i, so a repeat
-    check within one iteration is not a second idle iteration."""
+    with state.total_num_evals unchanged (see NO_PROGRESS_MAX_IDLE_ITERATIONS
+    for what charges nothing). No metric-call budget stopper would end that
+    loop. Counts per state.i, so a repeat check within one iteration is not a
+    second idle iteration.
+
+    Also a GEPA callback, so it can tell (a) from (b)/(c): no_proposals is
+    True when the idle window reached reflection (a parent minibatch not
+    skipped) yet never evaluated a child -- nothing was optimized."""
     def __init__(self, max_idle_iterations: int = NO_PROGRESS_MAX_IDLE_ITERATIONS) -> None:
         self.max_idle_iterations = max_idle_iterations
         self.tripped = False
         self._last_i: int | None = None
         self._last_evals: int | None = None
         self._idle = 0
+        # Counted since the last iteration that charged a metric call.
+        self._reflection_reached = 0
+        self._children = 0
+
+    @property
+    def no_proposals(self) -> bool:
+        return self.tripped and self._reflection_reached > 0 and self._children == 0
+
+    def on_evaluation_start(self, event) -> None:
+        # GEPA fires this with candidate_idx None only for a proposed child,
+        # before evaluating it -- so a fully cached child still counts.
+        if event.get("candidate_idx") is None:
+            self._children += 1
+
+    def on_evaluation_end(self, event) -> None:
+        if event.get("candidate_idx") is not None:
+            self._reflection_reached += 1
+
+    def on_evaluation_skipped(self, event) -> None:
+        self._reflection_reached -= 1
 
     def __call__(self, gepa_state) -> bool:
         i, evals = gepa_state.i, gepa_state.total_num_evals
@@ -368,6 +396,8 @@ class NoProgressStopper:
             return self.tripped
         if self._last_i is not None:
             self._idle = self._idle + 1 if evals == self._last_evals else 0
+        if self._idle == 0:
+            self._reflection_reached = self._children = 0
         self._last_i, self._last_evals = i, evals
         if self._idle >= self.max_idle_iterations:
             self.tripped = True
@@ -375,6 +405,14 @@ class NoProgressStopper:
 
 
 def _run_live(args: argparse.Namespace) -> int:
+    # Checked even for --estimate-only, before anything is written: a NaN
+    # deadline makes every LiveBudget/run_batch deadline comparison False,
+    # silently disabling the wall-clock backstop.
+    if not (math.isfinite(args.max_wall_clock_s) and args.max_wall_clock_s > 0):
+        print(f"Refusing to run: --max-wall-clock-s must be a finite number > 0, got "
+              f"{args.max_wall_clock_s}.", file=sys.stderr)
+        return 1
+
     # --estimate-only spends nothing (no worktree, no adapter, no LM call) --
     # it exists precisely to let a human decide whether to authorize the
     # spend gates below, so it must not itself be blocked by them.
@@ -724,7 +762,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 track_best_outputs=True,
                 display_progress_bar=False,
                 run_dir=str(out_dir / "gepa"),
-                callbacks=[spend_log_callback],
+                callbacks=[spend_log_callback, no_progress],
                 seed=args.seed,
                 raise_on_exception=True,
                 stop_callbacks=stop_callbacks,
@@ -738,7 +776,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 print(f"\nHarness error, stopping optimization: {e}", file=sys.stderr)
             # Every valset evaluation up to here was paid for -- keep the best
             # one rather than only GEPA's run_dir state. Exit codes match
-            # --baseline-only's (3 budget, 4 harness).
+            # --baseline-only's (3 budget, 4 harness); 5 is no_proposals below.
             best = spend_log_callback
             if best.best_candidate is None:
                 print("No candidate finished a valset evaluation before the stop -- "
@@ -758,9 +796,18 @@ def _run_live(args: argparse.Namespace) -> int:
             print(f"\nStopped: {no_progress.max_idle_iterations} iterations in a row made no metric call "
                   "(total_num_evals unchanged); ending the run instead of waiting for the wall-clock "
                   "limit.", file=sys.stderr)
+        if no_progress.no_proposals:
+            print("NOT OPTIMIZED: reflection ran but no child candidate was ever evaluated in "
+                  "those iterations -- GEPA swallows reflection errors, so check "
+                  f"{out_dir / 'gepa'}'s log and the reflection model / ${REFLECTION_LM_API_KEY_ENV}. "
+                  "The file written below is the best candidate so far, not an optimized one.",
+                  file=sys.stderr)
         _write_optimized_components(out_dir, result.best_candidate)
-        spend_log.run_end(reason="no_progress" if no_progress.tripped else "completed",
-                          total_metric_calls=getattr(result, "total_metric_calls", None))
+        reason = ("no_proposals" if no_progress.no_proposals
+                  else "no_progress" if no_progress.tripped else "completed")
+        spend_log.run_end(reason=reason, total_metric_calls=getattr(result, "total_metric_calls", None))
+        if no_progress.no_proposals:
+            return 5
 
     return 0
 

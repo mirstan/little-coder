@@ -639,7 +639,8 @@ def test_optimize_overrun_writes_the_best_candidate_seen_so_far(
         seed = dict(kwargs["seed_candidate"])
         improved = {**seed, "agents_md": "---\nname: dup\n---\nImproved instructions.\n"}
         worse = {**seed, "agents_md": "Worse instructions.\n"}
-        for cb in kwargs["callbacks"]:
+        # GEPA's notify_callbacks skips a callback without the method.
+        for cb in [cb for cb in kwargs["callbacks"] if hasattr(cb, "on_valset_evaluated")]:
             cb.on_valset_evaluated(_valset_event(0, seed, 0.5, True))
             cb.on_valset_evaluated(_valset_event(1, improved, 0.8, True))
             cb.on_valset_evaluated(_valset_event(2, worse, 0.1, False))
@@ -737,6 +738,135 @@ def test_optimize_stopped_for_no_progress_records_a_distinct_reason(
     assert run_end["event"] == "run_end"
     assert run_end["reason"] == "no_progress"
     assert run_end["total_metric_calls"] == 3
+
+
+def _parent_evaluated(iteration):
+    return {"iteration": iteration, "candidate_idx": 0}
+
+
+def _parent_skipped(iteration):
+    return {"iteration": iteration, "candidate_idx": 0, "reason": "all_scores_perfect"}
+
+
+def _child_evaluation_started(iteration):
+    return {"iteration": iteration, "candidate_idx": None}
+
+
+def test_no_progress_stopper_flags_an_idle_window_where_reflection_never_produced_a_child():
+    """GEPA 0.1.4 swallows a reflection exception (reflective_mutation.py
+    _propose_texts_batch_safe), so a broken reflection model evaluates no
+    child and charges nothing -- the same zero-eval signature as a perfect
+    cache hit, but nothing was optimized."""
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=2)
+    stopper(_gepa_state(-1, 4))
+    for i in range(3):
+        stopper.on_evaluation_end(_parent_evaluated(i))
+        stopper(_gepa_state(i, 4))
+    assert stopper.tripped is True
+    assert stopper.no_proposals is True
+
+
+def test_no_progress_stopper_is_not_no_proposals_when_a_cached_child_was_evaluated():
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=2)
+    stopper(_gepa_state(-1, 4))
+    for i in range(3):
+        stopper.on_evaluation_end(_parent_evaluated(i))
+        stopper.on_evaluation_start(_child_evaluation_started(i))
+        stopper(_gepa_state(i, 4))
+    assert stopper.tripped is True
+    assert stopper.no_proposals is False
+
+
+def test_no_progress_stopper_is_not_no_proposals_when_every_parent_was_skipped_as_perfect():
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=2)
+    stopper(_gepa_state(-1, 4))
+    for i in range(3):
+        stopper.on_evaluation_start({"iteration": i, "candidate_idx": 0})
+        stopper.on_evaluation_end(_parent_evaluated(i))
+        stopper.on_evaluation_skipped(_parent_skipped(i))
+        stopper(_gepa_state(i, 4))
+    assert stopper.tripped is True
+    assert stopper.no_proposals is False
+
+
+def test_no_progress_stopper_forgets_a_childless_iteration_that_charged_a_metric_call():
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=2)
+    stopper(_gepa_state(-1, 0))
+    stopper.on_evaluation_end(_parent_evaluated(0))  # a reflection failure, but it paid a live run
+    stopper(_gepa_state(0, 2))
+    for i in (1, 2):
+        stopper.on_evaluation_end(_parent_evaluated(i))
+        stopper.on_evaluation_skipped(_parent_skipped(i))
+        stopper(_gepa_state(i, 2))
+    assert stopper.tripped is True
+    assert stopper.no_proposals is False
+
+
+@pytest.mark.parametrize("emit_child,expected_code,expected_reason", [
+    (False, 5, "no_proposals"),
+    (True, 0, "no_progress"),
+])
+def test_optimize_stopped_without_any_proposal_exits_non_zero_as_no_proposals(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys, emit_child, expected_code, expected_reason,
+):
+    """Without a child evaluation in the idle window, a run whose reflection
+    model was failing used to exit 0 as no_progress with the seed written as
+    optimized_components.yaml."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        (stopper,) = [s for s in kwargs["stop_callbacks"] if isinstance(s, run_gepa.NoProgressStopper)]
+        callbacks = kwargs["callbacks"]
+
+        def notify(method, event):
+            for cb in callbacks:
+                if hasattr(cb, method):
+                    getattr(cb, method)(event)
+
+        i = -1
+        while not stopper(_gepa_state(i, 3)):
+            i += 1
+            notify("on_evaluation_start", {"iteration": i, "candidate_idx": 0})
+            notify("on_evaluation_end", _parent_evaluated(i))
+            if emit_child:
+                notify("on_evaluation_start", _child_evaluation_started(i))
+        return type("Result", (), {"best_candidate": dict(kwargs["seed_candidate"]),
+                                   "total_metric_calls": 3})()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == expected_code
+    assert (out_dir / "optimized_components.yaml").exists()
+    err = capsys.readouterr().err.lower()
+    assert ("reflection" in err and "not optimized" in err) is (not emit_child)
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["reason"] == expected_reason
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-1"])
+@pytest.mark.parametrize("mode", ["--estimate-only", "--baseline-only"])
+def test_refuses_a_non_finite_or_non_positive_max_wall_clock_before_writing_anything(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys, value, mode,
+):
+    """A NaN deadline makes every LiveBudget/run_batch deadline comparison
+    False, silently disabling the wall-clock backstop."""
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    out_dir = tmp_path / "run_out"
+    code = _run_main([
+        "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
+        "--benchmark-root", str(fake_practice), "--exercises", "wordy,acronym",
+        "--exercise-count", "2", "--val-count", "1",
+        "--model", "gpt-fake", "--confirm-live-rollouts", "--max-metric-calls", "5",
+        "--out-dir", str(out_dir), "--scratch-dir", str(tmp_path / "scratch"),
+        "--pi-bin", str(FAKE_PI), "--max-wall-clock-s", value, mode, "--yes",
+    ])
+    assert code == 1
+    assert "--max-wall-clock-s" in capsys.readouterr().err
+    assert not out_dir.exists()
 
 
 def test_baseline_run_writes_the_manifest_before_any_spend(source_repo, fake_practice, tmp_path, monkeypatch):
