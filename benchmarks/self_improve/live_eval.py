@@ -879,7 +879,7 @@ class PolyglotLiveRunner:
         test_output_tail = ""
         final_output = ex_log_dir / "final_output.txt"
         if final_output.exists():
-            test_output_tail = final_output.read_text()[-_MAX_TAIL_CHARS:]
+            test_output_tail = final_output.read_text(errors="replace")[-_MAX_TAIL_CHARS:]
 
         transcript_excerpt = ""
         reasoning_excerpt = ""
@@ -897,24 +897,24 @@ class PolyglotLiveRunner:
         traj_files = sorted(ex_log_dir.glob("trajectory_*.json"), key=_attempt_num)
         for traj_file in traj_files:
             try:
-                traj_data = json.loads(traj_file.read_text())
+                traj_data = json.loads(traj_file.read_bytes())
                 notifications.extend(
                     f"[{n.get('notifyType', 'info')}] {n.get('message', '')}"
                     for n in traj_data.get("notifications", [])
                 )
-            except (json.JSONDecodeError, OSError):
+            except (ValueError, OSError, RecursionError):
                 pass
         if traj_files:
             latest = traj_files[-1]
             try:
-                traj_data = json.loads(latest.read_text())
+                traj_data = json.loads(latest.read_bytes())
                 full_assistant_text = traj_data.get("assistant_text") or ""
                 transcript_excerpt = full_assistant_text[-_MAX_TRANSCRIPT_CHARS:]
                 reasoning_excerpt = _reasoning_excerpt_from_trajectory(traj_data)
                 summarized_transcript = summarize_for_reflection(
                     full_assistant_text, traj_data.get("tool_calls") or [],
                 )
-            except (json.JSONDecodeError, OSError):
+            except (ValueError, OSError, RecursionError):
                 pass
             workdir = ex_log_dir / f"workdir_{_attempt_num(latest)}"
             if workdir.is_dir():
@@ -962,8 +962,14 @@ class PolyglotLiveRunner:
             if py_file.is_symlink() or not py_file.is_file() or py_file.stat().st_size > _MAX_SNAPSHOT_FILE_BYTES:
                 continue
             pristine_file = pristine_dir / py_file.name
-            pristine_lines = pristine_file.read_text().splitlines(keepends=True) if pristine_file.exists() else []
-            new_lines = py_file.read_text().splitlines(keepends=True)
+            # errors="replace": the snapshot holds the agent's raw bytes, and
+            # a UnicodeDecodeError here would escape after the paid run,
+            # before run_batch() records it against the budget or reports it.
+            pristine_lines = (
+                pristine_file.read_text(errors="replace").splitlines(keepends=True)
+                if pristine_file.exists() else []
+            )
+            new_lines = py_file.read_text(errors="replace").splitlines(keepends=True)
             diff = difflib.unified_diff(
                 pristine_lines, new_lines,
                 fromfile=f"pristine/{py_file.name}", tofile=f"agent/{py_file.name}",

@@ -1003,6 +1003,41 @@ def test_non_utf8_results_file_is_retried_then_raises_harness_error(runner_facto
     assert not list((tmp_path / "cache").rglob("*.json"))
 
 
+def test_a_non_utf8_agent_file_still_reaches_the_budget_and_on_result(runner_factory, tmp_path):
+    """The child scores a pass and its snapshot holds an agent file with one
+    latin-1 byte. _compute_diff used to raise UnicodeDecodeError after the
+    run, so run_batch() never recorded it against the budget, never reported
+    it to on_result, and never cached it."""
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget
+
+    child = tmp_path / "latin1_snapshot_child.sh"
+    child.write_text(
+        '#!/bin/sh\n'
+        '[ -n "$POLYGLOT_RESULTS_FILE" ] || exit 1\n'
+        'd="$POLYGLOT_LOG_ROOT/pi/python/wordy"\n'
+        'mkdir -p "$d/workdir_1"\n'
+        "printf '{}' > \"$d/trajectory_1.json\"\n"
+        "printf 'x = \\047\\351\\047\\n' > \"$d/workdir_1/wordy.py\"\n"
+        "printf '{\"exercises\": {\"pi/python/wordy\": {\"status\": \"pass_1\"}}}' "
+        '> "$POLYGLOT_RESULTS_FILE"\n'
+    )
+    child.chmod(0o755)
+    cache = LiveResultCache(tmp_path / "cache")
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=5)
+    seen = []
+    for runner in runner_factory(cache=cache, budget=budget, on_result=seen.append):
+        runner.python_executable = str(child)
+        results = runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert results[0].status == "pass_1"
+    assert "agent/wordy.py" in results[0].diff_summary
+    assert [r.status for r in seen] == ["pass_1"]
+    assert budget.live_runs == 1
+    assert len(list((tmp_path / "cache").rglob("*.json"))) == 1
+
+
 def test_live_run_result_from_dict_ignores_an_unknown_key():
     """A stray key in a cache entry must load, not raise TypeError -- a cache
     read can't be allowed to kill an in-flight run."""

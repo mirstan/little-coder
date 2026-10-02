@@ -182,3 +182,46 @@ def test_parse_result_treats_a_schema_invalid_results_file_as_a_harness_error(tm
     assert result.status == "harness_error"
     assert result.score == 0.0 and result.success is False
     assert result.error
+
+
+def test_parse_result_tolerates_non_utf8_trajectory_and_final_output(tmp_path):
+    """Reflection material degrades quietly: the status still comes from the
+    results record when the trajectory or final_output.txt is not UTF-8."""
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    ex_log_dir = log_root / "pi" / "python" / "wordy"
+    ex_log_dir.mkdir(parents=True)
+    _write_results(results_file, "pi/python/wordy", {"status": "pass_1"})
+    (ex_log_dir / "trajectory_1.json").write_bytes(b'{"assistant_text": "caf\xe9"}')
+    (ex_log_dir / "final_output.txt").write_bytes(b"1 passed \xff\n")
+
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+
+    assert result.status == "pass_1"
+    assert result.score == 1.0
+    assert "1 passed" in result.test_output_tail
+
+
+@pytest.mark.parametrize("side", ["agent", "pristine"])
+def test_compute_diff_tolerates_a_non_utf8_file(tmp_path, side):
+    """aider_polyglot copies the agent's raw files into the snapshot, so one
+    latin-1 byte used to raise UnicodeDecodeError here: after the paid run,
+    before run_batch() recorded it against the budget or reported it."""
+    runner = _bare_runner()
+    root = tmp_path / "bench"
+    pristine = root / "python" / "exercises" / "practice" / "wordy"
+    pristine.mkdir(parents=True)
+    runner.benchmark_root = root
+    workdir = tmp_path / "workdir_1"
+    workdir.mkdir()
+    if side == "agent":
+        (pristine / "wordy.py").write_text("stub\n")
+        (workdir / "wordy.py").write_bytes(b"x = '\xe9'\n")
+    else:
+        (pristine / "wordy.py").write_bytes(b"x = '\xe9'\n")
+        (workdir / "wordy.py").write_text("solved\n")
+
+    diff = runner._compute_diff(ExerciseSpec("wordy"), workdir)
+
+    assert "agent/wordy.py" in diff
