@@ -122,7 +122,18 @@ redundant safety, not a bug to work around:
 `benchmarks/self_improve/.env` are orchestrator-only: `run_gepa` removes them
 from the environment of the agent-under-test, its bash tool, and the
 exercise test runs. The startup banner lists the withheld names (never their
-values). Put the model-under-test's provider key in your shell or pi's
+values). That environment also loses git's repository-location and
+config-override variables: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` and the rest of
+`git rev-parse --local-env-vars`, plus `GIT_ATTR_SOURCE`, `GIT_NAMESPACE` and
+`GIT_QUARANTINE_PATH`. Without that, starting `run_gepa` from a git hook
+(a pre-commit hook in a linked worktree exports an absolute `GIT_DIR` and
+`GIT_INDEX_FILE`) or from a shell that exports them would make the agent's
+own git commands act on your checkout. `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM` and other git settings such as
+`GIT_EXEC_PATH` or `GIT_AUTHOR_*` reach the agent unchanged, since they
+choose your git config or installation, not a repository. Put the model-under-test's provider key in your shell or pi's
 config, not in this `.env`. A run knob the agent reads itself
 (`ATTEMPT_TIMEOUT_S`, `CODEX_TIMEOUT_S`, or any `LITTLE_CODER_*` / `PI_*`
 name) is refused if it appears in the `.env`, because the orchestrator and

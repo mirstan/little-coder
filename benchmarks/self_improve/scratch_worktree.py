@@ -26,7 +26,8 @@ Design choices, all deliberate:
   scratch repo is hardened rather than trusting G or the tree:
     * config is pinned: GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1,
       and the git location/config env vars (`git rev-parse
-      --local-env-vars`, GIT_CONFIG_KEY_*/VALUE_*, GIT_ATTR_SOURCE) removed;
+      --local-env-vars`, GIT_CONFIG_KEY_*/VALUE_*, GIT_ATTR_SOURCE,
+      GIT_NAMESPACE, GIT_QUARANTINE_PATH) removed;
       GIT_COMMON_DIR is then pinned to G, so a planted G/commondir cannot
       redirect config, refs or objects elsewhere;
     * before every call (ScratchWorktree._verify_git_dir): the tree and G
@@ -81,6 +82,12 @@ Design choices, all deliberate:
   handed to a subprocess with an arbitrary cwd). The tree has no
   node_modules of its own (gitignored, never fetched); a symlink placed
   there by hand survives reset() because `clean` excludes node_modules.
+- ScratchWorktree.env(), the environment of everything the agent runs,
+  drops the orchestrator-only secrets and the same git location/config
+  variables (but not the user's GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM), so an
+  orchestrator started from a git hook -- a pre-commit hook in a linked
+  worktree exports an absolute GIT_DIR and GIT_INDEX_FILE -- does not point
+  the agent's own git commands at the caller's repository.
 """
 from __future__ import annotations
 
@@ -313,15 +320,29 @@ def _git_local_env_vars() -> frozenset[str]:
     return _FALLBACK_LOCAL_ENV_VARS | frozenset(out.split()) | {"GIT_ATTR_SOURCE"}
 
 
+#: Repository-specific variables that are not in `--local-env-vars`: set by
+#: git for hooks run on a namespaced or quarantined push.
+_REPO_SCOPED_ENV_VARS = frozenset({"GIT_NAMESPACE", "GIT_QUARANTINE_PATH"})
+
+
+def _without_git_overrides(env: Mapping[str, str], withheld: Iterable[str] = ()) -> dict[str, str]:
+    """A copy of `env` minus `withheld` and every git repository-location or
+    config override: `git rev-parse --local-env-vars`, GIT_ATTR_SOURCE,
+    GIT_CONFIG_KEY_*/VALUE_*, GIT_NAMESPACE and GIT_QUARANTINE_PATH.
+    GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM, GIT_EXEC_PATH and the like are kept:
+    they choose the user's config or installation, not a repository."""
+    drop = frozenset(withheld) | _git_local_env_vars() | _REPO_SCOPED_ENV_VARS
+    return {
+        k: v for k, v in env.items()
+        if k not in drop and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
+
+
 def _git_env(withheld: Iterable[str] = ()) -> dict[str, str]:
     """Environment for the orchestrator's own git calls: os.environ minus
     the orchestrator-only secrets and every git location/config override,
     with user and system config pinned off."""
-    drop = ALWAYS_ORCHESTRATOR_ONLY_ENV | frozenset(withheld) | _git_local_env_vars()
-    env = {
-        k: v for k, v in os.environ.items()
-        if k not in drop and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-    }
+    env = _without_git_overrides(os.environ, ALWAYS_ORCHESTRATOR_ONLY_ENV | frozenset(withheld))
     env.pop("GIT_CONFIG_SYSTEM", None)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -655,9 +676,17 @@ class ScratchWorktree:
         exercise's tests) inherits this environment, so the reflection LM's
         key and the other orchestrator-only names are removed here. Neither
         `base` nor os.environ is modified. The override is set after the
-        removal, so naming it orchestrator-only cannot drop it."""
+        removal, so naming it orchestrator-only cannot drop it.
+
+        It also drops git's repository-location and config-override
+        variables (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR,
+        GIT_CONFIG_PARAMETERS, ...; see _without_git_overrides). Otherwise an
+        orchestrator started from a git hook, or from a shell exporting them,
+        would point the agent's own git commands at the caller's repository.
+        The user's own config selection (GIT_CONFIG_GLOBAL etc.) is passed
+        through unchanged."""
         withheld = ALWAYS_ORCHESTRATOR_ONLY_ENV | self.orchestrator_only_env
-        merged = {k: v for k, v in (base if base is not None else os.environ).items() if k not in withheld}
+        merged = _without_git_overrides(base if base is not None else os.environ, withheld)
         merged["LITTLE_CODER_PI_BIN_OVERRIDE"] = str(self.pi_bin)
         return merged
 

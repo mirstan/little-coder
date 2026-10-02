@@ -917,6 +917,58 @@ def test_env_from_os_environ_strips_the_key_without_touching_os_environ(source_r
     assert os.environ["REFLECTION_LM_API_KEY"] == "sk-sentinel"
 
 
+_GIT_OVERRIDES_STRIPPED = {
+    "GIT_ATTR_SOURCE": "x", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/x",
+    "GIT_NAMESPACE": "ns", "GIT_QUARANTINE_PATH": "/q",
+}
+_GIT_SETTINGS_KEPT = {
+    "GIT_CONFIG_GLOBAL": "/u/gitconfig", "GIT_CONFIG_SYSTEM": "/etc/x", "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "Dev", "GIT_EXEC_PATH": "/opt/git/libexec", "GIT_SSH_COMMAND": "ssh -i k",
+}
+
+
+def test_env_strips_git_location_and_config_override_vars(source_repo, tmp_path):
+    base = {**_ENV_BASE, **{n: "planted" for n in sw._FALLBACK_LOCAL_ENV_VARS},
+            **_GIT_OVERRIDES_STRIPPED, **_GIT_SETTINGS_KEPT}
+    snapshot = dict(base)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        env = wt.env(base)
+    for name in [*sw._FALLBACK_LOCAL_ENV_VARS, *_GIT_OVERRIDES_STRIPPED]:
+        assert name not in env, name
+    # Passed through as given: env() does not apply _git_env's /dev/null pin.
+    for name, value in _GIT_SETTINGS_KEPT.items():
+        assert env[name] == value, name
+    assert env["OMLX_API_KEY"] == "model-sentinel"
+    assert env["LITTLE_CODER_PI_BIN_OVERRIDE"] == str((tmp_path / "pi").resolve())
+    assert base == snapshot
+
+
+def test_agent_git_in_its_own_dir_ignores_an_inherited_git_dir(source_repo, tmp_path):
+    """A pre-commit hook run in a linked worktree exports an absolute
+    GIT_DIR/GIT_INDEX_FILE. If run_gepa is started from one, the agent's own
+    git commands must not act on that repository."""
+    other = _init_repo(tmp_path / "exercise")
+    leaky = {**os.environ, "GIT_DIR": str(source_repo / ".git"), "GIT_WORK_TREE": str(source_repo)}
+
+    def _git_dir(env):
+        out = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=other, env=env,
+                             capture_output=True, text=True, check=True).stdout.strip()
+        return os.path.realpath(out)
+
+    # Negative control: the leaked variables do redirect git.
+    assert _git_dir(leaky) == os.path.realpath(source_repo / ".git")
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        assert _git_dir(wt.env(leaky)) == os.path.realpath(other / ".git")
+
+
+def test_git_env_also_strips_namespace_and_quarantine(monkeypatch):
+    monkeypatch.setenv("GIT_NAMESPACE", "ns")
+    monkeypatch.setenv("GIT_QUARANTINE_PATH", "/q")
+    env = sw._git_env()
+    assert "GIT_NAMESPACE" not in env
+    assert "GIT_QUARANTINE_PATH" not in env
+
+
 def test_python_is_new_enough_for_safe_rmtree():
     assert shutil.rmtree.avoids_symlink_attacks, sys.platform
 
