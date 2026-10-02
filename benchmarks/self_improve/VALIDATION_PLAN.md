@@ -168,7 +168,10 @@ own iteration loop, so live executions are capped at exactly `--max-metric-calls
 5. Record wall-clock time and, if the reflection model API reports usage/cost,
    record that too. `spend_log.jsonl` (append-only, flushed per line) is the
    authoritative record of what actually ran, regardless of how the process exited.
-6. Read the resulting `apply_results.py`-produced diff for `skills/tools/bash.md`:
+6. Apply the run's output as Layer 5 step 1 describes (a local commit in a
+   disposable worktree; nothing is pushed), then read that
+   `apply_results.py`-produced diff for `skills/tools/bash.md`
+   (`git -C <scratch-dir> show self-improve/layer5-apply`):
    - Frontmatter block is byte-identical to before, except its `token_cost:` line
      (the one deliberate exception `write_components_back` makes -- see
      `TDD_SPEC.md` §7.2's "Contract update" -- when the rewritten body's estimated
@@ -188,7 +191,7 @@ own iteration loop, so live executions are capped at exactly `--max-metric-calls
      match what `spend_log.jsonl` actually recorded, not re-deriving them from a
      frozen dataset.
 
-**Pass criterion**: run completes within a documented cost/time budget, PR diff is
+**Pass criterion**: run completes within a documented cost/time budget, applied diff is
 human-legible and correct (frontmatter untouched except for a possible `token_cost:`
 update, body coherent), reported score delta matches `spend_log.jsonl`.
 
@@ -212,10 +215,31 @@ confuse the model in-context, etc). Layer 5 re-runs against exercises/tasks
 independent of Layer 4's own pool.
 
 **Procedure**:
-1. Check out the PR branch from Layer 4 into a **separate scratch worktree** (not
+1. Apply the Layer 4 run's output in a **separate scratch worktree** (not
    `dev`, not `main`, not the `self-improve/gepa-loop` worktree itself — a fourth,
    disposable one), so the live re-run doesn't collide with ongoing implementation
-   work.
+   work. `run_gepa.py` creates no branch and edits no component file; it only
+   writes `<new-out-dir>/optimized_components.yaml` (README's "Applying results").
+   Start the worktree at the commit the run read its seed from, recorded as
+   `env_fingerprint.repo_head` in `<new-out-dir>/manifest.yaml`, then apply
+   locally with `push_and_open_pr=False` (`<new-out-dir>` absolute):
+
+   ```
+   git worktree add --detach <scratch-dir> "$(yq '.env_fingerprint.repo_head' <new-out-dir>/manifest.yaml)"
+   cd <scratch-dir> && python -c '
+   import yaml; from pathlib import Path
+   from benchmarks.self_improve.apply_results import apply_and_open_pr
+   apply_and_open_pr(Path("<scoped yaml>"), Path("."),
+       yaml.safe_load(Path("<new-out-dir>/optimized_components.yaml").read_text()),
+       {}, "self-improve/layer5-apply", push_and_open_pr=False)'
+   ```
+
+   `<scoped yaml>` is the `--components-config` the Layer 4 run used. This
+   commits the rewrite to a new local branch, `self-improve/layer5-apply`, and
+   pushes nothing. If no commit appears (`git log -1` still shows `repo_head`),
+   every optimized body matched its seed, and there is nothing to compare. The
+   **baseline** for the comparison below is the pre-apply commit, `repo_head`;
+   the **candidate** is the branch's commit.
 2. Identify the exercises in the **`splits.test`** list of the Layer 4 run's
    `<new-out-dir>/manifest.yaml` (e.g. `yq '.splits.test[]'
    <new-out-dir>/manifest.yaml`). That split is drawn disjoint from the search
@@ -225,8 +249,9 @@ independent of Layer 4's own pool.
    so a pass rate measured on it is selection-biased.
 3. Re-run those test-split exercises for real, through the actual harness
    (`aider_polyglot.py --exercise <name> --language <manifest's language>` per
-   exercise), once with the OLD `bash.md` (checked out from `dev`) and
-   once with the NEW `bash.md` (from the PR branch) — same model, same seed/params
+   exercise) in `<scratch-dir>`, once with the OLD `bash.md` (the baseline:
+   `git checkout --detach <repo_head>`) and once with the NEW `bash.md` (the
+   candidate: `git checkout self-improve/layer5-apply`) — same model, same seed/params
    where controllable, to isolate the skill-file change as the only variable.
 4. Compare live pass/fail outcomes before vs. after on this held-out set. This is
    the number that actually matters — not GEPA's internally reported score delta
@@ -237,8 +262,8 @@ independent of Layer 4's own pool.
    regressions that a binary pass/fail metric would miss.
 
 **Pass criterion**: held-out live pass rate is non-regressive (ideally improved)
-compared to the old skill text. A regression here means the PR should not be
-merged even if Layer 4's offline score delta was positive — treat Layer 5 as
+compared to the old skill text. A regression here means the rewrite should not be
+opened as a PR or merged, even if Layer 4's offline score delta was positive — treat Layer 5 as
 overriding Layer 4, not merely confirming it.
 
 ---
