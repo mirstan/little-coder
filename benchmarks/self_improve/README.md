@@ -272,14 +272,21 @@ python -m benchmarks.self_improve.report_trajectories \
 
 ### Cleaning up scratch repos
 
-A run that is SIGKILLed (or one passed `--keep-scratch`) leaves its scratch
-tree, `<tree>.git`, `<tree>.marker.json` and `<tree>.lock` in the scratch
-parent dir. List or remove orphans with:
+A run that is SIGKILLed leaves its scratch tree, `<tree>.git`,
+`<tree>.marker.json` and `<tree>.lock` in the scratch parent dir. A run
+passed `--keep-scratch` leaves the tree, `<tree>.git` and the marker, but
+releases and deletes its lock on exit, so a preserved tree has no
+`<tree>.lock` and the GC judges it by the marker alone. List or remove
+orphans with:
 
 ```bash
 python -m benchmarks.self_improve.gepa_scratch_gc --list  [--scratch-root DIR]
 python -m benchmarks.self_improve.gepa_scratch_gc --clean [--scratch-root DIR] [--older-than-hours 6] [--yes]
 ```
+
+`--older-than-hours` defaults to 0, which means no grace period: every
+removable entry is removed, however recent. Pass it explicitly (6 above) to
+remove only entries whose marker records a creation time at least that old.
 
 `--scratch-root` defaults to the system temp dir, which is also where
 `run_gepa` puts scratch repos by default; if the run used `--scratch-dir X`,
@@ -302,7 +309,9 @@ A run whose reflection attempts never produced an evaluated child anywhere
 in the run (GEPA swallows reflection errors), so its best candidate is still
 the seed, still writes the file, but it is not optimized: `run_end` carries
 `reason: no_proposals` and the exit code is 5, whichever stop condition
-ended the run. A run that evaluated children but found none better than the
+ended the run, provided `gepa.optimize()` returned normally. A budget
+backstop or harness error raised out of it exits 3 or 4 as above before this
+check is reached. A run that evaluated children but found none better than the
 seed exits 0 with the seed written.
 Use `apply_results.py`'s `apply_and_open_pr()` (or its
 lower-level `create_branch_and_commit()`) to write the optimized text back
