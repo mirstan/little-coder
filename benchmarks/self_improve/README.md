@@ -192,10 +192,12 @@ files directly (the scratch worktree it ran in is destroyed on exit unless
 harness error stops `gepa.optimize()` early, the file still holds the best
 candidate GEPA had scored on the valset so far; `spend_log.jsonl`'s `run_end`
 then carries `partial: true` and the exit code is 3 (budget) or 4 (harness).
-A run that stops after repeated reflection attempts that never produced an
-evaluated child (GEPA swallows reflection errors) still writes the file, but
-it is not optimized: `run_end` carries `reason: no_proposals` and the exit
-code is 5.
+A run whose reflection attempts never produced an evaluated child anywhere
+in the run (GEPA swallows reflection errors), so its best candidate is still
+the seed, still writes the file, but it is not optimized: `run_end` carries
+`reason: no_proposals` and the exit code is 5, whichever stop condition
+ended the run. A run that evaluated children but found none better than the
+seed exits 0 with the seed written.
 Use `apply_results.py`'s `apply_and_open_pr()` (or its
 lower-level `create_branch_and_commit()`) to write the optimized text back
 into the real files, preserving each skill file's YAML frontmatter untouched

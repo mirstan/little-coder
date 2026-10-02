@@ -847,6 +847,81 @@ def test_optimize_stopped_without_any_proposal_exits_non_zero_as_no_proposals(
     assert run_end["reason"] == expected_reason
 
 
+def _notifier(callbacks):
+    def notify(method, event):
+        for cb in callbacks:
+            if hasattr(cb, method):
+                getattr(cb, method)(event)
+    return notify
+
+
+def test_optimize_that_improved_then_lost_reflection_is_not_reported_not_optimized(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    """A run that accepted a valset improvement and later lost its reflection
+    model trips NoProgressStopper in a childless window. Its best candidate is
+    the improved one, so it must not exit 5 as not optimized."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        (stopper,) = [s for s in kwargs["stop_callbacks"] if isinstance(s, run_gepa.NoProgressStopper)]
+        notify = _notifier(kwargs["callbacks"])
+        seed = dict(kwargs["seed_candidate"])
+        improved = {**seed, "agents_md": "Improved instructions.\n"}
+        notify("on_valset_evaluated", _valset_event(0, seed, 0.5, True))
+        stopper(_gepa_state(-1, 2))
+        notify("on_evaluation_end", _parent_evaluated(0))
+        notify("on_evaluation_start", _child_evaluation_started(0))
+        notify("on_valset_evaluated", _valset_event(1, improved, 0.8, True))
+        i = 0
+        while not stopper(_gepa_state(i, 5)):
+            i += 1
+            notify("on_evaluation_end", _parent_evaluated(i))
+        return type("Result", (), {"best_candidate": improved, "total_metric_calls": 5})()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == 0
+    assert "not optimized" not in capsys.readouterr().err.lower()
+    written = yaml.safe_load((out_dir / "optimized_components.yaml").read_text())
+    assert written["agents_md"] == "Improved instructions.\n"
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["reason"] == "no_progress"
+
+
+def test_optimize_with_dead_reflection_ended_by_another_stopper_exits_as_no_proposals(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    """Reflection failing from the first iteration, with the run ended by a
+    stopper other than NoProgressStopper (metric budget, wall clock, stop
+    file), used to exit 0 as completed with the seed written as optimized."""
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        notify = _notifier(kwargs["callbacks"])
+        seed = dict(kwargs["seed_candidate"])
+        notify("on_valset_evaluated", _valset_event(0, seed, 0.5, True))
+        for i in range(3):  # each parent minibatch charges a metric call
+            notify("on_evaluation_start", {"iteration": i, "candidate_idx": 0})
+            notify("on_evaluation_end", _parent_evaluated(i))
+        return type("Result", (), {"best_candidate": seed, "total_metric_calls": 6})()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == 5
+    assert "not optimized" in capsys.readouterr().err.lower()
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["reason"] == "no_proposals"
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1"])
 @pytest.mark.parametrize("mode", ["--estimate-only", "--baseline-only"])
 def test_refuses_a_non_finite_or_non_positive_max_wall_clock_before_writing_anything(

@@ -362,7 +362,9 @@ class NoProgressStopper:
 
     Also a GEPA callback, so it can tell (a) from (b)/(c): no_proposals is
     True when the idle window reached reflection (a parent minibatch not
-    skipped) yet never evaluated a child -- nothing was optimized."""
+    skipped) yet never evaluated a child. The window counters only explain a
+    stop; reflection_total/children_total count the whole run and are never
+    reset, for _run_live's run-level "not optimized" verdict."""
     def __init__(self, max_idle_iterations: int = NO_PROGRESS_MAX_IDLE_ITERATIONS) -> None:
         self.max_idle_iterations = max_idle_iterations
         self.tripped = False
@@ -372,6 +374,8 @@ class NoProgressStopper:
         # Counted since the last iteration that charged a metric call.
         self._reflection_reached = 0
         self._children = 0
+        self.reflection_total = 0
+        self.children_total = 0
 
     @property
     def no_proposals(self) -> bool:
@@ -382,13 +386,16 @@ class NoProgressStopper:
         # before evaluating it -- so a fully cached child still counts.
         if event.get("candidate_idx") is None:
             self._children += 1
+            self.children_total += 1
 
     def on_evaluation_end(self, event) -> None:
         if event.get("candidate_idx") is not None:
             self._reflection_reached += 1
+            self.reflection_total += 1
 
     def on_evaluation_skipped(self, event) -> None:
         self._reflection_reached -= 1
+        self.reflection_total -= 1
 
     def __call__(self, gepa_state) -> bool:
         i, evals = gepa_state.i, gepa_state.total_num_evals
@@ -796,17 +803,32 @@ def _run_live(args: argparse.Namespace) -> int:
             print(f"\nStopped: {no_progress.max_idle_iterations} iterations in a row made no metric call "
                   "(total_num_evals unchanged); ending the run instead of waiting for the wall-clock "
                   "limit.", file=sys.stderr)
-        if no_progress.no_proposals:
+        # Judged over the whole run, whichever stopper ended it: the seed is
+        # still the best (GEPA reports the seed as candidate_idx 0) and
+        # reflection ran yet no child was ever evaluated. A run whose every
+        # parent was skipped as perfect never reached reflection.
+        seed_is_best = spend_log_callback.best_candidate_idx in (None, 0)
+        not_optimized = (seed_is_best and no_progress.reflection_total > 0
+                         and no_progress.children_total == 0)
+        if not_optimized:
             print("NOT OPTIMIZED: reflection ran but no child candidate was ever evaluated in "
-                  "those iterations -- GEPA swallows reflection errors, so check "
+                  "this run -- GEPA swallows reflection errors, so check "
                   f"{out_dir / 'gepa'}'s log and the reflection model / ${REFLECTION_LM_API_KEY_ENV}. "
-                  "The file written below is the best candidate so far, not an optimized one.",
+                  "The file written below is the seed, not an optimized candidate.",
+                  file=sys.stderr)
+        elif seed_is_best:
+            print("No candidate beat the seed on the valset; the file written below is the seed.",
+                  file=sys.stderr)
+        elif no_progress.no_proposals:
+            print("Reflection produced no child candidate in the idle iterations before the stop -- "
+                  f"check {out_dir / 'gepa'}'s log. The run's best candidate is "
+                  f"#{spend_log_callback.best_candidate_idx}, from earlier iterations.",
                   file=sys.stderr)
         _write_optimized_components(out_dir, result.best_candidate)
-        reason = ("no_proposals" if no_progress.no_proposals
+        reason = ("no_proposals" if not_optimized
                   else "no_progress" if no_progress.tripped else "completed")
         spend_log.run_end(reason=reason, total_metric_calls=getattr(result, "total_metric_calls", None))
-        if no_progress.no_proposals:
+        if not_optimized:
             return 5
 
     return 0
