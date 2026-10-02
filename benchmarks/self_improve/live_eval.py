@@ -125,6 +125,41 @@ def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
     return value
 
 
+#: Directories skipped by _exercise_inputs_fingerprint: caches a local
+#: pytest run can leave inside a benchmark checkout, which the child never
+#: reads as an input.
+_FINGERPRINT_SKIP_DIRS = frozenset({"__pycache__", ".pytest_cache"})
+
+
+def _exercise_inputs_fingerprint(ex_dir: Path) -> str:
+    """sha256 over one exercise directory's files (stub, tests, .meta,
+    .docs): each file's relative path plus its bytes, a symlink's target
+    rather than what it points at, and only the type of anything else (a
+    FIFO is never opened). A missing directory hashes to a fixed marker, so
+    the key still changes once the exercise appears."""
+    hasher = hashlib.sha256()
+    if not ex_dir.is_dir():
+        hasher.update(b"missing")
+        return hasher.hexdigest()
+    for dirpath, dirnames, filenames in os.walk(ex_dir):
+        dirnames[:] = sorted(d for d in dirnames if d not in _FINGERPRINT_SKIP_DIRS)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            rel = path.relative_to(ex_dir).as_posix().encode("utf-8", "surrogateescape")
+            hasher.update(b"\0path\0" + rel)
+            try:
+                st = path.lstat()
+                if path.is_symlink():
+                    hasher.update(b"\0link\0" + os.fsencode(os.readlink(path)))
+                elif path.is_file():
+                    hasher.update(b"\0file\0" + path.read_bytes())
+                else:
+                    hasher.update(b"\0other\0" + str(st.st_mode).encode())
+            except OSError as e:
+                hasher.update(b"\0unreadable\0" + type(e).__name__.encode())
+    return hasher.hexdigest()
+
+
 #: In-place retries for an exercise whose run came back with any status in
 #: live_cache.UNSCOREABLE_STATUSES, not only "harness_error" (a config
 #: "error" is not retried; see _is_config_error) -- the name predates the
@@ -349,12 +384,15 @@ class PolyglotLiveRunner:
         # the source checkout's: an uncommitted local edit makes them
         # diverge, and the source's value could yield an outer timeout
         # shorter than the pinned copy's own per-attempt budget.
-        worktree_default = _attempt_timeout_default_from_source(
+        self._worktree_attempt_timeout_default = _attempt_timeout_default_from_source(
             worktree.path / "benchmarks" / "aider_polyglot.py"
         )
         self.per_exercise_timeout_s = per_exercise_timeout_s or (
-            max_attempts * (_attempt_timeout_s(default=worktree_default) + 90) + 180
+            max_attempts * (_attempt_timeout_s(default=self._worktree_attempt_timeout_default) + 90) + 180
         )
+        #: (benchmark root, language, exercise) -> _exercise_inputs_fingerprint,
+        #: so each exercise directory is hashed once per runner.
+        self._exercise_fingerprints: dict[tuple[str, str, str], str] = {}
         self.python_executable = python_executable
         #: Optional callable(LiveRunResult) -- invoked as EACH result becomes
         #: available inside run_batch() (cache hits included), not after the
@@ -419,6 +457,11 @@ class PolyglotLiveRunner:
             # versa) -- both change what a cached score actually measures.
             "benchmark_root": str(self.benchmark_root) if self.benchmark_root else None,
             "per_exercise_timeout_s": self.per_exercise_timeout_s,
+            # The child's own per-attempt budget, resolved the way it will
+            # resolve it (ATTEMPT_TIMEOUT_S from the environment it inherits,
+            # else the worktree copy's default). An explicit outer timeout
+            # above leaves this free to change on its own.
+            "attempt_timeout_s": _attempt_timeout_s(default=self._worktree_attempt_timeout_default),
             # The pi binary IS the agent under test -- omitting it means a
             # smoke run through fake_pi.py (LITTLE_CODER_PI_BIN_OVERRIDE) can
             # populate the cache with fabricated results that a later real
@@ -431,6 +474,28 @@ class PolyglotLiveRunner:
             # runs pytest under it too (aider_polyglot._run_python_gated).
             **self._interpreter_info(),
         }
+
+    def _effective_benchmark_root(self) -> Path:
+        """The root the child reads exercises from: benchmark_root when set,
+        else the POLYGLOT_BENCHMARK_ROOT it inherits, else aider_polyglot.py's
+        own default (its BENCHMARK_ROOT line)."""
+        if self.benchmark_root:
+            return self.benchmark_root
+        inherited = self.worktree.env().get("POLYGLOT_BENCHMARK_ROOT")
+        return Path(inherited) if inherited else Path.home() / "Documents" / "polyglot-benchmark"
+
+    def exercise_run_config(self, spec: ExerciseSpec, run_config: Mapping | None = None) -> dict:
+        """run_config plus a fingerprint of this exercise's benchmark inputs,
+        the key run_batch() reads and writes live_cache under. Per exercise,
+        so editing one exercise's tests leaves every other entry valid."""
+        root = self._effective_benchmark_root()
+        memo_key = (str(root), spec.language, spec.exercise)
+        fingerprint = self._exercise_fingerprints.get(memo_key)
+        if fingerprint is None:
+            fingerprint = _exercise_inputs_fingerprint(practice_dir(root, spec.language) / spec.exercise)
+            self._exercise_fingerprints[memo_key] = fingerprint
+        return {**(self.run_config if run_config is None else run_config),
+                "exercise_inputs_sha256": fingerprint}
 
     def _interpreter_info(self) -> dict:
         """python_executable plus its Python and pytest versions, probed
@@ -520,7 +585,8 @@ class PolyglotLiveRunner:
         misses: list[ExerciseSpec] = []
         for spec in specs:
             cached = (
-                self.cache.get(sanitized, run_config, spec.task_id, sample_index=sample_index)
+                self.cache.get(sanitized, self.exercise_run_config(spec, run_config), spec.task_id,
+                               sample_index=sample_index)
                 if self.cache else None
             )
             if cached is not None:
@@ -546,7 +612,8 @@ class PolyglotLiveRunner:
                     )
                 results[spec.task_id] = result
                 if self.cache is not None:
-                    self.cache.put(sanitized, run_config, spec.task_id, result.to_dict(), sample_index=sample_index)
+                    self.cache.put(sanitized, self.exercise_run_config(spec, run_config), spec.task_id,
+                                   result.to_dict(), sample_index=sample_index)
 
         return [results[spec.task_id] for spec in specs]
 
@@ -748,14 +815,29 @@ class PolyglotLiveRunner:
                 error=f"malformed results file: {e}", **base_kwargs,
             )
 
-        record = data.get("exercises", {}).get(spec.results_key)
+        # Valid JSON of the wrong shape is a harness failure too: an
+        # AttributeError here would escape run_batch()'s retry path.
+        exercises = data.get("exercises", {}) if isinstance(data, dict) else None
+        if not isinstance(exercises, dict):
+            return LiveRunResult(
+                status="harness_error", score=0.0, success=False,
+                error=f"malformed results file: expected an object with an \"exercises\" object "
+                      f"in {results_file}", **base_kwargs,
+            )
+        record = exercises.get(spec.results_key)
         if record is None:
             return LiveRunResult(
                 status="harness_error", score=0.0, success=False,
                 error=f"no record for {spec.results_key!r} in {results_file}", **base_kwargs,
             )
+        status = record.get("status", "error") if isinstance(record, dict) else None
+        if not isinstance(status, str):
+            return LiveRunResult(
+                status="harness_error", score=0.0, success=False,
+                error=f"malformed record for {spec.results_key!r} in {results_file}: expected an "
+                      "object with a string \"status\"", **base_kwargs,
+            )
 
-        status = record.get("status", "error")
         compaction_total = record.get("compaction_total", 0) or 0
         success, score = pass_n_score(status, compaction_events=compaction_total) or (False, 0.0)
         stop_reasons = record.get("stop_reasons") or []

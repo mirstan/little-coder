@@ -145,3 +145,32 @@ def test_compute_diff_does_not_follow_a_symlink_in_the_snapshot(tmp_path):
     diff = runner._compute_diff(ExerciseSpec("wordy"), workdir)
     assert "+solved" in diff
     assert "zero.py" not in diff
+
+
+import pytest
+
+
+@pytest.mark.parametrize("payload", [
+    [],
+    "not an object",
+    {"exercises": []},
+    {"exercises": "x"},
+    {"exercises": {"pi/python/wordy": []}},
+    {"exercises": {"pi/python/wordy": "pass_1"}},
+    {"exercises": {"pi/python/wordy": {"status": 5}}},
+    {"exercises": {"pi/python/wordy": {"status": ["pass_1"]}}},
+])
+def test_parse_result_treats_a_schema_invalid_results_file_as_a_harness_error(tmp_path, payload):
+    """Valid JSON of the wrong shape used to raise AttributeError/TypeError
+    out of _parse_result, past run_batch()'s harness_error retry path."""
+    runner = _bare_runner()
+    results_file = tmp_path / "results.json"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    results_file.write_text(json.dumps(payload))
+
+    result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
+
+    assert result.status == "harness_error"
+    assert result.score == 0.0 and result.success is False
+    assert result.error

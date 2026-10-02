@@ -20,7 +20,7 @@ import yaml
 
 import benchmarks.self_improve.live_eval as live_eval
 from benchmarks.self_improve.exercises import ExerciseSpec
-from benchmarks.self_improve.live_cache import LiveResultCache
+from benchmarks.self_improve.live_cache import LiveResultCache, run_config_hash
 from benchmarks.self_improve.live_eval import PolyglotLiveRunner
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
@@ -791,7 +791,7 @@ def test_unscoreable_status_is_retried_in_place_and_never_cached(status, runner_
             return _canned(spec, s, score=1.0 if s == "pass_1" else 0.0, error="boom")
         monkeypatch.setattr(runner, "_run_one_uncached", _next)
         results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
-        run_config = runner.run_config
+        run_config = runner.exercise_run_config(ExerciseSpec("wordy"))
 
     assert [r.status for r in results] == ["pass_1"]
     # Both genuine runs reach the audit trail; only the real outcome is scored.
@@ -985,3 +985,82 @@ def test_live_run_result_from_dict_ignores_an_unknown_key():
     entry["unexpected"] = False
     loaded = live_eval.LiveRunResult.from_dict(entry)
     assert loaded == live_eval.LiveRunResult.from_dict(_canned(ExerciseSpec("wordy"), "fail").to_dict())
+
+
+def _exercise_key(runner, name="wordy"):
+    return run_config_hash(runner.exercise_run_config(ExerciseSpec(name)))
+
+
+@pytest.mark.parametrize("relpath", ["wordy_test.py", "wordy.py", ".meta/config.json"])
+def test_exercise_cache_key_changes_when_the_exercises_benchmark_inputs_change(
+    runner_factory, fake_practice, relpath,
+):
+    """Same benchmark_root path, different stub/test/.meta content: a cached
+    score measured against the old inputs must not be served."""
+    ex_dir = fake_practice / "python" / "exercises" / "practice" / "wordy"
+    (ex_dir / ".meta").mkdir(exist_ok=True)
+    (ex_dir / ".meta" / "config.json").write_text('{"files": {"test": ["wordy_test.py"]}}')
+    for runner in runner_factory():
+        before = _exercise_key(runner)
+    target = ex_dir / relpath
+    target.write_text(target.read_text() + "\n# changed\n")
+    for runner in runner_factory():
+        after = _exercise_key(runner)
+    assert before != after
+
+
+def test_exercise_cache_key_is_per_exercise(runner_factory, fake_practice):
+    """Editing one exercise must not invalidate every other exercise's entry."""
+    practice = fake_practice / "python" / "exercises" / "practice"
+    other = practice / "other"
+    other.mkdir()
+    (other / "other.py").write_text("x = 1\n")
+    for runner in runner_factory():
+        wordy_before, other_before = _exercise_key(runner), _exercise_key(runner, "other")
+    (other / "other.py").write_text("x = 2\n")
+    for runner in runner_factory():
+        assert _exercise_key(runner) == wordy_before
+        assert _exercise_key(runner, "other") != other_before
+
+
+def test_exercise_inputs_are_hashed_once_per_runner(runner_factory, fake_practice, monkeypatch):
+    calls = []
+    real = live_eval._exercise_inputs_fingerprint
+    monkeypatch.setattr(live_eval, "_exercise_inputs_fingerprint", lambda p: calls.append(p) or real(p))
+    for runner in runner_factory():
+        _exercise_key(runner)
+        _exercise_key(runner)
+    assert len(calls) == 1
+
+
+def test_run_config_records_the_resolved_inner_timeout_even_with_an_explicit_outer_one(
+    runner_factory, monkeypatch,
+):
+    """runner_factory passes per_exercise_timeout_s=60 explicitly, so the
+    child's own ATTEMPT_TIMEOUT_S used to reach no part of the key."""
+    for runner in runner_factory():
+        assert runner.per_exercise_timeout_s == 60
+        assert runner.run_config["attempt_timeout_s"] == 30
+        before = run_config_hash(runner.run_config)
+        monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "31")
+        assert runner.run_config["attempt_timeout_s"] == 31
+        assert run_config_hash(runner.run_config) != before
+
+
+def test_run_batch_misses_the_cache_after_the_exercises_tests_change(
+    runner_factory, fake_practice, tmp_path, monkeypatch,
+):
+    cache = LiveResultCache(tmp_path / "cache")
+    candidate = {"agents_md": "text"}
+    for runner in runner_factory(cache=cache):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "pass_1", score=1.0))
+        runner.run_batch(candidate, [ExerciseSpec("wordy")])
+    test_file = fake_practice / "python" / "exercises" / "practice" / "wordy" / "wordy_test.py"
+    test_file.write_text(test_file.read_text() + "\ndef test_more():\n    assert False\n")
+    calls = []
+    for runner in runner_factory(cache=cache):
+        monkeypatch.setattr(runner, "_run_one_uncached",
+                            lambda spec: calls.append(spec) or _canned(spec, "fail"))
+        results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
+    assert len(calls) == 1
+    assert results[0].from_cache is False and results[0].status == "fail"
