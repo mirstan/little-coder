@@ -144,7 +144,8 @@ the tree and everything next to it as reachable. It can still:
   `<your checkout>/node_modules`;
 - write to your real checkout and its `.git` by absolute path, or to the
   scratch repo's git dir (`<tree>.git`). Only part of that git dir is
-  checked (below); its objects and refs are not.
+  checked (below); its objects and refs are not, though replace refs are
+  ignored (`core.useReplaceRefs=false`).
 
 What the orchestrator does about it is limited to its own git calls. The
 scratch repo is a private repo (its own object store, no hooks directory, no
@@ -155,8 +156,8 @@ dir sits beside the tree, not inside it. Every git call on it:
 - ignores user and system git config (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`) and drops git's location/config environment
   variables;
-- pins `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
-  `core.attributesFile=/dev/null`, and reads attributes only from the base
+- pins `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+  `core.attributesFile=/dev/null` and `core.useReplaceRefs=false`, and reads attributes only from the base
   commit (`--attr-source`, git 2.40 or later; on older git, `reset()` removes
   untracked files before checkout instead);
 - runs `status` with `--no-optional-locks`;

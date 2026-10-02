@@ -98,6 +98,9 @@ _HARDEN = [
     "-c", "core.hooksPath=" + os.devnull,
     "-c", "core.fsmonitor=false",
     "-c", "core.attributesFile=" + os.devnull,
+    # A refs/replace/<base> planted in the sibling git dir would otherwise
+    # swap in another commit on every checkout/reset.
+    "-c", "core.useReplaceRefs=false",
     "-c", "gc.auto=0",
     "-c", "maintenance.auto=false",
 ]

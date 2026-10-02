@@ -625,6 +625,24 @@ def test_planted_gitfile_pointing_at_the_source_is_ignored_and_removed_by_reset(
     assert _current_branch(source_repo).stdout == branch_before
 
 
+def test_planted_replace_ref_does_not_change_what_reset_checks_out(source_repo, tmp_path):
+    """refs/replace/<base> in the sibling git dir would otherwise make every
+    reset() check out the agent's substitute commit instead of the base."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        raw = ["git", "--git-dir", str(wt.git_dir)]
+        run = lambda *a, **kw: subprocess.run([*raw, *a], capture_output=True, text=True, check=True, **kw)
+        blob = run("hash-object", "-w", "--stdin", input="TAMPERED\n").stdout.strip()
+        skills_tree = run("rev-parse", f"{wt.base_commit}:skills").stdout.strip()
+        tree = run("mktree", input=f"100644 blob {blob}\tAGENTS.md\n040000 tree {skills_tree}\tskills\n").stdout.strip()
+        fake = run("commit-tree", tree, "-m", "substitute",
+                   env={**os.environ, "GIT_AUTHOR_NAME": "x", "GIT_AUTHOR_EMAIL": "x@x",
+                        "GIT_COMMITTER_NAME": "x", "GIT_COMMITTER_EMAIL": "x@x"}).stdout.strip()
+        run("update-ref", f"refs/replace/{wt.base_commit}", fake)
+        (wt.path / "AGENTS.md").write_text("mutated\n")
+        wt.reset()
+        assert (wt.path / "AGENTS.md").read_text() == "# little-coder\n\nBody text.\n"
+
+
 def test_nested_dot_git_entries_anywhere_in_the_tree_are_removed_by_reset(source_repo, tmp_path):
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
         (wt.path / "skills" / ".git").mkdir()
