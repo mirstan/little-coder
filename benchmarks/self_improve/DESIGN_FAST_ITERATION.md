@@ -126,14 +126,18 @@ Implementation: an `aider_polyglot.py --resume-attempt 2 --from-log <dir>` flag.
 
 ### 6.3 Estimator for mixed full runs and attempt-2 reruns
 
-For binary pass (the primary metric):
+For binary pass (the primary metric), the estimator is **stratified by whether attempt 1 is touched** (§6.1), because the child can change attempt 1 only in the touched stratum:
 
-ΔP = P(fail@1) · (q_child − q_parent), where q = P(pass@2 | fail@1)
+ΔP = w_u · ΔP_u + w_t · ΔP_t
 
-- **P(fail@1)** is estimated from all full runs, parent and child pooled, because attempt 1 is identical when it is untouched.
-- **q** is estimated from attempt-2 reruns on fail@1 records **drawn uniformly at random**, paired with parent vs child on the same record. Variance is clustered by record.
-- **Never pool** rerun outcomes with full-run outcomes as if they measured the same quantity.
-- **Score delta:** ΔScore = 0.7 · ΔP(fail@1 → pass@2).
+- **Weights.** w_u and w_t are the shares of records in the attempt-1-untouched stratum (§6.2 rows 1–2) and the attempt-1-touched stratum (§6.2 row 3). T0r fixes them offline before any run, so they don't depend on outcomes.
+- **Untouched stratum:** ΔP_u = P(fail@1) · (q_child − q_parent), where q = P(pass@2 | fail@1).
+  - **P(fail@1)** is estimated from attempt-1 outcomes in this stratum only, parent and child pooled, because attempt-1 prompts are identical here.
+  - **q** is estimated from attempt-2 reruns on this stratum's fail@1 records **drawn uniformly at random**, paired with parent vs child on the same record. Row-1 records are reused, so their q_child − q_parent is 0 by construction. Variance is clustered by record.
+- **Touched stratum:** ΔP_t is the paired child-minus-parent pass difference from full runs on the same records, used directly with no P(fail@1) · q decomposition, since attempt 1 itself can differ. Variance is clustered by record.
+- **Combined variance** is w_u² · Var(ΔP_u) + w_t² · Var(ΔP_t); the strata share no records.
+- **Never pool** rerun outcomes with full-run outcomes as if they measured the same quantity, and never pool P(fail@1) across strata.
+- **Score delta:** in the untouched stratum only attempt 2 can change, so ΔScore_u = 0.7 · ΔP_u. In the touched stratum, ΔScore_t is the paired attempt-weighted score difference from the full runs. ΔScore = w_u · ΔScore_u + w_t · ΔScore_t.
 
 ### 6.4 What doesn't fork
 
