@@ -24,13 +24,29 @@ while [[ $# -gt 0 ]]; do
 done
 """
 
+# The script picks between running harbor directly and wrapping it in
+# `sg docker -c ...` from `groups` and the presence of `sg`, which vary by
+# machine. Both are stubbed so each test takes one branch deterministically.
+GROUPS_WITH_DOCKER = "#!/usr/bin/env bash\necho \"staff docker\"\n"
+GROUPS_WITHOUT_DOCKER = "#!/usr/bin/env bash\necho \"staff\"\n"
+# Tripwire: the direct branch must never reach sg.
+SG_FORBIDDEN = "#!/usr/bin/env bash\necho \"sg must not be called\" >&2\nexit 97\n"
+# Runs the command sg was handed, after checking the call shape.
+SG_PASSTHROUGH = '#!/usr/bin/env bash\n[[ $1 == docker && $2 == -c ]] || exit 97\nexec bash -c "$3"\n'
 
-def _run(tmp_path, *tasks, dataset=None):
+
+def _write_stub(bin_dir, name, body):
+    stub = bin_dir / name
+    stub.write_text(body)
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _run(tmp_path, *tasks, dataset=None, groups=GROUPS_WITH_DOCKER, sg=SG_FORBIDDEN):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    stub = bin_dir / "harbor"
-    stub.write_text(STUB)
-    stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    _write_stub(bin_dir, "harbor", STUB)
+    _write_stub(bin_dir, "groups", groups)
+    _write_stub(bin_dir, "sg", sg)
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env.pop("TB_DATASET", None)
@@ -61,3 +77,12 @@ def test_prefixed_name_passes_through(tmp_path):
 
 def test_legacy_name_at_version_dataset_keeps_bare_name(tmp_path):
     assert _run(tmp_path, "fix-git", dataset="terminal-bench@2.0") == ["fix-git"]
+
+
+def test_sg_branch_passes_task_names_through(tmp_path):
+    """Not in the docker group, sg present: the command goes through
+    `sg docker -c` with %q quoting and must arrive intact."""
+    assert _run(
+        tmp_path, "fix-git", "terminal-bench/other-task",
+        groups=GROUPS_WITHOUT_DOCKER, sg=SG_PASSTHROUGH,
+    ) == ["terminal-bench/fix-git", "terminal-bench/other-task"]
