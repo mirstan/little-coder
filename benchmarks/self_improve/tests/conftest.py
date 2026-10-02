@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 # Runs before any test module imports run_gepa, whose import loads
@@ -92,38 +93,49 @@ def _restore_dspy_settings():
     yield from _dspy_settings_snapshot_and_restore()
 
 
+REAL_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _git_common_dir(path) -> str | None:
+    """Resolved `git rev-parse --git-common-dir` of `path`, or None if it is
+    not inside a git repo. Every linked worktree of one repo shares it, so
+    comparing it (not the checkout path) also catches a sibling worktree of
+    the real repo."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=path, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return os.path.realpath(result.stdout.strip())
+
+
+#: The real repo's git common dir, read once (read-only) at import.
+_REAL_GIT_COMMON_DIR = _git_common_dir(REAL_REPO_ROOT)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _no_stray_real_worktrees():
-    """Session-scoped backstop for the live-eval rewrite: scratch_worktree.py
-    creates/destroys REAL git worktrees, and this repo keeps several other
-    real worktrees checked out. Every scratch-worktree test must operate
-    against a THROWAWAY `git init` repo, never the real checkout -- this
-    snapshots this process's gepa-scratch worktrees on the REAL repo before
-    and after the whole test session and fails loudly if they differ.
+def _no_stray_scratch_artifacts():
+    """Session-scoped backstop: fails the session if this pytest process
+    leaves scratch artifacts behind. Two snapshots, both limited to names
+    THIS process could have made (scratch_worktree() names everything
+    gepa-scratch-<pid>-<hex>; other sessions work concurrently):
 
-    Limitation: this only detects a NET change across
-    the whole session. A test that calls `scratch_worktree(REAL_REPO_ROOT,
-    ...)` -- the exact "touches real repo state instead of a fixture repo"
-    bug this fixture exists to catch -- both creates AND destroys that real
-    worktree within its own `with` block, so the porcelain snapshot is
-    identical before and after and this assertion never fires. It catches
-    LEAKED or OVERLAPPING real worktrees (e.g. a crash mid-test, or two
-    tests racing), not a transient one a single test cleanly creates and
-    removes against the real repo. `_forbid_real_pi` below is the stronger
-    per-test guard against the same class of mistake going all the way to a
-    real model call, but neither one closes this specific gap."""
-    repo_root = Path(__file__).resolve().parents[3]
+    1. `git worktree list` on the REAL repo -- scratch_worktree() no longer
+       registers worktrees at all, so any new entry is a regression to the
+       old mechanism or a test touching the real repo;
+    2. the system temp dir's top-level entries (tree, .git, .marker.json,
+       .lock) -- what a test leaks if it omits parent_dir and teardown fails.
 
-    # Only worktrees THIS pytest process could have made count:
-    # scratch_worktree() names them gepa-scratch-<pid>-<hex>. Other sessions
-    # add, remove and move worktrees in the same repo concurrently, so
-    # comparing the whole list (HEAD lines included) failed on their work.
+    It only detects a NET change across the session. _forbid_scratch_of_real_repo
+    below is the per-test guard against pointing scratch_worktree() at the
+    real repo."""
     ours = f"gepa-scratch-{os.getpid()}-"
 
-    def _snapshot() -> set[str]:
+    def _worktrees() -> set[str]:
         out = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=repo_root, capture_output=True, text=True, check=True,
+            cwd=REAL_REPO_ROOT, capture_output=True, text=True, check=True,
         ).stdout
         return {
             line.removeprefix("worktree ")
@@ -131,14 +143,43 @@ def _no_stray_real_worktrees():
             if line.startswith("worktree ") and Path(line.removeprefix("worktree ")).name.startswith(ours)
         }
 
-    before = _snapshot()
+    def _tempdir_entries() -> set[str]:
+        return {name for name in os.listdir(tempfile.gettempdir()) if name.startswith(ours)}
+
+    before = (_worktrees(), _tempdir_entries())
     yield
-    after = _snapshot()
-    assert after == before, (
+    after = (_worktrees(), _tempdir_entries())
+    assert after[0] == before[0], (
         "a gepa-scratch worktree from this test session was left on the REAL "
         "repo -- a test touched the real repo's worktrees instead of a "
-        f"throwaway fixture repo.\nbefore: {sorted(before)}\nafter: {sorted(after)}"
+        f"throwaway fixture repo.\nbefore: {sorted(before[0])}\nafter: {sorted(after[0])}"
     )
+    assert after[1] == before[1], (
+        f"scratch artifacts from this test session were left in {tempfile.gettempdir()}.\n"
+        f"before: {sorted(before[1])}\nafter: {sorted(after[1])}"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_scratch_of_real_repo(monkeypatch):
+    """Per-test guard: scratch_worktree() pointed at the real repo -- or any
+    linked worktree of it -- fails the test before the private repo is
+    populated. Wraps scratch_worktree._create_private_repo, the one step that
+    reads the source's objects."""
+    import benchmarks.self_improve.scratch_worktree as sw
+
+    real_create = sw._create_private_repo
+
+    def _guarded(source_repo_root, *args, **kwargs):
+        real_common = _REAL_GIT_COMMON_DIR
+        if real_common is not None and _git_common_dir(source_repo_root) == real_common:
+            pytest.fail(
+                f"a test pointed scratch_worktree() at the real repo ({source_repo_root}, "
+                f"git common dir {real_common}); use a throwaway `git init` repo instead"
+            )
+        return real_create(source_repo_root, *args, **kwargs)
+
+    monkeypatch.setattr(sw, "_create_private_repo", _guarded)
 
 
 @pytest.fixture(autouse=True)

@@ -1,9 +1,9 @@
-"""End-to-end live-eval pipeline test: REAL `git worktree add`, REAL
+"""End-to-end live-eval pipeline test: a REAL private scratch repo, REAL
 candidate file writes, a REAL subprocess invocation of aider_polyglot.py, a
 REAL `pytest -x -q` scoring run, REAL result-JSON parsing -- with `pi`
 routed through fake_pi.py so zero model calls happen. This is the centerpiece
 test of the whole live-execution rewrite: it exercises the exact mechanism
-(rpc_client.REPO_ROOT resolving to the SCRATCH worktree because
+(rpc_client.REPO_ROOT resolving to the SCRATCH tree because
 aider_polyglot.py is invoked as a subprocess whose own __file__ lives there)
 that makes a candidate's text actually reach a live agent.
 """
@@ -24,7 +24,7 @@ from benchmarks.self_improve.live_cache import LiveResultCache
 from benchmarks.self_improve.live_eval import PolyglotLiveRunner
 from benchmarks.self_improve.scratch_worktree import scratch_worktree
 
-# This module unconditionally drives real `git init`/`git worktree add` and
+# This module unconditionally drives real `git init`/`git fetch` and
 # real subprocesses -- unlike the sibling fake_pi tests, it never skips on a
 # minimal runner without git, which would otherwise hard-error every test
 # here (masking the rest of the self_improve suite's own results) instead of

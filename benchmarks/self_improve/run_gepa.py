@@ -899,8 +899,11 @@ def main() -> int:
 
     ap.add_argument("--live-cache-dir", default=None)
     ap.add_argument("--no-live-cache", action="store_true")
-    ap.add_argument("--scratch-dir", default=None)
-    ap.add_argument("--keep-scratch", action="store_true")
+    ap.add_argument("--scratch-dir", default=None,
+                     help="Parent dir for the private scratch repo (default: system temp dir). "
+                          "Pass the same dir to gepa_scratch_gc --scratch-root.")
+    ap.add_argument("--keep-scratch", action="store_true",
+                     help="Leave the scratch tree, its git dir and marker on disk for post-mortem.")
     ap.add_argument("--pi-bin", default=None)
     ap.add_argument("--allow-dirty-components", action="store_true")
 

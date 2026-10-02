@@ -12,9 +12,11 @@ machine-level deny ($SELF_IMPROVE_NO_LIVE_ROLLOUTS) that overrides everything.
 """
 import base64
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -286,10 +288,18 @@ def _run_main(args_list):
         sys.argv = argv_backup
 
 
+def _scratch_entries(directory) -> set[str]:
+    """This process's scratch_worktree() artifacts (tree, .git, .marker.json,
+    .lock) directly under `directory`."""
+    prefix = f"gepa-scratch-{os.getpid()}-"
+    return {name for name in os.listdir(directory) if name.startswith(prefix)}
+
+
 def test_estimate_only_exits_zero_and_creates_no_worktree(source_repo, fake_practice, tmp_path, monkeypatch):
     monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
     before = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=source_repo,
                              capture_output=True, text=True, check=True).stdout
+    tmp_before = _scratch_entries(tempfile.gettempdir())
     out_dir = tmp_path / "run_out"
     code = _run_main([
         "--repo-root", str(source_repo), "--components-config", "config/components.yaml",
@@ -301,6 +311,10 @@ def test_estimate_only_exits_zero_and_creates_no_worktree(source_repo, fake_prac
     after = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=source_repo,
                             capture_output=True, text=True, check=True).stdout
     assert before == after
+    # No private scratch repo either: nothing under tmp_path or the default
+    # scratch parent (the system temp dir).
+    assert _scratch_entries(tmp_path) == set()
+    assert _scratch_entries(tempfile.gettempdir()) == tmp_before
     assert not (out_dir / "spend_log.jsonl").exists()
 
 
@@ -383,6 +397,7 @@ def test_baseline_only_end_to_end_real_pipeline(source_repo, fake_practice, tmp_
         "--pi-bin", str(FAKE_PI), "--baseline-only", "--yes",
     ])
     assert code == 0
+    assert _scratch_entries(scratch_dir) == set()  # tree, git dir, marker and lock all removed
     assert (out_dir / "spend_log.jsonl").exists()
     seed_baseline = json.loads((out_dir / "seed_baseline.json").read_text())
     assert "python/wordy" in seed_baseline
@@ -1264,6 +1279,7 @@ def test_a_shared_knob_in_dotenv_refuses_before_any_worktree_or_prompt(
     assert ("ATTEMPT_TIMEOUT_S is set in benchmarks/self_improve/.env, which is orchestrator-only; "
             "export it in your shell instead.") in capsys.readouterr().err
     assert not scratch_dir.exists()
+    assert _scratch_entries(tmp_path) == set()
     assert "gepa-scratch" not in subprocess.run(
         ["git", "worktree", "list"], cwd=source_repo, capture_output=True, text=True, check=True,
     ).stdout

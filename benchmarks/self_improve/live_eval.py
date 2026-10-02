@@ -1,5 +1,5 @@
 """LiveRunResult + PolyglotLiveRunner: materializes a GEPA candidate into a
-scratch worktree, runs a real aider_polyglot.py exercise as a subprocess per
+scratch tree (a private git repo, see scratch_worktree.py), runs a real aider_polyglot.py exercise as a subprocess per
 exercise (not in-process -- see scratch_worktree.py's module docstring for
 why), and parses the result into a graded score plus real feedback material
 (diff, pytest output, transcript excerpt, reasoning excerpt) for the
@@ -297,7 +297,7 @@ class LiveRunResult:
 
 class PolyglotLiveRunner:
     """Runs real aider_polyglot.py exercises, one subprocess per exercise,
-    against a candidate materialized into a shared scratch worktree (reused
+    against a candidate materialized into a shared scratch tree (reused
     across evaluations within one optimize() call -- GEPA's own
     default_batch_evaluate is confirmed sequential, so this is safe as long
     as no adapter-level batch_evaluate is ever defined on top of it)."""
@@ -610,9 +610,10 @@ class PolyglotLiveRunner:
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True,
         )
-        # Recorded so gepa_scratch_gc.py can tell "the orchestrator died" apart
-        # from "this exercise subprocess is still alive and using the
-        # worktree" -- start_new_session=True means this child has its own
+        # Recorded (in the marker beside the scratch tree) so
+        # gepa_scratch_gc.py can tell "the orchestrator died" apart from
+        # "this exercise subprocess is still alive and using the scratch
+        # tree" -- start_new_session=True means this child has its own
         # process group/pid and does NOT die when the orchestrator does.
         try:
             self.worktree.set_active_pid(proc.pid)
@@ -646,8 +647,8 @@ class PolyglotLiveRunner:
             # marker-file I/O before communicate() is even reached) must not
             # leave this detached (start_new_session=True) subprocess
             # running -- it never received the interrupt itself, and would
-            # otherwise keep driving a real paid rollout against a worktree
-            # the caller may be about to remove. Calling this twice (the
+            # otherwise keep driving a real paid rollout against a scratch
+            # tree the caller may be about to remove. Calling this twice (the
             # budget_clamped raise above already killed it) is safe --
             # _kill_process_group treats an already-dead process as a no-op.
             self._kill_process_group(proc)

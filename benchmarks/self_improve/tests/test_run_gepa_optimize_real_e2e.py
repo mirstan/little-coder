@@ -20,7 +20,7 @@ touching GEPA's own reflective_mutation.py at all) could have caught this --
 it's specifically a gap in how PolyglotGEPAAdapter satisfies GEPAAdapter's
 structural contract, only reachable by calling the real gepa.optimize().
 
-Real git worktree, real subprocess invocation of aider_polyglot.py, `pi`
+Real private scratch repo, real subprocess invocation of aider_polyglot.py, `pi`
 routed through fake_pi.py -- zero live-model cost. reflection_lm is a plain
 Python callable (a valid LanguageModel per gepa's own Protocol), not a model
 string -- zero reflection-LM cost either.
