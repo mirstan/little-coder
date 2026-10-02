@@ -504,6 +504,31 @@ def main():
         emit({"type": "agent_settled"})
         return
 
+    if mode == "echo_then_mutate":
+        # Records what the tree looked like when this run started, then
+        # changes it the way an agent can: appends {"seen": <content of
+        # FAKE_PI_WATCH_PATH>, "planted_present": <FAKE_PI_PLANT_PATH
+        # exists>} as one JSON line to FAKE_PI_ECHO_FILE, overwrites the
+        # watched file, creates the planted one, then solves. Both paths are
+        # absolute (this process runs in the exercise workdir).
+        watch_path = os.environ["FAKE_PI_WATCH_PATH"]
+        plant_path = os.environ["FAKE_PI_PLANT_PATH"]
+        with open(watch_path) as fh:
+            seen = fh.read()
+        with open(os.environ["FAKE_PI_ECHO_FILE"], "a") as fh:
+            fh.write(json.dumps({"seen": seen, "planted_present": os.path.exists(plant_path)}) + "\n")
+        with open(watch_path, "w") as fh:
+            fh.write("MUTATED BY EXERCISE\n")
+        with open(plant_path, "w") as fh:
+            fh.write("planted by an earlier exercise\n")
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        _write_solution_files()
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
     if mode == "noop_then_solve":
         # Solves only on the SECOND invocation. Attempts are separate
         # PROCESSES -- aider_polyglot.py opens a fresh PiRpc (and therefore a

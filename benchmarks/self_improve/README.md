@@ -473,3 +473,11 @@ What this does not close:
    A leftover that survives can also make the next run's `reset()` raise
    `ScratchWorktreeCorrupted`, which stops the batch rather than scoring
    a tree it changed.
+7. **A kept scratch tree holds only the last live run's logs.** Every live
+   run, retries included, starts from a reset tree, and the reset deletes
+   untracked files, so `benchmarks/full_polyglot_logs/` and
+   `benchmarks/results_full_polyglot.json` inside a tree kept with
+   `--keep-scratch` show only the last run. A cached result in `live_cache` keeps its
+   own reflection material (diff, test output tail, transcript excerpts);
+   for an unscoreable try, `spend_log.jsonl` keeps only its status and
+   error.

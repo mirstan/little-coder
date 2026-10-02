@@ -1256,3 +1256,112 @@ def test_post_run_cleanup_never_signals_the_orchestrators_group(runner_factory, 
 
     assert result.status == "harness_error"
     assert calls and os.getpgrp() not in calls
+
+
+def _add_acronym(fake_practice):
+    ex_dir = fake_practice / "python" / "exercises" / "practice" / "acronym"
+    ex_dir.mkdir(parents=True)
+    (ex_dir / "acronym.py").write_text(_WORDY_STUB)
+    (ex_dir / "acronym_test.py").write_text(_WORDY_TEST.replace("wordy", "acronym"))
+
+
+def test_each_exercise_in_a_batch_sees_a_pristine_tree(runner_factory, fake_practice, tmp_path, monkeypatch):
+    """The tree used to be reset and written once per batch, so the second
+    exercise ran against whatever the first one's agent left in it."""
+    _add_acronym(fake_practice)
+    echo_file = tmp_path / "echo.jsonl"
+    monkeypatch.setenv("FAKE_PI_MODE", "echo_then_mutate")
+    monkeypatch.setenv("FAKE_PI_ECHO_FILE", str(echo_file))
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({
+        "wordy.py": _b64(_WORDY_SOLUTION), "acronym.py": _b64(_WORDY_SOLUTION),
+    }))
+    for runner in runner_factory():
+        skill = runner.worktree.path / "skills" / "tools" / "bash.md"
+        monkeypatch.setenv("FAKE_PI_WATCH_PATH", str(skill))
+        monkeypatch.setenv("FAKE_PI_PLANT_PATH", str(skill.parent / "evil.md"))
+        results = runner.run_batch({"skills_tools_bash": "Candidate guidance.\n"},
+                                   [ExerciseSpec("wordy"), ExerciseSpec("acronym")])
+
+    assert [r.status for r in results] == ["pass_1", "pass_1"]
+    seen = [json.loads(line) for line in echo_file.read_text().splitlines()]
+    assert len(seen) == 2
+    assert seen[0]["seen"] == seen[1]["seen"]
+    assert "name: bash" in seen[0]["seen"] and "Candidate guidance." in seen[0]["seen"]
+    assert [s["planted_present"] for s in seen] == [False, False]
+
+
+def test_each_retry_starts_from_a_clean_tree(runner_factory, monkeypatch):
+    from benchmarks.self_improve.scratch_worktree import ScratchWorktree
+
+    resets = []
+    real_reset = ScratchWorktree.reset
+
+    def _counting_reset(self):
+        resets.append(self.path)
+        return real_reset(self)
+
+    outcomes = iter(["harness_error", "pass_1"])
+    seen = []
+    for runner in runner_factory():
+        skill = runner.worktree.path / "skills" / "tools" / "bash.md"
+        monkeypatch.setattr(ScratchWorktree, "reset", _counting_reset)
+
+        def _mutating_run(spec):
+            seen.append((skill.read_text(), (skill.parent / "evil.md").exists()))
+            skill.write_text("MUTATED BY TRY\n")
+            (skill.parent / "evil.md").write_text("planted\n")
+            status = next(outcomes)
+            return _canned(spec, status, score=1.0 if status == "pass_1" else 0.0, error="boom")
+
+        monkeypatch.setattr(runner, "_run_one_uncached", _mutating_run)
+        results = runner.run_batch({"skills_tools_bash": "Candidate guidance.\n"}, [ExerciseSpec("wordy")])
+
+    assert results[0].status == "pass_1"
+    assert len(resets) == 2  # once per try
+    assert seen[0] == seen[1]
+    assert "Candidate guidance." in seen[0][0] and seen[0][1] is False
+
+
+def test_all_cache_hits_never_reset_the_tree(runner_factory, tmp_path, monkeypatch):
+    from benchmarks.self_improve.scratch_worktree import ScratchWorktree
+
+    cache = LiveResultCache(tmp_path / "cache")
+    candidate = {"agents_md": "text"}
+    for runner in runner_factory(cache=cache):
+        monkeypatch.setattr(runner, "_run_one_uncached", lambda spec: _canned(spec, "pass_1", score=1.0))
+        runner.run_batch(candidate, [ExerciseSpec("wordy")])
+
+    for runner in runner_factory(cache=cache):
+        def _must_not_reset(self):
+            raise AssertionError("an all-hit batch must not touch the tree")
+        monkeypatch.setattr(ScratchWorktree, "reset", _must_not_reset)
+        results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
+
+    assert results[0].from_cache is True
+
+
+def test_budget_refusal_does_not_touch_the_tree(runner_factory, monkeypatch):
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
+    from benchmarks.self_improve.scratch_worktree import ScratchWorktree
+
+    resets = []
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=0)
+    for runner in runner_factory(budget=budget):
+        monkeypatch.setattr(ScratchWorktree, "reset", lambda self: resets.append(self.path))
+        with pytest.raises(LiveEvalBudgetExceeded):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert resets == []
+
+
+def test_an_unmapped_component_fails_before_a_budget_refusal(runner_factory):
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget
+
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=0)
+    for runner in runner_factory(budget=budget):
+        with pytest.raises(ValueError, match="not present in"):
+            runner.run_batch({"agents_md": "text", "totally_unmapped_pred_name": "x"}, [ExerciseSpec("wordy")])

@@ -632,6 +632,21 @@ class PolyglotLiveRunner:
         _sanitize_candidate strips only ONE leading block, so it must not be
         re-applied to text that is already sanitized (run_batch() sanitizes
         once and uses that same dict for both the cache key and the write)."""
+        self._check_mapped(sanitized)
+        changed = write_components_back(self.components_yaml, self.worktree.path, sanitized)
+        self.worktree.assert_only_expected_dirty(changed)
+        return changed
+
+    def _prepare_clean_tree(self, sanitized: Mapping[str, str]) -> None:
+        """Before every live run, retries included: back to the pinned base
+        commit (reset() also verifies the checkout), then the candidate's
+        text, so no run sees what an earlier run's agent left in the tree."""
+        self.worktree.reset()
+        self._write_sanitized(sanitized)
+
+    def _check_mapped(self, sanitized: Mapping[str, str]) -> None:
+        """Raises ValueError for a component the pinned components.yaml does
+        not map."""
         mapping = yaml.safe_load(Path(self.components_yaml).read_text()) or {}
         unmapped = sorted(set(sanitized) - set(mapping))
         if unmapped:
@@ -649,17 +664,17 @@ class PolyglotLiveRunner:
                 "no-op. Commit a components.yaml entry for them first, or use --only-components "
                 "to scope the candidate down to what's actually mapped."
             )
-        changed = write_components_back(self.components_yaml, self.worktree.path, sanitized)
-        self.worktree.assert_only_expected_dirty(changed)
-        return changed
 
     def run_batch(
         self, candidate: Mapping[str, str], specs: Sequence[ExerciseSpec], *, sample_index: int = 0,
     ) -> list[LiveRunResult]:
-        """Cache-first, materialize-once: checks the on-disk memo for every
-        requested exercise before touching the worktree at all; only if
-        there's at least one miss does it reset+write the candidate, then
-        runs each missed exercise. Returns results in the SAME order as
+        """Cache-first, reset-per-run: checks the on-disk memo for every
+        requested exercise before touching the worktree at all, so a batch
+        of cache hits never touches it. Each missed exercise then runs live,
+        and before every run, retries included, the tree is reset to the
+        base commit and the candidate written again (_prepare_clean_tree):
+        an agent can change anything in the tree, and no run may be scored
+        against what an earlier one left there. Returns results in the SAME order as
         `specs` (a hard requirement for the GEPA adapter built on top of
         this -- EvaluationBatch.scores must align index-for-index with the
         batch).
@@ -700,10 +715,11 @@ class PolyglotLiveRunner:
                 misses.append(spec)
 
         if misses:
-            self.worktree.reset()
-            self._write_sanitized(sanitized)
+            # Before any budget check, so an unmapped component still fails
+            # fast instead of behind a budget refusal.
+            self._check_mapped(sanitized)
             for spec in misses:
-                result = self._run_with_retries(spec)
+                result = self._run_with_retries(spec, sanitized)
                 if result.status in UNSCOREABLE_STATUSES:
                     logger.warning(
                         "live_eval: %s still hit %s after %d retries (reason: %s) -- "
@@ -718,14 +734,21 @@ class PolyglotLiveRunner:
 
         return [results[spec.task_id] for spec in specs]
 
-    def _run_with_retries(self, spec: ExerciseSpec) -> LiveRunResult:
-        """Runs one exercise live against whatever is materialized, retrying
-        an unscoreable status in place. Returns the first scoreable result,
-        or the last unscoreable one once the retries are spent; raises for a
-        config error or a persistent harness_error."""
+    def _run_with_retries(self, spec: ExerciseSpec, sanitized: Mapping[str, str]) -> LiveRunResult:
+        """Runs one exercise live, retrying an unscoreable status in place,
+        each try in a freshly reset tree with `sanitized` written into it.
+        Returns the first scoreable result, or the last unscoreable one once
+        the retries are spent; raises for a config error or a persistent
+        harness_error.
+
+        The order within a try matters: the budget check comes first, so a
+        refusal touches nothing; _run_one_uncached parses its result
+        (reading log_root inside the tree) before returning, and the next
+        try's reset deletes log_root with every other untracked file."""
         for _try in range(1 + HARNESS_ERROR_RETRIES):
             if self.budget is not None:
                 self.budget.check_before_exercise(spec.task_id)  # raises rather than faking a score
+            self._prepare_clean_tree(sanitized)
             result = self._run_one_uncached(spec)
             if self.budget is not None:
                 self.budget.record_live_run()
