@@ -682,6 +682,63 @@ def test_optimize_overrun_before_any_valset_evaluation_writes_nothing(
     assert run_end["best_candidate_idx"] is None
 
 
+def _gepa_state(i, total_num_evals):
+    return type("State", (), {"i": i, "total_num_evals": total_num_evals})()
+
+
+def test_no_progress_stopper_trips_after_n_iterations_without_a_metric_call():
+    """A parent minibatch of perfect cache hits charges no metric call and
+    skip_perfect_score skips reflection, so total_num_evals never grows and
+    max_metric_calls never stops GEPA."""
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=3)
+    assert stopper(_gepa_state(-1, 4)) is False  # before the first iteration
+    assert stopper(_gepa_state(0, 6)) is False  # spent two metric calls
+    assert stopper(_gepa_state(1, 6)) is False
+    assert stopper(_gepa_state(2, 6)) is False
+    assert stopper.tripped is False
+    assert stopper(_gepa_state(3, 6)) is True
+    assert stopper.tripped is True
+
+
+def test_no_progress_stopper_resets_on_a_metric_call_and_ignores_repeat_checks():
+    stopper = run_gepa.NoProgressStopper(max_idle_iterations=2)
+    assert stopper(_gepa_state(-1, 0)) is False
+    assert stopper(_gepa_state(0, 0)) is False
+    assert stopper(_gepa_state(0, 0)) is False  # same iteration checked twice counts once
+    assert stopper(_gepa_state(1, 1)) is False  # a live run resets the streak
+    assert stopper(_gepa_state(2, 1)) is False
+    assert stopper(_gepa_state(3, 1)) is True
+
+
+def test_optimize_stopped_for_no_progress_records_a_distinct_reason(
+    source_repo, fake_practice, tmp_path, monkeypatch, capsys,
+):
+    import gepa
+
+    monkeypatch.delenv(NO_LIVE_ROLLOUTS_ENV, raising=False)
+    monkeypatch.setenv(REFLECTION_LM_API_KEY_ENV, "fake-key")
+
+    def fake_optimize(**kwargs):
+        (stopper,) = [s for s in kwargs["stop_callbacks"] if isinstance(s, run_gepa.NoProgressStopper)]
+        i = -1  # GEPA checks once before iteration 0
+        while not stopper(_gepa_state(i, 3)):
+            i += 1
+        assert i + 1 == run_gepa.NO_PROGRESS_MAX_IDLE_ITERATIONS  # iterations 0..i, all idle
+        return type("Result", (), {"best_candidate": dict(kwargs["seed_candidate"]),
+                                   "total_metric_calls": 3})()
+
+    monkeypatch.setattr(gepa, "optimize", fake_optimize)
+    out_dir = tmp_path / "run_out"
+    code = _run_main(_optimize_argv(source_repo, fake_practice, tmp_path, out_dir))
+    assert code == 0
+    assert (out_dir / "optimized_components.yaml").exists()
+    assert "no metric call" in capsys.readouterr().err.lower()
+    run_end = [json.loads(line) for line in (out_dir / "spend_log.jsonl").read_text().splitlines()][-1]
+    assert run_end["event"] == "run_end"
+    assert run_end["reason"] == "no_progress"
+    assert run_end["total_metric_calls"] == 3
+
+
 def test_baseline_run_writes_the_manifest_before_any_spend(source_repo, fake_practice, tmp_path, monkeypatch):
     """manifest.yaml pre-registers the run: the search split is exactly what
     GEPA/baseline evaluates, acceptance and test hold the rest of the pool,

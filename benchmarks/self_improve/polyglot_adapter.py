@@ -220,7 +220,11 @@ class PolyglotGEPAAdapter:
         )
         # Only actual live runs count against max_metric_calls -- a fully
         # cached re-evaluation must charge nothing, so max_metric_calls
-        # means "real agent runs I'm willing to pay for."
+        # means "real agent runs I'm willing to pay for." GEPA reads this on
+        # its minibatch evaluations only; a valset evaluation is charged
+        # GEPA's own evaluation-cache misses instead (gepa/core/engine.py).
+        # An iteration of nothing but cache hits charges nothing at all,
+        # which is why run_gepa.py adds NoProgressStopper.
         num_metric_calls = sum(1 for r in results if not r.from_cache)
 
         return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories,

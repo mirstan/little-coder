@@ -44,8 +44,10 @@ from pathlib import Path
 # litellm (imported lazily by gepa on the first reflection call) runs its own
 # load_dotenv() on import while LITELLM_MODE is DEV, its default. That would
 # load a .env this module never parsed, whose names _DOTENV_KEYS could not
-# withhold from the agent. Set before any import can pull litellm in.
-os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+# withhold from the agent. Set before any import can pull litellm in, and
+# assigned rather than defaulted: an exported LITELLM_MODE=DEV would turn it
+# back on.
+os.environ["LITELLM_MODE"] = "PRODUCTION"
 
 import yaml  # noqa: E402
 from dotenv import dotenv_values, load_dotenv  # noqa: E402
@@ -338,6 +340,38 @@ def _resolve_components_yaml(repo_root: Path, components_config: str) -> tuple[P
                 "it could never be read there anyway."
             ) from None
     return repo_root / rel, rel
+
+
+#: An idle iteration costs only cache reads and a gepa_state save, so this
+#: errs long rather than cutting off a run whose next minibatch would have
+#: had something to reflect on.
+NO_PROGRESS_MAX_IDLE_ITERATIONS = 20
+
+
+class NoProgressStopper:
+    """GEPA stop callback: trips after max_idle_iterations iterations in a row
+    with state.total_num_evals unchanged. A parent minibatch of perfect cache
+    hits charges no metric call (PolyglotGEPAAdapter.evaluate) and
+    skip_perfect_score then skips reflection, so without this only the
+    wall-clock timeout would end that loop. Counts per state.i, so a repeat
+    check within one iteration is not a second idle iteration."""
+    def __init__(self, max_idle_iterations: int = NO_PROGRESS_MAX_IDLE_ITERATIONS) -> None:
+        self.max_idle_iterations = max_idle_iterations
+        self.tripped = False
+        self._last_i: int | None = None
+        self._last_evals: int | None = None
+        self._idle = 0
+
+    def __call__(self, gepa_state) -> bool:
+        i, evals = gepa_state.i, gepa_state.total_num_evals
+        if i == self._last_i:
+            return self.tripped
+        if self._last_i is not None:
+            self._idle = self._idle + 1 if evals == self._last_evals else 0
+        self._last_i, self._last_evals = i, evals
+        if self._idle >= self.max_idle_iterations:
+            self.tripped = True
+        return self.tripped
 
 
 def _run_live(args: argparse.Namespace) -> int:
@@ -660,7 +694,8 @@ def _run_live(args: argparse.Namespace) -> int:
                     self.best_val_score = event.get("average_score")
 
         spend_log_callback = _SpendLogCallback()
-        stop_callbacks = [stopper, _StopFileStopper()]
+        no_progress = NoProgressStopper()
+        stop_callbacks = [stopper, _StopFileStopper(), no_progress]
         if args.max_wall_clock_s:
             stop_callbacks.append(TimeoutStopCondition(args.max_wall_clock_s * 0.8))
 
@@ -719,8 +754,13 @@ def _run_live(args: argparse.Namespace) -> int:
             )
             return code
 
+        if no_progress.tripped:
+            print(f"\nStopped: {no_progress.max_idle_iterations} iterations in a row made no metric call "
+                  "(total_num_evals unchanged); ending the run instead of waiting for the wall-clock "
+                  "limit.", file=sys.stderr)
         _write_optimized_components(out_dir, result.best_candidate)
-        spend_log.run_end(reason="completed", total_metric_calls=getattr(result, "total_metric_calls", None))
+        spend_log.run_end(reason="no_progress" if no_progress.tripped else "completed",
+                          total_metric_calls=getattr(result, "total_metric_calls", None))
 
     return 0
 

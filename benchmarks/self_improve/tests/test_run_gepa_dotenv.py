@@ -127,6 +127,14 @@ def test_import_sets_litellm_mode_production_so_litellm_loads_no_dotenv(tmp_path
     assert out == "PRODUCTION"
 
 
+def test_import_overrides_an_exported_litellm_mode_dev(tmp_path):
+    """An exported LITELLM_MODE=DEV would turn litellm's own load_dotenv()
+    back on, so run_gepa must overwrite it, not merely default it."""
+    out = _run_import_and_print(tmp_path / "missing.env", "os.environ.get('LITELLM_MODE')",
+                                LITELLM_MODE="DEV")
+    assert out == "PRODUCTION"
+
+
 def test_dotenv_refusals_name_knobs_the_child_reads(tmp_path):
     import benchmarks.aider_polyglot as aider_polyglot
     shared = ["ATTEMPT_TIMEOUT_S", "CODEX_TIMEOUT_S", "LITTLE_CODER_ANYTHING", "PI_ANYTHING",
