@@ -267,6 +267,30 @@ def test_exercise_subprocess_is_asked_to_request_lessons(runner_factory, monkeyp
     assert child_envs[0]["POLYGLOT_REQUEST_LESSONS"] == "1"
 
 
+def test_exercise_subprocess_is_asked_for_strict_scoring(runner_factory, monkeypatch):
+    """Both guards are off by default in aider_polyglot.py; a crash on a
+    later attempt must not be cached as a fail, and an edited test file must
+    not score as a pass, so live_eval turns them on for the child."""
+    monkeypatch.setenv("POLYGLOT_CRASH_IS_ERROR", "0")
+    monkeypatch.setenv("POLYGLOT_RESTORE_TESTS", "0")
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    real_popen = subprocess.Popen
+    child_envs = []
+
+    def spy(cmd, *a, **kw):
+        if any(str(part).endswith("aider_polyglot.py") for part in cmd):
+            child_envs.append(kw.get("env"))
+        return real_popen(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    for runner in runner_factory():
+        runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+    assert len(child_envs) == 1
+    assert child_envs[0]["POLYGLOT_CRASH_IS_ERROR"] == "1"
+    assert child_envs[0]["POLYGLOT_RESTORE_TESTS"] == "1"
+
+
 def test_materialize_writes_candidate_text_preserving_frontmatter(runner_factory):
     for runner in runner_factory():
         runner.materialize({"skills_tools_bash": "Brand new guidance body.\n"})

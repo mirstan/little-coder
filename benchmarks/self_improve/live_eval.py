@@ -579,6 +579,11 @@ class PolyglotLiveRunner:
         # Off by default in aider_polyglot.py (it changes the retry prompt);
         # self-improve needs the LESSON: lines for self_reported_lessons.
         env["POLYGLOT_REQUEST_LESSONS"] = "1"
+        # Also off by default there. A pi crash on a later attempt would
+        # otherwise record "fail", which is scored and cached; and an agent
+        # that edits its test file could score a pass.
+        env["POLYGLOT_CRASH_IS_ERROR"] = "1"
+        env["POLYGLOT_RESTORE_TESTS"] = "1"
         if self.benchmark_root:
             env["POLYGLOT_BENCHMARK_ROOT"] = str(self.benchmark_root)
 

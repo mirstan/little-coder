@@ -99,6 +99,25 @@ def _request_lessons() -> bool:
     return os.environ.get(REQUEST_LESSONS_ENV) == "1"
 
 
+#: Opt-in for the same reason as REQUEST_LESSONS_ENV: each changes how an
+#: exercise is scored, so a plain run keeps the published accounting. Set by
+#: live_eval, whose scores are cached and optimized against.
+#: CRASH_IS_ERROR_ENV: a pi crash on ANY attempt of an exercise that did not
+#: pass records "error" (see _classify_status), not just on a lone attempt.
+CRASH_IS_ERROR_ENV = "POLYGLOT_CRASH_IS_ERROR"
+#: RESTORE_TESTS_ENV: score against the test files as prepared, not as the
+#: agent left them (see _restore_tests).
+RESTORE_TESTS_ENV = "POLYGLOT_RESTORE_TESTS"
+
+
+def _crash_is_error() -> bool:
+    return os.environ.get(CRASH_IS_ERROR_ENV) == "1"
+
+
+def _restore_tests_on() -> bool:
+    return os.environ.get(RESTORE_TESTS_ENV) == "1"
+
+
 def _positive_int_env(name: str, default: int) -> int:
     """Parse a positive-integer env var, failing with a readable message.
 
@@ -544,6 +563,11 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
     # those are pi-only, and this changes codex's prompt too.
     if _request_lessons():
         params["request_lessons"] = True
+    # Same only-when-on rule as request_lessons.
+    if _crash_is_error():
+        params["crash_is_error"] = True
+    if _restore_tests_on():
+        params["restore_tests"] = True
     return params
 
 
@@ -669,7 +693,8 @@ def _usage_tokens(result) -> dict:
     }
 
 
-def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> str:
+def _classify_status(passed: bool, attempt: str | None, outcomes: list[str], *,
+                     crash_is_error: bool = False) -> str:
     """Precedence for the recorded status. Pure, so it can be table-tested.
 
     `passed` wins over everything: a pi that exits right after writing a
@@ -677,10 +702,16 @@ def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> 
     Generalized from a hardcoded two attempts to however many `outcomes`
     actually ran, so --max-attempts can be raised without touching this
     function.
+
+    crash_is_error (POLYGLOT_CRASH_IS_ERROR) widens the process_exit rule
+    below to any attempt: a "fail" is scored and cached as the candidate's
+    result, which a transient pi death is not.
     """
     if passed:
         return attempt or "pass_1"
     if not outcomes:
+        return "error"
+    if crash_is_error and "process_exit" in outcomes:
         return "error"
     last = outcomes[-1]
     if last == "process_exit" and len(outcomes) == 1:
@@ -694,7 +725,54 @@ def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> 
     return "fail"
 
 
-def _score(desc, work: Path, timeout: int):
+def _test_files(src: Path, work: Path, tests) -> dict[str, bytes]:
+    """The exercise's test files as prepared, keyed by path relative to `work`.
+
+    Taken right after desc["prepare"], so it carries the harness's own edits
+    (JS un-skipping) and none of the agent's. The prepare step's test list
+    plus .meta/config.json's files.test, which also names fixtures the
+    prepare globs miss (python's paasio ships test_utils.py, which
+    _prepare_python hands the agent as a stub).
+    """
+    names = {Path(t).relative_to(work).as_posix() for t in tests}
+    try:
+        config = json.loads((src / ".meta" / "config.json").read_text())
+        listed = config.get("files", {}).get("test", [])
+    except (OSError, ValueError, AttributeError):
+        listed = []
+    for name in listed if isinstance(listed, list) else []:
+        if isinstance(name, str) and not Path(name).is_absolute() and ".." not in Path(name).parts:
+            names.add(Path(name).as_posix())
+    return {n: (work / n).read_bytes() for n in sorted(names) if (work / n).is_file()}
+
+
+def _tests_tampered(root: Path, pristine: dict[str, bytes]) -> bool:
+    """Whether any test file under `root` differs from its prepared bytes."""
+    for name, data in pristine.items():
+        p = root / name
+        if p.is_symlink() or not p.is_file() or p.read_bytes() != data:
+            return True
+    return False
+
+
+def _restore_tests(root: Path, pristine: dict[str, bytes]) -> None:
+    """Put the prepared test files back under `root`.
+
+    A symlink or directory in a test file's place is removed rather than
+    written through: in a scoring copy, a symlink can point back into the
+    agent's own tree.
+    """
+    for name, data in pristine.items():
+        p = root / name
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+
+def _score(desc, work: Path, timeout: int, pristine_tests: dict[str, bytes] | None = None):
     """Run the tests against a COPY, so a live agent cannot influence the score.
 
     prompt_and_collect returning does not mean pi is finished: measured on three
@@ -705,8 +783,13 @@ def _score(desc, work: Path, timeout: int):
     stops the test runner's own droppings landing in the agent's tree. Not
     enabled for cpp/rust, whose build dirs are absolute-path-bound and would
     force a full rebuild per scoring pass.
+
+    `pristine_tests` (POLYGLOT_RESTORE_TESTS) restores the test files before
+    the run: in the copy, or in the agent's tree when there is no copy.
     """
     if not desc.get("score_in_copy"):
+        if pristine_tests:
+            _restore_tests(work, pristine_tests)
         return desc["run_tests"](work, timeout)
     with tempfile.TemporaryDirectory() as scratch:
         target = Path(scratch) / work.name
@@ -715,6 +798,8 @@ def _score(desc, work: Path, timeout: int):
         # (hundreds of MB) on every scoring pass of every attempt; preserving
         # the (absolute) symlink still resolves from the copy.
         shutil.copytree(work, target, symlinks=True)
+        if pristine_tests:
+            _restore_tests(target, pristine_tests)
         return desc["run_tests"](target, timeout)
 
 
@@ -914,6 +999,8 @@ def _run_exercise(
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp) / ex_name
         stubs, tests = desc["prepare"](src, work)
+        pristine_tests = _test_files(src, work, tests) if _restore_tests_on() else None
+        tests_tampered = False
         prompt = _build_prompt(ex_name, stubs, tests, desc["syntax_hint"])
 
         t0 = time.time()
@@ -1045,7 +1132,9 @@ def _run_exercise(
             # Snapshot BEFORE the tests run and before any retry prompt is
             # sent, so the artifact reflects what THIS attempt produced.
             _dump_trajectory(log_dir, str(i), r, work, notifications=attempt_notifications)
-            passed, out = _score(desc, work, desc["timeout_s"])
+            if pristine_tests is not None and _tests_tampered(work, pristine_tests):
+                tests_tampered = True
+            passed, out = _score(desc, work, desc["timeout_s"], pristine_tests)
             (log_dir / f"final_output_{i}.txt").write_text(out)
             if passed:
                 attempt = f"pass_{i}"
@@ -1119,7 +1208,8 @@ def _run_exercise(
 
         record = {
             "run_id": RUN_ID,
-            "status": _classify_status(passed, attempt, outcomes),
+            "status": _classify_status(passed, attempt, outcomes,
+                                       crash_is_error=_crash_is_error()),
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
@@ -1131,6 +1221,8 @@ def _run_exercise(
                 for key in ("input_tokens", "cache_read_tokens", "output_tokens")
             },
         }
+        if pristine_tests is not None:
+            record["tests_tampered"] = tests_tampered
         return record
 
 
