@@ -807,12 +807,16 @@ class PolyglotLiveRunner:
                 error=f"results file missing: {results_file}\nstderr tail: {stderr[-2000:]}",
                 **base_kwargs,
             )
+        # Read as bytes so the locale's encoding does not matter (the child
+        # writes ASCII JSON). ValueError covers JSONDecodeError and
+        # UnicodeDecodeError; RecursionError is a deeply nested file. Each
+        # used to escape run_batch()'s harness_error retry path.
         try:
-            data = json.loads(results_file.read_text())
-        except (json.JSONDecodeError, OSError) as e:
+            data = json.loads(results_file.read_bytes())
+        except (ValueError, OSError, RecursionError) as e:
             return LiveRunResult(
                 status="harness_error", score=0.0, success=False,
-                error=f"malformed results file: {e}", **base_kwargs,
+                error=f"malformed results file: {type(e).__name__}: {e}", **base_kwargs,
             )
 
         # Valid JSON of the wrong shape is a harness failure too: an

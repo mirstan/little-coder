@@ -978,6 +978,31 @@ def test_a_stale_results_file_is_not_read_back_as_this_runs_outcome(runner_facto
     assert "results file missing" in result.error
 
 
+def test_non_utf8_results_file_is_retried_then_raises_harness_error(runner_factory, tmp_path):
+    """A results file that is not UTF-8 used to raise UnicodeDecodeError out
+    of _parse_result, past the harness_error retry path and before the
+    budget and on_result bookkeeping for a run that did happen."""
+    child = tmp_path / "bad_results_child.sh"
+    # _interpreter_info() also runs this executable, without the variable.
+    child.write_text(
+        '#!/bin/sh\n'
+        '[ -n "$POLYGLOT_RESULTS_FILE" ] || exit 1\n'
+        "printf '{\"exercises\": {\"pi/python/wordy\": {\"status\": \"pass_1\\377\"}}}' "
+        '> "$POLYGLOT_RESULTS_FILE"\n'
+    )
+    child.chmod(0o755)
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        runner.python_executable = str(child)
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="malformed results file"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("wordy")])
+
+    assert [r.status for r in seen] == ["harness_error"] * (1 + live_eval.HARNESS_ERROR_RETRIES)
+    assert "UnicodeDecodeError" in seen[0].error
+    assert not list((tmp_path / "cache").rglob("*.json"))
+
+
 def test_live_run_result_from_dict_ignores_an_unknown_key():
     """A stray key in a cache entry must load, not raise TypeError -- a cache
     read can't be allowed to kill an in-flight run."""

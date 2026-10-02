@@ -159,6 +159,11 @@ import pytest
     {"exercises": {"pi/python/wordy": "pass_1"}},
     {"exercises": {"pi/python/wordy": {"status": 5}}},
     {"exercises": {"pi/python/wordy": {"status": ["pass_1"]}}},
+    # Raw bytes, written as-is: not UTF-8 (UnicodeDecodeError is a
+    # ValueError, not a JSONDecodeError), and nested deep enough for
+    # RecursionError. Neither starts with a UTF-16 byte-order mark.
+    pytest.param(b'{"exercises": {"pi/python/wordy": {"status": "pass_1\xff"}}}', id="not-utf8"),
+    pytest.param(b"[" * 100_000, id="deeply-nested"),
 ])
 def test_parse_result_treats_a_schema_invalid_results_file_as_a_harness_error(tmp_path, payload):
     """Valid JSON of the wrong shape used to raise AttributeError/TypeError
@@ -167,7 +172,10 @@ def test_parse_result_treats_a_schema_invalid_results_file_as_a_harness_error(tm
     results_file = tmp_path / "results.json"
     log_root = tmp_path / "logs"
     log_root.mkdir()
-    results_file.write_text(json.dumps(payload))
+    if isinstance(payload, bytes):
+        results_file.write_bytes(payload)
+    else:
+        results_file.write_text(json.dumps(payload))
 
     result = runner._parse_result(ExerciseSpec("wordy"), results_file, log_root, stderr="", exit_code=0)
 
