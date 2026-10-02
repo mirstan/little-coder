@@ -40,7 +40,6 @@ from benchmarks.self_improve.scratch_worktree import (
     LEGACY_SCRATCH_MARKER_NAME,
     _force_rmtree,
     _git_env,
-    _read_nofollow,
     prune_stale,
     scratch_git_dir,
     scratch_lock_path,
@@ -54,7 +53,11 @@ _SCRATCH_ENTRY_RE = re.compile(r"^(gepa-scratch-\d+-[0-9a-f]{8})(\.lock|\.marker
 
 
 def _pid_alive(pid: object) -> bool:
-    if not isinstance(pid, int):
+    """Whether the marker's pid names a live process. A value no process can
+    have (a bool, 0 or below, or past pid_t, where os.kill raises
+    OverflowError) is not alive; 0 and -1 would otherwise probe a process
+    group or every process."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
@@ -62,9 +65,26 @@ def _pid_alive(pid: object) -> bool:
         return False
     except PermissionError:
         return True  # exists, just not ours to signal
-    except OSError:
+    except (OSError, OverflowError):
         return False
     return True
+
+
+def _read_marker_bytes(path: Path) -> bytes:
+    """Read a marker without following a symlink, without blocking on a
+    FIFO, and only if the opened fd is a regular file (a FIFO or device at
+    the marker name is never a marker scratch_worktree() wrote). Raises
+    OSError otherwise."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _lock_held(path: Path) -> bool:
@@ -164,7 +184,7 @@ def find_scratch_dirs(scratch_root: Path) -> list[dict]:
             continue
 
         try:
-            marker = json.loads(_read_nofollow(marker_path))
+            marker = json.loads(_read_marker_bytes(marker_path))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
             info["reason"] = f"marker unreadable ({e}) -- not ours, never touch"
             results.append(info)
@@ -319,7 +339,7 @@ def find_legacy_worktrees(repo_root: Path, scratch_root: Optional[Path] = None) 
             results.append(info)
             continue
         try:
-            marker = json.loads(_read_nofollow(marker_path))
+            marker = json.loads(_read_marker_bytes(marker_path))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
             info["reason"] = f"marker file unreadable ({e}) -- not ours, never touch"
             results.append(info)

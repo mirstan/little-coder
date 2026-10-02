@@ -441,3 +441,47 @@ def test_cli_list_prints_every_registered_worktree_and_scratch_dir(source_repo, 
     assert branch_wt.name in out
     assert wt.path.name in out
     assert "private-repo" in out and "legacy-worktree" in out
+
+
+@pytest.mark.parametrize("bad_pid", [2 ** 64, -(2 ** 64), 0, -1, True])
+def test_impossible_marker_pid_is_not_alive_and_does_not_abort_the_scan(source_repo, root, bad_pid):
+    """os.kill raises OverflowError past the C pid_t range, which used to
+    escape _pid_alive and abort the whole scan; 0/-1 address a process
+    group / every process, and True is int 1."""
+    bad = _make_kept(source_repo, root)
+    good = _make_kept(source_repo, root)
+    _forge_dead_marker(bad.path)
+    _edit_marker(bad.path, pid=bad_pid)
+    _forge_dead_marker(good.path)
+    assert gc._pid_alive(bad_pid) is False
+    entries = find_scratch_dirs(root)
+    assert _entry(entries, bad.path)["removable"] is True
+    assert _entry(entries, good.path)["removable"] is True
+
+
+def test_overflowing_active_pid_does_not_abort_the_scan(source_repo, root):
+    wt = _make_kept(source_repo, root)
+    _forge_dead_marker(wt.path)
+    _edit_marker(wt.path, active_pid=2 ** 70)
+    assert _entry(find_scratch_dirs(root), wt.path)["removable"] is True
+
+
+def test_fifo_marker_is_rejected_without_blocking(source_repo, root):
+    """A FIFO at the marker name is never ownership evidence. The scan must
+    neither hang on it nor parse whatever a writer feeds it."""
+    wt = _make_kept(source_repo, root)
+    wt.marker_path.unlink()
+    os.mkfifo(wt.marker_path)
+    e = _entry(find_scratch_dirs(root), wt.path)
+    assert e["removable"] is False
+    assert "not a regular file" in e["reason"]
+
+
+def test_fifo_legacy_marker_is_rejected_without_blocking(source_repo, root):
+    path = _make_legacy_scratch(source_repo, root)
+    marker = path / LEGACY_SCRATCH_MARKER_NAME
+    marker.unlink()
+    os.mkfifo(marker)
+    e = _entry(find_legacy_worktrees(source_repo, root), path)
+    assert e["removable"] is False
+    assert "not a regular file" in e["reason"]
