@@ -144,9 +144,10 @@ the tree and everything next to it as reachable. It can still:
   `<your checkout>/node_modules`;
 - write to your real checkout and its `.git` by absolute path, or to the
   scratch repo's git dir (`<tree>.git`). The checks below cover that git
-  dir's top level and config, and what `reset()` checks out. Nothing stops
-  the agent changing `objects/` or `refs/`, but a change there that alters
-  the checkout makes the next `reset()` fail.
+  dir's top level, config and `refs/` subtree, and what `reset()` checks
+  out. Nothing stops the agent changing `objects/` or `refs/` (though a
+  symlink or special file under `refs/` fails the check), but a change
+  there that alters the checkout makes the next `reset()` fail.
 
 What the orchestrator does about it is limited to its own git calls and
 file operations. The scratch repo is a private repo (its own object store,
@@ -170,6 +171,12 @@ git call on it:
   `core.sparseCheckout=false` and `index.sparse=false`. These are defense
   in depth: a planted commit-graph did not change what checkout produced
   on git 2.54;
+- pins `core.logAllRefUpdates=false`, so git never creates
+  `<tree>.git/logs/`. git still appends to a reflog that already exists,
+  through a symlink or hard link, so a `logs/` directory in `<tree>.git`
+  fails the check below instead of being trusted. Without that, a link at
+  `<tree>.git/logs/HEAD` would make `reset()` append a line to any file you
+  can write, your checkout's `.git/config` included;
 - runs `status` with `--no-optional-locks` and `--ignore-submodules=all`;
 - runs without the orchestrator-only variables above in its environment;
 - first checks, raising `ScratchWorktreeCorrupted` instead of running git
@@ -179,18 +186,28 @@ git call on it:
     descriptor held since creation, so a symlink or another directory at
     either path fails the check;
   - `<tree>.git` contains `HEAD`, `config`, `objects/` and `refs/`, and
-    nothing at its top level other than those plus `index`, `logs/`,
-    `shallow` and `ORIG_HEAD`, each of the expected type (no symlinks).
-    `commondir`, `gitdir`, `config.worktree`, `worktrees/`, `hooks/`,
-    `info/`, `sharedindex.*` and anything else fail;
+    nothing at its top level other than those plus `index`, `shallow` and
+    `ORIG_HEAD`, each of the expected type (no symlinks). `commondir`,
+    `gitdir`, `config.worktree`, `logs/`, `worktrees/`, `hooks/`, `info/`,
+    `sharedindex.*` and anything else fail;
+  - nothing under `<tree>.git/refs/` is a symlink or special file, and
+    every directory there can be listed. A symlinked directory would let a
+    ref update that follows a symbolic ref write into another directory,
+    and git only needs search permission to pass through one the check
+    cannot list;
   - `<tree>.git/config` has exactly the bytes creation wrote.
 
   The same checks run once at the end of creation.
 
 `reset()` deletes `<tree>.git/index` before checking out, so a crafted index
 (skip-worktree or assume-unchanged bits, split or sparse index, untracked
-cache) is rebuilt from the base commit. It deletes every `.git` entry (any
-case, any depth) left in the tree, since git itself skips them. Last, it
+cache) is rebuilt from the base commit. It also deletes
+`<tree>.git/ORIG_HEAD`: `reset --hard` updates it, and would follow a
+symbolic one (`ref: refs/heads/<name>`) and write the base commit's sha into
+the ref it names. `HEAD` needs no such step, because `checkout --detach`
+rewrites it without following it before `reset --hard` runs. It deletes
+every `.git` entry (any case, any depth) left in the tree, since git itself
+skips them. Last, it
 compares every path of the base commit with the `git ls-tree -r` listing
 recorded at creation, before the agent ran: file type, executable bit, and
 the blob hash of the file's content or the symlink's target. Any difference
@@ -205,9 +222,9 @@ status` would not report.
 
 Apart from the identity check itself, the orchestrator's own file
 operations on the tree and `<tree>.git` (reading the git dir, deleting the
-index, removing `.git` entries, the content check, teardown) go through the
-held directory descriptors, never through the paths, so swapping a path
-cannot redirect them. Teardown empties each directory through its
+index and `ORIG_HEAD`, removing `.git` entries, the content check,
+teardown) go through the held directory descriptors, never through the
+paths, so swapping a path cannot redirect them. Teardown empties each directory through its
 descriptor and then `rmdir`s the path, which cannot remove a non-empty
 directory or a symlink. If the path no longer names the directory this run
 created, teardown leaves whatever is there alone and warns; the directory

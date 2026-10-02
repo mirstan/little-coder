@@ -33,11 +33,19 @@ Design choices, all deliberate:
       must still be the directories this run created (lstat compared with
       a directory fd held since creation); G's top level must hold only
       the entries in _GIT_DIR_REQUIRED/_GIT_DIR_OPTIONAL, each of its
-      expected type; and G/config must have the bytes captured when
-      creation finished -- otherwise ScratchWorktreeCorrupted (fail
-      closed: config-defined hooks have no global off switch in git 2.54).
+      expected type (so a logs/ fails; see the core.logAllRefUpdates
+      pin); everything under G/refs must be a real directory or regular
+      file, and a directory there that cannot be listed fails too (a
+      symlinked directory would send a ref update into another
+      directory); and G/config must have the bytes captured when creation
+      finished -- otherwise ScratchWorktreeCorrupted (fail closed:
+      config-defined hooks have no global off switch in git 2.54).
       These are point-in-time checks: a swap made after one and undone
       before the next is not seen, and git's exec takes paths;
+    * `-c core.logAllRefUpdates=false`, so git never creates G/logs/.
+      The pin does not stop git appending to a reflog that already exists,
+      through a symlink or hard link, so a logs/ in G fails the check
+      above instead of being trusted;
     * `-c core.hooksPath=/dev/null -c core.fsmonitor=false
       -c core.attributesFile=/dev/null`, and `--attr-source=<base_commit>`
       so an agent-written .gitattributes cannot select a filter driver.
@@ -51,11 +59,14 @@ Design choices, all deliberate:
     * the orchestrator-only secrets are removed from the environment of
       every git call, creation included.
 - The orchestrator's own file operations on the tree and G (the G checks,
-  the index unlink, the `.git` removal, teardown) go through those held
-  directory fds, never by path, so a path swapped after a check cannot
-  redirect them.
+  the index and ORIG_HEAD unlinks, the `.git` removal, teardown) go
+  through those held directory fds, never by path, so a path swapped
+  after a check cannot redirect them.
 - reset() deletes G/index before checking out (a crafted index is rebuilt
-  from the base commit) and finishes by comparing every tracked path with
+  from the base commit) and G/ORIG_HEAD (`reset --hard` would follow a
+  symbolic one and write the base sha into the ref it names; HEAD is
+  rewritten by `checkout --detach` without being followed), and finishes
+  by comparing every tracked path with
   `git ls-tree -r <base>` as recorded at creation, before the agent ran:
   type, exec bit and blob hash. Tampering with G/objects (a rewritten
   object, a planted pack or alternates) that changes the checkout fails
@@ -137,16 +148,23 @@ _HARDEN = [
     # GIT_CONFIG_GLOBAL=/dev/null does not stop git reading the default
     # $XDG_CONFIG_HOME/git/ignore, which could hide a file from status.
     "-c", "core.excludesFile=" + os.devnull,
+    # git then never creates G/logs/, which lets the G check reject any
+    # logs/ entry. The pin alone is not enough: git still appends to a
+    # reflog that already exists, through a symlink or hard link.
+    "-c", "core.logAllRefUpdates=false",
 ]
 
 #: Every top-level entry of G that git 2.54 creates during `init --template=`,
 #: the depth-1 fetch (FETCH_HEAD is unlinked before creation finishes),
 #: checkout, `reset --hard`, `status` and `clean`, with its required type.
-#: Anything else -- commondir, gitdir, config.worktree, worktrees/, hooks/,
-#: info/, modules/, sharedindex.*, index.lock, packed-refs, ... -- fails closed.
-#: packed-refs is left out on purpose: nothing here creates it.
+#: Anything else -- commondir, gitdir, config.worktree, logs/, worktrees/,
+#: hooks/, info/, modules/, sharedindex.*, index.lock, packed-refs, ... --
+#: fails closed. packed-refs is left out on purpose: nothing here creates it.
+#: logs/ is left out because git appends to a reflog that already exists,
+#: through a symlink or hard link; core.logAllRefUpdates=false in _HARDEN
+#: keeps git from creating it.
 _GIT_DIR_REQUIRED = {"HEAD": stat.S_ISREG, "config": stat.S_ISREG, "objects": stat.S_ISDIR, "refs": stat.S_ISDIR}
-_GIT_DIR_OPTIONAL = {"index": stat.S_ISREG, "logs": stat.S_ISDIR, "shallow": stat.S_ISREG, "ORIG_HEAD": stat.S_ISREG}
+_GIT_DIR_OPTIONAL = {"index": stat.S_ISREG, "shallow": stat.S_ISREG, "ORIG_HEAD": stat.S_ISREG}
 
 #: `git rev-parse --local-env-vars` on git 2.54, used when that call fails.
 #: GIT_COMMON_DIR is stripped here like the rest, then re-pinned to G by
@@ -257,7 +275,8 @@ class ScratchWorktreeCorrupted(ScratchWorktreeError):
     """The scratch tree or its git dir is in a state the orchestrator did not
     put it in -- unexpected dirty files or flagged index entries, a tree or
     git dir that is no longer the directory this run created, an entry in
-    G's top level outside the allowlist, a tampered G/config, or a checkout
+    G's top level outside the allowlist, a symlink or special file under
+    G/refs, a tampered G/config, or a checkout
     that differs from the base commit's recorded tree. The caller should
     abort the whole run rather than continue on unverified state: every
     score after an undetected corruption is untrustworthy, and a tampered
@@ -344,6 +363,12 @@ _DIR_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 def _lstat_at(dir_fd: int, name: str | bytes) -> os.stat_result:
     return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+def _reraise(e: OSError) -> None:
+    """os.fwalk onerror: without it fwalk silently skips a directory it
+    cannot open or list."""
+    raise e
 
 
 @functools.lru_cache(maxsize=None)
@@ -654,8 +679,10 @@ class ScratchWorktree:
         the directories this run created (_verify_identity); G's top level
         must hold every _GIT_DIR_REQUIRED entry and nothing outside
         _GIT_DIR_REQUIRED/_GIT_DIR_OPTIONAL, each of its expected type (so
-        no symlinks); and G/config must have exactly the bytes it had when
-        creation finished. G is read through the held fd, never by path."""
+        no symlinks); everything under G/refs must be a directory or a
+        regular file, every directory there listable; and G/config must
+        have exactly the bytes it had when creation finished. G is read
+        through the held fd, never by path."""
         self._verify_identity()
         g, gfd = self.git_dir, self.git_dir_fd
         try:
@@ -670,6 +697,17 @@ class ScratchWorktree:
             for name in names:
                 if not allowed[name](_lstat_at(gfd, name).st_mode):
                     raise ScratchWorktreeCorrupted(f"{g / name} has the wrong file type")
+            # git writes loose refs and their lockfiles inside refs/; a
+            # symlinked directory there sends a ref update that follows a
+            # symbolic ref into another directory. git only needs search
+            # permission to traverse, so a directory this walk cannot list
+            # fails closed (onerror) instead of being skipped.
+            for _, dirnames, filenames, dirfd in os.fwalk("refs", follow_symlinks=False, dir_fd=gfd,
+                                                          onerror=_reraise):
+                for name in [*dirnames, *filenames]:
+                    mode = _lstat_at(dirfd, name).st_mode
+                    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                        raise ScratchWorktreeCorrupted(f"{g / 'refs'} holds a symlink or special file")
             if _read_nofollow("config", dir_fd=gfd) != self.config_bytes:
                 raise ScratchWorktreeCorrupted(f"{g / 'config'} changed since the scratch repo was created")
         except OSError as e:
@@ -796,10 +834,16 @@ class ScratchWorktree:
         # A crafted index (skip-worktree or assume-unchanged bits, split or
         # sparse index, untracked cache) survives checkout/reset and hides
         # files from status; checkout rebuilds it from base_commit.
-        try:
-            os.unlink("index", dir_fd=self.git_dir_fd)
-        except FileNotFoundError:
-            pass
+        # `reset --hard` updates ORIG_HEAD and follows it if it is a symbolic
+        # ref (`ref: refs/heads/<x>`), writing the base sha into whatever
+        # that names; unlinked here, it is simply recreated. HEAD needs no
+        # unlink: `checkout --detach` below rewrites it without following
+        # it, so it must stay before `reset --hard`.
+        for name in ("index", "ORIG_HEAD"):
+            try:
+                os.unlink(name, dir_fd=self.git_dir_fd)
+            except FileNotFoundError:
+                pass
         self._remove_dot_git_entries(top_level_only=True)
         if not _git_supports_attr_source():
             # No --attr-source: remove an agent-written .gitattributes before

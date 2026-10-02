@@ -462,6 +462,7 @@ def test_repeated_reset_cycles_keep_the_git_dir_check_passing(source_repo, tmp_p
             wt.assert_only_expected_dirty([target])
             assert not (wt.git_dir / "hooks").exists()
             assert not (wt.git_dir / "info").exists()
+            assert not (wt.git_dir / "logs").exists()
         wt.reset()
         assert wt.git(["status", "--porcelain"]).stdout == ""
 
@@ -1077,7 +1078,7 @@ def test_git_dir_replaced_by_a_copy_is_rejected(source_repo, tmp_path):
     ("commondir", "file"), ("gitdir", "file"), ("config.worktree", "file"), ("worktrees", "dir"),
     ("hooks", "dir"), ("info", "dir"), ("modules", "dir"), ("sharedindex.0123", "file"),
     ("index.lock", "file"), ("packed-refs", "file"), ("description", "file"), ("COMMIT_EDITMSG", "file"),
-    ("FETCH_HEAD", "file"), ("MERGE_HEAD", "file"), ("Config", "file"),
+    ("FETCH_HEAD", "file"), ("MERGE_HEAD", "file"), ("Config", "file"), ("logs", "dir"),
 ])
 def test_unexpected_git_dir_entry_fails_closed(source_repo, tmp_path, entry, kind):
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
@@ -1092,7 +1093,7 @@ def test_unexpected_git_dir_entry_fails_closed(source_repo, tmp_path, entry, kin
             wt.reset()
 
 
-@pytest.mark.parametrize("entry", ["HEAD", "objects", "refs", "index", "logs", "shallow", "ORIG_HEAD"])
+@pytest.mark.parametrize("entry", ["HEAD", "objects", "refs", "index", "shallow", "ORIG_HEAD"])
 def test_allowed_git_dir_entry_of_the_wrong_type_fails_closed(source_repo, tmp_path, entry):
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
         wt.reset()  # creates ORIG_HEAD
@@ -1120,6 +1121,7 @@ def test_git_dir_holds_only_allowlisted_entries_through_many_cycles(source_repo,
     allowed = set(sw._GIT_DIR_REQUIRED) | set(sw._GIT_DIR_OPTIONAL)
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
         assert set(os.listdir(wt.git_dir)) <= allowed
+        assert not (wt.git_dir / "logs").exists()
         target = wt.path / "skills" / "bash.md"
         for i in range(3):
             (wt.path / "junk").write_text("x")
@@ -1127,6 +1129,7 @@ def test_git_dir_holds_only_allowlisted_entries_through_many_cycles(source_repo,
             target.write_text(f"candidate {i}\n")
             wt.assert_only_expected_dirty([target])
             assert set(os.listdir(wt.git_dir)) <= allowed, sorted(os.listdir(wt.git_dir))
+            assert not (wt.git_dir / "logs").exists()
 
 
 def test_unknown_entry_left_by_creation_fails_at_startup_and_cleans_up(source_repo, tmp_path, monkeypatch):
@@ -1176,6 +1179,140 @@ def test_global_excludes_file_cannot_hide_an_untracked_file_from_status(source_r
         (wt.path / "hidden.txt").write_text("planted\n")
         with pytest.raises(ScratchWorktreeCorrupted, match="hidden.txt"):
             wt.assert_only_expected_dirty([])
+
+
+# --------------------------------------------------------------------------
+# reset() never writes through a reflog or ref the agent planted in G
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("link", [os.symlink, os.link], ids=["symlink", "hardlink"])
+@pytest.mark.parametrize("reflog", ["HEAD", "ORIG_HEAD"])
+def test_planted_reflog_linked_to_the_source_config_is_rejected_and_never_written(
+        source_repo, tmp_path, link, reflog):
+    """git appends to a reflog that already exists, through a symlink or a
+    hard link, even with core.logAllRefUpdates=false. A logs/ entry in G
+    must fail closed rather than let reset() append to any file the user can
+    write -- here the source checkout's .git/config."""
+    victim = source_repo / ".git" / "config"
+    before = victim.read_bytes()
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()  # creates ORIG_HEAD
+        g = wt.git_dir
+        (g / "logs").mkdir()
+        link(victim, g / "logs" / reflog)
+        (g / "HEAD").write_text("ref: refs/heads/x\n")
+        (wt.path / "AGENTS.md").write_text("mutated\n")
+        try:
+            with pytest.raises(ScratchWorktreeCorrupted, match="unexpected"):
+                wt.reset()
+        finally:
+            shutil.rmtree(g / "logs")
+            (g / "HEAD").write_text(wt.base_commit + "\n")
+    assert victim.read_bytes() == before
+
+
+def test_every_scratch_git_call_pins_log_all_ref_updates_off(source_repo, tmp_path, monkeypatch):
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        # Leaves out conftest's real-repo guard (--git-common-dir) and the
+        # static probes, which read no repo and carry no -c pins.
+        if (cmd and cmd[0] == "git" and "--git-common-dir" not in cmd
+                and cmd[1:] not in (["version"], ["rev-parse", "--local-env-vars"])):
+            calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    sw._git_version.cache_clear()
+    sw._git_local_env_vars.cache_clear()
+    monkeypatch.setattr(sw.subprocess, "run", _spy)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+        wt.assert_only_expected_dirty([])
+    monkeypatch.setattr(sw.subprocess, "run", real_run)
+    assert any("init" in c for c in calls) and any("reset" in c for c in calls)
+    for c in calls:
+        assert "core.logAllRefUpdates=false" in c, c
+
+
+def test_creation_pin_keeps_logallrefupdates_out_of_the_scratch_config(source_repo, tmp_path):
+    """`git init` writes core.logallrefupdates=true unless the pin is in
+    effect, so its absence shows the pin applied at creation too."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        assert b"logallrefupdates" not in wt.config_bytes.lower()
+        assert not (wt.git_dir / "logs").exists()
+
+
+def test_symbolic_orig_head_is_not_followed_by_reset(source_repo, tmp_path):
+    """`reset --hard` updates ORIG_HEAD and would follow a symbolic one,
+    writing the base sha into the ref it names. reset() unlinks ORIG_HEAD
+    first, so the named ref is left alone."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+        g = wt.git_dir
+        planted = "1" * 40 + "\n"
+        (g / "refs" / "heads" / "y").write_text(planted)
+        (g / "ORIG_HEAD").write_text("ref: refs/heads/y\n")
+        wt.reset()
+        assert (g / "refs" / "heads" / "y").read_text() == planted
+        assert (g / "ORIG_HEAD").read_text().strip() == wt.base_commit
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o300, 0o100], ids=["0700", "0300", "0100"])
+def test_symlinked_directory_under_refs_fails_closed_even_when_unreadable(source_repo, tmp_path, mode):
+    """A symlink under refs/ would let a ref update land in another
+    directory. git only needs search permission to traverse refs/heads, so
+    a directory the check cannot list (0300, 0100) must fail closed too."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+        heads = wt.git_dir / "refs" / "heads"
+        os.symlink(outside, heads / "sub")
+        (wt.git_dir / "ORIG_HEAD").write_text("ref: refs/heads/sub/y\n")
+        os.chmod(heads, mode)
+        try:
+            with pytest.raises(ScratchWorktreeCorrupted):
+                wt.reset()
+        finally:
+            os.chmod(heads, 0o700)
+    assert os.listdir(outside) == []
+
+
+@pytest.mark.parametrize("kind", ["file-symlink", "fifo"])
+def test_symlink_or_special_file_under_refs_fails_closed(source_repo, tmp_path, kind):
+    target = tmp_path / "outside-ref"
+    target.write_text("1" * 40 + "\n")
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        p = wt.git_dir / "refs" / "tags" / "t"
+        if kind == "fifo":
+            os.mkfifo(p)
+        else:
+            os.symlink(target, p)
+        with pytest.raises(ScratchWorktreeCorrupted, match="symlink or special file"):
+            wt.reset()
+    assert target.read_text() == "1" * 40 + "\n"
+
+
+def test_reset_detaches_head_before_reset_hard(source_repo, tmp_path, monkeypatch):
+    """checkout --detach rewrites HEAD without following it, so the
+    reset --hard after it never updates a ref through a symbolic HEAD."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        calls = []
+        real_run = subprocess.run
+
+        def _spy(cmd, *a, **kw):
+            if cmd and cmd[0] == "git":
+                calls.append(list(cmd))
+            return real_run(cmd, *a, **kw)
+
+        monkeypatch.setattr(sw.subprocess, "run", _spy)
+        wt.reset()
+        monkeypatch.setattr(sw.subprocess, "run", real_run)
+    checkout = next(i for i, c in enumerate(calls) if "checkout" in c and "--detach" in c)
+    reset_hard = next(i for i, c in enumerate(calls) if "reset" in c and "--hard" in c)
+    assert checkout < reset_hard
 
 
 # --------------------------------------------------------------------------
