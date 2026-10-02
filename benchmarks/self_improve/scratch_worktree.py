@@ -781,6 +781,7 @@ class ScratchWorktree:
 
     def git(
         self, args: Sequence[str], check: bool = True, global_opts: Sequence[str] = (),
+        text: bool = True,
     ) -> subprocess.CompletedProcess:
         """Run git on this scratch repo with the hardened, scrubbed setup
         (see the module docstring), after verifying G."""
@@ -788,8 +789,26 @@ class ScratchWorktree:
         attr = [f"--attr-source={self.base_commit}"] if _git_supports_attr_source() else []
         return _run_git(
             args, git_dir=self.git_dir, work_tree=self.path, env=self._git_env(),
-            check=check, global_opts=[*attr, *global_opts],
+            check=check, global_opts=[*attr, *global_opts], text=text,
         )
+
+    def base_file_bytes(self, rel: str) -> bytes | None:
+        """The content of the regular file at `rel` (a tree-relative POSIX
+        path) in base_commit, or None when base_commit has no regular file
+        there. Never reads the work tree: the blob id comes from `tracked`
+        (recorded at creation, before the agent ran), the bytes from
+        `git cat-file` through git(), and they must hash to that id."""
+        key = rel.encode()
+        for mode, oid, path in self.tracked:
+            if path != key:
+                continue
+            if mode not in (b"100644", b"100755"):
+                return None
+            data = self.git(["cat-file", "blob", oid], text=False).stdout
+            if _git_object_id(data, oid) != oid:
+                raise ScratchWorktreeCorrupted(f"object {oid} for {rel} in {self.git_dir} does not match its id")
+            return data
+        return None
 
     def mark_spawn_pending(self) -> None:
         """Record, BEFORE subprocess.Popen() is even called, that a new

@@ -16,8 +16,10 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+import weakref
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +106,13 @@ def _attempt_timeout_default_from_source(aider_polyglot_py_path: Path) -> int:
 _ATTEMPT_TIMEOUT_S_DEFAULT = _attempt_timeout_default_from_source(
     Path(__file__).resolve().parent.parent / "aider_polyglot.py"
 )
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _attempt_timeout_s(default: int = _ATTEMPT_TIMEOUT_S_DEFAULT) -> int:
@@ -473,6 +482,29 @@ class PolyglotLiveRunner:
     ):
         self.worktree = worktree
         self.components_yaml = Path(components_yaml)
+        # Read once, here, never again by path: the tree is agent-writable
+        # after any run, and run_batch() checks the mapping before its first
+        # reset. See _pinned_bytes() for where each copy comes from.
+        pinned_yaml = self._pinned_bytes(self.components_yaml)
+        if pinned_yaml is None:
+            raise ValueError(f"{self.components_yaml} is not a file at the pinned commit {worktree.base_commit}")
+        self._component_mapping: dict = yaml.safe_load(pinned_yaml) or {}
+        # write_components_back() takes a path, so it gets a private copy
+        # of the pinned bytes outside the tree, removed with the runner.
+        fd, copy_path = tempfile.mkstemp(prefix="components-", suffix=".yaml")
+        with os.fdopen(fd, "wb") as f:
+            f.write(pinned_yaml)
+        self._pinned_components_yaml = Path(copy_path)
+        weakref.finalize(self, _unlink_quietly, copy_path)
+        #: aider_polyglot.py/rpc_client.py as the subprocess runs them (see
+        #: run_config), from the base commit; a file the commit lacks is
+        #: left out of the hash.
+        self._worktree_executed_bytes = [
+            data for data in (
+                worktree.base_file_bytes("benchmarks/aider_polyglot.py"),
+                worktree.base_file_bytes("benchmarks/rpc_client.py"),
+            ) if data is not None
+        ]
         self.model = model
         self.language = language
         self.max_attempts = max_attempts
@@ -511,6 +543,18 @@ class PolyglotLiveRunner:
         #: (e.g. LiveBudget's own backstop firing on exercise N of M).
         self.on_result = on_result
 
+    def _pinned_bytes(self, path: Path) -> bytes | None:
+        """`path`'s content as of construction. Inside the scratch tree:
+        its content at base_commit, from the scratch repo's object store
+        (ScratchWorktree.base_file_bytes), or None when the commit has no
+        file there. Outside the tree (tests pass the source repo's copy):
+        read by path, once, now."""
+        try:
+            rel = path.relative_to(self.worktree.path)
+        except ValueError:
+            return path.read_bytes()
+        return self.worktree.base_file_bytes(rel.as_posix())
+
     @property
     def run_config(self) -> dict:
         """Everything besides the candidate text that changes what a score
@@ -522,7 +566,10 @@ class PolyglotLiveRunner:
         differs by file:
 
         aider_polyglot.py/rpc_client.py run as a SUBPROCESS inside the
-        scratch worktree, so the worktree's pinned copy is hashed. Hashing
+        scratch worktree, so the worktree's pinned copy is hashed -- its
+        content at base_commit, read once in __init__, since reset() puts
+        exactly that back before every run while the tree itself is
+        whatever the last run's agent left. Hashing
         the source repo instead would let an uncommitted debug edit or a
         branch switch there change the cache key without changing a byte of
         what executes, spuriously re-running already-cached work.
@@ -534,17 +581,15 @@ class PolyglotLiveRunner:
         _COMPACTION_PENALTY, _estimate_token_cost, or _parse_result's own
         scoring logic, and LiveResultCache would keep serving scores
         computed under the superseded formula."""
-        worktree_executed_files = [
-            self.worktree.path / "benchmarks" / "aider_polyglot.py",
-            self.worktree.path / "benchmarks" / "rpc_client.py",
-        ]
         parent_imported_files = [
             Path(_aider_polyglot_ingest_module.__file__),
             Path(_components_module.__file__),
             Path(__file__),
         ]
         hasher = hashlib.sha256()
-        for f in worktree_executed_files + parent_imported_files:
+        for data in self._worktree_executed_bytes:
+            hasher.update(data)
+        for f in parent_imported_files:
             if f.exists():
                 hasher.update(f.read_bytes())
         pi_bin = Path(self.worktree.pi_bin)
@@ -641,7 +686,7 @@ class PolyglotLiveRunner:
         re-applied to text that is already sanitized (run_batch() sanitizes
         once and uses that same dict for both the cache key and the write)."""
         self._check_mapped(sanitized)
-        changed = write_components_back(self.components_yaml, self.worktree.path, sanitized)
+        changed = write_components_back(self._pinned_components_yaml, self.worktree.path, sanitized)
         self.worktree.assert_only_expected_dirty(changed)
         return changed
 
@@ -654,9 +699,8 @@ class PolyglotLiveRunner:
 
     def _check_mapped(self, sanitized: Mapping[str, str]) -> None:
         """Raises ValueError for a component the pinned components.yaml does
-        not map."""
-        mapping = yaml.safe_load(Path(self.components_yaml).read_text()) or {}
-        unmapped = sorted(set(sanitized) - set(mapping))
+        not map (the mapping __init__ read, never the tree's copy)."""
+        unmapped = sorted(set(sanitized) - set(self._component_mapping))
         if unmapped:
             # write_components_back() only logs a warning and skips a
             # pred_name absent from the pinned components.yaml -- every GEPA

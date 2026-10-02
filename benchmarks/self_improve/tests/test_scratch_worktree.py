@@ -155,6 +155,18 @@ def test_scratch_tree_contains_the_committed_files(source_repo, tmp_path):
         assert (wt.path / "skills" / "bash.md").exists()
 
 
+def test_base_file_bytes_reads_the_base_commit_not_the_tree(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        (wt.path / "AGENTS.md").unlink()
+        os.mkfifo(wt.path / "AGENTS.md")  # a read by path would block
+        (wt.path / "skills" / "bash.md").write_text("agent edit\n")
+        assert wt.base_file_bytes("AGENTS.md") == b"# little-coder\n\nBody text.\n"
+        assert wt.base_file_bytes("skills/bash.md") == b"---\nname: bash\n---\nBash guidance.\n"
+        assert wt.base_file_bytes("missing.md") is None
+        assert wt.base_file_bytes("skills") is None
+        (wt.path / "AGENTS.md").unlink()
+
+
 def test_two_managers_get_distinct_paths_and_coexist(source_repo, tmp_path):
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt1:
         with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt2:

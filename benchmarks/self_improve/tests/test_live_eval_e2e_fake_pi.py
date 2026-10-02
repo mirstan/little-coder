@@ -1390,3 +1390,117 @@ def test_an_unmapped_component_fails_before_a_budget_refusal(runner_factory):
     for runner in runner_factory(budget=budget):
         with pytest.raises(ValueError, match="not present in"):
             runner.run_batch({"agents_md": "text", "totally_unmapped_pred_name": "x"}, [ExerciseSpec("wordy")])
+
+
+@pytest.fixture
+def in_tree_runner_factory(source_repo, fake_practice, tmp_path, monkeypatch):
+    """Like runner_factory, but with components_yaml inside the scratch tree,
+    the way run_gepa.py passes it (wt.path / components_rel)."""
+    monkeypatch.setenv("ATTEMPT_TIMEOUT_S", "30")
+    monkeypatch.setenv("LITTLE_CODER_PI_BIN_OVERRIDE", str(FAKE_PI))
+
+    def _make(budget=None):
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=FAKE_PI) as wt:
+            yield PolyglotLiveRunner(
+                worktree=wt, components_yaml=wt.path / "config" / "components.yaml",
+                model="fake/model", max_attempts=1, benchmark_root=fake_practice,
+                per_exercise_timeout_s=60, budget=budget,
+            )
+
+    return _make
+
+
+def _leave_in_tree(runner, how: str) -> None:
+    """What an agent can leave at the tree's components.yaml after the
+    previous batch's last run (nothing resets the tree between batches)."""
+    target = runner.worktree.path / "config" / "components.yaml"
+    target.unlink()
+    if how == "fifo":
+        os.mkfifo(target)
+    elif how == "edited":
+        target.write_text(yaml.dump({"agents_md": "AGENTS.md", "rogue": "AGENTS.md"}))
+    elif how == "emptied":
+        target.write_text("")
+    elif how == "garbage":
+        target.write_text("{{{ not: yaml")
+    # "deleted": leave it unlinked
+
+
+def _run_batch_guarded(runner, candidate, timeout_s=60.0):
+    """run_batch in a daemon thread, so a read blocking on a FIFO fails the
+    test instead of hanging the suite. On timeout, opens the FIFO's write
+    end once so the blocked reader sees EOF and the thread ends."""
+    import threading
+
+    outcome: dict = {}
+
+    def _target():
+        try:
+            outcome["value"] = runner.run_batch(candidate, [ExerciseSpec("wordy")])
+        except BaseException as e:  # noqa: BLE001 -- re-raised by the caller
+            outcome["error"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        fifo = runner.worktree.path / "config" / "components.yaml"
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        t.join(10)
+        pytest.fail(f"run_batch did not return within {timeout_s}s (blocked on the tree's components.yaml?)")
+    return outcome
+
+
+@pytest.mark.parametrize("how", ["fifo", "edited", "emptied", "garbage", "deleted"])
+def test_components_yaml_left_in_the_tree_between_batches_changes_nothing(
+    in_tree_runner_factory, monkeypatch, how,
+):
+    """The mapping comes from the base commit, read once at construction;
+    the tree's copy is agent-writable after a batch's last run, and the next
+    batch's unmapped-component check runs before any reset."""
+    import time as time_module
+
+    from benchmarks.self_improve.live_budget import LiveBudget, LiveEvalBudgetExceeded
+
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_from_env")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    budget = LiveBudget(hard_deadline_monotonic=time_module.monotonic() + 3600, max_live_runs=1)
+    for runner in in_tree_runner_factory(budget=budget):
+        first = runner.run_batch({"skills_tools_bash": "First.\n"}, [ExerciseSpec("wordy")])
+        assert first[0].status == "pass_1"
+        _leave_in_tree(runner, how)
+
+        # A miss: reaches the mapping check, then the budget (spent) refuses.
+        outcome = _run_batch_guarded(runner, {"skills_tools_bash": "Second.\n"})
+        assert isinstance(outcome.get("error"), LiveEvalBudgetExceeded), outcome
+
+        # Still the pinned mapping: a key only the tree's copy maps is rejected.
+        outcome = _run_batch_guarded(runner, {"skills_tools_bash": "Third.\n", "rogue": "x"})
+        assert isinstance(outcome.get("error"), ValueError), outcome
+        assert "not present in" in str(outcome["error"])
+
+
+def test_components_yaml_left_in_the_tree_does_not_change_what_materialize_writes(in_tree_runner_factory):
+    for runner in in_tree_runner_factory():
+        target = runner.worktree.path / "config" / "components.yaml"
+        target.write_text(yaml.dump({"agents_md": "skills/tools/bash.md", "skills_tools_bash": "AGENTS.md"}))
+        changed = runner.materialize({"agents_md": "New agents text.\n"})
+        assert changed == [runner.worktree.path / "AGENTS.md"]
+        assert (runner.worktree.path / "AGENTS.md").read_text() == "New agents text.\n"
+
+
+def test_editing_the_trees_harness_files_between_batches_leaves_the_cache_key_alone(in_tree_runner_factory):
+    """aider_polyglot.py/rpc_client.py are hashed from the base commit, not
+    from the tree an agent ran in."""
+    for runner in in_tree_runner_factory():
+        before = runner.run_config["harness_hash"]
+        for name in ("aider_polyglot.py", "rpc_client.py"):
+            p = runner.worktree.path / "benchmarks" / name
+            p.write_text(p.read_text() + "\n# agent edit\n")
+        assert runner.run_config["harness_hash"] == before
+        for name in ("aider_polyglot.py", "rpc_client.py"):
+            (runner.worktree.path / "benchmarks" / name).unlink()
+        assert runner.run_config["harness_hash"] == before
