@@ -143,34 +143,87 @@ the tree and everything next to it as reachable. It can still:
   environment is the resolved pi path, which by default lies inside
   `<your checkout>/node_modules`;
 - write to your real checkout and its `.git` by absolute path, or to the
-  scratch repo's git dir (`<tree>.git`). Only part of that git dir is
-  checked (below); its objects and refs are not, though replace refs are
-  ignored (`core.useReplaceRefs=false`).
+  scratch repo's git dir (`<tree>.git`). The checks below cover that git
+  dir's top level and config, and what `reset()` checks out. Nothing stops
+  the agent changing `objects/` or `refs/`, but a change there that alters
+  the checkout makes the next `reset()` fail.
 
-What the orchestrator does about it is limited to its own git calls. The
-scratch repo is a private repo (its own object store, no hooks directory, no
-remote) created by a depth-1 fetch of the base commit, so it shares no git
-admin with your checkout, and your checkout's `.git` is only read. Its git
-dir sits beside the tree, not inside it. Every git call on it:
+What the orchestrator does about it is limited to its own git calls and
+file operations. The scratch repo is a private repo (its own object store,
+no hooks directory, no remote) created by a depth-1 fetch of the base
+commit, so it shares no git admin with your checkout, and your checkout's
+`.git` is only read. Its git dir sits beside the tree, not inside it. Every
+git call on it:
 
 - ignores user and system git config (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`) and drops git's location/config environment
   variables;
+- pins `GIT_COMMON_DIR` to `<tree>.git`, so a planted `commondir` file
+  cannot redirect config, refs or objects elsewhere;
 - pins `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-  `core.attributesFile=/dev/null` and `core.useReplaceRefs=false`, and reads attributes only from the base
-  commit (`--attr-source`, git 2.40 or later; on older git, `reset()` removes
-  untracked files before checkout instead);
-- runs `status` with `--no-optional-locks`;
+  `core.attributesFile=/dev/null`, `core.excludesFile=/dev/null` and
+  `core.useReplaceRefs=false`, and reads attributes only from the base
+  commit (`--attr-source`, git 2.40 or later; on older git, `reset()`
+  removes untracked files before checkout instead);
+- also pins `core.commitGraph=false`, `core.multiPackIndex=false`,
+  `core.splitIndex=false`, `core.untrackedCache=false`,
+  `core.sparseCheckout=false` and `index.sparse=false`. These are defense
+  in depth: a planted commit-graph did not change what checkout produced
+  on git 2.54;
+- runs `status` with `--no-optional-locks` and `--ignore-submodules=all`;
 - runs without the orchestrator-only variables above in its environment;
-- once creation has finished, first checks that `<tree>.git/config` is a
-  regular file with exactly the bytes creation wrote, and that
-  `<tree>.git/hooks` and `<tree>.git/info` do not exist. If not, it raises
-  `ScratchWorktreeCorrupted` instead of running git.
+- first checks, raising `ScratchWorktreeCorrupted` instead of running git
+  if any check fails:
+  - the tree's and `<tree>.git`'s paths still name the directories this
+    run created. Each path is `lstat`ed and compared with a directory
+    descriptor held since creation, so a symlink or another directory at
+    either path fails the check;
+  - `<tree>.git` contains `HEAD`, `config`, `objects/` and `refs/`, and
+    nothing at its top level other than those plus `index`, `logs/`,
+    `shallow` and `ORIG_HEAD`, each of the expected type (no symlinks).
+    `commondir`, `gitdir`, `config.worktree`, `worktrees/`, `hooks/`,
+    `info/`, `sharedindex.*` and anything else fail;
+  - `<tree>.git/config` has exactly the bytes creation wrote.
 
-`reset()` also deletes every `.git` entry (any case, any depth) left in the
-tree, since git itself skips them. Use a separate, spend-limited key for
-reflection, and don't export it in shells where you run other harnesses
-(harbor, tb, or `aider_polyglot.py` directly), which do not remove it.
+  The same checks run once at the end of creation.
+
+`reset()` deletes `<tree>.git/index` before checking out, so a crafted index
+(skip-worktree or assume-unchanged bits, split or sparse index, untracked
+cache) is rebuilt from the base commit. It deletes every `.git` entry (any
+case, any depth) left in the tree, since git itself skips them. Last, it
+compares every path of the base commit with the `git ls-tree -r` listing
+recorded at creation, before the agent ran: file type, executable bit, and
+the blob hash of the file's content or the symlink's target. Any difference
+raises `ScratchWorktreeCorrupted`. The check looks at the result, not at how
+`<tree>.git/objects` stores it, so it catches a rewritten object, an added
+pack or an `objects/info/alternates` file alike. Without it, such a change
+would persist into every later candidate's harness, which the exercise
+subprocess runs: on git 2.54, checkout writes a rewritten loose object's
+content without complaint. `assert_only_expected_dirty()` also fails if any
+index entry carries a skip-worktree or assume-unchanged bit, which `git
+status` would not report.
+
+Apart from the identity check itself, the orchestrator's own file
+operations on the tree and `<tree>.git` (reading the git dir, deleting the
+index, removing `.git` entries, the content check, teardown) go through the
+held directory descriptors, never through the paths, so swapping a path
+cannot redirect them. Teardown empties each directory through its
+descriptor and then `rmdir`s the path, which cannot remove a non-empty
+directory or a symlink. If the path no longer names the directory this run
+created, teardown leaves whatever is there alone and warns; the directory
+this run created is then wherever the agent moved it, with no marker, and
+the GC will not find it.
+
+git itself takes paths, and the identity checks run at points in time
+(before each git call), not continuously. A process the agent leaves
+running that escapes the exercise's process-group kill (for example, by
+double-forking) could swap a path just after a check and swap it back
+before the next one. Nothing detects that swap, and for the git call in
+between, git could be pointed at another directory, such as your checkout.
+
+Use a separate, spend-limited key for reflection, and don't export it in
+shells where you run other harnesses (harbor, tb, or `aider_polyglot.py`
+directly), which do not remove it.
 
 `$SELF_IMPROVE_NO_LIVE_ROLLOUTS=1` refuses regardless of flags — a hard,
 machine-level deny for a shared host. A graceful stop is available mid-run via

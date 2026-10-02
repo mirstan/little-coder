@@ -228,9 +228,10 @@ def test_keep_true_prints_hardened_inspect_command_and_gc_hint(source_repo, tmp_
     assert f"--git-dir={wt.git_dir}" in inspect_line
     assert f"--work-tree={wt.path}" in inspect_line
     # The human's post-mortem must not run what the agent planted either.
-    for flag in ("GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
+    for flag in ("GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", f"GIT_COMMON_DIR={wt.git_dir}",
                  "core.hooksPath=/dev/null", "core.fsmonitor=false",
-                 "core.attributesFile=/dev/null", "--no-optional-locks"):
+                 "core.attributesFile=/dev/null", "core.excludesFile=/dev/null", "--no-optional-locks",
+                 "--no-pager", "status --porcelain --ignore-submodules=all"):
         assert flag in inspect_line
     assert f"--scratch-root {tmp_path.resolve()}" in out
     _purge(wt)
@@ -707,6 +708,8 @@ def test_attr_source_is_passed_on_git_that_supports_it(source_repo, tmp_path, mo
         assert "core.attributesFile=/dev/null" in c
     status_calls = [c for c in calls if "status" in c]
     assert status_calls and all("--no-optional-locks" in c for c in status_calls)
+    assert all("--ignore-submodules=all" in c for c in status_calls)
+    assert all("core.excludesFile=/dev/null" in c for c in calls)
 
 
 # --------------------------------------------------------------------------
@@ -826,13 +829,14 @@ def test_teardown_removes_chmod_000_dirs_and_immutable_files(source_repo, tmp_pa
 def test_teardown_that_cannot_remove_the_tree_keeps_marker_and_lock(source_repo, tmp_path, monkeypatch, capsys):
     """If the tree survives teardown, the marker (and the unheld lock file)
     must stay, or the GC would later see an unmarked dir and never touch it."""
-    def _cannot_remove(path):
-        raise PermissionError(13, "simulated: cannot remove", str(path))
+    def _cannot_remove(*args, **kwargs):
+        raise PermissionError(13, "simulated: cannot remove", str(args))
 
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
         (wt.path / "skills" / "hid").mkdir()
         (wt.path / "skills" / "hid").chmod(0)
         monkeypatch.setattr(sw, "_force_rmtree", _cannot_remove)
+        monkeypatch.setattr(sw, "_force_rmtree_at", _cannot_remove)
     err = capsys.readouterr()
     assert "could not remove" in (err.out + err.err)
     assert wt.path.exists() and wt.git_dir.exists()
@@ -931,4 +935,496 @@ def test_conftest_guard_rejects_any_worktree_of_the_protected_repo(source_repo, 
                 pass
     with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi"):
         pass  # an unrelated repo is still allowed
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("gepa-scratch-")] == []
+
+
+# --------------------------------------------------------------------------
+# The scratch git dir: GIT_COMMON_DIR pin, top-level allowlist, index rebuild
+# --------------------------------------------------------------------------
+
+
+def _raw_git(wt, *args, **kw):
+    """What the agent can run: plain git on G, no hardening."""
+    return subprocess.run(["git", f"--git-dir={wt.git_dir}", f"--work-tree={wt.path}", *args],
+                          capture_output=True, text=True, check=True, **kw)
+
+
+def _plant_commondir(wt, tmp_path, sentinel):
+    evil = tmp_path / "evil-common"
+    (evil / "objects" / "info").mkdir(parents=True)
+    (evil / "refs").mkdir()
+    (evil / "config").write_text(
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+        f'[hook "evil"]\n\tevent = post-checkout\n\tevent = reference-transaction\n\tcommand = touch {sentinel}\n'
+    )
+    (evil / "objects" / "info" / "alternates").write_text(f"{wt.git_dir / 'objects'}\n")
+    shutil.copy(wt.git_dir / "HEAD", evil / "HEAD")
+    (wt.git_dir / "commondir").write_text(f"{evil}\n")
+
+
+def test_planted_commondir_is_rejected_and_its_config_hook_never_fires(source_repo, tmp_path):
+    sentinel = tmp_path / "fired"
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        _plant_commondir(wt, tmp_path, sentinel)
+        (wt.path / "AGENTS.md").write_text("mutated\n")
+        with pytest.raises(ScratchWorktreeCorrupted, match="commondir"):
+            wt.reset()
+        with pytest.raises(ScratchWorktreeCorrupted):
+            wt.assert_only_expected_dirty([])
+    assert not sentinel.exists()
+
+
+def test_git_common_dir_is_pinned_even_if_the_allowlist_check_is_bypassed(source_repo, tmp_path, monkeypatch):
+    sentinel = tmp_path / "fired"
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        assert wt._git_env()["GIT_COMMON_DIR"] == str(wt.git_dir)
+        _plant_commondir(wt, tmp_path, sentinel)
+        monkeypatch.setattr(type(wt), "_verify_git_dir", lambda self: None)
+        (wt.path / "AGENTS.md").write_text("mutated\n")
+        wt.reset()
+        out = wt.git(["rev-parse", "--git-common-dir"]).stdout.strip()
+        assert os.path.realpath(out) == os.path.realpath(wt.git_dir)
+        monkeypatch.undo()
+        os.unlink(wt.git_dir / "commondir")
+    assert not sentinel.exists()
+
+
+def test_skip_worktree_bit_does_not_survive_reset(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        target = wt.path / "skills" / "bash.md"
+        _raw_git(wt, "update-index", "--skip-worktree", "skills/bash.md")
+        target.write_text("POISONED\n")
+        wt.reset()
+        assert target.read_text() == "---\nname: bash\n---\nBash guidance.\n"
+        wt.assert_only_expected_dirty([])
+        assert "S " not in wt.git(["ls-files", "-v"]).stdout
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_assert_only_expected_dirty_rejects_flagged_index_entries(source_repo, tmp_path, flag):
+    """Set after reset() (an agent process left running), the bit hides the
+    edit from status; ls-files -v still shows it."""
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+        _raw_git(wt, "update-index", flag, "skills/bash.md")
+        (wt.path / "skills" / "bash.md").write_text("POISONED\n")
+        with pytest.raises(ScratchWorktreeCorrupted, match="skills/bash.md"):
+            wt.assert_only_expected_dirty([])
+
+
+def _make_other_checkout(tmp_path):
+    other = _init_repo(tmp_path / "other-checkout")
+    (other / ".env").write_text("SECRET=1\n")
+    (other / "untracked.txt").write_text("keep me\n")
+    (other / "AGENTS.md").write_text("uncommitted work\n")
+    return other
+
+
+def _snapshot_other(other):
+    return {
+        "git": sorted(p.name for p in (other / ".git").iterdir()),
+        "index": (other / ".git" / "index").read_bytes(),
+        "env": (other / ".env").read_text(),
+        "untracked": (other / "untracked.txt").read_text(),
+        "edit": (other / "AGENTS.md").read_text(),
+    }
+
+
+@pytest.mark.parametrize("when", ["reset", "git", "assert"])
+def test_tree_swapped_for_a_symlink_to_another_checkout_is_never_followed(source_repo, tmp_path, when):
+    other = _make_other_checkout(tmp_path)
+    before = _snapshot_other(other)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        moved = wt.path.with_name(wt.path.name + "-moved")
+        os.rename(wt.path, moved)
+        os.symlink(other, wt.path)
+        with pytest.raises(ScratchWorktreeCorrupted, match="tree .* is not the directory this run created"):
+            if when == "reset":
+                wt.reset()
+            elif when == "git":
+                wt.git(["status", "--porcelain"])
+            else:
+                wt.assert_only_expected_dirty([])
+    shutil.rmtree(moved)
+    if os.path.lexists(wt.path):
+        os.unlink(wt.path)
+    assert _snapshot_other(other) == before
+
+
+def test_tree_replaced_by_a_fresh_real_directory_is_rejected(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        shutil.rmtree(wt.path)
+        os.mkdir(wt.path)
+        with pytest.raises(ScratchWorktreeCorrupted, match="tree .* is not the directory this run created"):
+            wt.reset()
+    if os.path.lexists(wt.path):
+        os.rmdir(wt.path)
+
+
+def test_git_dir_replaced_by_a_copy_is_rejected(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        copy = tmp_path / "g-copy"
+        shutil.copytree(wt.git_dir, copy, symlinks=True)
+        shutil.rmtree(wt.git_dir)
+        os.rename(copy, wt.git_dir)
+        with pytest.raises(ScratchWorktreeCorrupted, match="git dir .* is not the directory this run created"):
+            wt.reset()
+    if os.path.lexists(wt.git_dir):
+        shutil.rmtree(wt.git_dir)
+
+
+@pytest.mark.parametrize("entry,kind", [
+    ("commondir", "file"), ("gitdir", "file"), ("config.worktree", "file"), ("worktrees", "dir"),
+    ("hooks", "dir"), ("info", "dir"), ("modules", "dir"), ("sharedindex.0123", "file"),
+    ("index.lock", "file"), ("packed-refs", "file"), ("description", "file"), ("COMMIT_EDITMSG", "file"),
+    ("FETCH_HEAD", "file"), ("MERGE_HEAD", "file"), ("Config", "file"),
+])
+def test_unexpected_git_dir_entry_fails_closed(source_repo, tmp_path, entry, kind):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        p = wt.git_dir / entry
+        if kind == "dir":
+            p.mkdir()
+        elif not os.path.lexists(p):
+            p.write_text("x\n")
+        else:
+            pytest.skip("case-insensitive filesystem: aliases an existing entry")
+        with pytest.raises(ScratchWorktreeCorrupted, match="unexpected"):
+            wt.reset()
+
+
+@pytest.mark.parametrize("entry", ["HEAD", "objects", "refs", "index", "logs", "shallow", "ORIG_HEAD"])
+def test_allowed_git_dir_entry_of_the_wrong_type_fails_closed(source_repo, tmp_path, entry):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()  # creates ORIG_HEAD
+        p = wt.git_dir / entry
+        target = tmp_path / "elsewhere"
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.copytree(p, target)
+        else:
+            shutil.copy(p, target)
+        sw._force_rmtree(p)
+        os.symlink(target, p)
+        with pytest.raises(ScratchWorktreeCorrupted, match="wrong file type"):
+            wt.reset()
+
+
+@pytest.mark.parametrize("entry", ["HEAD", "objects", "refs", "config"])
+def test_missing_required_git_dir_entry_fails_closed(source_repo, tmp_path, entry):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        sw._force_rmtree(wt.git_dir / entry)
+        with pytest.raises(ScratchWorktreeCorrupted, match="is missing"):
+            wt.reset()
+
+
+def test_git_dir_holds_only_allowlisted_entries_through_many_cycles(source_repo, tmp_path):
+    allowed = set(sw._GIT_DIR_REQUIRED) | set(sw._GIT_DIR_OPTIONAL)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        assert set(os.listdir(wt.git_dir)) <= allowed
+        target = wt.path / "skills" / "bash.md"
+        for i in range(3):
+            (wt.path / "junk").write_text("x")
+            wt.reset()
+            target.write_text(f"candidate {i}\n")
+            wt.assert_only_expected_dirty([target])
+            assert set(os.listdir(wt.git_dir)) <= allowed, sorted(os.listdir(wt.git_dir))
+
+
+def test_unknown_entry_left_by_creation_fails_at_startup_and_cleans_up(source_repo, tmp_path, monkeypatch):
+    real = sw._create_private_repo
+
+    def _leaves_extra(source, base, tree, g, env):
+        real(source, base, tree, g, env)
+        (g / "description").write_text("from a future git\n")
+
+    monkeypatch.setattr(sw, "_create_private_repo", _leaves_extra)
+    with pytest.raises(ScratchWorktreeCorrupted, match="description"):
+        with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi"):
+            pass
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("gepa-scratch-")] == []
+
+
+def test_creation_pins_git_common_dir_but_the_source_rev_parse_does_not(source_repo, tmp_path, monkeypatch):
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        if cmd and cmd[0] == "git" and "--git-common-dir" not in cmd:
+            calls.append((list(cmd), dict(kw.get("env") or {})))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(sw.subprocess, "run", _spy)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+    monkeypatch.setattr(sw.subprocess, "run", real_run)
+    assert any("rev-parse" in cmd and "--verify" in cmd for cmd, _ in calls)
+    for cmd, env in calls:
+        if any(a.startswith("--git-dir=") for a in cmd):
+            assert env.get("GIT_COMMON_DIR") == str(wt.git_dir), cmd
+        elif "rev-parse" in cmd and "--verify" in cmd:
+            assert "GIT_COMMON_DIR" not in env, cmd
+
+
+def test_global_excludes_file_cannot_hide_an_untracked_file_from_status(source_repo, tmp_path, monkeypatch):
+    """GIT_CONFIG_GLOBAL=/dev/null does not stop git reading the default
+    $XDG_CONFIG_HOME/git/ignore; core.excludesFile=/dev/null does."""
+    xdg = tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    (xdg / "git" / "ignore").write_text("hidden.txt\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt.reset()
+        (wt.path / "hidden.txt").write_text("planted\n")
+        with pytest.raises(ScratchWorktreeCorrupted, match="hidden.txt"):
+            wt.assert_only_expected_dirty([])
+
+
+# --------------------------------------------------------------------------
+# The orchestrator's own file operations go through the held directory fds
+# --------------------------------------------------------------------------
+
+
+def _swap_after_first_check(monkeypatch, wt, swap):
+    """Run the real _verify_git_dir once, then `swap()`: the swap lands
+    between the check and the file operations reset() does next. Later
+    calls run the real check (and so raise)."""
+    real = type(wt)._verify_git_dir
+    state = {"done": False}
+
+    def _check_then_swap(self):
+        real(self)
+        if not state["done"]:
+            state["done"] = True
+            swap()
+
+    monkeypatch.setattr(type(wt), "_verify_git_dir", _check_then_swap)
+
+
+def test_tree_swapped_after_the_check_is_not_followed_by_the_dot_git_removal(source_repo, tmp_path, monkeypatch):
+    other = _make_other_checkout(tmp_path)
+    before = _snapshot_other(other)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        moved = wt.path.with_name(wt.path.name + "-moved")
+        (wt.path / ".git").mkdir()
+        (wt.path / ".git" / "planted").write_text("x\n")
+
+        def _swap():
+            os.rename(wt.path, moved)
+            os.symlink(other, wt.path)
+
+        _swap_after_first_check(monkeypatch, wt, _swap)
+        with pytest.raises(ScratchWorktreeCorrupted, match="tree .* is not the directory this run created"):
+            wt.reset()
+        monkeypatch.undo()
+        # The removal went through the held fd: it hit our tree, not theirs.
+        assert not os.path.lexists(moved / ".git")
+    shutil.rmtree(moved)
+    os.unlink(wt.path)
+    assert _snapshot_other(other) == before
+
+
+def test_git_dir_swapped_after_the_check_is_not_followed_by_the_index_unlink(source_repo, tmp_path, monkeypatch):
+    other = _make_other_checkout(tmp_path)
+    before = _snapshot_other(other)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        moved = wt.git_dir.with_name(wt.git_dir.name + "-moved")
+
+        def _swap():
+            os.rename(wt.git_dir, moved)
+            os.symlink(other / ".git", wt.git_dir)
+
+        _swap_after_first_check(monkeypatch, wt, _swap)
+        with pytest.raises(ScratchWorktreeCorrupted, match="git dir .* is not the directory this run created"):
+            wt.reset()
+        monkeypatch.undo()
+        assert not os.path.lexists(moved / "index")
+    shutil.rmtree(moved)
+    os.unlink(wt.git_dir)
+    assert _snapshot_other(other) == before
+
+
+def test_tree_swapped_before_the_nested_dot_git_walk_is_not_followed(source_repo, tmp_path, monkeypatch):
+    """A swap after the last git call and undone later is not detected (the
+    checks are point-in-time), but the walk itself never leaves our tree."""
+    other = _make_other_checkout(tmp_path)
+    (other / "sub").mkdir()
+    (other / "sub" / ".git").write_text("gitdir: elsewhere\n")
+    before = _snapshot_other(other)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        moved = wt.path.with_name(wt.path.name + "-moved")
+        (wt.path / "skills" / ".git").mkdir()
+        real_remove = type(wt)._remove_dot_git_entries
+
+        def _swap_then_remove(self, top_level_only):
+            if not top_level_only:
+                os.rename(self.path, moved)
+                os.symlink(other, self.path)
+            try:
+                return real_remove(self, top_level_only)
+            finally:
+                if not top_level_only:
+                    os.unlink(self.path)
+                    os.rename(moved, self.path)
+
+        monkeypatch.setattr(type(wt), "_remove_dot_git_entries", _swap_then_remove)
+        wt.reset()
+        monkeypatch.undo()
+        assert not os.path.lexists(wt.path / "skills" / ".git")
+    assert (other / "sub" / ".git").read_text() == "gitdir: elsewhere\n"
+    assert _snapshot_other(other) == before
+
+
+@pytest.mark.parametrize("what", ["tree", "git dir"])
+def test_teardown_never_removes_a_directory_renamed_into_place(source_repo, tmp_path, what, capsys):
+    other = _make_other_checkout(tmp_path)
+    before = _snapshot_other(other)
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        ours = wt.path if what == "tree" else wt.git_dir
+        moved = ours.with_name(ours.name + "-moved")
+        os.rename(ours, moved)
+        os.rename(other, ours)
+    assert "is not the directory this run created" in capsys.readouterr().err
+    assert _snapshot_other(ours) == before
+    os.rename(ours, other)
+    shutil.rmtree(moved)
+    for p in _siblings(wt.path):
+        if os.path.lexists(p):
+            sw._force_rmtree(p)
+
+
+def test_teardown_still_removes_everything_if_closing_a_held_fd_fails(source_repo, tmp_path, monkeypatch):
+    real_close = os.close
+    held = []
+
+    def _close(fd):
+        real_close(fd)
+        if fd in held:
+            raise OSError(9, "simulated close failure")
+
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        held[:] = [wt.tree_fd, wt.git_dir_fd]
+        monkeypatch.setattr(sw.os, "close", _close)
+    monkeypatch.undo()
+    assert not any(os.path.lexists(p) for p in _siblings(wt.path))
+
+
+def test_held_fds_are_closed_after_exit(source_repo, tmp_path):
+    before = set(os.listdir("/dev/fd"))
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        assert {str(wt.tree_fd), str(wt.git_dir_fd)} <= set(os.listdir("/dev/fd"))
+    assert set(os.listdir("/dev/fd")) == before
+
+
+# --------------------------------------------------------------------------
+# reset() verifies what it checked out against the base commit's tree
+# --------------------------------------------------------------------------
+
+
+def _loose_object_path(wt, oid):
+    return wt.git_dir / "objects" / oid[:2] / oid[2:]
+
+
+def _write_loose_object(path, content):
+    import zlib
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(path):
+        os.chmod(path, 0o644)
+        path.unlink()
+    path.write_bytes(zlib.compress(b"blob %d\0" % len(content) + content))
+
+
+def test_rewritten_loose_object_makes_reset_raise(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        oid = wt.git(["rev-parse", f"{wt.base_commit}:skills/bash.md"]).stdout.strip()
+        obj = _loose_object_path(wt, oid)
+        assert obj.is_file(), "the depth-1 fetch of a tiny repo should unpack to loose objects"
+        _write_loose_object(obj, b"POISONED\n")
+        (wt.path / "skills" / "bash.md").write_text("mutated\n")
+        with pytest.raises(ScratchWorktreeCorrupted, match="skills/bash.md"):
+            wt.reset()
+        # Without the check, reset() would have left the poisoned blob in place.
+        assert (wt.path / "skills" / "bash.md").read_text() == "POISONED\n"
+
+
+def test_object_served_from_planted_alternates_makes_reset_raise(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        oid = wt.git(["rev-parse", f"{wt.base_commit}:skills/bash.md"]).stdout.strip()
+        alt = tmp_path / "alt-objects"
+        _write_loose_object(alt / oid[:2] / oid[2:], b"POISONED VIA ALTERNATES\n")
+        (wt.git_dir / "objects" / "info").mkdir(exist_ok=True)
+        (wt.git_dir / "objects" / "info" / "alternates").write_text(f"{alt}\n")
+        obj = _loose_object_path(wt, oid)
+        os.chmod(obj, 0o644)
+        obj.unlink()
+        (wt.path / "skills" / "bash.md").write_text("mutated\n")
+        with pytest.raises(ScratchWorktreeCorrupted, match="skills/bash.md"):
+            wt.reset()
+        assert (wt.path / "skills" / "bash.md").read_text() == "POISONED VIA ALTERNATES\n"
+
+
+@pytest.mark.parametrize("tamper", ["content", "exec-bit", "symlink", "missing", "dir"])
+def test_checkout_check_rejects_each_kind_of_mismatch(source_repo, tmp_path, tamper):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        wt._verify_checkout()
+        target = wt.path / "skills" / "bash.md"
+        if tamper == "content":
+            target.write_text("---\nname: bash\n---\nBash guidancE.\n")
+        elif tamper == "exec-bit":
+            target.chmod(0o755)
+        elif tamper == "symlink":
+            copy = tmp_path / "bash-copy.md"
+            shutil.copy(target, copy)
+            target.unlink()
+            target.symlink_to(copy)
+        elif tamper == "missing":
+            target.unlink()
+        else:
+            target.unlink()
+            target.mkdir()
+        with pytest.raises(ScratchWorktreeCorrupted, match="skills/bash.md"):
+            wt._verify_checkout()
+
+
+def test_checkout_check_rejects_a_symlinked_parent_directory(source_repo, tmp_path):
+    with scratch_worktree(source_repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        copy = tmp_path / "skills-copy"
+        shutil.copytree(wt.path / "skills", copy)
+        shutil.rmtree(wt.path / "skills")
+        (wt.path / "skills").symlink_to(copy)
+        with pytest.raises(ScratchWorktreeCorrupted, match="skills"):
+            wt._verify_checkout()
+
+
+def test_checkout_check_covers_exec_bits_and_symlinks_in_the_base(tmp_path):
+    repo = tmp_path / "rich-source"
+    _init_repo(repo)
+    _write_exec(repo / "bin" / "run.sh", "#!/bin/sh\necho hi\n")
+    (repo / "link.md").symlink_to("AGENTS.md")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "exec and symlink")
+    with scratch_worktree(repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi") as wt:
+        modes = {path: mode for mode, _, path in wt.tracked}
+        assert modes[b"bin/run.sh"] == b"100755" and modes[b"link.md"] == b"120000"
+        (wt.path / "bin" / "run.sh").chmod(0o644)
+        (wt.path / "link.md").unlink()
+        (wt.path / "link.md").symlink_to("skills/bash.md")
+        wt.reset()
+        assert os.access(wt.path / "bin" / "run.sh", os.X_OK)
+        assert os.readlink(wt.path / "link.md") == "AGENTS.md"
+        (wt.path / "link.md").unlink()
+        (wt.path / "link.md").symlink_to("skills/bash.md")
+        with pytest.raises(ScratchWorktreeCorrupted, match="link.md"):
+            wt._verify_checkout()
+
+
+def test_base_whose_checkout_differs_from_its_blobs_fails_at_startup(tmp_path):
+    """An eol conversion makes every reset differ from the recorded blobs;
+    that must fail at creation, not at candidate 2."""
+    repo = tmp_path / "crlf-source"
+    _init_repo(repo)
+    (repo / ".gitattributes").write_text("*.md text eol=crlf\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "crlf")
+    with pytest.raises(ScratchWorktreeCorrupted, match="AGENTS.md"):
+        with scratch_worktree(repo, parent_dir=tmp_path, pi_bin=tmp_path / "pi"):
+            pass
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith("gepa-scratch-")] == []
