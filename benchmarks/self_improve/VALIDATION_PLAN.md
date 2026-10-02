@@ -12,8 +12,8 @@ was confirmed structurally incapable of ever accepting a candidate (every
 candidate's score was independent of its actual text; see `polyglot_adapter.py`'s
 module docstring). `run_gepa.py` now implements `gepa.core.adapter.GEPAAdapter`
 directly and calls `gepa.optimize()`, scoring every candidate by actually running
-it against real `aider_polyglot.py` exercises in a disposable git worktree
-(`live_eval.py`, `scratch_worktree.py`). This makes Layer 4 genuinely live by
+it against real `aider_polyglot.py` exercises in a disposable private git repo
+whose git dir sits beside the tree (`live_eval.py`, `scratch_worktree.py`). This makes Layer 4 genuinely live by
 construction — it is no longer possible to "pass" Layer 4 without a real rollout.
 The old ingest-and-score dry-run pipeline still exists, unchanged in spirit, as
 `report_trajectories.py` — a free, GEPA-independent reporting tool over historical
@@ -28,9 +28,13 @@ python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_promp
   benchmarks/test_polyglot_env_overrides.py benchmarks/test_fake_pi_modes.py -q
 ```
 
-Fast, deterministic, no API calls, no live model calls, no real git worktrees
-(the session-scoped `_no_stray_real_worktrees` fixture in `tests/conftest.py`
-fails loudly if any test touches the real repo's worktree list). Fully specified
+Fast, deterministic, no API calls, no live model calls, no scratch repo of the
+real checkout: the per-test `_forbid_scratch_of_real_repo` fixture in
+`tests/conftest.py` fails any test that points `scratch_worktree()` at the real
+repo or a sibling worktree of it, and the session-scoped
+`_no_stray_scratch_artifacts` fixture fails loudly if the session leaves a
+`gepa-scratch-*` worktree on the real repo or a scratch artifact in the system
+temp dir. Fully specified
 in `TDD_SPEC.md`; the live-eval CLI's own gate/refusal logic is specified in
 `tests/test_run_gepa_live_gate.py`. This is the gate before Layer 2 runs at all —
 do not debug ingestion/live-eval behavior against real data while a unit test is

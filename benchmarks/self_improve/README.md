@@ -9,7 +9,8 @@ auto-commits, never auto-merges — results are always proposed as a PR for
 human review.
 
 Every GEPA candidate is scored by **actually running it**: a candidate's
-component text is materialized into a disposable `git worktree`, and a real
+component text is materialized into a disposable private git repo (its own
+object store, git dir kept beside the tree), and a real
 `aider_polyglot.py --exercise <name>` subprocess is invoked against it. This
 replaces an earlier design that scored candidates from frozen historical
 trajectories — that design was confirmed structurally incapable of ever
@@ -40,7 +41,8 @@ pip install -e .[dev]      # gepa, dspy-ai, pydantic, pyyaml, python-dotenv, pyt
 ```
 
 Run the test suite (fast, deterministic, no external API calls; some E2E tests
-create disposable local git worktrees, not against the real checkout):
+create disposable private git repos from throwaway fixture repos, never from the
+real checkout):
 
 ```bash
 python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_prompt.py \
@@ -52,7 +54,7 @@ python -m pytest benchmarks/self_improve/tests/ benchmarks/test_rpc_system_promp
 ### Free: `--estimate-only`
 
 Prints a pre-flight cost/wall-clock estimate for the run you're about to
-authorize and exits — constructs no git worktree, no adapter, spends nothing.
+authorize and exits — constructs no scratch repo, no adapter, spends nothing.
 This is deliberately **not** gated by `--confirm-live-rollouts`/
 `--confirm-real-run`/API keys, since its whole purpose is to inform whether to
 grant those.
@@ -130,13 +132,44 @@ instead.
 This scrub stops *accidental* exposure: an `env` or `printenv`, or an error
 dump, ending up in transcripts, run logs, cached results or the reflection
 dataset. It does not contain a hostile agent. The agent runs as your user
-with unrestricted bash and no filesystem sandbox, so it can still read the
-`.env` file on disk, read the orchestrator's launch environment (`ps eww
-<pid>` on macOS; the scratch worktree's marker file records that pid), or
-plant git hooks in the shared `.git` that later run inside the orchestrator's
-own git calls. Use a separate, spend-limited key for reflection, and don't
-export it in shells where you run other harnesses (harbor, tb, or
-`aider_polyglot.py` directly), which do not remove it.
+with unrestricted bash and no filesystem sandbox. Its bash starts in a
+per-exercise temp dir, but the scratch tree's path is in pi's argv, so treat
+the tree and everything next to it as reachable. It can still:
+
+- read the `.env` file on disk;
+- read the orchestrator's launch environment (`ps eww <pid>` on macOS); the
+  marker beside the scratch tree (`<tree>.marker.json`) records that pid;
+- learn where your checkout is: `LITTLE_CODER_PI_BIN_OVERRIDE` in its own
+  environment is the resolved pi path, which by default lies inside
+  `<your checkout>/node_modules`;
+- write to your real checkout and its `.git` by absolute path, or to the
+  scratch repo's git dir (`<tree>.git`). Only part of that git dir is
+  checked (below); its objects and refs are not.
+
+What the orchestrator does about it is limited to its own git calls. The
+scratch repo is a private repo (its own object store, no hooks directory, no
+remote) created by a depth-1 fetch of the base commit, so it shares no git
+admin with your checkout, and your checkout's `.git` is only read. Its git
+dir sits beside the tree, not inside it. Every git call on it:
+
+- ignores user and system git config (`GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`) and drops git's location/config environment
+  variables;
+- pins `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
+  `core.attributesFile=/dev/null`, and reads attributes only from the base
+  commit (`--attr-source`, git 2.40 or later; on older git, `reset()` removes
+  untracked files before checkout instead);
+- runs `status` with `--no-optional-locks`;
+- runs without the orchestrator-only variables above in its environment;
+- once creation has finished, first checks that `<tree>.git/config` is a
+  regular file with exactly the bytes creation wrote, and that
+  `<tree>.git/hooks` and `<tree>.git/info` do not exist. If not, it raises
+  `ScratchWorktreeCorrupted` instead of running git.
+
+`reset()` also deletes every `.git` entry (any case, any depth) left in the
+tree, since git itself skips them. Use a separate, spend-limited key for
+reflection, and don't export it in shells where you run other harnesses
+(harbor, tb, or `aider_polyglot.py` directly), which do not remove it.
 
 `$SELF_IMPROVE_NO_LIVE_ROLLOUTS=1` refuses regardless of flags — a hard,
 machine-level deny for a shared host. A graceful stop is available mid-run via
@@ -183,11 +216,30 @@ python -m benchmarks.self_improve.report_trajectories \
   --repo-root <path to the little-coder repo root>
 ```
 
+### Cleaning up scratch repos
+
+A run that is SIGKILLed (or one passed `--keep-scratch`) leaves its scratch
+tree, `<tree>.git`, `<tree>.marker.json` and `<tree>.lock` in the scratch
+parent dir. List or remove orphans with:
+
+```bash
+python -m benchmarks.self_improve.gepa_scratch_gc --list  [--scratch-root DIR]
+python -m benchmarks.self_improve.gepa_scratch_gc --clean [--scratch-root DIR] [--older-than-hours 6] [--yes]
+```
+
+`--scratch-root` defaults to the system temp dir, which is also where
+`run_gepa` puts scratch repos by default; if the run used `--scratch-dir X`,
+pass `--scratch-root X`. In the scratch root, nothing without a marker is
+touched and a symlinked tree or git dir is never followed; an entry whose
+owner still holds its lock is never removed. Worktrees left by older
+runs (which used `git worktree add`) are handled by a legacy pass over the
+repo given by `--repo-root` (default: the current directory).
+
 ### Applying results
 
 A real `run_gepa.py` run writes `<out-dir>/optimized_components.yaml`
 (pred_name → optimized instruction text) and never touches the actual repo
-files directly (the scratch worktree it ran in is destroyed on exit unless
+files directly (the scratch repo it ran in is destroyed on exit unless
 `--keep-scratch` was passed). If the live budget backstop or a persistent
 harness error stops `gepa.optimize()` early, the file still holds the best
 candidate GEPA had scored on the valset so far; `spend_log.jsonl`'s `run_end`
@@ -232,8 +284,8 @@ mean; start any further run in a new `--out-dir`, reusing the warm cache with
   fire on any dataset size; the one real paid run under that design correctly
   reported "no improvement" for exactly this reason) to a live-execution
   design: every candidate is scored by actually running `aider_polyglot.py`
-  against it in a disposable git worktree (`live_eval.py`,
-  `polyglot_adapter.py`). The end-to-end pipeline (real git worktree, real
+  against it in a disposable private git repo (`live_eval.py`,
+  `polyglot_adapter.py`). The end-to-end pipeline (real scratch repo, real
   subprocess, real pytest scoring) is proven with `fake_pi.py` at zero cost
   (`tests/test_live_eval_e2e_fake_pi.py`, including a regression test that two
   candidates differing only in text now score differently). A real,

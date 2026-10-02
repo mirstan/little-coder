@@ -40,7 +40,7 @@ File paths are relative to the little-coder repo unless marked.
 | F5 | Injected blocks are tail `custom` → `user` messages (default `message` mode, #73). The system prompt (AGENTS.md via `--system-prompt`) is not stored in sessions. | `_shared/inject.ts`, `agent-session.js:900-910` |
 | F6 | pi-ai already parses oMLX `cached_tokens` into `usage.cacheRead`, and `rpc_client` sums it. It is **dropped** before the results JSON, `LiveRunResult` and `spend_log`. | `openai-completions.js:1076-1092`, `rpc_client.py:885-897`, `aider_polyglot.py:~1067` |
 | F7 | GEPA 0.1.4 provides four hooks. (1) A custom `acceptance_criterion` sees `eval_before`/`eval_after`/`objective_scores`. (2) `evaluate` may run repeats and report `num_metric_calls`. (3) `objective_scores` plus `frontier_type="objective"\|"hybrid"` affect parent selection. (4) `propose_new_texts` returning `{}` skips the child evaluation, but the **parent minibatch has already been evaluated by then**. | `api.py:97`, `core/adapter.py:34-35,206-227`, `core/state.py:22`, `reflective_mutation.py:130-150,306` |
-| F8 | `live_eval.run_batch` is **sequential, in a single worktree**. oMLX is configured for 8 concurrent requests. | `live_eval.py:390-432`; `~/.omlx/settings.json` |
+| F8 | `live_eval.run_batch` is **sequential, in a single scratch tree** (one private repo). oMLX is configured for 8 concurrent requests. | `live_eval.py:390-432`; `~/.omlx/settings.json` |
 | F9 | oMLX has paged, prefix-shared KV (256-token blocks), a 4 GB RAM tier, and a 50 GB SSD tier that persists across restarts (currently 51 GB used). It batches continuously (8). For hybrid GDN models it stores boundary snapshots, so reuse is block-aligned. | oMLX source and settings |
 | F10 | Session resume via `--session` works only after rewriting the header `cwd`; Polyglot temp directories are deleted. The SDK can `agent.continue()` from a tool result but bypasses `before_agent_start`, so there is no turn cap or thinking budget. RPC has no continue command. `appendEntry(customType, data)` is positional and not in the model's context. | `main.js:498-521`, `agent.js:229-251`, `loader.js:247`, `rpc-mode.js` |
 | F11 | Bugs: the cache key uses raw text while the sanitized text runs; `skip_perfect_score` is off; a wall-clock overrun loses output; `harness_error` scores 0; `split_train_val` is unstratified. | review §Bugs, `live_cache.py:36-60`, `exercises.py:65-76` |
@@ -253,7 +253,7 @@ These are read from `~/.omlx/settings.json`, `~/.omlx/model_settings.json` and `
 
 ## 9. Inference layer (oMLX)
 
-1. **Parallelism.** A worktree pool of N scratch worktrees (N = 4–6, fixed per experiment) runs exercises concurrently. This fixes F8, the biggest cheap win.
+1. **Parallelism.** A scratch pool of N scratch trees (N = 4–6, fixed per experiment; each one is its own private repo, created by `scratch_worktree()`) runs exercises concurrently. This fixes F8, the biggest cheap win.
    - Concurrency is part of the sample condition.
    - Parent and child that are compared must share a concurrency band.
 2. **Prefix warmup.** Before each batch, send one `max_tokens=1` request with the candidate's system prompt and tools. Otherwise N concurrent cold starts all miss the shared prefix.
@@ -295,7 +295,7 @@ These are read from `~/.omlx/settings.json`, `~/.omlx/model_settings.json` and `
 
 | Step | What | Runs | Go/no-go it decides |
 |---|---|---|---|
-| **M0** | S-size fixes (§14 phase 0) + worktree pool + usage plumbing | — | — |
+| **M0** | S-size fixes (§14 phase 0) + scratch pool + usage plumbing | — | — |
 | **M1** | Adaptive flip-rate: 4 repeats on all 34 exercises; 6 more on exercises with 1–3 passes; 4 more on exercises with 0 passes. Include 20 runs at concurrency 1 vs N and cold vs warm cache | ~250 | Classes and splits, whether concurrency or cache changes outcomes, the MDE statement |
 | **M1b** | A/A: the full §7 protocol, parent vs itself, about 20 times, by resampling M1 data | ~0 | **Empirical false-accept rate.** Go if ≤ 2% |
 | **M2** | Relevance: for each component, the share of (exercise, attempt) pairs it touches, via T0r on the M1 records | 0 | How much §6 reuse saves; which components are in scope |
@@ -328,7 +328,7 @@ Order: M0 → M1 → (M1b, M2, M4, all free) → M4b → M3 (conditional) → M5
 6. Add the manifest schema (`self_improve/manifest.py`) and three disjoint splits using `exclude=`.
 
 **Phase 1: throughput and statistics (M)**
-7. Worktree pool with fixed N plus prefix warmup; exercise-major scheduler.
+7. Scratch pool (one private repo per slot) with fixed N plus prefix warmup; exercise-major scheduler.
 8. Sample store (§8) with the env-fingerprint reader for oMLX settings.
 9. Custom T4 procedure in `adapter.evaluate` (e-value sequential test, guards, parent pairing through adapter state), a `batch_evaluate` override for plain fixed-k valset evaluations, and the custom `acceptance_criterion` (reads the reject flag, the T4 verdict, the ledger and root non-inferiority).
 10. `split_stratified()` after M1; `run_t5.py` and `report_test.py` outside GEPA (§7.5).
@@ -360,7 +360,7 @@ Order: M0 → M1 → (M1b, M2, M4, all free) → M4b → M3 (conditional) → M5
 - **Temperature pre-registered** at > 0.
 - **Cache and pairing.** v1's "same cache path for pairs" was impossible given GEPA's ordering. It is replaced by condition-matched sample reuse or co-batched parent re-sampling.
 - **Recording layer shrank.** Most of it already exists (F4, F6); only hashes and usage plumbing are needed.
-- **Added:** worktree parallelism, prefix warmup, speculative decoding, failure-cluster proposals, reviewer, adherence metric, parameter track, candidate cards, governance, and a second language for AGENTS.md candidates.
+- **Added:** scratch-tree parallelism, prefix warmup, speculative decoding, failure-cluster proposals, reviewer, adherence metric, parameter track, candidate cards, governance, and a second language for AGENTS.md candidates.
 - **Metric fixes.** The 0.4 score level is unreachable with 2 attempts; binary pass is primary. The efficiency metric is decode plus total prompt tokens, not uncached prefill.
 
 ## 16. Open questions
@@ -390,12 +390,12 @@ Order: M0 → M1 → (M1b, M2, M4, all free) → M4b → M3 (conditional) → M5
 | # | Fact | Evidence |
 |---|---|---|
 | H1 | **pi runs on the host, not in the task container.** The container is reached only through Harbor's `environment.exec`, via the `__LC_TB_SHELL__` UI-proxy channel (`_shared/tb-proxy.ts`). `setup()` is a no-op. pi calls oMLX directly at `127.0.0.1:8000`, with no proxy. | dev `little_coder_agent.py:1370, 1693-1696`; `models.json:68-70` |
-| H2 | Everything the agent reads comes from the checkout that Harbor imports: `rpc_client.REPO_ROOT` (bound at import), AGENTS.md (`--system-prompt`), `.pi/extensions` (`-e`), and skills (resolved relative to each extension's file). **A scratch worktree works** if Harbor is launched with `cwd=worktree` and `PYTHONPATH=worktree`, the same way `harbor_pilot.sh:101,170` does with the repo root. | dev `rpc_client.py:30-71, 322-324` |
+| H2 | Everything the agent reads comes from the checkout that Harbor imports: `rpc_client.REPO_ROOT` (bound at import), AGENTS.md (`--system-prompt`), `.pi/extensions` (`-e`), and skills (resolved relative to each extension's file). **A scratch tree (private repo) works** if Harbor is launched with `cwd=<tree>` and `PYTHONPATH=<tree>`, the same way `harbor_pilot.sh:101,170` does with the repo root. | dev `rpc_client.py:30-71, 322-324` |
 | H3 | Command: `harbor run --dataset terminal-bench/terminal-bench-2-1 --include-task-name … --agent benchmarks.harbor_adapter.little_coder_agent:LittleCoderAgent --model omlx/<id> --jobs-dir … --n-concurrent 1 --timeout-multiplier 15 --override-cpus 4 -y --force-build`. The per-task deadline is `timeout_sec × 15 × 0.9`, so often 203 min. | `harbor_pilot.sh:135-156`; `lca:121, 977-978` |
 | H4 | The per-trial `result.json` has `verifier_result.rewards.reward` ∈ {0, 1}, `exception_info`, `agent_execution` timing, `agent_result.n_input/n_cache/n_output_tokens`, and metadata (`stop_reason`, `n_turns`, `n_compactions`, …). `task_name` carries a `terminal-bench/` prefix. | `lca:2199-2237` |
 | H5 | **Time.** 98 historical trials (`little-coder-dev/benchmarks/harbor_runs/`): median agent time per task ranges from 2.5 to 321 min. About 9% of trials are harness crashes. The 12-task validate set takes about 1–1.5 days per candidate at concurrency 1. | trial scan |
 | H6 | **Allowed tools on TB** are the ShellSession family only. The GEPA components that can affect TB are therefore `agents_md`, `skills_tools_shell_session`, and knowledge cards without unmet `requires_tools`. **The strongest TB lever, `prompt_prefix`, is hardcoded** in the adapter (dev `little_coder_agent.py:~1720`), outside `components.yaml`. | `lca:111`; skill-inject `:176` |
-| H7 | **Merging dev into pr16** conflicts in `benchmarks/rpc_client.py` and `.gitignore` (`git merge-tree`). The `rpc_client` conflict lies in the region that holds pr16's `LITTLE_CODER_PI_BIN_OVERRIDE`, which the worktree approach needs, and must also keep pr16's `PRINCIPLES.md` concatenation. The adapter itself merges cleanly. | merge-tree |
+| H7 | **Merging dev into pr16** conflicts in `benchmarks/rpc_client.py` and `.gitignore` (`git merge-tree`). The `rpc_client` conflict lies in the region that holds pr16's `LITTLE_CODER_PI_BIN_OVERRIDE`, which the scratch-tree approach needs, and must also keep pr16's `PRINCIPLES.md` concatenation. The adapter itself merges cleanly. | merge-tree |
 | H8 | PR16's `ingest/harbor_tb_ingest.py` has three problems against dev's format: it keeps the `terminal-bench/` prefix; it ignores `exception_info`, so a crash is scored as reward 0; and it treats the job-level `result.json` as a trial when pointed at `harbor_runs/`. | ingest `:90, 98-139` |
 
 ### 18.2 Role 1 (now): TB 2.1 is the T5 cross-benchmark canary
@@ -423,15 +423,15 @@ This resolves open question 5. TB runs are far too slow for T4 selection: the v2
 ### 18.3 `HarborLiveRunner` (Role 1 needs a minimal version)
 
 It implements the same interface as `PolyglotLiveRunner`:
-1. **`materialize()`**: unchanged (reset the worktree, write components, dirty-check). With TB, the adapter in the candidate's worktree is the one that runs, and it is part of the non-candidate files hash.
-2. **Launch.** `harbor run …` (H3) as a subprocess with `cwd=worktree.path`, `PYTHONPATH=worktree.path`, `LITTLE_CODER_PI_BIN_OVERRIDE`, `start_new_session=True`, a deterministic `--job-name` (candidate hash + batch), and **`--jobs-dir` outside the worktree**, because `reset()` runs `git clean -fdx`. Drop `--force-build` after the first build of each image.
+1. **`materialize()`**: unchanged (reset the scratch tree, write components, dirty-check). With TB, the adapter in the candidate's scratch tree is the one that runs, and it is part of the non-candidate files hash.
+2. **Launch.** `harbor run …` (H3) as a subprocess with `cwd=wt.path`, `PYTHONPATH=wt.path`, `LITTLE_CODER_PI_BIN_OVERRIDE`, `start_new_session=True`, a deterministic `--job-name` (candidate hash + batch), and **`--jobs-dir` outside the scratch tree**, because `reset()` runs `git clean -ffdx`. Keep it out of the scratch root's `gepa-scratch-*` names too, so `gepa_scratch_gc` never sees it. Drop `--force-build` after the first build of each image.
 3. **Parse** `<jobs>/<job>/<trial>/result.json` (H4):
    - strip the `terminal-bench/` prefix;
    - `exception_info` → `harness_error`, handled exactly as §7.1 says (never scored or cached; retried in place, then the run stops);
    - reward, `stop_reason`, tokens (input/cache/output feed §7.1 efficiency and the cache-ratio ops metric), agent duration;
    - feedback paths: `verifier/test-stdout.txt`, `agent/little_coder.log`.
 4. **Timeouts.** Kill the process group **and** remove the trial's Docker containers (Harbor's `environment.delete` runs only on a clean exit). Label containers via the job name, then `docker ps --filter` → `docker rm -f`.
-5. **`run_config` / env-fingerprint.** Add the dataset `ref`, multiplier, cpus/memory overrides, Harbor version, and a hash of the worktree's `little_coder_agent.py` + `rpc_client.py`.
+5. **`run_config` / env-fingerprint.** Add the dataset `ref`, multiplier, cpus/memory overrides, Harbor version, and a hash of the scratch tree's `little_coder_agent.py` + `rpc_client.py`.
 6. **Budget.** Wall-clock only ($0 per token). `--estimate-only` uses the per-task median from the historical scan.
 7. **Fix the ingest** (H8), so historical TB trials can be used for M1-style baselines and T1 analysis.
 
