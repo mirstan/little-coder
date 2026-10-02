@@ -18,18 +18,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import uuid
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rpc_client import (  # noqa: E402
@@ -40,10 +45,19 @@ from rpc_client import (  # noqa: E402
     resolve_thinking_level,
 )
 
-BENCHMARK_ROOT = Path.home() / "Documents" / "polyglot-benchmark"
+# `or`, not os.environ.get(name, default): an exported-but-empty override
+# must still fall back -- Path("") normalizes to Path("."), whose .exists()
+# is True, silently pointing at the wrong directory instead of the intended
+# default (same trap documented for LITTLE_CODER_PI_BIN_OVERRIDE in
+# rpc_client.py). These three exist so a live-eval test harness can point
+# an isolated subprocess invocation of this script at a synthetic benchmark
+# root/results file/log dir, without which none of that machinery is
+# testable without a real paid model run (BENCHMARK_ROOT feeds
+# LANG_DESCRIPTORS below at IMPORT time).
+BENCHMARK_ROOT = Path(os.environ.get("POLYGLOT_BENCHMARK_ROOT") or (Path.home() / "Documents" / "polyglot-benchmark"))
 REPO_ROOT = Path(__file__).parent.parent
-RESULTS_FILE = Path(__file__).parent / "results_full_polyglot.json"
-LOG_ROOT = Path(__file__).parent / "full_polyglot_logs"
+RESULTS_FILE = Path(os.environ.get("POLYGLOT_RESULTS_FILE") or (Path(__file__).parent / "results_full_polyglot.json"))
+LOG_ROOT = Path(os.environ.get("POLYGLOT_LOG_ROOT") or (Path(__file__).parent / "full_polyglot_logs"))
 #: Identifies one invocation, so records and artifacts can be traced back to the
 #: run that produced them. RESULTS_FILE and LOG_ROOT are both deterministic and
 #: shared across runs, which has already caused artifacts from different runs to
@@ -52,9 +66,63 @@ RUN_ID = f"{datetime.datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
 #: Caps applied to persisted trajectories -- see _dump_trajectory.
 TRAJECTORY_TEXT_CHARS = 200_000
 TRAJECTORY_FIELD_CHARS = 20_000
+#: Combined raw-size budget for non_text_deltas, split between a head slice
+#: and a tail slice (see _cap_non_text_deltas).
+TRAJECTORY_NON_TEXT_DELTA_CHARS = 200_000
 #: Give up if this many exercises fail in a row -- a broken environment,
 #: not broken exercises.
 MAX_CONSECUTIVE_ERRORS = 3
+#: Retry-prompt convention for a between-attempt self-reflection (Reflexion-
+#: style: the agent reflects on why THIS attempt failed before the next one
+#: begins). Follows gaia_scorer.py's own `Answer:` line convention rather
+#: than inventing a new extraction style. Deliberately supplementary, not
+#: required -- a missing LESSON: line just means no lesson was captured for
+#: that attempt, never a harness error.
+#: \** sits immediately after the colon, with no \s* before it, so it
+#: absorbs only a closing bold marker wrapping the label ("**LESSON:**
+#: text"); the leading strip below handles decoration before "lesson".
+#: Allowing a space first would also swallow the content's own opening
+#: bold ("LESSON: **Refactor X** now" -> "Refactor X** now").
+_LESSON_RE = re.compile(r"(?i)^lesson\s*[:\-]\**\s*(.+)$")
+#: The matched line is raw model output (on the codex path, drawn from the
+#: entire stdout file) and lands verbatim in results.json and the reflection
+#: LM prompt, so it needs the same cap every other free-text field on this
+#: path already has (out[-4000:], TRAJECTORY_TEXT_CHARS, the excerpts).
+LESSON_MAX_CHARS = 500
+#: Opt-in, because asking for a LESSON: line changes the retry prompt and so
+#: the benchmark protocol: without it a plain run's pass@2 stays comparable
+#: with published results. live_eval sets it for self-improve runs.
+REQUEST_LESSONS_ENV = "POLYGLOT_REQUEST_LESSONS"
+_LESSON_ASK = ("Before continuing: on a single line starting with 'LESSON:', "
+               "state in one sentence what tool, skill, or information would "
+               "have most helped you get here faster or more reliably. Then "
+               "fix the implementation and try again.")
+
+
+def _request_lessons() -> bool:
+    """Read at call time, not import, so a test can toggle it."""
+    return os.environ.get(REQUEST_LESSONS_ENV) == "1"
+
+
+#: Opt-in for the same reason as REQUEST_LESSONS_ENV: each changes how an
+#: exercise is scored, so a plain run keeps the published accounting. Set by
+#: live_eval, whose scores are cached and optimized against.
+#: CRASH_IS_ERROR_ENV: a pi crash on ANY attempt of an exercise that did not
+#: pass records "error" (see _classify_status), not just on a lone attempt.
+CRASH_IS_ERROR_ENV = "POLYGLOT_CRASH_IS_ERROR"
+#: RESTORE_TESTS_ENV: score each attempt in a tree the harness builds, with
+#: verified reports (see _score_gated).
+RESTORE_TESTS_ENV = "POLYGLOT_RESTORE_TESTS"
+
+
+def _crash_is_error() -> bool:
+    return os.environ.get(CRASH_IS_ERROR_ENV) == "1"
+
+
+def _restore_tests_on() -> bool:
+    return os.environ.get(RESTORE_TESTS_ENV) == "1"
+
+
 def _positive_int_env(name: str, default: int) -> int:
     """Parse a positive-integer env var, failing with a readable message.
 
@@ -79,7 +147,9 @@ def _positive_int_env(name: str, default: int) -> int:
 #: budget needs headroom: wordy/transpose hit 691-722s even at a smaller
 #: budget, and GAIA completions under the 32768 budget ran 200-900+s. 2700
 #: keeps a hard multi-turn exercise capability-limited, not clock-limited.
-ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", 2700)
+#: Named so live_eval.py can read the same default instead of duplicating it.
+_ATTEMPT_TIMEOUT_S_DEFAULT = 2700
+ATTEMPT_TIMEOUT_S = _positive_int_env("ATTEMPT_TIMEOUT_S", _ATTEMPT_TIMEOUT_S_DEFAULT)
 #: Per-attempt budget for `codex exec`, seconds.
 CODEX_TIMEOUT_S = _positive_int_env("CODEX_TIMEOUT_S", 900)
 DEFAULT_MODEL = "llamacpp/qwen3.6-35b-a3b"
@@ -192,6 +262,358 @@ def _run_javascript(work: Path, timeout: int):
         return False, f"timed out after {timeout}s"
 
 
+# ── Gated runners (POLYGLOT_RESTORE_TESTS only) ──────────────────────────
+#
+# These score the tree _score_gated builds. A pass needs the runner's own
+# report, written outside that tree, to show every test passing. Exit code 0
+# alone is not enough: a solution can call os._exit(0) or process.exit(0)
+# before the runner has finished.
+#
+# Residual: code running inside the test process can still forge a passing
+# report. _python_tripwire makes that harder for python but does not rule it
+# out. The interpreter's own environment (site-packages, $HOME) can also be
+# written by the agent. See benchmarks/self_improve/README.md.
+
+#: Upper bound on every read of an agent-controlled file, and on a regular
+#: file's size in a trajectory snapshot.
+_SAFE_READ_LIMIT = 4 << 20
+
+
+def _read_regular(path, limit: int = _SAFE_READ_LIMIT) -> bytes | None:
+    """Read a file the agent may control, or return None.
+
+    O_NOFOLLOW and O_NONBLOCK make a symlink or a FIFO in the file's place
+    fail fast instead of following it or blocking. The caller checks parent
+    directories (_parent_unsafe): O_NOFOLLOW covers only the last component.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, min(1 << 20, limit + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _gated_python_env() -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    return env
+
+
+def _pytest_version_cmd() -> list[str]:
+    return [sys.executable, "-I", "-m", "pytest", "--version"]
+
+
+#: Languages whose preflight has passed in this process.
+_PREFLIGHT_OK: set[str] = set()
+_INTERPRETER_INFO: dict = {}
+
+
+def _python_preflight() -> None:
+    """Fail loudly, before any agent runs, if scoring cannot import pytest.
+
+    Runs the same interpreter, flags and environment as _run_python_gated.
+    A find_spec check in this process would pass while `-I` scoring fails,
+    and that failure would be recorded as an ordinary fail. A raise here
+    becomes an "error" record (see main()), which live_eval never caches
+    and treats as a config error (see its _CONFIG_ERROR_REASON_PREFIXES).
+    _run_exercise calls it after prepare and before any agent runs.
+    """
+    if "python" in _PREFLIGHT_OK:
+        return
+    cmd = _pytest_version_cmd()
+    try:
+        r = subprocess.run(cmd, env=_gated_python_env(), capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"scoring preflight `{' '.join(cmd)}` could not run: {exc}") from exc
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"scoring preflight `{' '.join(cmd)}` exited {r.returncode}: "
+            f"{(r.stdout + r.stderr)[-300:]!r}; install pytest into {sys.executable}'s environment")
+    _PREFLIGHT_OK.add("python")
+
+
+def _python_interpreter_info() -> dict:
+    """What scores a gated python run, recorded in the scoring parameters."""
+    if not _INTERPRETER_INFO:
+        version = None
+        try:
+            r = subprocess.run(_pytest_version_cmd(), env=_gated_python_env(),
+                               capture_output=True, text=True, timeout=120)
+            m = re.search(r"pytest (\S+)", r.stdout + r.stderr)
+            version = m.group(1) if m else None
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        _INTERPRETER_INFO.update({
+            "python_executable": sys.executable,
+            "python_version": sys.version.split()[0],
+            "pytest_version": version,
+        })
+    return dict(_INTERPRETER_INFO)
+
+
+def _junit_ok(report: Path, expected) -> tuple[bool, str]:
+    """Whether a JUnit report shows a full, clean pass.
+
+    `expected` is a set of (classname, name) pairs from _python_test_names;
+    each must appear in the report, with any [param] suffix removed. Empty or
+    None means only "at least one test ran" is enforced.
+    """
+    try:
+        st = os.lstat(report)
+    except OSError:
+        return False, "no JUnit report (the test process exited before pytest finished)"
+    if not stat.S_ISREG(st.st_mode):
+        return False, "the JUnit report is not a regular file"
+    data = _read_regular(report)
+    if data is None:
+        return False, "the JUnit report could not be read"
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return False, "the JUnit report is not valid XML"
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    try:
+        counts = {k: sum(int(s.get(k, 0)) for s in suites)
+                  for k in ("tests", "failures", "errors", "skipped")}
+    except ValueError:
+        return False, "the JUnit report has malformed counts"
+    if counts["tests"] <= 0:
+        return False, "no tests ran"
+    if counts["failures"] or counts["errors"] or counts["skipped"]:
+        return False, (f"the report shows {counts['failures']} failures, {counts['errors']} errors, "
+                       f"{counts['skipped']} skipped")
+    if expected:
+        seen = {(tc.get("classname"), re.sub(r"\[.*\]$", "", tc.get("name") or ""))
+                for tc in root.iter("testcase")}
+        missing = sorted(set(expected) - seen)
+        if missing:
+            return False, (f"{len(missing)} expected test(s) missing from the report, "
+                           f"e.g. {'::'.join(missing[0])}")
+    return True, ""
+
+
+_TESTCASE_BASES = frozenset({"TestCase", "IsolatedAsyncioTestCase"})
+
+
+def _sets_test_dunder(cls: ast.ClassDef) -> bool:
+    for item in cls.body:
+        targets = (item.targets if isinstance(item, ast.Assign)
+                   else [item.target] if isinstance(item, ast.AnnAssign) else [])
+        if any(isinstance(t, ast.Name) and t.id == "__test__" for t in targets):
+            return True
+    return False
+
+
+def _python_test_names(files: dict, tests) -> frozenset | None:
+    """The (classname, name) pairs pytest reports for the pristine tests.
+
+    Approximates pytest's collection rules, erring towards counting less
+    (an expected name pytest does not report fails an honest run; one it
+    reports but this leaves out only weakens _junit_ok's subset check):
+
+    - module-level test* functions;
+    - test* methods defined in the body of a module-level class that
+      subclasses unittest's TestCase or IsolatedAsyncioTestCase (through
+      `import unittest [as x]`, `from unittest import TestCase [as y]`, or
+      an earlier such class in the same file), or that is named Test*, has
+      no base but `object`, and defines no __init__/__new__;
+    - a class that assigns __test__ in its body is skipped, and so are its
+      subclasses here.
+
+    Not counted: inherited methods, nested classes, and bases imported from
+    other modules. Still counted although pytest skips them: a module-level
+    `__test__ = False`, @property test methods, a method-level __test__,
+    @dataclass Test* classes, and names that are later rebound, deleted or
+    defined twice. Only files pytest's default patterns pick up. None when a
+    test file does not parse.
+    """
+    names = set()
+    for rel in sorted(tests):
+        base = Path(rel).name
+        if rel not in files or not (base.endswith("_test.py")
+                                    or (base.startswith("test_") and base.endswith(".py"))):
+            continue
+        try:
+            tree = ast.parse(files[rel])
+        except (SyntaxError, ValueError):
+            return None
+        module = rel[:-3].replace("/", ".")
+        ut_mods: set[str] = set()
+        tc_names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                ut_mods.update(a.asname or a.name for a in node.names if a.name == "unittest")
+            elif isinstance(node, ast.ImportFrom) and node.module == "unittest" and not node.level:
+                tc_names.update(a.asname or a.name for a in node.names if a.name in _TESTCASE_BASES)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                names.add((module, node.name))
+                continue
+            if not isinstance(node, ast.ClassDef) or _sets_test_dunder(node):
+                continue
+            is_testcase = any(
+                (isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name)
+                 and b.value.id in ut_mods and b.attr in _TESTCASE_BASES)
+                or (isinstance(b, ast.Name) and b.id in tc_names)
+                for b in node.bases)
+            if is_testcase:
+                tc_names.add(node.name)
+            elif not (node.name.startswith("Test")
+                      and all(isinstance(b, ast.Name) and b.id == "object" for b in node.bases)
+                      and not any(isinstance(i, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                  and i.name in ("__init__", "__new__") for i in node.body)):
+                continue
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and item.name.startswith("test"):
+                    names.add((f"{module}.{node.name}", item.name))
+    return frozenset(names)
+
+
+#: Imports and names a solution has no business using, because they reach
+#: into the test process: the runner, exit paths, argv (where the report
+#: path is), frames and the import system. None appears in the 34 reference
+#: solutions or stubs. This raises the bar against in-process forging and
+#: does not close it: code that never names any of these can still do it.
+_TRIPWIRE_MODULES = frozenset({
+    "pytest", "_pytest", "unittest", "conftest", "atexit", "ctypes", "importlib",
+    "builtins", "inspect", "gc", "signal", "faulthandler",
+})
+_TRIPWIRE_ATTRS = frozenset({"_exit", "argv", "modules", "settrace", "setprofile", "_getframe"})
+_TRIPWIRE_NAMES = frozenset({"__import__", "__builtins__"})
+
+
+def _python_tripwire(data: bytes) -> list[str]:
+    """AST hits for _TRIPWIRE_*; comments and strings never match."""
+    try:
+        tree = ast.parse(data)
+    except (SyntaxError, ValueError):
+        return []  # it cannot import, so its tests fail anyway
+    hits = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            hits.update(a.name for a in node.names if a.name.split(".")[0] in _TRIPWIRE_MODULES)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in _TRIPWIRE_MODULES:
+                hits.add(node.module)
+            hits.update(a.name for a in node.names if a.name in _TRIPWIRE_ATTRS | _TRIPWIRE_NAMES)
+        elif isinstance(node, ast.Attribute) and node.attr in _TRIPWIRE_ATTRS:
+            hits.add(node.attr)
+        elif isinstance(node, ast.Name) and node.id in _TRIPWIRE_NAMES:
+            hits.add(node.id)
+    return sorted(hits)
+
+
+def _run_python_gated(work: Path, timeout: int, report_dir: Path, expected):
+    """pytest isolated from everything the agent could have placed around it.
+
+    -I keeps cwd and user site off sys.path and ignores PYTHON* variables;
+    --noconftest and `-c /dev/null` ignore conftest.py and ini files; plugin
+    autoload is off; the interpreter is this process's, not `python3` from
+    PATH (a pyenv shim picks its version from a .python-version file).
+    """
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / "report.xml"
+    cmd = [sys.executable, "-I", "-m", "pytest", "-x", "-q", "--noconftest",
+           "-c", os.devnull, "--rootdir", ".", "-p", "no:cacheprovider",
+           f"--junitxml={report}"]
+    try:
+        r = subprocess.run(cmd, cwd=work, env=_gated_python_env(), capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    out = r.stdout + r.stderr
+    ok, why = _junit_ok(report, expected)
+    if r.returncode == 0 and not ok:
+        out += f"\n[scorer] pytest exited 0 but {why}; scored as a failure"
+    return r.returncode == 0 and ok, out
+
+
+def _jest_bin(work: Path) -> Path:
+    return work / "node_modules" / "jest" / "bin" / "jest.js"
+
+
+def _javascript_preflight() -> None:
+    if "javascript" in _PREFLIGHT_OK:
+        return
+    if shutil.which("node") is None:
+        raise RuntimeError("scoring preflight: `node` is not on PATH")
+    jest = _JS_SHARED_NODE_MODULES / "jest" / "bin" / "jest.js"
+    if not jest.is_file():
+        raise RuntimeError(f"scoring preflight: jest not found at {jest}")
+    _PREFLIGHT_OK.add("javascript")
+
+
+def _jest_report_ok(report: Path) -> tuple[bool, str]:
+    try:
+        st = os.lstat(report)
+    except OSError:
+        return False, "no jest report (the test process exited before jest finished)"
+    if not stat.S_ISREG(st.st_mode):
+        return False, "the jest report is not a regular file"
+    data = _read_regular(report)
+    try:
+        doc = json.loads(data) if data is not None else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        return False, "the jest report could not be read"
+
+    def n(key):
+        val = doc.get(key)
+        return val if isinstance(val, int) and not isinstance(val, bool) else -1
+
+    if doc.get("success") is not True or n("numFailedTests") != 0:
+        return False, f"jest reported a failure ({n('numFailedTests')} failed tests)"
+    if n("numPendingTests") != 0 or n("numTodoTests") != 0:
+        return False, (f"jest reported {n('numPendingTests')} pending and "
+                       f"{n('numTodoTests')} todo tests")
+    if n("numTotalTests") <= 0:
+        return False, "no tests ran"
+    return True, ""
+
+
+def _run_javascript_gated(work: Path, timeout: int, report_dir: Path, expected):
+    """jest run directly, not through `npm test`.
+
+    npm would read ~/.npmrc and global npm config, which the agent can write.
+    The pattern `./*` matches what package.json's `jest ./*` runs. The cache
+    lives in the per-score scratch dir: jest's default cache directory sits
+    under the shared temp dir, where the agent could plant transformed code.
+    """
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / "jest-report.json"
+    node = shutil.which("node") or "node"
+    cmd = [node, str(_jest_bin(work)), "--ci", "--json", f"--outputFile={report}",
+           f"--cacheDirectory={report_dir / 'jest-cache'}", "--no-watchman", "./*"]
+    try:
+        r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    # --json prints the report on stdout too; stderr carries the readable run.
+    out = r.stderr
+    ok, why = _jest_report_ok(report)
+    if r.returncode == 0 and not ok:
+        out += f"\n[scorer] jest exited 0 but {why}; scored as a failure"
+    return r.returncode == 0 and ok, out
+
+
 LANG_DESCRIPTORS = {
     "python": {
         "score_in_copy": True,
@@ -200,6 +622,17 @@ LANG_DESCRIPTORS = {
         "run_tests": _run_python,
         "syntax_hint": "Use Python 3. Run tests with `python -m pytest -x -q`.",
         "timeout_s": 90,
+        # Gated mode only (POLYGLOT_RESTORE_TESTS) -- see _score_gated.
+        "run_tests_gated": _run_python_gated,
+        "test_names": _python_test_names,
+        "preflight_gated": _python_preflight,
+        "interpreter_info": _python_interpreter_info,
+        "solution_tripwire": _python_tripwire,
+        "hook_names": frozenset({
+            "conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini",
+            "pytest.py", "_pytest", "sitecustomize.py", "usercustomize.py", ".python-version",
+        }),
+        "hook_suffixes": (".pth",),
     },
     "javascript": {
         "score_in_copy": True,
@@ -208,6 +641,16 @@ LANG_DESCRIPTORS = {
         "run_tests": _run_javascript,
         "syntax_hint": "Use Node.js (CommonJS/ES modules as the stub already uses). Run tests with `npm test`.",
         "timeout_s": 90,
+        # Gated mode only (POLYGLOT_RESTORE_TESTS) -- see _score_gated.
+        "run_tests_gated": _run_javascript_gated,
+        "preflight_gated": _javascript_preflight,
+        "protected_names": frozenset({"package.json", "babel.config.js", ".npmrc"}),
+        "hook_names": frozenset({
+            "package.json", "package-lock.json", "jest.config.js", "jest.config.cjs",
+            "jest.config.mjs", "jest.config.ts", "jest.config.json", "babel.config.js",
+            "babel.config.cjs", "babel.config.mjs", "babel.config.json", ".babelrc",
+            ".babelrc.js", ".babelrc.json", ".npmrc", "node_modules", "__mocks__",
+        }),
     },
     # go/rust/cpp/java descriptors omitted from this scaffold; port them the
     # same way javascript was ported above when running those languages.
@@ -268,6 +711,63 @@ def _clip(value, limit: int):
     return value if len(text) <= limit else text[:limit]
 
 
+def _cap_non_text_deltas(deltas: list, char_budget: int = TRAJECTORY_NON_TEXT_DELTA_CHARS) -> list:
+    """Keep a HEAD slice and a TAIL region of `deltas`, dropping the
+    middle, splitting char_budget evenly between the two ends. The tail
+    region is budget-fit, not necessarily contiguous with the true end --
+    an oversized entry within it (e.g. one huge toolcall_delta) is skipped
+    rather than truncating the whole tail at that point, so smaller,
+    genuinely-recent entries on either side of it still survive.
+
+    The tail matters because live_eval.py's
+    _reasoning_excerpt_from_trajectory tail-truncates whatever survives here,
+    assuming it is the model's LATEST reasoning; a head-only cutoff would
+    hand it the oldest content instead. Long streams really do hit this: a
+    ~13min bowling attempt filled an earlier 200-entry cap, almost all
+    thinking_delta.
+
+    A char budget (not a flat entry count) also keeps output size bounded
+    regardless of entry size: a handful of toolcall_* deltas (each carrying
+    a full "partial" state dump) can dwarf hundreds of small thinking_delta
+    chunks, so counting entries alone doesn't bound bytes.
+
+    Sizes are measured on the RAW (pre-_clip) entries -- close enough for a
+    budget, and avoids serializing twice. If nothing needs dropping, returns
+    `deltas` unchanged (no synthetic marker)."""
+    if not deltas:
+        return []
+    sizes = [len(json.dumps(d, default=str)) for d in deltas]
+    if sum(sizes) <= char_budget:
+        return deltas
+
+    head_budget = char_budget // 2
+    tail_budget = char_budget - head_budget
+
+    head_end = 0
+    used = 0
+    while head_end < len(deltas) and used + sizes[head_end] <= head_budget:
+        used += sizes[head_end]
+        head_end += 1
+
+    # Keeps scanning backward past an entry that doesn't fit rather than
+    # stopping there: one oversized delta (a toolcall_delta carrying a full
+    # "partial" state dump dwarfs the small thinking_delta chunks around it)
+    # would otherwise discard every smaller, budget-fitting entry behind it,
+    # including genuinely recent reasoning.
+    tail = []
+    used = 0
+    for i in range(len(deltas) - 1, head_end - 1, -1):
+        if used + sizes[i] <= tail_budget:
+            tail.append(deltas[i])
+            used += sizes[i]
+    tail.reverse()
+
+    omitted = len(deltas) - head_end - len(tail)
+    if omitted <= 0:
+        return deltas
+    return deltas[:head_end] + [{"type": "_omitted", "omitted_count": omitted}] + tail
+
+
 def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=None):
     """Persist what the harness otherwise discards.
 
@@ -283,6 +783,12 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
     it live with rpc.notifications() to compare (this is exactly how the
     thinking-budget intervention was first discovered, on a real `bowling`
     failure -- nothing in the persisted trajectory said so).
+
+    notifications: this attempt's OWN rpc.notifications(). Each attempt opens
+    a fresh PiRpc session (see _run_exercise), so this is already scoped to
+    just this attempt -- no delta-slicing across attempts needed or possible
+    anymore. Extension activity (skill-inject, knowledge-inject,
+    quality-monitor, etc.) otherwise invisible in this dump.
 
     Writes per attempt: trajectory_<n>.json, trajectory_<n>.txt, workdir_<n>/.
     """
@@ -311,6 +817,16 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
                 {**n, "message": _clip(n.get("message"), TRAJECTORY_FIELD_CHARS)}
                 for n in (notifications or [])
             ],
+            # Every assistantMessageEvent delta whose type wasn't
+            # "text_delta" -- confirmed to be real reasoning/thinking content
+            # (thinking_delta, mostly) for a thinking-enabled model, plus
+            # toolcall_*/text_start/text_end bracketing events. Head+tail
+            # capped by _cap_non_text_deltas, then each surviving entry
+            # clipped to TRAJECTORY_FIELD_CHARS, same policy as tool_calls.
+            "non_text_deltas": [
+                _clip(d, TRAJECTORY_FIELD_CHARS)
+                for d in _cap_non_text_deltas(getattr(result, "non_text_deltas", None) or [])
+            ],
         }
         (log_dir / f"trajectory_{attempt_name}.json").write_text(
             json.dumps(payload, indent=2, default=str),
@@ -335,16 +851,35 @@ def _dump_trajectory(log_dir, attempt_name, result, work=None, notifications=Non
             # A full 225-exercise run copies go/rust/cpp/js/java trees too;
             # without this a snapshot pulls in target/, build/, node_modules/
             # and compiled binaries, twice per exercise.
-            ignore = shutil.ignore_patterns(
+            by_name = shutil.ignore_patterns(
                 "__pycache__", ".pytest_cache", "target", "build", "node_modules",
                 ".gradle", "CMakeFiles", "*.o", "*.so", "*.class", "*.rlib")
+
+            # The agent controls this tree. symlinks=True below copies a
+            # symlink as a symlink instead of following it (one to /dev/zero
+            # filled 85 GB in 30 s); this drops FIFOs, sockets and devices,
+            # and regular files too large to be worth a snapshot.
+            def ignore(directory, names):
+                skipped = set(by_name(directory, names))
+                for name in names:
+                    try:
+                        st = os.lstat(os.path.join(directory, name))
+                    except OSError:
+                        skipped.add(name)
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        if st.st_size > _SAFE_READ_LIMIT:
+                            skipped.add(name)
+                    elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                        skipped.add(name)
+                return skipped
             # A file can vanish mid-walk while the agent is still active. One
             # retry beats losing the snapshot to the blanket except below,
             # which would leave only a .ERROR file for the very case the
             # snapshot exists to explain.
             for attempt_i in range(2):
                 try:
-                    shutil.copytree(work, snap, ignore=ignore)
+                    shutil.copytree(work, snap, ignore=ignore, symlinks=True)
                     break
                 except FileNotFoundError:
                     shutil.rmtree(snap, ignore_errors=True)
@@ -406,7 +941,7 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
     blind to exactly the kind of change (a different per-attempt budget)
     this function exists to catch.
     """
-    return {
+    params = {
         "agent": agent,
         "model": model,
         "language": language,
@@ -419,6 +954,23 @@ def _scoring_params(model: str, language: str, retry: bool, desc: dict, *,
         "allowed_tools": sorted(set(ALLOWED_TOOLS)) if agent == "pi" else None,
         "env": {k: os.environ[k] for k in _ENV_KNOBS if k in os.environ} if agent == "pi" else {},
     }
+    # Only when on, so a default run's params match every results file
+    # written before the LESSON: request was gated, and --resume refuses to
+    # blend runs made under the two retry prompts. Not an _ENV_KNOBS entry:
+    # those are pi-only, and this changes codex's prompt too.
+    if _request_lessons():
+        params["request_lessons"] = True
+    # Same only-when-on rule as request_lessons.
+    if _crash_is_error():
+        params["crash_is_error"] = True
+    if _restore_tests_on():
+        # Not True: --resume must not blend these with results scored under
+        # the earlier restore-in-place mechanism.
+        params["restore_tests"] = "manifest-v2"
+        interpreter_info = desc.get("interpreter_info")
+        if interpreter_info is not None:
+            params["scoring_interpreter"] = interpreter_info()
+    return params
 
 
 def _param_mismatches(recorded: dict, current: dict) -> list[str]:
@@ -516,7 +1068,35 @@ def _attempt_outcome(result) -> str:
     return "completed"
 
 
-def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> str:
+def _usage_tokens(result) -> dict:
+    """One attempt's token usage as {input_tokens, cache_read_tokens,
+    output_tokens}.
+
+    input_tokens is the whole prompt pi sent -- uncached input + cache read
+    + cache write -- the same convention as the Harbor adapter's
+    n_input_tokens, so cache_read_tokens / input_tokens is the prefix-cache
+    hit ratio. pi's own `input` counts only the uncached part. Sourced from
+    PromptResult.usage (summed turn_end usage); a result without one (codex,
+    test fakes) reports zeros rather than failing the exercise over token
+    accounting.
+    """
+    usage = getattr(result, "usage", None)
+    if not isinstance(usage, dict):
+        usage = {}
+
+    def _n(key):
+        val = usage.get(key, 0)
+        return int(val) if isinstance(val, (int, float)) else 0
+
+    return {
+        "input_tokens": _n("input") + _n("cache_read") + _n("cache_write"),
+        "cache_read_tokens": _n("cache_read"),
+        "output_tokens": _n("output"),
+    }
+
+
+def _classify_status(passed: bool, attempt: str | None, outcomes: list[str], *,
+                     crash_is_error: bool = False) -> str:
     """Precedence for the recorded status. Pure, so it can be table-tested.
 
     `passed` wins over everything: a pi that exits right after writing a
@@ -524,10 +1104,16 @@ def _classify_status(passed: bool, attempt: str | None, outcomes: list[str]) -> 
     Generalized from a hardcoded two attempts to however many `outcomes`
     actually ran, so --max-attempts can be raised without touching this
     function.
+
+    crash_is_error (POLYGLOT_CRASH_IS_ERROR) widens the process_exit rule
+    below to any attempt: a "fail" is scored and cached as the candidate's
+    result, which a transient pi death is not.
     """
     if passed:
         return attempt or "pass_1"
     if not outcomes:
+        return "error"
+    if crash_is_error and "process_exit" in outcomes:
         return "error"
     last = outcomes[-1]
     if last == "process_exit" and len(outcomes) == 1:
@@ -563,6 +1149,250 @@ def _score(desc, work: Path, timeout: int):
         # the (absolute) symlink still resolves from the copy.
         shutil.copytree(work, target, symlinks=True)
         return desc["run_tests"](target, timeout)
+
+
+# ── Gated scoring (POLYGLOT_RESTORE_TESTS) ───────────────────────────────
+#
+# The scored tree is built by the harness from a manifest taken right after
+# prepare, before the agent runs: the agent's bytes for the solution files,
+# the prepared bytes for everything else, and nothing the agent added. The
+# harness reads the agent's tree but never writes into it, and every
+# directory it writes into is one it created itself.
+
+#: Ignored when listing added files: runner and OS droppings.
+_NOISE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".DS_Store"})
+_NOISE_SUFFIXES = (".pyc",)
+_MAX_WALK_ENTRIES = 10_000
+
+
+@dataclass(frozen=True)
+class _Manifest:
+    #: Paths the agent is asked to write; scored with the agent's bytes.
+    solution: frozenset
+    #: Every other prepared regular file -> its prepared bytes.
+    files: dict
+    #: Prepared symlinks (JS node_modules) -> target.
+    links: dict
+    dirs: frozenset
+    tests: frozenset
+    #: Paths whose change forces a failed attempt: tests plus runner config.
+    protected: frozenset
+    #: (classname, name) pairs the report must contain; None if unknown.
+    expected_tests: frozenset | None
+
+
+def _rel(work: Path, p) -> str:
+    return Path(p).relative_to(work).as_posix()
+
+
+def _listed_tests(src: Path) -> list[str]:
+    """.meta/config.json files.test, which also names fixtures the prepare
+    globs miss: python's paasio ships test_utils.py, which _prepare_python
+    hands the agent as a stub."""
+    try:
+        listed = json.loads((src / ".meta" / "config.json").read_text()).get("files", {}).get("test", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [Path(n).as_posix() for n in (listed if isinstance(listed, list) else [])
+            if isinstance(n, str) and not Path(n).is_absolute() and ".." not in Path(n).parts]
+
+
+def _snapshot(src: Path, work: Path, stubs, tests, desc) -> _Manifest:
+    """Record the prepared tree. Taken after desc["prepare"], so it carries
+    the harness's own edits (JS un-skipping) and none of the agent's."""
+    regular, links, dirs = {}, {}, set()
+    for root, dirnames, filenames in os.walk(work, followlinks=False):
+        for name in dirnames + filenames:
+            p = Path(root) / name
+            st = os.lstat(p)
+            rel = _rel(work, p)
+            if stat.S_ISLNK(st.st_mode):
+                links[rel] = os.readlink(p)
+            elif stat.S_ISDIR(st.st_mode):
+                dirs.add(rel)
+            elif stat.S_ISREG(st.st_mode):
+                regular[rel] = p.read_bytes()
+    test_names = {_rel(work, t) for t in tests} | set(_listed_tests(src))
+    test_names = frozenset(n for n in test_names if n in regular)
+    # Config-listed tests win: paasio's test_utils.py stays pristine.
+    solution = frozenset(_rel(work, s) for s in stubs) - test_names
+    files = {rel: data for rel, data in regular.items() if rel not in solution}
+    protected = test_names | (frozenset(desc.get("protected_names", ())) & (set(files) | set(links)))
+    names_fn = desc.get("test_names")
+    expected = names_fn(files, test_names) if names_fn else None
+    return _Manifest(solution=solution, files=files, links=links, dirs=frozenset(dirs),
+                     tests=test_names, protected=frozenset(protected), expected_tests=expected)
+
+
+def _parent_unsafe(root: Path, rel: str) -> bool:
+    """Whether any parent directory of `rel` is missing, a symlink, or not a
+    directory. A symlinked parent could point anywhere outside the tree."""
+    parts = Path(rel).parts[:-1]
+    for i in range(1, len(parts) + 1):
+        try:
+            st = os.lstat(root.joinpath(*parts[:i]))
+        except OSError:
+            return True
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return True
+    return False
+
+
+class _Inspection(NamedTuple):
+    """What _inspect found. `tampered` and `rejected` force a fail."""
+    tampered: list
+    rejected: list
+    notes: list
+    added: list
+    solution_bytes: dict
+
+
+def _inspect(work: Path, m: _Manifest, desc) -> _Inspection:
+    """Compare the agent's tree with the manifest.
+
+    `tampered`: a changed test or runner-config file (protected). `rejected`:
+    a solution file that is not a regular file of at most _SAFE_READ_LIMIT
+    bytes, or trips the descriptor's tripwire. Both force the attempt to
+    fail. `notes` are information only: other prepared files that changed,
+    and added files named like runner hooks. Neither can change the score,
+    because the scored tree is built from prepared bytes and leaves added
+    files out. All strings are fixed templates around repr()'d, clipped
+    paths.
+    """
+    tampered: list[str] = []
+    rejected: list[str] = []
+    notes: list[str] = []
+
+    def shown(rel):
+        return repr(rel[:120])
+
+    def problem(rel, what):
+        if rel in m.protected:
+            tampered.append(f"protected file {shown(rel)} {what}")
+        else:
+            notes.append(f"info: {shown(rel)} {what} (the scored tree uses the prepared version)")
+
+    for rel in sorted(set(m.files) | set(m.links)):
+        if _parent_unsafe(work, rel):
+            problem(rel, "has a parent directory that is a symlink, missing, or not a directory")
+        elif rel in m.links:
+            p = work / rel
+            if not p.is_symlink() or os.readlink(p) != m.links[rel]:
+                problem(rel, "was replaced or retargeted")
+        else:
+            data = _read_regular(work / rel)
+            if data is None:
+                problem(rel, "was removed or replaced by something that is not a regular file")
+            elif data != m.files[rel]:
+                problem(rel, "was modified")
+
+    tripwire = desc.get("solution_tripwire")
+    solution_bytes: dict[str, bytes] = {}
+    for rel in sorted(m.solution):
+        data = None if _parent_unsafe(work, rel) else _read_regular(work / rel)
+        if data is None:
+            rejected.append(f"solution file {shown(rel)} is missing, not a regular file, "
+                           f"under a symlinked directory, or over {_SAFE_READ_LIMIT >> 20} MiB")
+            continue
+        solution_bytes[rel] = data
+        hits = tripwire(data) if tripwire else []
+        if hits:
+            rejected.append(f"solution file {shown(rel)} uses {', '.join(hits)[:120]}, "
+                            f"which the scorer disallows in solution code")
+
+    known = set(m.files) | set(m.links) | m.dirs | m.solution
+    hook_names = desc.get("hook_names", frozenset())
+    hook_suffixes = tuple(desc.get("hook_suffixes", ()))
+    added: list[str] = []
+    seen = 0
+    for root, dirnames, filenames in os.walk(work, followlinks=False):
+        keep = []
+        for name in sorted(dirnames) + sorted(filenames):
+            seen += 1
+            if seen > _MAX_WALK_ENTRIES:
+                break
+            rel = _rel(work, Path(root) / name)
+            if name in _NOISE_NAMES or name.endswith(_NOISE_SUFFIXES):
+                continue
+            if rel in known:
+                if name in dirnames and rel in m.dirs:
+                    keep.append(name)
+                continue
+            added.append(rel)
+            if name in hook_names or name.endswith(hook_suffixes):
+                notes.append(f"info: added {shown(rel)} is a test-runner hook file; "
+                             f"it is not part of the scored tree")
+        dirnames[:] = keep
+        if seen > _MAX_WALK_ENTRIES:
+            notes.append(f"info: stopped listing added files after {_MAX_WALK_ENTRIES} entries")
+            break
+    return _Inspection(tampered, rejected, notes, added, solution_bytes)
+
+
+def _build_scoring_tree(target: Path, m: _Manifest, solution_bytes: dict) -> None:
+    """Write the scored tree. Every directory here is created by the harness."""
+    target.mkdir(parents=True)
+    for rel in sorted(m.dirs):
+        (target / rel).mkdir(parents=True, exist_ok=True)
+    for rel, data in m.files.items():
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        (target / rel).write_bytes(data)
+    for rel, link_target in m.links.items():
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link_target, target / rel)
+    for rel, data in solution_bytes.items():
+        (target / rel).parent.mkdir(parents=True, exist_ok=True)
+        (target / rel).write_bytes(data)
+
+
+class _GatedScore(NamedTuple):
+    passed: bool
+    out: str
+    tampered: list
+    rejected: list
+    notes: list
+    added: list
+
+
+def _score_gated(desc, work: Path, timeout: int, m: _Manifest) -> _GatedScore:
+    """Score one attempt from a tree the harness builds (see _Manifest).
+
+    `tampered` and `rejected` are _inspect's. `score_in_copy` does not
+    apply: the scored tree is always a fresh harness-built copy. Notes and
+    the policy trailers go at the END of `out`, because the retry prompt
+    keeps only out[-4000:].
+    """
+    tampered, rejected, notes, added, solution_bytes = _inspect(work, m, desc)
+    with tempfile.TemporaryDirectory() as scratch:
+        target = Path(scratch) / "tree" / work.name
+        _build_scoring_tree(target, m, solution_bytes)
+        gated = desc.get("run_tests_gated")
+        if gated is not None:
+            passed, out = gated(target, timeout, Path(scratch) / "report", m.expected_tests)
+        else:
+            passed, out = desc["run_tests"](target, timeout)
+    if notes:
+        out += ("\n[scorer] note: " + "; ".join(n.removeprefix("info: ") for n in notes[:5])
+                + ". Only the solution file(s) are scored.")
+    if tampered:
+        passed = False
+        out += ("\n[scorer] scored as a failure, by policy: " + "; ".join(tampered[:5])
+                + ". Tests and runner configuration are scored from their original bytes, "
+                "so revert any change to them and edit only the solution file(s).")
+    if rejected:
+        passed = False
+        out += ("\n[scorer] scored as a failure, by policy: " + "; ".join(rejected[:5])
+                + ". Solution code must not use these, because they can reach into the test "
+                "runner: remove them (e.g. remove sys.argv; take input through function "
+                "arguments). Each solution file must be a regular file of at most "
+                f"{_SAFE_READ_LIMIT >> 20} MiB.")
+    return _GatedScore(passed, out, tampered, rejected, notes, added)
+
+
+def _extend_unique(dst: list, items) -> None:
+    for item in items:
+        if item not in dst:
+            dst.append(item)
 
 
 def _run_codex_turn(
@@ -745,6 +1575,7 @@ def _run_exercise(
     src = desc["practice_dir"] / ex_name
     if not src.exists():
         return {"status": "error", "reason": f"exercise not found at {src}"}
+    gated = _restore_tests_on()
 
     # Namespaced by agent: two agents run against the same exercise names,
     # and an un-namespaced log_dir let a later agent's run silently
@@ -761,6 +1592,18 @@ def _run_exercise(
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp) / ex_name
         stubs, tests = desc["prepare"](src, work)
+        # After prepare, so a missing shared JS install reports
+        # _prepare_javascript's remediation message rather than "jest not
+        # found"; still before the snapshot and any agent.
+        if gated and desc.get("preflight_gated") is not None:
+            desc["preflight_gated"]()
+        manifest = _snapshot(src, work, stubs, tests, desc) if gated else None
+        # Unions across attempts, for feedback. Each attempt is scored on its
+        # own: one that reverts an earlier edit and passes is an honest pass.
+        tamper_reasons: list[str] = []
+        rejection_reasons: list[str] = []
+        tamper_notes: list[str] = []
+        added_files: list[str] = []
         prompt = _build_prompt(ex_name, stubs, tests, desc["syntax_hint"])
 
         t0 = time.time()
@@ -789,6 +1632,9 @@ def _run_exercise(
         outcomes: list[str] = []
         stop_reasons: list[str] = []
         turn_total = 0
+        compaction_total = 0
+        attempt_usage: list[dict] = []
+        lessons: list[str] = []
         current_prompt = prompt
         codex_session_id = None
         for i in range(1, effective_attempts + 1):
@@ -864,13 +1710,40 @@ def _run_exercise(
             else:
                 return {"status": "error", "reason": f"unknown agent {agent!r}"}
             turn_total += r.turn_count
+            compaction_total += getattr(r, "compaction_events", 0) or 0
+            attempt_usage.append(_usage_tokens(r))
+            # Only a retry prompt asks for a LESSON: line, and only under
+            # POLYGLOT_REQUEST_LESSONS=1; extraction is not gated on that.
+            # Gated on i > 1 explicitly, not just by where the retry prompt
+            # asking for a LESSON: line happens to live: attempt 1's
+            # assistant_text is all of the model's unprompted output, where a
+            # coincidental match (a `# LESSON: ...` code comment) would be
+            # fed to reflection as a genuine self-reflection. First match
+            # only -- one lesson per attempt, not one per mention.
+            for line in (getattr(r, "assistant_text", "") or "").splitlines():
+                # Strip leading markdown decoration a model may wrap the line
+                # in: "**LESSON:** ...", "- LESSON: ...", "## LESSON: ..."
+                # otherwise match nothing.
+                stripped = re.sub(r"^[\s>#*\-]+", "", line.strip()) if i > 1 else ""
+                m = _LESSON_RE.match(stripped)
+                if m:
+                    lessons.append(m.group(1).strip()[:LESSON_MAX_CHARS])
+                    break
             outcome = _attempt_outcome(r)
             outcomes.append(outcome)
             stop_reasons.append(_stop_reason(r))
             # Snapshot BEFORE the tests run and before any retry prompt is
             # sent, so the artifact reflects what THIS attempt produced.
             _dump_trajectory(log_dir, str(i), r, work, notifications=attempt_notifications)
-            passed, out = _score(desc, work, desc["timeout_s"])
+            if manifest is not None:
+                scored = _score_gated(desc, work, desc["timeout_s"], manifest)
+                passed, out = scored.passed, scored.out
+                _extend_unique(tamper_reasons, scored.tampered)
+                _extend_unique(rejection_reasons, scored.rejected)
+                _extend_unique(tamper_notes, scored.notes)
+                _extend_unique(added_files, scored.added)
+            else:
+                passed, out = _score(desc, work, desc["timeout_s"])
             (log_dir / f"final_output_{i}.txt").write_text(out)
             if passed:
                 attempt = f"pass_{i}"
@@ -915,7 +1788,9 @@ def _run_exercise(
                       "your previous attempt's code (read the current state "
                       "before editing). The tests failed with this output:\n\n```\n"
                     + out[-4000:]
-                    + "\n```\n\nFix the implementation and try again."
+                    + "\n```\n\n"
+                    + (_LESSON_ASK if _request_lessons()
+                       else "Fix the implementation and try again.")
                 )
             else:
                 # codex resumes its own session (see above), so it already
@@ -930,7 +1805,9 @@ def _run_exercise(
                     "The tests failed. Output:\n\n```\n"
                     + out[-4000:]
                     + "\n```\n\nThe test file(s) are for reference only -- "
-                      "do not edit them. Fix the implementation and try again."
+                      "do not edit them. "
+                    + (_LESSON_ASK if _request_lessons()
+                       else "Fix the implementation and try again.")
                 )
 
         elapsed = time.time() - t0
@@ -940,12 +1817,41 @@ def _run_exercise(
 
         record = {
             "run_id": RUN_ID,
-            "status": _classify_status(passed, attempt, outcomes),
+            "status": _classify_status(passed, attempt, outcomes,
+                                       crash_is_error=_crash_is_error()),
             "stop_reasons": stop_reasons,
             "elapsed_s": round(elapsed, 2),
             "turn_count": turn_total,
+            "compaction_total": compaction_total,
+            "lessons": lessons,
+            "attempt_usage": attempt_usage,
+            "usage": {
+                key: sum(u[key] for u in attempt_usage)
+                for key in ("input_tokens", "cache_read_tokens", "output_tokens")
+            },
         }
+        if manifest is not None:
+            # tests_tampered: some attempt changed a protected file;
+            # solution_rejected: some attempt's solution file broke the
+            # solution policy. Either forced that attempt to fail (see
+            # _inspect). Notes ride along in tamper_reasons, marked "info:".
+            record["tests_tampered"] = bool(tamper_reasons)
+            record["solution_rejected"] = bool(rejection_reasons)
+            record["tamper_reasons"] = [r[:200] for r in (tamper_reasons + tamper_notes)[:10]]
+            record["rejection_reasons"] = [r[:200] for r in rejection_reasons[:10]]
+            record["added_files"] = [a[:200] for a in added_files[:20]]
         return record
+
+
+def _error_reason(exc: BaseException) -> str:
+    """record["reason"] for an exception _run_exercise raised (see main()).
+
+    1000, not 400: some exceptions (e.g. the JS shared-deps RuntimeError in
+    _prepare_javascript) are deliberately raised with a full remediation
+    command in the message -- truncating too tightly cuts off the actual fix
+    instruction the hard failure exists to surface.
+    """
+    return f"{type(exc).__name__}: {exc}"[:1000]
 
 
 def main():
@@ -1083,12 +1989,7 @@ def main():
                 thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
-            # 1000, not 400: some exceptions (e.g. the JS shared-deps
-            # RuntimeError in _prepare_javascript) are deliberately raised
-            # with a full remediation command in the message -- truncating
-            # too tightly cuts off the actual fix instruction the hard
-            # failure exists to surface.
-            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:1000]}
+            r = {"status": "error", "reason": _error_reason(exc)}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
         # Idempotent after the first exercise (thinking_confirmation stops
