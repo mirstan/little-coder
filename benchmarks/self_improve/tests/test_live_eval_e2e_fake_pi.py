@@ -10,9 +10,12 @@ that makes a candidate's text actually reach a live agent.
 import base64
 import json
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1124,3 +1127,132 @@ def test_run_batch_misses_the_cache_after_the_exercises_tests_change(
         results = runner.run_batch(candidate, [ExerciseSpec("wordy")])
     assert len(calls) == 1
     assert results[0].from_cache is False and results[0].status == "fail"
+
+
+def _alive(pid: int) -> bool:
+    """Liveness from process state: kill(pid, 0) succeeds on a zombie, and
+    a reparented orphan stays one forever where nothing reaps (a container
+    whose PID 1 is pytest)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def _kill_recorded(pid_file: Path, setsid: bool) -> None:
+    """finally-cleanup by recorded pid, so a red run leaks nothing."""
+    if not pid_file.exists():
+        return
+    pid = int(pid_file.read_text())
+    targets = [lambda: os.kill(pid, signal.SIGKILL)]
+    if setsid and pid != os.getpgrp():
+        targets.append(lambda: os.killpg(pid, signal.SIGKILL))
+    for kill in targets:
+        try:
+            kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _require_the_sweep_to_see_a_tagged_python():
+    """Skip, rather than fail, where the platform hides other processes'
+    environments altogether (a restricted CI)."""
+    token = "canary" + os.urandom(8).hex()
+    canary = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        env={**os.environ, live_eval._RUN_TOKEN_ENV: token},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if canary.pid in live_eval._list_tagged_pids(token):
+                return
+            time.sleep(0.1)
+    finally:
+        canary.kill()
+        canary.wait()
+    pytest.skip("this platform does not show a tagged process's environment to the sweep")
+
+
+def _run_with_a_leftover_writer(runner_factory, tmp_path, monkeypatch, *, setsid, shell=False):
+    bg_file = tmp_path / "bg_writes.txt"
+    pid_file = tmp_path / "bg.pid"
+    monkeypatch.setenv("FAKE_PI_MODE", "solve_and_leave_writer")
+    monkeypatch.setenv("FAKE_PI_WRITE_FILES", json.dumps({"wordy.py": _b64(_WORDY_SOLUTION)}))
+    monkeypatch.setenv("FAKE_PI_BG_FILE", str(bg_file))
+    monkeypatch.setenv("FAKE_PI_BG_PID_FILE", str(pid_file))
+    monkeypatch.setenv("FAKE_PI_BG_PYTHON", sys.executable)
+    monkeypatch.setenv("FAKE_PI_BG_SETSID", "1" if setsid else "0")
+    monkeypatch.setenv("FAKE_PI_BG_SHELL", "1" if shell else "0")
+    alive_at_parse = []
+    try:
+        for runner in runner_factory():
+            real_parse = runner._parse_result
+
+            def _parse_spy(*a, **kw):
+                alive_at_parse.append(_alive(int(pid_file.read_text())))
+                return real_parse(*a, **kw)
+
+            monkeypatch.setattr(runner, "_parse_result", _parse_spy)
+            results = runner.run_batch({"skills_tools_bash": "Revised guidance.\n"}, [ExerciseSpec("wordy")])
+
+        assert results[0].status == "pass_1"
+        # Dead before scoring started, not merely by the time run_batch returned.
+        assert alive_at_parse == [False]
+        size = bg_file.stat().st_size
+        time.sleep(0.3)
+        assert bg_file.stat().st_size == size
+    finally:
+        _kill_recorded(pid_file, setsid)
+
+
+def test_a_same_group_background_writer_is_killed_before_scoring(runner_factory, tmp_path, monkeypatch):
+    """A leftover in the child's own process group: the group kill."""
+    _run_with_a_leftover_writer(runner_factory, tmp_path, monkeypatch, setsid=False)
+
+
+def test_a_setsid_background_writer_is_killed_by_the_env_token_sweep(runner_factory, tmp_path, monkeypatch):
+    """pi's bash tool starts every command in its own session, so `cmd &`
+    escapes the child's group; only the run-token sweep finds it."""
+    _require_the_sweep_to_see_a_tagged_python()
+    _run_with_a_leftover_writer(runner_factory, tmp_path, monkeypatch, setsid=True)
+
+
+@pytest.mark.xfail(
+    sys.platform == "darwin", strict=True,
+    reason="macOS hides the environment of Apple binaries (/bin/sh, sleep) from ps -E, so a "
+           "leftover made only of them, outside any tagged process's group, is not found",
+)
+def test_a_setsid_shell_only_background_writer_is_killed(runner_factory, tmp_path, monkeypatch):
+    _run_with_a_leftover_writer(runner_factory, tmp_path, monkeypatch, setsid=True, shell=True)
+
+
+def test_post_run_cleanup_never_signals_the_orchestrators_group(runner_factory, monkeypatch):
+    calls = []
+    real_killpg = os.killpg
+
+    def _spy(pgid, sig):
+        calls.append(pgid)
+        if pgid == os.getpgrp():
+            raise AssertionError("signalled the orchestrator's own process group")
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", _spy)
+    for runner in runner_factory():
+        runner.python_executable = shutil.which("false") or "/usr/bin/false"
+        result = runner._run_one_uncached(ExerciseSpec("wordy"))
+
+    assert result.status == "harness_error"
+    assert calls and os.getpgrp() not in calls

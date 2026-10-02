@@ -16,6 +16,8 @@ import re
 import signal
 import subprocess
 import sys
+import time
+import uuid
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -206,6 +208,105 @@ class LiveEvalHarnessError(RuntimeError):
     def __init__(self, message: str, result: "LiveRunResult | None" = None):
         super().__init__(message)
         self.result = result
+
+
+#: Set to a fresh uuid4 hex in each live run's child environment (never in
+#: os.environ). pi, its bash tool and the gated pytest all copy their
+#: parent's environment, so whatever the run leaves behind carries it,
+#: including processes in sessions of their own that a process-group kill
+#: cannot reach. _sweep_tagged_processes finds them by it.
+_RUN_TOKEN_ENV = "LITTLE_CODER_SELF_IMPROVE_RUN_TOKEN"
+#: SIGTERM-to-SIGKILL grace for a run's process group: after a normal exit,
+#: when only leftovers can be in it, and after the outer timeout.
+_POST_RUN_GRACE_S = 2.0
+_TIMEOUT_GRACE_S = 15.0
+#: How long to wait for a SIGKILLed group to disappear before warning.
+_KILL_CONFIRM_S = 5.0
+#: Rescans after killing what a sweep found, bounding a respawning process.
+_SWEEP_ROUNDS = 3
+#: SIGTERM-to-SIGKILL grace for each process a sweep finds.
+_SWEEP_GRACE_S = 1.0
+_PS_TIMEOUT_S = 10
+#: Linux reads /proc/<pid>/environ; elsewhere (macOS) `ps -E` prints it.
+_USE_PROC = sys.platform.startswith("linux")
+
+
+def _ps_environ_listing() -> bytes:
+    """`ps` output with each process's environment after its command line.
+    Bytes, not text: one process with a non-UTF-8 value must not disable
+    the sweep. Raises on a failed or timed-out ps."""
+    r = subprocess.run(
+        ["ps", "-A", "-E", "-ww", "-o", "pid=", "-o", "command="],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=_PS_TIMEOUT_S,
+    )
+    if r.returncode != 0:
+        raise OSError(f"ps exited {r.returncode}: {r.stderr[-300:]!r}")
+    return r.stdout
+
+
+def _tagged_pids_from_ps(listing: bytes, token: str) -> set[int]:
+    """Pids whose `ps -E` line has the exact entry NAME=token, bounded by
+    whitespace or the line's ends so a longer value does not match."""
+    entry = re.compile(rb"(?:^|\s)" + re.escape(f"{_RUN_TOKEN_ENV}={token}".encode()) + rb"(?:\s|$)")
+    pids = set()
+    for line in listing.splitlines():
+        head = line.split(None, 1)
+        if head and head[0].isdigit() and entry.search(line):
+            pids.add(int(head[0]))
+    return pids
+
+
+def _list_tagged_pids(token: str) -> set[int]:
+    """Every process, other than this one, whose environment carries this
+    run's token. Raises if the process list cannot be read at all.
+
+    What it cannot see: a process that cleared or rewrote its environment,
+    one owned by another user, and on macOS any Apple platform binary
+    (/bin/sh, /bin/bash, /bin/zsh, sleep, tail, perl and the rest), whose
+    environment ps -E does not show."""
+    if _USE_PROC:
+        needle = f"{_RUN_TOKEN_ENV}={token}".encode()
+        pids = set()
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/environ", "rb") as fh:
+                    environ = fh.read()
+            except OSError:  # gone, another user's, or a kernel thread
+                continue
+            if needle in environ.split(b"\0"):
+                pids.add(int(name))
+    else:
+        pids = _tagged_pids_from_ps(_ps_environ_listing(), token)
+    pids.discard(os.getpid())
+    return pids
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _group_gone(pgid: int) -> bool:
+    """macOS answers EPERM for a group whose only members are zombies."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return True
+    return False
+
+
+def _signal_quietly(send, target: int, sig: int) -> None:
+    try:
+        send(target, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 _MAX_TAIL_CHARS = 4_000
@@ -700,6 +801,9 @@ class PolyglotLiveRunner:
                 effective_timeout = max(1.0, remaining)
                 budget_clamped = True
 
+        token = uuid.uuid4().hex
+        env[_RUN_TOKEN_ENV] = token
+
         results_file.unlink(missing_ok=True)
         # Written BEFORE Popen() -- see mark_spawn_pending()'s own docstring
         # for the TOCTOU gap this closes (a SIGKILL between Popen() returning
@@ -721,8 +825,13 @@ class PolyglotLiveRunner:
             try:
                 _stdout, stderr = proc.communicate(timeout=effective_timeout)
                 exit_code = proc.returncode
+                # Before _parse_result: an agent's `cmd &` outlives the run
+                # and could otherwise still be writing while it is scored.
+                self._reap_leftovers(proc, token, grace_s=_POST_RUN_GRACE_S)
             except subprocess.TimeoutExpired:
+                # Both before communicate(): a leftover can hold the pipes.
                 self._kill_process_group(proc)
+                self._sweep_tagged_processes(token)
                 _stdout, stderr = proc.communicate()
                 if budget_clamped:
                     # This kill was a budget decision, not a genuine
@@ -753,6 +862,10 @@ class PolyglotLiveRunner:
             # budget_clamped raise above already killed it) is safe --
             # _kill_process_group treats an already-dead process as a no-op.
             self._kill_process_group(proc)
+            try:
+                self._sweep_tagged_processes(token)
+            except Exception:
+                logger.exception("live_eval: leftover-process sweep failed while unwinding")
             raise
         finally:
             self.worktree.set_active_pid(None)
@@ -760,7 +873,7 @@ class PolyglotLiveRunner:
         return self._parse_result(spec, results_file, log_root, stderr, exit_code)
 
     @staticmethod
-    def _kill_process_group(proc: subprocess.Popen) -> None:
+    def _kill_process_group(proc: subprocess.Popen, grace_s: float = _TIMEOUT_GRACE_S) -> bool:
         """A plain subprocess timeout only kills the DIRECT child --
         aider_polyglot.py's own comments document that a spawned bash
         grandchild (from the agent's own tool calls) can still outlive
@@ -777,24 +890,134 @@ class PolyglotLiveRunner:
         proc.wait() returns immediately (only ever waiting on the direct
         child) -- naively treating that as "done" would skip SIGKILL
         entirely and leave the caller's subsequent communicate() call
-        hanging forever on pipes that never close."""
+        hanging forever on pipes that never close. The grace period is
+        timed from the group's liveness too: after a normal exit the leader
+        is already reaped, so waiting on it would end the grace at once.
+
+        Refuses a pgid of 0 or 1 or this process's own group. A group whose
+        only members are zombies (macOS answers EPERM for it) or another
+        user's processes counts as done: nothing in it can be signalled.
+        Never blocks past grace_s + _KILL_CONFIRM_S; warns if the group
+        outlives that. Returns whether the group still existed, i.e.
+        whether anything had to be signalled."""
         pgid = proc.pid
+        if pgid <= 1 or pgid == os.getpgrp():
+            logger.warning("live_eval: refusing to signal process group %d", pgid)
+            return False
         try:
             os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(pgid, 0)  # raises ProcessLookupError iff the WHOLE group is gone
-        except ProcessLookupError:
-            return
+        except (ProcessLookupError, PermissionError):
+            return False
+
+        def _gone_within(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while True:
+                proc.poll()  # reaps the leader if it is a zombie
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, PermissionError):
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+
+        if _gone_within(grace_s):
+            return True
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, PermissionError):
+            return True
+        if not _gone_within(_KILL_CONFIRM_S):
+            logger.warning(
+                "live_eval: process group %d still exists %.0fs after SIGKILL", pgid, _KILL_CONFIRM_S,
+            )
+        return True
+
+    @staticmethod
+    def _sweep_tagged_processes(token: str, _lister=None) -> list[int]:
+        """Kills every process carrying this run's token (see
+        _RUN_TOKEN_ENV), and every process group one of them is in: SIGTERM,
+        up to _SWEEP_GRACE_S, then SIGKILL, then a rescan, for at most
+        _SWEEP_ROUNDS rounds. Returns the tagged pids it signalled.
+
+        The group kill is what reaches a leftover the listing cannot see. A
+        non-interactive shell keeps its `&` jobs in its own process group,
+        so on macOS, where ps -E hides the environment of Apple binaries, a
+        /bin/bash loop sharing a group with a visible tagged process (python,
+        node) still dies. It is safe because setpgid() cannot move a process
+        into a group in another session, and every tagged process is in a
+        session the run's child (start_new_session=True) or one of its
+        descendants created. Group 0, group 1 and this process's own group
+        are never signalled.
+
+        Best effort, fail-open: if the process list cannot be read, logs one
+        warning and kills nothing. Never raises except KeyboardInterrupt.
+        Stands down if this process's own environment carries the token,
+        which would make the orchestrator's other children targets.
+        `_lister` replaces _list_tagged_pids (tests)."""
+        lister = _lister or _list_tagged_pids
+        if os.environ.get(_RUN_TOKEN_ENV) == token:
+            logger.warning(
+                "live_eval: this process's own environment carries %s for this run -- "
+                "skipping the leftover-process sweep", _RUN_TOKEN_ENV,
+            )
+            return []
+        killed: set[int] = set()
+        try:
+            for _round in range(_SWEEP_ROUNDS):
+                try:
+                    pids = set(lister(token)) - {os.getpid()}
+                except Exception as e:
+                    logger.warning(
+                        "live_eval: could not list processes for the leftover-process sweep "
+                        "(%s: %s) -- anything this run left behind is still running",
+                        type(e).__name__, e,
+                    )
+                    break
+                if not pids:
+                    break
+                own_group = os.getpgrp()
+                pgids = set()
+                for pid in pids:  # before any signal: a reaped pid has no group to ask about
+                    try:
+                        pgids.add(os.getpgid(pid))
+                    except OSError:
+                        pass
+                pgids = {g for g in pgids if g > 1 and g != own_group}
+                live_pids, live_pgids = set(pids), set(pgids)
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    for pid in live_pids:
+                        _signal_quietly(os.kill, pid, sig)
+                    for pgid in live_pgids:
+                        _signal_quietly(os.killpg, pgid, sig)
+                    deadline = time.monotonic() + _SWEEP_GRACE_S
+                    while True:
+                        live_pids = {p for p in live_pids if not _pid_gone(p)}
+                        live_pgids = {g for g in live_pgids if not _group_gone(g)}
+                        if not (live_pids or live_pgids) or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                    if not (live_pids or live_pgids):
+                        break
+                killed.update(pids)
+            else:
+                logger.warning(
+                    "live_eval: tagged processes still appearing after %d sweep rounds", _SWEEP_ROUNDS,
+                )
+        except Exception as e:  # never let cleanup hide the run's own outcome
+            logger.warning("live_eval: leftover-process sweep failed: %s: %s", type(e).__name__, e)
+        if killed:
+            logger.warning("live_eval: killed processes this run left behind: %s", sorted(killed))
+        return sorted(killed)
+
+    def _reap_leftovers(self, proc: subprocess.Popen, token: str, grace_s: float) -> None:
+        """The run's process group, then everything carrying its token. Runs
+        before _parse_result and before set_active_pid(None), so nothing the
+        run started can still write into the tree while it is scored, and
+        the GC treats the tree as busy until it is quiet."""
+        if self._kill_process_group(proc, grace_s=grace_s):
+            logger.warning("live_eval: the run's process group outlived its leader; killed it")
+        self._sweep_tagged_processes(token)
 
     def _parse_result(
         self, spec: ExerciseSpec, results_file: Path, log_root: Path, stderr: str, exit_code: int | None,

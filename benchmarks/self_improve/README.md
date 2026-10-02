@@ -216,9 +216,9 @@ the GC will not find it.
 
 git itself takes paths, and the identity checks run at points in time
 (before each git call), not continuously. A process the agent leaves
-running that escapes the exercise's process-group kill (for example, by
-double-forking) could swap a path just after a check and swap it back
-before the next one. Nothing detects that swap, and for the git call in
+running that survives the post-run cleanup (see "Processes a live run
+leaves behind" under Known gaps / next steps) could swap a path just after
+a check and swap it back before the next one. Nothing detects that swap, and for the git call in
 between, git could be pointed at another directory, such as your checkout.
 
 Use a separate, spend-limited key for reflection, and don't export it in
@@ -434,3 +434,42 @@ What this does not close:
    separate log files per benchmark, which is more than a "safe, well-defined"
    fix -- it needs its own design pass on what "right after" should mean
    (same turn? N lines apart? within a time window?).
+
+6. **Processes a live run leaves behind.** After every live run, before its
+   result is parsed (and before the next run starts), `live_eval.py` kills
+   the run's process group, then every process whose environment carries
+   that run's token (`LITTLE_CODER_SELF_IMPROVE_RUN_TOKEN`, a fresh value
+   per run), together with each such process's own process group. The
+   group kill alone is not enough: pi starts every bash tool call in a
+   session of its own, so an agent's `cmd &` is outside the run's group.
+   What this still misses:
+   - **macOS: Apple's own binaries.** `ps -E` does not show the
+     environment of Apple platform binaries: `/bin/sh`, `/bin/bash`,
+     `/bin/zsh`, `sleep`, `tail`, `perl` and the rest. A leftover made
+     only of them is not found unless it shares a process group with a
+     process that is found (python, node). pi's bash tool runs
+     `/bin/bash`, so a plain shell loop the agent backgrounds is exactly
+     this case. `test_a_setsid_shell_only_background_writer_is_killed` is
+     marked as an expected failure on macOS for this reason.
+   - **Linux** reads `/proc/<pid>/environ`, which shows every process of
+     the same user, so for those the sweep is complete.
+   - **Anywhere:** a process that clears or rewrites its environment
+     (`env -i`, an exec with an explicit environment), or that runs as
+     another user.
+   - **Writes made before the cleanup.** The results file and the log root
+     are inside the tree the agent can write to, so a leftover can still
+     change them between the child exiting and being killed. Moving them
+     into a directory only the orchestrator writes is the real fix.
+   - **A daemon the agent started** during the run (watchman, a gradle
+     daemon) carries the token and is killed with the rest.
+   - **A container whose PID 1 does not reap orphans.** Killed leftovers
+     stay zombies there. A run that left something in its own process
+     group then waits out the 2 s grace plus the 5 s SIGKILL confirmation
+     and logs a warning; each sweep round that found something waits up
+     to its 1 s grace twice.
+   - If the process list cannot be read at all, the sweep logs one warning
+     and the run is scored without it.
+
+   A leftover that survives can also make the next run's `reset()` raise
+   `ScratchWorktreeCorrupted`, which stops the batch rather than scoring
+   a tree it changed.

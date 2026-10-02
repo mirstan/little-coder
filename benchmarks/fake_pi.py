@@ -8,7 +8,7 @@ expressed against a real agent anyway: it needs a process that exits on cue.
 Mode comes from FAKE_PI_MODE. Reads JSONL requests on stdin, emits JSONL on
 stdout, exactly as rpc_client expects.
 """
-import base64, json, os, sys, time
+import base64, json, os, subprocess, sys, time
 
 # Canned get_session_stats data (docs/rpc.md's documented shape) -- distinct
 # from any single turn_end's usage so tests can tell the two sources apart
@@ -458,6 +458,47 @@ def main():
         emit({"type": "response", "id": rid, "success": True})
         emit({"type": "agent_start"})
         _write_solution_files()
+        emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
+
+    if mode == "solve_and_leave_writer":
+        # solve_from_env, plus a background process that outlives this run,
+        # the way `cmd &` in an agent's bash call does. It appends a line to
+        # FAKE_PI_BG_FILE every 50 ms for at most 60 s. All three stdio
+        # streams go to /dev/null, or the harness's communicate() would wait
+        # on the pipe. FAKE_PI_BG_SETSID=1 starts it in its own session, as
+        # pi's bash tool does; FAKE_PI_BG_SHELL=1 makes it a /bin/sh loop
+        # instead of FAKE_PI_BG_PYTHON (default: this interpreter). Its pid
+        # is written to FAKE_PI_BG_PID_FILE (atomically) before agent_end,
+        # so a test can kill it whatever happens.
+        bg_file = os.environ["FAKE_PI_BG_FILE"]
+        pid_file = os.environ["FAKE_PI_BG_PID_FILE"]
+        emit({"type": "response", "id": rid, "success": True})
+        emit({"type": "agent_start"})
+        _write_solution_files()
+        if os.environ.get("FAKE_PI_BG_SHELL") == "1":
+            cmd = ["/bin/sh", "-c",
+                   'end=$(( $(date +%s) + 60 )); '
+                   'while [ "$(date +%s)" -lt "$end" ]; do echo x >> "$1"; sleep 0.05; done',
+                   "sh", bg_file]
+        else:
+            cmd = [os.environ.get("FAKE_PI_BG_PYTHON") or sys.executable, "-c",
+                   "import sys, time\n"
+                   "end = time.monotonic() + 60\n"
+                   "while time.monotonic() < end:\n"
+                   "    with open(sys.argv[1], 'a') as fh:\n"
+                   "        fh.write('x\\n')\n"
+                   "    time.sleep(0.05)\n",
+                   bg_file]
+        writer = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=os.environ.get("FAKE_PI_BG_SETSID") == "1",
+        )
+        with open(pid_file + ".tmp", "w") as fh:
+            fh.write(f"{writer.pid}\n")
+        os.replace(pid_file + ".tmp", pid_file)
         emit({"type": "turn_end", "message": {"usage": TURN_USAGE}})
         emit({"type": "agent_end"})
         emit({"type": "agent_settled"})
