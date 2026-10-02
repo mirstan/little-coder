@@ -329,7 +329,9 @@ def _python_preflight() -> None:
     Runs the same interpreter, flags and environment as _run_python_gated.
     A find_spec check in this process would pass while `-I` scoring fails,
     and that failure would be recorded as an ordinary fail. A raise here
-    becomes an "error" record (see main()), which live_eval never caches.
+    becomes an "error" record (see main()), which live_eval never caches
+    and treats as a config error (see its _CONFIG_ERROR_REASON_PREFIXES).
+    _run_exercise calls it after prepare and before any agent runs.
     """
     if "python" in _PREFLIGHT_OK:
         return
@@ -1498,8 +1500,6 @@ def _run_exercise(
     if not src.exists():
         return {"status": "error", "reason": f"exercise not found at {src}"}
     gated = _restore_tests_on()
-    if gated and desc.get("preflight_gated") is not None:
-        desc["preflight_gated"]()
 
     # Namespaced by agent: two agents run against the same exercise names,
     # and an un-namespaced log_dir let a later agent's run silently
@@ -1516,6 +1516,11 @@ def _run_exercise(
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp) / ex_name
         stubs, tests = desc["prepare"](src, work)
+        # After prepare, so a missing shared JS install reports
+        # _prepare_javascript's remediation message rather than "jest not
+        # found"; still before the snapshot and any agent.
+        if gated and desc.get("preflight_gated") is not None:
+            desc["preflight_gated"]()
         manifest = _snapshot(src, work, stubs, tests, desc) if gated else None
         # Unions across attempts, for feedback. Each attempt is scored on its
         # own: one that reverts an earlier edit and passes is an honest pass.
@@ -1755,6 +1760,17 @@ def _run_exercise(
         return record
 
 
+def _error_reason(exc: BaseException) -> str:
+    """record["reason"] for an exception _run_exercise raised (see main()).
+
+    1000, not 400: some exceptions (e.g. the JS shared-deps RuntimeError in
+    _prepare_javascript) are deliberately raised with a full remediation
+    command in the message -- truncating too tightly cuts off the actual fix
+    instruction the hard failure exists to surface.
+    """
+    return f"{type(exc).__name__}: {exc}"[:1000]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", choices=["pi", "codex"], default="pi")
@@ -1890,12 +1906,7 @@ def main():
                 thinking_confirmation=thinking_confirmation,
             )
         except Exception as exc:
-            # 1000, not 400: some exceptions (e.g. the JS shared-deps
-            # RuntimeError in _prepare_javascript) are deliberately raised
-            # with a full remediation command in the message -- truncating
-            # too tightly cuts off the actual fix instruction the hard
-            # failure exists to surface.
-            r = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:1000]}
+            r = {"status": "error", "reason": _error_reason(exc)}
             print(f"[{args.language}/{name}] ERROR {r['reason']}")
 
         # Idempotent after the first exercise (thinking_confirmation stops

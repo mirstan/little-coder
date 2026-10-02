@@ -225,3 +225,53 @@ def test_compute_diff_tolerates_a_non_utf8_file(tmp_path, side):
     diff = runner._compute_diff(ExerciseSpec("wordy"), workdir)
 
     assert "agent/wordy.py" in diff
+
+
+def _preflight_messages(monkeypatch, tmp_path):
+    """Each RuntimeError aider_polyglot.py's two scoring preflights raise,
+    formatted as main() records it."""
+    import subprocess
+
+    import benchmarks.aider_polyglot as AP
+
+    def raised(fn):
+        monkeypatch.setattr(AP, "_PREFLIGHT_OK", set())
+        try:
+            fn()
+        except RuntimeError as exc:
+            return AP._error_reason(exc)
+        raise AssertionError(f"{fn.__name__} did not raise")
+
+    reasons = []
+    monkeypatch.setattr(AP.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "No module named pytest"))
+    reasons.append(raised(AP._python_preflight))
+
+    def oserror(cmd, **kw):
+        raise OSError("exec format error")
+    monkeypatch.setattr(AP.subprocess, "run", oserror)
+    reasons.append(raised(AP._python_preflight))
+
+    monkeypatch.setattr(AP.shutil, "which", lambda name: None)
+    reasons.append(raised(AP._javascript_preflight))
+
+    empty = tmp_path / "empty_node_modules"
+    empty.mkdir()
+    monkeypatch.setattr(AP.shutil, "which", lambda name: "/usr/bin/node")
+    monkeypatch.setattr(AP, "_JS_SHARED_NODE_MODULES", empty)
+    reasons.append(raised(AP._javascript_preflight))
+    return reasons
+
+
+def test_scoring_preflight_failures_are_config_errors(monkeypatch, tmp_path):
+    """A machine that cannot score cannot be fixed by retrying the exercise,
+    so every preflight message must match _CONFIG_ERROR_REASON_PREFIXES as
+    main() writes it."""
+    from benchmarks.self_improve.live_eval import LiveRunResult, _is_config_error
+
+    reasons = _preflight_messages(monkeypatch, tmp_path)
+    assert len(reasons) == 4
+    for reason in reasons:
+        result = LiveRunResult(task_id="python/wordy", exercise="wordy", language="python",
+                               status="error", score=0.0, success=False, error=reason)
+        assert _is_config_error(result), reason

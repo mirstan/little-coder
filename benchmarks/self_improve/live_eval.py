@@ -175,13 +175,15 @@ HARNESS_ERROR_RETRIES = 2
 #: record["reason"] prefixes for an "error" that retrying cannot change,
 #: written by aider_polyglot.py's _run_exercise (missing exercise dir, unknown
 #: agent) and by main()'s exception wrapper around it (the JS shared-deps
-#: RuntimeError from _prepare_javascript). If that wording changes, such an
+#: RuntimeError from _prepare_javascript, and the gated-scoring checks in
+#: _python_preflight / _javascript_preflight). If that wording changes, such an
 #: error is retried and then scored 0.0 like any other runtime error, which
 #: wastes retries and hides the misconfiguration behind 0.0 scores.
 _CONFIG_ERROR_REASON_PREFIXES = (
     "exercise not found at ",
     "unknown agent ",
     "RuntimeError: shared JS deps missing at ",
+    "RuntimeError: scoring preflight",
 )
 
 

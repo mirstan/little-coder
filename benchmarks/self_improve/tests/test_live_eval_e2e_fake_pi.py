@@ -893,6 +893,8 @@ def test_fail_timeout_is_scored_once_not_retried_and_not_cached(runner_factory, 
     "exercise not found at /somewhere/wordy",
     "unknown agent 'nope'",
     "RuntimeError: shared JS deps missing at /x/node_modules; create them with ...",
+    "RuntimeError: scoring preflight `x -I -m pytest --version` exited 1: 'No module named pytest'",
+    "RuntimeError: scoring preflight: `node` is not on PATH",
 ])
 def test_config_error_raises_immediately_without_retrying(reason, runner_factory, tmp_path, monkeypatch):
     """These can't change on retry, and aren't the candidate's doing."""
@@ -906,6 +908,29 @@ def test_config_error_raises_immediately_without_retrying(reason, runner_factory
     assert [r.status for r in seen] == ["error"]
     assert not list((tmp_path / "cache").rglob("*.json"))
 
+
+
+def test_gated_js_with_missing_shared_deps_is_a_config_error(runner_factory, fake_practice, tmp_path, monkeypatch):
+    """Gated JS scoring on a machine without the shared npm install: the
+    child records the remediation message from _prepare_javascript (not a
+    preflight "jest not found"), and live_eval stops after one run instead
+    of retrying it and scoring 0.0. fake_practice has no .shared-npm."""
+    ex_dir = fake_practice / "javascript" / "exercises" / "practice" / "two-fer"
+    ex_dir.mkdir(parents=True)
+    (ex_dir / "package.json").write_text('{"scripts": {"test": "jest ./*"}}')
+    (ex_dir / "two-fer.js").write_text("export const twoFer = () => {};\n")
+    (ex_dir / "two-fer.spec.js").write_text(
+        "import { twoFer } from './two-fer';\ntest('x', () => { expect(twoFer()).toBe(1); });\n")
+    monkeypatch.setenv("FAKE_PI_MODE", "clean")
+    cache = LiveResultCache(tmp_path / "cache")
+    seen = []
+    for runner in runner_factory(cache=cache, on_result=seen.append):
+        with pytest.raises(live_eval.LiveEvalHarnessError, match="config"):
+            runner.run_batch({"agents_md": "text"}, [ExerciseSpec("two-fer", "javascript")])
+
+    assert len(seen) == 1
+    assert seen[0].error.startswith("RuntimeError: shared JS deps missing at"), seen[0].error
+    assert not list((tmp_path / "cache").rglob("*.json"))
 
 def _canned_by_exercise(statuses: dict):
     def _run(spec):
