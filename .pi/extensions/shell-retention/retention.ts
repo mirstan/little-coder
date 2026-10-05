@@ -286,13 +286,24 @@ function collectPairs(messages: any[]): Pair[] {
   return pairs;
 }
 
+// pi-ai's openai-completions provider sets thinkingSignature to the name of
+// the delta field the reasoning streamed in (its `reasoningFields` list), so it
+// can replay the thinking under that key. Nothing is signed, so the toolCall
+// args are free to rewrite. The exemption needs both that api and one of those
+// names: another provider's thinkingSignature, or a message without `api`,
+// keeps the protection. retention.test.ts pins this list against the installed
+// provider, since `reasoningFields` is internal to pi-ai.
+export const REASONING_FIELD_NAMES = new Set(["reasoning_content", "reasoning", "reasoning_text"]);
+
 function isSignedMessage(m: any): boolean {
   if (!Array.isArray(m?.content)) return false;
+  const fieldNameMarkers = m.api === "openai-completions";
   return m.content.some(
     (b: any) =>
       b?.thoughtSignature !== undefined ||
       b?.textSignature !== undefined ||
-      b?.thinkingSignature !== undefined,
+      (b?.thinkingSignature !== undefined &&
+        !(fieldNameMarkers && REASONING_FIELD_NAMES.has(b.thinkingSignature))),
   );
 }
 

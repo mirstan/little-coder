@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   archiveId,
   archiveText,
@@ -16,6 +19,7 @@ import {
   DEFAULT_STALE_DISTANCE,
   ENV_MIN_PAIR_BYTES,
   ENV_RETAIN_RAW,
+  REASONING_FIELD_NAMES,
   RESULT_DEMOTED_PREFIX,
   type RetentionArchive,
   type RetentionOptions,
@@ -485,6 +489,83 @@ describe("demoteMessages", () => {
     expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
   });
 
+  // pi-ai's openai-completions provider stores the name of the delta field
+  // the reasoning arrived in as thinkingSignature — a replay hint, not a
+  // signature.
+  function thinkingThenShell(
+    id: string,
+    command: string,
+    thinkingSignature: string,
+    callExtra = {},
+    api: string | null = "openai-completions",
+  ) {
+    return {
+      role: "assistant",
+      ...(api === null ? {} : { api }),
+      content: [
+        { type: "thinking", thinking: "Compile it next.", thinkingSignature },
+        { type: "toolCall", id, name: "ShellSession", arguments: { command }, ...callExtra },
+      ],
+    };
+  }
+
+  for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+    it(`demotes the command when thinkingSignature is openai-completions' "${field}" field name`, () => {
+      const command = `cat > /tmp/c.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/c /tmp/c.c`;
+      const msgs = [
+        userMsg("t"),
+        thinkingThenShell("rc", command, field),
+        shellResult("rc", filler(8192, "out")),
+        ...pairs(4, "n"),
+      ];
+      const out = demoteMessages(msgs, memArchive(), opts());
+      const assistantOut = out.messages[1] as any;
+      expect(assistantOut.content[1].arguments.command).toContain(archiveId("rc"));
+      expect(assistantOut.content[0]).toEqual(msgs[1].content[0]);
+    });
+  }
+
+  for (const [label, api] of [["another provider", "anthropic-messages"], ["no api field", null]] as const) {
+    it(`never rewrites the command for a field-name thinkingSignature from ${label}`, () => {
+      const command = `cat > /tmp/g.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/g /tmp/g.c`;
+      const msgs = [
+        userMsg("t"),
+        thinkingThenShell("xp", command, "reasoning", {}, api),
+        shellResult("xp", filler(8192, "out")),
+        ...pairs(4, "n"),
+      ];
+      const out = demoteMessages(msgs, memArchive(), opts());
+      expect((out.messages[1] as any).content[1].arguments.command).toBe(command);
+      expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+    });
+  }
+
+  it("never rewrites the command when thinkingSignature is an opaque signature", () => {
+    const command = `cat > /tmp/d.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/d /tmp/d.c`;
+    const msgs = [
+      userMsg("t"),
+      thinkingThenShell("op", command, "EqQBCkgIAxABGAIiQL2x9signedBlob"),
+      shellResult("op", filler(8192, "out")),
+      ...pairs(4, "n"),
+    ];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect((out.messages[1] as any).content[1].arguments.command).toBe(command);
+    expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+  });
+
+  it("never rewrites the command when a field-name thinkingSignature sits beside an encrypted reasoning detail", () => {
+    const command = `cat > /tmp/e.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/e /tmp/e.c`;
+    const detail = JSON.stringify({ type: "reasoning.encrypted", id: "en", data: "gAAAAB" });
+    const msgs = [
+      userMsg("t"),
+      thinkingThenShell("en", command, "reasoning", { thoughtSignature: detail }),
+      shellResult("en", filler(8192, "out")),
+      ...pairs(4, "n"),
+    ];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect((out.messages[1] as any).content[1].arguments.command).toBe(command);
+  });
+
   it("honors env overrides for retainRaw and the size floor", () => {
     const prevRetain = process.env[ENV_RETAIN_RAW];
     const prevFloor = process.env[ENV_MIN_PAIR_BYTES];
@@ -584,4 +665,70 @@ describe("recallSlice", () => {
     expect(out.isError).toBe(true);
     expect(out.text).toContain("sr-x");
   });
+});
+
+// The field-name exemption mirrors pi-ai internals that are not an exported
+// contract. These run the installed provider so a pi-ai change that alters
+// what lands in thinkingSignature fails here instead of silently bringing
+// back undemotable commands.
+describe("pi-ai openai-completions thinkingSignature", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
+  const piAiDir = [
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai",
+    "node_modules/@earendil-works/pi-ai",
+  ].map((p) => join(repoRoot, p)).find((p) => existsSync(join(p, "dist/api/openai-completions.js")));
+  const providerFile = piAiDir ? join(piAiDir, "dist/api/openai-completions.js") : "";
+
+  it("finds the installed provider", () => {
+    expect(piAiDir).toBeDefined();
+  });
+
+  it("pins the provider's reasoning field list to REASONING_FIELD_NAMES", () => {
+    const src = readFileSync(providerFile, "utf8");
+    const m = /const reasoningFields = (\[[^\]]*\]);/.exec(src);
+    expect(m, "reasoningFields literal not found in openai-completions.js").not.toBeNull();
+    const fields: string[] = JSON.parse(m![1]);
+    expect(fields.length).toBeGreaterThan(0);
+    for (const f of fields) expect(REASONING_FIELD_NAMES.has(f)).toBe(true);
+  });
+
+  function sse(chunks: unknown[]): Response {
+    const body = [...chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`), "data: [DONE]\n\n"].join("");
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  async function streamedAssistant(field: string, id: string, command: string): Promise<any> {
+    const { stream } = await import(pathToFileURL(providerFile).href);
+    const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({
+      id: "c1", object: "chat.completion.chunk", created: 0, model: "local",
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    });
+    const model = {
+      id: "local", name: "local", api: "openai-completions", provider: "omlx",
+      baseUrl: "http://127.0.0.1:1/v1", reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 32768, maxTokens: 4096,
+    };
+    const fetch = async () => sse([
+      chunk({ role: "assistant", [field]: "Compile it next." }),
+      chunk({ tool_calls: [{ index: 0, id, type: "function", function: { name: "ShellSession", arguments: JSON.stringify({ command }) } }] }),
+      chunk({}, "tool_calls"),
+    ]);
+    const s = stream(model, { messages: [{ role: "user", content: "t", timestamp: 0 }] }, { apiKey: "x", fetch });
+    const msg = await s.result();
+    expect(msg.stopReason).toBe("toolUse");
+    return msg;
+  }
+
+  for (const field of REASONING_FIELD_NAMES) {
+    it(`demotes the command of a real streamed "${field}" turn`, async () => {
+      const command = `cat > /tmp/f.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/f /tmp/f.c`;
+      const assistant = await streamedAssistant(field, "live", command);
+      expect(assistant.content.some((b: any) => b.type === "thinking")).toBe(true);
+      const msgs = [userMsg("t"), assistant, shellResult("live", filler(8192, "out")), ...pairs(4, "n")];
+      const out = demoteMessages(msgs, memArchive(), opts());
+      const call = (out.messages[1] as any).content.find((b: any) => b.type === "toolCall");
+      expect(call.arguments.command).toContain(archiveId("live"));
+    });
+  }
 });
