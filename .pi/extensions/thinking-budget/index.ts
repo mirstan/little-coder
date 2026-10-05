@@ -122,6 +122,14 @@ const DEFAULT_GUARD_THROUGHPUT_SLACK = 1.25;
 const SAMPLE_MIN_SPAN_MS = 5000;
 const SAMPLE_MIN_CHARS = 500;
 
+// Runaway tool-call argument cap. A TB2.1 trial streamed one
+// ShellSession call of ~80K tokens of invented base64 for 1,447s: the token
+// budget counts only thinking, and the wall-clock guard's floor reads base64
+// (~1.3 chars/token) at a third of its real token rate, so its window grew past
+// the runaway. Across ~2,800 logged TB2.1 tool calls p99 was ~5K chars and the
+// largest ~11.3K; 32K leaves ~3x headroom over that.
+const DEFAULT_TOOLCALL_MAX_CHARS = 32_000;
+
 // Consecutive content-free extension aborts before both breach triggers stand
 // down. Two rather than one: a single fruitless abort is ordinary, a second in
 // a row means the recovery is not reaching the model and further aborts only
@@ -231,6 +239,7 @@ let turnsObserved = 0;
 // Guard knobs for the throughput floor, resolved per run like the two above.
 let guardMinActionTokensForRun = DEFAULT_GUARD_MIN_ACTION_TOKENS;
 let guardSlackForRun = DEFAULT_GUARD_THROUGHPUT_SLACK;
+let toolcallMaxCharsForRun = DEFAULT_TOOLCALL_MAX_CHARS;
 
 // Per-turn stream observation. The first streamed delta is the prefill/
 // generation boundary: message_update cannot fire during prefill at all (the
@@ -243,6 +252,9 @@ let turnDeltaChars = 0;
 // Thinking deltas deliberately excluded: a turn that only deliberated and was
 // then cut off produced nothing the circuit breaker should credit as progress.
 let turnNonThinkingChars = 0;
+// Argument chars per in-flight tool call, keyed by contentIndex: parallel calls
+// are capped one by one, never on their sum.
+const toolcallArgChars = new Map<number, number>();
 // Session-scoped, not per-run, for the same reason avgTurnMs above is: it
 // measures this model on this machine, which a new prompt doesn't change.
 let ewmaCharsPerSec = 0;
@@ -267,6 +279,7 @@ function resetTurnStreamState(): void {
   turnLastDeltaAt = undefined;
   turnDeltaChars = 0;
   turnNonThinkingChars = 0;
+  toolcallArgChars.clear();
 }
 
 /**
@@ -429,11 +442,22 @@ function notifyBreakerOnce(ctx: any): void {
   );
 }
 
-// The exact recovery sequence both breach triggers (token-budget below, and
-// the wall-clock guard) run: capture + force off, queue the follow-up, notify,
-// THEN abort — in that order, and synchronously, for the reason in the Issue
-// #8 header above (ctx.abort() replaces the session; anything deferred past it
-// runs against a stale `pi`).
+// Queue the follow-up, notify, THEN abort — in that order, and synchronously,
+// for the reason in the Issue #8 header above (ctx.abort() replaces the
+// session; anything deferred past it runs against a stale `pi`).
+function sendFollowUpAndAbort(pi: ExtensionAPI, ctx: any, followUpMessage: string, notifyMessage: string): void {
+  try {
+    // Not awaited: this must all land before ctx.abort() below.
+    pi.sendUserMessage(followUpMessage, { deliverAs: "followUp" });
+  } catch {
+    // SDK without sendUserMessage — abort still forces the turn to end.
+  }
+  harnessIntervention(ctx, notifyMessage);
+  ctx.abort();
+}
+
+// The recovery both thinking triggers (token-budget below, and the wall-clock
+// guard) run: capture + force thinking off, then sendFollowUpAndAbort.
 function runBreachRecovery(
   pi: ExtensionAPI,
   ctx: any,
@@ -462,14 +486,7 @@ function runBreachRecovery(
     forcedOffByWallClockGuard = triggeredByWallClockGuard;
   }
   safeSetThinkingLevel(pi, "off");
-  try {
-    // Not awaited: this must all land before ctx.abort() below.
-    pi.sendUserMessage(followUpMessage, { deliverAs: "followUp" });
-  } catch {
-    // SDK without sendUserMessage — abort still forces the turn to end.
-  }
-  harnessIntervention(ctx, notifyMessage);
-  ctx.abort();
+  sendFollowUpAndAbort(pi, ctx, followUpMessage, notifyMessage);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -612,6 +629,7 @@ export default function (pi: ExtensionAPI) {
       "LITTLE_CODER_THINKING_GUARD_THROUGHPUT_SLACK",
       DEFAULT_GUARD_THROUGHPUT_SLACK,
     );
+    toolcallMaxCharsForRun = envNumber("LITTLE_CODER_TOOLCALL_MAX_CHARS", DEFAULT_TOOLCALL_MAX_CHARS);
 
     // Per-run, deliberately not session-scoped like the timing state above:
     // both exist to mirror finalize-warn's own per-run bookkeeping.
@@ -727,6 +745,44 @@ export default function (pi: ExtensionAPI) {
       turnLastDeltaAt = deltaAt;
       turnDeltaChars += deltaText.length;
       if (ev.type !== "thinking_delta") turnNonThinkingChars += deltaText.length;
+    }
+
+    // ── Runaway tool-call argument cap ──────────────────────────────────────
+    // Not deadline-gated, and deaf to the finalize-warn window and the circuit
+    // breaker: a call this far past any legitimate size is not a final answer
+    // worth protecting, and its abort is never content-free. Thinking is left
+    // alone too — the model didn't over-think, it over-wrote.
+    //
+    // pi neither executes nor replays the aborted message's tool calls, any
+    // completed sibling included (agent-loop.js skips tools on stopReason
+    // "aborted"; transform-messages.js drops the message), so the follow-up has
+    // to tell the model what happened to all of them.
+    //
+    // The cap relies on arguments streaming incrementally. A terminal-buffered
+    // provider (omlx) sends the whole call as one delta, which is already
+    // generated and can't be cut short, so a call's first delta never trips it.
+    if (ev?.type === "toolcall_delta" && deltaText.length > 0) {
+      const index: number = ev.contentIndex ?? 0;
+      const priorChars = toolcallArgChars.get(index) ?? 0;
+      const argChars = priorChars + deltaText.length;
+      toolcallArgChars.set(index, argChars);
+      if (!aborted && toolcallMaxCharsForRun > 0 && priorChars > 0 && argChars > toolcallMaxCharsForRun) {
+        aborted = true;
+        const name: string = ev.partial?.content?.[index]?.name || "tool";
+        sendFollowUpAndAbort(
+          pi,
+          ctx,
+          `[tool call too large] Your ${name} call passed ${toolcallMaxCharsForRun} characters of ` +
+            "arguments and was cut off and not executed. Your whole response was discarded, so any " +
+            "other tool calls in that response were not executed either; re-issue any you still " +
+            "need. Do not repeat the oversized call: write large content in smaller pieces " +
+            "(several writes or appends), or generate it with a short script.",
+          `a ${name} call's arguments passed ${toolcallMaxCharsForRun} chars — discarding the response.`,
+        );
+        return;
+      }
+    } else if (ev?.type === "toolcall_end") {
+      toolcallArgChars.delete(ev.contentIndex ?? 0);
     }
 
     const breakerHolding = consecutiveNoContentAborts >= BREAKER_ABORT_THRESHOLD;

@@ -1446,3 +1446,210 @@ describe("thinking-budget circuit breaker", () => {
     expect(breakerNotices).toHaveLength(0);
   });
 });
+
+// ── runaway tool-call argument cap ──────────────────────────────────────────
+// A TB2.1 trial streamed one ShellSession call of ~80K tokens of invented
+// base64 for 1,447s. Neither existing trigger could see it: the token budget
+// counts thinking only, and the wall-clock guard's throughput floor reads
+// base64 (~1.3 chars/token) as a third of its real token rate, so its window
+// outgrew the runaway.
+describe("thinking-budget runaway tool-call cap", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS;
+    delete process.env.LITTLE_CODER_THINKING_BUDGET;
+    delete process.env.LITTLE_CODER_DEADLINE_EPOCH_MS;
+  });
+
+  function toolcallStart(contentIndex: number, name = "ShellSession") {
+    return {
+      assistantMessageEvent: {
+        type: "toolcall_start",
+        contentIndex,
+        partial: { content: { [contentIndex]: { type: "toolCall", name } } },
+      },
+    };
+  }
+
+  function toolcallDelta(contentIndex: number, s: string, name = "ShellSession") {
+    return {
+      assistantMessageEvent: {
+        type: "toolcall_delta",
+        contentIndex,
+        delta: s,
+        partial: { content: { [contentIndex]: { type: "toolCall", name } } },
+      },
+    };
+  }
+
+  function toolcallEnd(contentIndex: number) {
+    return { assistantMessageEvent: { type: "toolcall_end", contentIndex } };
+  }
+
+  async function stream(h: ReturnType<typeof makeHarness>, contentIndex: number, total: number, chunk = 1000) {
+    for (let sent = 0; sent < total; sent += chunk) {
+      await fire(h.pi, "message_update", toolcallDelta(contentIndex, "A".repeat(Math.min(chunk, total - sent))), h.ctx);
+    }
+  }
+
+  it("aborts a call whose arguments pass the default 32,000 chars, without touching thinking", async () => {
+    const h = makeHarness("high");
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await stream(h, 0, 32_000);
+    expect(h.calls).toEqual([]);
+
+    await fire(h.pi, "message_update", toolcallDelta(0, "A"), h.ctx);
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+    expect(h.level()).toBe("high");
+    expect(h.followUps[0]).toMatch(/ShellSession/);
+    expect(h.followUps[0]).toMatch(/32000/);
+    expect(h.followUps[0]).toMatch(/not executed/i);
+    expect(h.notifies[0]).toMatch(/harness intervention:.*ShellSession/);
+  });
+
+  // A terminal-buffered provider (omlx) sends a finished call as one delta;
+  // cutting it saves no time and discards a call already generated.
+  it("lets a call that arrives whole in a single delta through, even over the cap", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A".repeat(40_000)), h.ctx);
+
+    expect(h.calls).toEqual([]);
+  });
+
+  it("still trips once a call over the cap keeps streaming", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A".repeat(40_000)), h.ctx);
+    expect(h.calls).toEqual([]);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A"), h.ctx);
+
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+  });
+
+  it("fires once per turn, then re-arms at the next turn_start", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await stream(h, 0, 500, 50);
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(1);
+
+    await fire(h.pi, "agent_start", {}, h.ctx);
+    await fire(h.pi, "turn_start", {}, h.ctx);
+    await stream(h, 0, 100, 50);
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(1);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A"), h.ctx);
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(2);
+  });
+
+  it("caps each call separately: parallel calls under the cap never sum into a trip", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await stream(h, 0, 80, 20);
+    await fire(h.pi, "message_update", toolcallEnd(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallStart(1, "write"), h.ctx);
+    await stream(h, 1, 80, 20);
+
+    expect(h.calls).toEqual([]);
+  });
+
+  // The abort discards the whole response, so a completed sibling call never
+  // runs either; the model must not be left believing it did.
+  it("tells the model that sibling calls in the same response were not executed", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0, "write"), h.ctx);
+    for (let i = 0; i < 4; i++) {
+      await fire(h.pi, "message_update", toolcallDelta(0, "B".repeat(20), "write"), h.ctx);
+    }
+    await fire(h.pi, "message_update", toolcallEnd(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallStart(1), h.ctx);
+    await stream(h, 1, 101, 20);
+
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+    expect(h.followUps[0]).toMatch(/ShellSession/);
+    expect(h.followUps[0]).toMatch(/100/);
+    expect(h.followUps[0]).toMatch(/other tool calls in (that|the same) response were not executed/i);
+    expect(h.followUps[0]).toMatch(/re-issue/i);
+  });
+
+  it("leaves normal-size calls, text, and long thinking alone", async () => {
+    process.env.LITTLE_CODER_THINKING_BUDGET = "100000";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", thinkingDelta("t".repeat(200_000)), h.ctx);
+    await fire(h.pi, "message_update", textDelta("p".repeat(50_000)), h.ctx);
+    // The largest call across ~2,800 logged TB2.1 tool calls was ~11.3K chars.
+    await stream(h, 2, 11_317);
+
+    expect(h.calls).toEqual([]);
+  });
+
+  it("honours an env override, and 0 disables the cap", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "0";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+    await stream(h, 0, 200_000, 10_000);
+    expect(h.calls).toEqual([]);
+
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "5000";
+    const h2 = makeHarness();
+    setupExtension(h2.pi as any);
+    await startRun(h2);
+    await stream(h2, 0, 5001);
+    expect(h2.calls).toEqual(["send", "notify", "abort"]);
+    expect(h2.followUps[0]).toMatch(/5000/);
+  });
+
+  // The other two triggers stand down here to protect a final answer. A call
+  // this far past any legitimate size is not one, and letting it run would
+  // spend the remaining trial on nothing.
+  it("still fires inside the finalize-warn window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    process.env.LITTLE_CODER_DEADLINE_EPOCH_MS = String(60 * 1000);
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await stream(h, 0, 101, 50);
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+  });
+
+  it("a trip is not a content-free abort for the circuit breaker", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    for (let i = 0; i < 3; i++) {
+      await stream(h, 0, 101, 50);
+      await fire(h.pi, "agent_start", {}, h.ctx);
+      await fire(h.pi, "turn_start", {}, h.ctx);
+    }
+    expect(h.calls.filter((c) => c === "abort")).toHaveLength(3);
+    expect(h.notifies.some((n) => /standing down/i.test(n))).toBe(false);
+  });
+});
