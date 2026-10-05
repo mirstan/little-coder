@@ -8,7 +8,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 # Least privilege: both jobs only read the repo. Without this the workflow
