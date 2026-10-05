@@ -243,6 +243,46 @@ describe("stubTruncatedMessages", () => {
     }
   });
 
+  it("leaves a Google message alone when only its thinking block carries a thinkingSignature", () => {
+    for (const api of ["google-generative-ai", "google-vertex"]) {
+      const msg = truncatedAssistant({ api });
+      (msg.content as any)[0] = { type: "thinking", thinking: THINKING, thinkingSignature: "sig" };
+      const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+      expect(stubbedCount).toBe(0);
+      expect(messages[1]).toBe(msg);
+    }
+  });
+
+  it("leaves a pi-messages message alone when a block carries a textSignature or thinkingSignature", () => {
+    const call = truncatedAssistant().content[1];
+    for (const signedBlock of [
+      { type: "text", text: "Writing it now.", textSignature: "sig" },
+      { type: "thinking", thinking: THINKING, thinkingSignature: "sig" },
+    ]) {
+      const msg = truncatedAssistant({ api: "pi-messages", content: [signedBlock, call] });
+      const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+      expect(stubbedCount).toBe(0);
+      expect(messages[1]).toBe(msg);
+    }
+  });
+
+  it("leaves an openai-completions message whole, thinking included, when a tool call carries a thoughtSignature", () => {
+    const msg = truncatedAssistant();
+    (msg.content as any)[1] = { ...(msg.content as any)[1], thoughtSignature: "[{\"type\":\"reasoning.encrypted\"}]" };
+    const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+    expect(stubbedCount).toBe(0);
+    expect(messages[1]).toBe(msg);
+  });
+
+  it("still stubs anthropic-messages arguments when only the thinking block carries a thinkingSignature", () => {
+    const msg = truncatedAssistant({ api: "anthropic-messages" });
+    (msg.content as any)[0] = { type: "thinking", thinking: THINKING, thinkingSignature: "sig" };
+    const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+    expect(stubbedCount).toBe(1);
+    expect((messages[1] as any).content[0]).toBe((msg.content as any)[0]);
+    expect(Buffer.byteLength((messages[1] as any).content[1].arguments.command)).toBeLessThan(STUB_MIN_BYTES);
+  });
+
   describe("thinking", () => {
     it("stubs an oversized thinking block to head + marker + tail, keeping its signature", () => {
       const { messages } = stubTruncatedMessages(convo());
@@ -281,6 +321,9 @@ describe("stubTruncatedMessages", () => {
         undefined,
       ]) {
         const msg = truncatedAssistant({ api });
+        // On Google a thinkingSignature is a replayed signature and would
+        // leave the whole message alone, so its thinking goes unsigned here.
+        if (api?.startsWith("google-")) delete (msg.content as any)[0].thinkingSignature;
         const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
         expect(stubbedCount).toBe(1);
         expect((messages[1] as any).content[0]).toEqual((msg.content as any)[0]);

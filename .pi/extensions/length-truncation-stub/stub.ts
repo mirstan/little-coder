@@ -30,21 +30,31 @@ export const ARGS_CAP_BYTES = 8192;
 // sign or replay it opaquely, so an unlisted API keeps its thinking.
 const PLAIN_THINKING_APIS = new Set(["openai-completions"]);
 
-// These adapters store a part's thoughtSignature in textSignature and replay
-// it (pi-ai google-generative-ai.js, google-vertex.js, google-shared.js). On
-// openai-responses it is just the encoded message-item id.
-const TEXT_SIGNATURE_APIS = new Set(["google-generative-ai", "google-vertex"]);
+// On these adapters textSignature and thinkingSignature hold opaque replay
+// signatures. The Google adapters store a text part's thoughtSignature in
+// textSignature and a thought part's in thinkingSignature, and google-shared
+// sends both back as thoughtSignature (pi-ai google-generative-ai.js,
+// google-vertex.js, google-shared.js). pi-messages sets both from the
+// gateway's contentSignature (pi-ai pi-messages.js).
+const REPLAY_SIGNED_APIS = new Set(["google-generative-ai", "google-vertex", "pi-messages"]);
 
 // A thought signature can sit on any part of a message, not only on the
-// tool call it covers, so one anywhere marks every call as signed. This
-// follows shell-retention's isSignedMessage, minus thinkingSignature and
-// non-Google textSignature: thinkingSignature is only a field name on
-// openai-completions, and counting it would leave every local model's
-// calls unstubbed.
+// tool call it covers, so one anywhere marks the whole message as signed.
+// This follows shell-retention's isSignedMessage, except that textSignature
+// and thinkingSignature count only on REPLAY_SIGNED_APIS. Elsewhere they do
+// not bind tool arguments: on openai-completions thinkingSignature is the
+// name of the reasoning field (pi-ai openai-completions.js), on
+// openai-responses textSignature is the encoded message-item id (pi-ai
+// openai-responses-shared.js), and on anthropic-messages and
+// bedrock-converse-stream thinkingSignature signs only its thinking block,
+// which this stub keeps as is there. Counting them would leave every local
+// model's calls unstubbed.
 function hasReplaySignature(content: any[], api: unknown): boolean {
-  const textSigned = typeof api === "string" && TEXT_SIGNATURE_APIS.has(api);
+  const blockSigned = typeof api === "string" && REPLAY_SIGNED_APIS.has(api);
   return content.some(
-    (b) => b?.thoughtSignature !== undefined || (textSigned && b?.textSignature !== undefined),
+    (b) =>
+      b?.thoughtSignature !== undefined ||
+      (blockSigned && (b?.textSignature !== undefined || b?.thinkingSignature !== undefined)),
   );
 }
 
@@ -108,8 +118,8 @@ function stubArguments(args: unknown): unknown {
   return { omitted: argsMarker(byteLen(JSON.stringify(args) ?? "")) };
 }
 
-function stubBlock(block: any, api: unknown, signed: boolean): any {
-  if (block?.type === "toolCall" && !signed) {
+function stubBlock(block: any, api: unknown): any {
+  if (block?.type === "toolCall") {
     const args = stubArguments(block.arguments);
     return JSON.stringify(args) === JSON.stringify(block.arguments) ? block : { ...block, arguments: args };
   }
@@ -130,17 +140,17 @@ function stubBlock(block: any, api: unknown, signed: boolean): any {
 
 /**
  * Stub the tool-call arguments and thinking of every assistant message that
- * stopped on "length" with tool calls in it, except where the provider
- * replays them signed (see above). Everything else, including the
- * paired toolResult, is returned as the same object.
+ * stopped on "length" with tool calls in it, unless the provider replays the
+ * message signed (see hasReplaySignature). Everything else, including a
+ * signed message and the paired toolResult, is returned as the same object.
  */
 export function stubTruncatedMessages(messages: any[]): { messages: any[]; stubbedCount: number } {
   let stubbedCount = 0;
   const out = messages.map((m) => {
     if (m?.role !== "assistant" || m.stopReason !== "length" || !Array.isArray(m.content)) return m;
     if (!m.content.some((c: any) => c?.type === "toolCall")) return m;
-    const signed = hasReplaySignature(m.content, m.api);
-    const content = m.content.map((c: any) => stubBlock(c, m.api, signed));
+    if (hasReplaySignature(m.content, m.api)) return m;
+    const content = m.content.map((c: any) => stubBlock(c, m.api));
     if (content.every((c: any, i: number) => c === m.content[i])) return m;
     stubbedCount++;
     return { ...m, content };
