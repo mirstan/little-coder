@@ -30,20 +30,55 @@ export const ARGS_CAP_BYTES = 8192;
 // sign or replay it opaquely, so an unlisted API keeps its thinking.
 const PLAIN_THINKING_APIS = new Set(["openai-completions"]);
 
+// These adapters store a part's thoughtSignature in textSignature and replay
+// it (pi-ai google-generative-ai.js, google-vertex.js, google-shared.js). On
+// openai-responses it is just the encoded message-item id.
+const TEXT_SIGNATURE_APIS = new Set(["google-generative-ai", "google-vertex"]);
+
 // A thought signature can sit on any part of a message, not only on the
 // tool call it covers, so one anywhere marks every call as signed. This
-// follows shell-retention's isSignedMessage, minus thinkingSignature: that
-// is only a field name on openai-completions, and counting it would leave
-// every local model's calls unstubbed.
-function hasReplaySignature(content: any[]): boolean {
-  return content.some((b) => b?.thoughtSignature !== undefined || b?.textSignature !== undefined);
+// follows shell-retention's isSignedMessage, minus thinkingSignature and
+// non-Google textSignature: thinkingSignature is only a field name on
+// openai-completions, and counting it would leave every local model's
+// calls unstubbed.
+function hasReplaySignature(content: any[], api: unknown): boolean {
+  const textSigned = typeof api === "string" && TEXT_SIGNATURE_APIS.has(api);
+  return content.some(
+    (b) => b?.thoughtSignature !== undefined || (textSigned && b?.textSignature !== undefined),
+  );
 }
 
-function argsMarker(dropped: number): string {
+// The fixed phrase the tool_call guard looks for. Split so this source file
+// does not itself contain it, or an edit to this file would be blocked.
+export const STUB_ECHO_PHRASE = "length-truncation " + "placeholder";
+
+export function argsMarker(dropped: number): string {
   return (
     `[... ${dropped} bytes of this tool call's arguments omitted: the response hit ` +
-    `the output token limit mid-call, so the call was not executed ...]`
+    `the output token limit mid-call, so the call was not executed. This ` +
+    `${STUB_ECHO_PHRASE} is not part of the content; do not copy it, ` +
+    `regenerate the content (in smaller calls if it is long) ...]`
   );
+}
+
+/**
+ * True when any string in a tool call's input carries the args marker's fixed
+ * phrase: the model copied a stub instead of regenerating what it replaced.
+ * Iterative, so arbitrarily deep input cannot overflow the stack.
+ */
+export function echoesStubMarker(input: unknown): boolean {
+  const stack: unknown[] = [input];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === "string") {
+      if (v.includes(STUB_ECHO_PHRASE)) return true;
+    } else if (Array.isArray(v)) {
+      for (const x of v) stack.push(x);
+    } else if (v !== null && typeof v === "object") {
+      for (const x of Object.values(v as Record<string, unknown>)) stack.push(x);
+    }
+  }
+  return false;
 }
 
 function thinkingMarker(dropped: number): string {
@@ -104,7 +139,7 @@ export function stubTruncatedMessages(messages: any[]): { messages: any[]; stubb
   const out = messages.map((m) => {
     if (m?.role !== "assistant" || m.stopReason !== "length" || !Array.isArray(m.content)) return m;
     if (!m.content.some((c: any) => c?.type === "toolCall")) return m;
-    const signed = hasReplaySignature(m.content);
+    const signed = hasReplaySignature(m.content, m.api);
     const content = m.content.map((c: any) => stubBlock(c, m.api, signed));
     if (content.every((c: any, i: number) => c === m.content[i])) return m;
     stubbedCount++;

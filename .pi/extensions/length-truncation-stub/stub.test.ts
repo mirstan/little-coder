@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   stubTruncatedMessages,
+  argsMarker,
+  echoesStubMarker,
+  STUB_ECHO_PHRASE,
   ARGS_CAP_BYTES,
   KEEP_HEAD_BYTES,
   KEEP_TAIL_BYTES,
@@ -216,15 +219,27 @@ describe("stubTruncatedMessages", () => {
     expect(messages[1]).toBe(msg);
   });
 
-  it("leaves every tool call alone when a sibling text block carries a textSignature", () => {
+  it("leaves every tool call alone when a sibling text block carries a Google textSignature", () => {
+    for (const api of ["google-generative-ai", "google-vertex"]) {
+      const msg = truncatedAssistant({
+        api,
+        content: [{ type: "text", text: "Writing it now.", textSignature: "sig" }, truncatedAssistant().content[1]],
+      });
+      const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+      expect((messages[1] as any).content[1]).toBe((msg.content as any)[1]);
+      expect(stubbedCount).toBe(0);
+    }
+  });
+
+  it("still stubs when a non-Google textSignature is only a message-item id", () => {
     for (const api of ["openai-responses", "openai-completions"]) {
       const msg = truncatedAssistant({
         api,
         content: [{ type: "text", text: "Writing it now.", textSignature: "msg_1" }, truncatedAssistant().content[1]],
       });
       const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
-      expect((messages[1] as any).content[1]).toBe((msg.content as any)[1]);
-      expect(stubbedCount).toBe(0);
+      expect(stubbedCount).toBe(1);
+      expect(Buffer.byteLength((messages[1] as any).content[1].arguments.command)).toBeLessThan(STUB_MIN_BYTES);
     }
   });
 
@@ -287,6 +302,51 @@ describe("stubTruncatedMessages", () => {
   });
 
   it("stub constants leave head + marker + tail strictly below the stub threshold", () => {
-    expect(KEEP_HEAD_BYTES + KEEP_TAIL_BYTES + 256).toBeLessThan(STUB_MIN_BYTES);
+    const marker = Buffer.byteLength(argsMarker(Number.MAX_SAFE_INTEGER));
+    expect(KEEP_HEAD_BYTES + KEEP_TAIL_BYTES + marker + 2).toBeLessThan(STUB_MIN_BYTES);
+  });
+
+  it("marks the stub as a placeholder the model must not copy", () => {
+    const cmd: string = (stubTruncatedMessages(convo()).messages[1] as any).content[1].arguments.command;
+    expect(cmd).toContain(STUB_ECHO_PHRASE);
+    expect(cmd).toMatch(/not part of the content/);
+    expect(cmd).toMatch(/do not copy/);
+    expect(cmd).toMatch(/regenerate/);
+  });
+});
+
+describe("echoesStubMarker", () => {
+  const stubbedCommand = () =>
+    (stubTruncatedMessages(convo()).messages[1] as any).content[1].arguments.command as string;
+
+  it("flags a real stub echoed into a new call, nested in objects and arrays", () => {
+    expect(echoesStubMarker({ command: stubbedCommand() })).toBe(true);
+    expect(echoesStubMarker({ path: "/app/x", edits: [{ oldText: "a", newText: stubbedCommand() }] })).toBe(true);
+  });
+
+  it("flags the whole-arguments marker object", () => {
+    const lines = Array.from({ length: 5_000 }, (_, i) => `line ${i}`);
+    const msg = truncatedAssistant({
+      content: [{ type: "toolCall", id: "call_1", name: "write", arguments: { path: "/app/x", lines } }],
+    });
+    const args = (stubTruncatedMessages(convo(msg)).messages[1] as any).content[0].arguments;
+    expect(echoesStubMarker({ content: args.omitted })).toBe(true);
+  });
+
+  it("passes ordinary input", () => {
+    expect(echoesStubMarker({ command: "ls -la", timeout: 5 })).toBe(false);
+    expect(echoesStubMarker({ path: "/a", content: "bytes omitted from the log" })).toBe(false);
+    expect(echoesStubMarker(null)).toBe(false);
+    expect(echoesStubMarker(undefined)).toBe(false);
+    expect(echoesStubMarker(42)).toBe(false);
+  });
+
+  it("does not throw on very deep nesting", () => {
+    let deep: unknown = STUB_ECHO_PHRASE;
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    expect(echoesStubMarker(deep)).toBe(true);
+    let deepObj: unknown = "plain";
+    for (let i = 0; i < 100_000; i++) deepObj = { x: deepObj };
+    expect(echoesStubMarker(deepObj)).toBe(false);
   });
 });
