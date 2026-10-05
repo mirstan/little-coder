@@ -11,11 +11,18 @@ import { harnessIntervention } from "../_shared/intervention.ts";
 export default function (pi: ExtensionAPI) {
   if (process.env.LITTLE_CODER_NO_LENGTH_STUB === "1") return;
 
+  // Set once the context hook below has stubbed a message, never cleared:
+  // the stubbed message stays in history.
+  let stubEmitted = false;
+
   // A model told to re-issue a cut-off call may copy the stub it sees,
   // marker included, and head + marker + tail is small enough to run. The
-  // reason must not quote the marker: copied into a file, it would trip
-  // this guard again.
+  // guard fires only after this registration emitted a stub: a model can
+  // copy only a stub it was shown, and before that a call quoting the phrase
+  // (a grep, a doc edit) is not an echo. The reason must not quote the
+  // marker: copied into a file, it would trip this guard again.
   pi.on("tool_call", async (event, ctx) => {
+    if (!stubEmitted) return;
     const input = (event as any).input;
     if (input == null || !echoesStubMarker(input)) return;
     harnessIntervention(ctx, "blocked a tool call echoing a length-truncation stub.");
@@ -31,6 +38,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("context", async (event) => {
     const { messages, stubbedCount } = stubTruncatedMessages((event as any).messages || []);
-    if (stubbedCount > 0) return { messages };
+    if (stubbedCount > 0) {
+      stubEmitted = true;
+      return { messages };
+    }
   });
 }

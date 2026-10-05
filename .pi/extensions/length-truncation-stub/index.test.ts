@@ -28,6 +28,25 @@ async function fireToolCall(handlers: Record<string, Handler[]>, event: any, ctx
   return undefined;
 }
 
+async function fireContext(handlers: Record<string, Handler[]>, messages: any[]) {
+  for (const h of handlers.context ?? []) {
+    const result = await h({ messages }, makeCtx());
+    if (result?.messages) messages = result.messages;
+  }
+  return messages;
+}
+
+// An assistant message cut off at the output limit mid tool call, big enough
+// for the context hook to stub.
+const truncated = {
+  role: "assistant",
+  api: "openai-completions",
+  stopReason: "length",
+  content: [
+    { type: "toolCall", id: "call_1", name: "write", arguments: { path: "/app/x", content: "x".repeat(20_000) } },
+  ],
+};
+
 const echoed = `head\n[... 9000 bytes of x ${STUB_ECHO_PHRASE} y ...]\ntail`;
 
 describe("length-truncation-stub tool_call guard (wired)", () => {
@@ -37,11 +56,25 @@ describe("length-truncation-stub tool_call guard (wired)", () => {
     else process.env.LITTLE_CODER_NO_LENGTH_STUB = saved;
   });
 
-  it("blocks a call whose input echoes the stub marker, and tells the model to regenerate", async () => {
+  it("lets a call quoting the phrase through when this registration has stubbed nothing", async () => {
     delete process.env.LITTLE_CODER_NO_LENGTH_STUB;
     const ctx = makeCtx();
+    const handlers = wireExtension();
+    await fireContext(handlers, [{ role: "user", content: "hi" }]);
+    expect(
+      await fireToolCall(handlers, { toolName: "write", input: { path: "/app/x", content: echoed } }, ctx),
+    ).toBeUndefined();
+    expect(ctx.notifies).toHaveLength(0);
+  });
+
+  it("blocks a call echoing the stub marker once a stub was emitted, and tells the model to regenerate", async () => {
+    delete process.env.LITTLE_CODER_NO_LENGTH_STUB;
+    const ctx = makeCtx();
+    const handlers = wireExtension();
+    const projected = await fireContext(handlers, [{ role: "user", content: "write it" }, truncated]);
+    expect(JSON.stringify(projected)).toContain(STUB_ECHO_PHRASE);
     const result = await fireToolCall(
-      wireExtension(),
+      handlers,
       { toolName: "write", input: { path: "/app/x", content: echoed } },
       ctx,
     );
@@ -53,10 +86,12 @@ describe("length-truncation-stub tool_call guard (wired)", () => {
     expect(ctx.notifies[0]).toMatch(/^harness intervention: /);
   });
 
-  it("lets ordinary calls through", async () => {
+  it("lets ordinary calls through, before and after a stub was emitted", async () => {
     delete process.env.LITTLE_CODER_NO_LENGTH_STUB;
     const ctx = makeCtx();
     const handlers = wireExtension();
+    expect(await fireToolCall(handlers, { toolName: "write", input: { path: "/a", content: "hi" } }, ctx)).toBeUndefined();
+    await fireContext(handlers, [{ role: "user", content: "write it" }, truncated]);
     expect(await fireToolCall(handlers, { toolName: "write", input: { path: "/a", content: "hi" } }, ctx)).toBeUndefined();
     expect(await fireToolCall(handlers, { toolName: "write", input: null }, ctx)).toBeUndefined();
     expect(ctx.notifies).toHaveLength(0);
