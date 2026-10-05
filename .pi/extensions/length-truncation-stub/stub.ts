@@ -24,9 +24,20 @@ export const STUB_MIN_BYTES = 2048;
 // at a time, so the serialized arguments get a cap of their own.
 export const ARGS_CAP_BYTES = 8192;
 
-// These APIs sign thinking blocks and reject an altered one, so their
-// thinking is left as is.
-const SIGNED_THINKING_APIS = new Set(["anthropic-messages", "bedrock-converse-stream"]);
+// Thinking is rewritten only where it is replayed as plain text. On
+// openai-completions thinkingSignature is just the name of the field the
+// text is sent back under (pi-ai openai-completions.js). Other APIs may
+// sign or replay it opaquely, so an unlisted API keeps its thinking.
+const PLAIN_THINKING_APIS = new Set(["openai-completions"]);
+
+// A thought signature can sit on any part of a message, not only on the
+// tool call it covers, so one anywhere marks every call as signed. This
+// follows shell-retention's isSignedMessage, minus thinkingSignature: that
+// is only a field name on openai-completions, and counting it would leave
+// every local model's calls unstubbed.
+function hasReplaySignature(content: any[]): boolean {
+  return content.some((b) => b?.thoughtSignature !== undefined || b?.textSignature !== undefined);
+}
 
 function argsMarker(dropped: number): string {
   return (
@@ -62,10 +73,8 @@ function stubArguments(args: unknown): unknown {
   return { omitted: argsMarker(byteLen(JSON.stringify(args) ?? "")) };
 }
 
-function stubBlock(block: any, api: unknown): any {
-  // A Google-style thoughtSignature is replayed against the original
-  // arguments; shell-retention leaves those calls alone for the same reason.
-  if (block?.type === "toolCall" && block.thoughtSignature === undefined) {
+function stubBlock(block: any, api: unknown, signed: boolean): any {
+  if (block?.type === "toolCall" && !signed) {
     const args = stubArguments(block.arguments);
     return JSON.stringify(args) === JSON.stringify(block.arguments) ? block : { ...block, arguments: args };
   }
@@ -73,7 +82,8 @@ function stubBlock(block: any, api: unknown): any {
     block?.type === "thinking" &&
     !block.redacted &&
     typeof block.thinking === "string" &&
-    !SIGNED_THINKING_APIS.has(String(api))
+    typeof api === "string" &&
+    PLAIN_THINKING_APIS.has(api)
   ) {
     // Never empty: openai-completions drops the reasoning field when the
     // text trims to nothing.
@@ -85,7 +95,8 @@ function stubBlock(block: any, api: unknown): any {
 
 /**
  * Stub the tool-call arguments and thinking of every assistant message that
- * stopped on "length" with tool calls in it. Everything else, including the
+ * stopped on "length" with tool calls in it, except where the provider
+ * replays them signed (see above). Everything else, including the
  * paired toolResult, is returned as the same object.
  */
 export function stubTruncatedMessages(messages: any[]): { messages: any[]; stubbedCount: number } {
@@ -93,7 +104,8 @@ export function stubTruncatedMessages(messages: any[]): { messages: any[]; stubb
   const out = messages.map((m) => {
     if (m?.role !== "assistant" || m.stopReason !== "length" || !Array.isArray(m.content)) return m;
     if (!m.content.some((c: any) => c?.type === "toolCall")) return m;
-    const content = m.content.map((c: any) => stubBlock(c, m.api));
+    const signed = hasReplaySignature(m.content);
+    const content = m.content.map((c: any) => stubBlock(c, m.api, signed));
     if (content.every((c: any, i: number) => c === m.content[i])) return m;
     stubbedCount++;
     return { ...m, content };

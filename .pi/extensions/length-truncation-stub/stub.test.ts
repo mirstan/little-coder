@@ -207,6 +207,27 @@ describe("stubTruncatedMessages", () => {
     expect((messages[1] as any).content[1]).toBe((msg.content as any)[1]);
   });
 
+  it("leaves every tool call alone when a sibling block carries a thoughtSignature", () => {
+    const msg = truncatedAssistant({ api: "google-generative-ai" });
+    (msg.content as any)[0] = { type: "thinking", thinking: THINKING, thoughtSignature: "sig" };
+    const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+    expect((messages[1] as any).content[1]).toBe((msg.content as any)[1]);
+    expect(stubbedCount).toBe(0);
+    expect(messages[1]).toBe(msg);
+  });
+
+  it("leaves every tool call alone when a sibling text block carries a textSignature", () => {
+    for (const api of ["openai-responses", "openai-completions"]) {
+      const msg = truncatedAssistant({
+        api,
+        content: [{ type: "text", text: "Writing it now.", textSignature: "msg_1" }, truncatedAssistant().content[1]],
+      });
+      const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
+      expect((messages[1] as any).content[1]).toBe((msg.content as any)[1]);
+      expect(stubbedCount).toBe(0);
+    }
+  });
+
   describe("thinking", () => {
     it("stubs an oversized thinking block to head + marker + tail, keeping its signature", () => {
       const { messages } = stubTruncatedMessages(convo());
@@ -234,8 +255,16 @@ describe("stubTruncatedMessages", () => {
       expect((messages[1] as any).content[0]).toEqual((msg.content as any)[0]);
     });
 
-    it("never rewrites thinking on an API that signs it, but still stubs the arguments", () => {
-      for (const api of ["anthropic-messages", "bedrock-converse-stream"]) {
+    it("never rewrites thinking outside openai-completions, but still stubs the arguments", () => {
+      for (const api of [
+        "anthropic-messages",
+        "bedrock-converse-stream",
+        "google-generative-ai",
+        "google-vertex",
+        "openai-responses",
+        "some-future-api",
+        undefined,
+      ]) {
         const msg = truncatedAssistant({ api });
         const { messages, stubbedCount } = stubTruncatedMessages(convo(msg));
         expect(stubbedCount).toBe(1);
