@@ -757,11 +757,16 @@ export default function (pi: ExtensionAPI) {
     // completed sibling included (agent-loop.js skips tools on stopReason
     // "aborted"; transform-messages.js drops the message), so the follow-up has
     // to tell the model what happened to all of them.
+    //
+    // The cap relies on arguments streaming incrementally. A terminal-buffered
+    // provider (omlx) sends the whole call as one delta, which is already
+    // generated and can't be cut short, so a call's first delta never trips it.
     if (ev?.type === "toolcall_delta" && deltaText.length > 0) {
       const index: number = ev.contentIndex ?? 0;
-      const argChars = (toolcallArgChars.get(index) ?? 0) + deltaText.length;
+      const priorChars = toolcallArgChars.get(index) ?? 0;
+      const argChars = priorChars + deltaText.length;
       toolcallArgChars.set(index, argChars);
-      if (!aborted && toolcallMaxCharsForRun > 0 && argChars > toolcallMaxCharsForRun) {
+      if (!aborted && toolcallMaxCharsForRun > 0 && priorChars > 0 && argChars > toolcallMaxCharsForRun) {
         aborted = true;
         const name: string = ev.partial?.content?.[index]?.name || "tool";
         sendFollowUpAndAbort(

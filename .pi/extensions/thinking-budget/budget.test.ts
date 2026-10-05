@@ -1510,6 +1510,32 @@ describe("thinking-budget runaway tool-call cap", () => {
     expect(h.notifies[0]).toMatch(/harness intervention:.*ShellSession/);
   });
 
+  // A terminal-buffered provider (omlx) sends a finished call as one delta;
+  // cutting it saves no time and discards a call already generated.
+  it("lets a call that arrives whole in a single delta through, even over the cap", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A".repeat(40_000)), h.ctx);
+
+    expect(h.calls).toEqual([]);
+  });
+
+  it("still trips once a call over the cap keeps streaming", async () => {
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A".repeat(40_000)), h.ctx);
+    expect(h.calls).toEqual([]);
+    await fire(h.pi, "message_update", toolcallDelta(0, "A"), h.ctx);
+
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+  });
+
   it("fires once per turn, then re-arms at the next turn_start", async () => {
     process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
     const h = makeHarness();
@@ -1608,7 +1634,7 @@ describe("thinking-budget runaway tool-call cap", () => {
     setupExtension(h.pi as any);
     await startRun(h);
 
-    await stream(h, 0, 101);
+    await stream(h, 0, 101, 50);
     expect(h.calls).toEqual(["send", "notify", "abort"]);
   });
 
@@ -1619,7 +1645,7 @@ describe("thinking-budget runaway tool-call cap", () => {
     await startRun(h);
 
     for (let i = 0; i < 3; i++) {
-      await stream(h, 0, 101);
+      await stream(h, 0, 101, 50);
       await fire(h.pi, "agent_start", {}, h.ctx);
       await fire(h.pi, "turn_start", {}, h.ctx);
     }
