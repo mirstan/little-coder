@@ -753,9 +753,10 @@ export default function (pi: ExtensionAPI) {
     // worth protecting, and its abort is never content-free. Thinking is left
     // alone too — the model didn't over-think, it over-wrote.
     //
-    // pi neither executes nor replays the aborted call (agent-loop.js skips
-    // tools on stopReason "aborted"; transform-messages.js drops the message),
-    // so the follow-up has to tell the model what happened to it.
+    // pi neither executes nor replays the aborted message's tool calls, any
+    // completed sibling included (agent-loop.js skips tools on stopReason
+    // "aborted"; transform-messages.js drops the message), so the follow-up has
+    // to tell the model what happened to all of them.
     if (ev?.type === "toolcall_delta" && deltaText.length > 0) {
       const index: number = ev.contentIndex ?? 0;
       const argChars = (toolcallArgChars.get(index) ?? 0) + deltaText.length;
@@ -767,9 +768,11 @@ export default function (pi: ExtensionAPI) {
           pi,
           ctx,
           `[tool call too large] Your ${name} call passed ${toolcallMaxCharsForRun} characters of ` +
-            "arguments and was cut off and not executed. Do not repeat it: write large content " +
-            "in smaller pieces (several writes or appends), or generate it with a short script.",
-          `a ${name} call's arguments passed ${toolcallMaxCharsForRun} chars — discarding it.`,
+            "arguments and was cut off and not executed. Your whole response was discarded, so any " +
+            "other tool calls in that response were not executed either; re-issue any you still " +
+            "need. Do not repeat the oversized call: write large content in smaller pieces " +
+            "(several writes or appends), or generate it with a short script.",
+          `a ${name} call's arguments passed ${toolcallMaxCharsForRun} chars — discarding the response.`,
         );
         return;
       }

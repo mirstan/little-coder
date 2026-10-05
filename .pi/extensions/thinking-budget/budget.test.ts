@@ -1542,6 +1542,29 @@ describe("thinking-budget runaway tool-call cap", () => {
     expect(h.calls).toEqual([]);
   });
 
+  // The abort discards the whole response, so a completed sibling call never
+  // runs either; the model must not be left believing it did.
+  it("tells the model that sibling calls in the same response were not executed", async () => {
+    process.env.LITTLE_CODER_TOOLCALL_MAX_CHARS = "100";
+    const h = makeHarness();
+    setupExtension(h.pi as any);
+    await startRun(h);
+
+    await fire(h.pi, "message_update", toolcallStart(0, "write"), h.ctx);
+    for (let i = 0; i < 4; i++) {
+      await fire(h.pi, "message_update", toolcallDelta(0, "B".repeat(20), "write"), h.ctx);
+    }
+    await fire(h.pi, "message_update", toolcallEnd(0), h.ctx);
+    await fire(h.pi, "message_update", toolcallStart(1), h.ctx);
+    await stream(h, 1, 101, 20);
+
+    expect(h.calls).toEqual(["send", "notify", "abort"]);
+    expect(h.followUps[0]).toMatch(/ShellSession/);
+    expect(h.followUps[0]).toMatch(/100/);
+    expect(h.followUps[0]).toMatch(/other tool calls in (that|the same) response were not executed/i);
+    expect(h.followUps[0]).toMatch(/re-issue/i);
+  });
+
   it("leaves normal-size calls, text, and long thinking alone", async () => {
     process.env.LITTLE_CODER_THINKING_BUDGET = "100000";
     const h = makeHarness();
