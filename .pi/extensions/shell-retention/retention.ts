@@ -286,13 +286,20 @@ function collectPairs(messages: any[]): Pair[] {
   return pairs;
 }
 
+// pi-ai's openai-completions provider sets thinkingSignature to the name of
+// the delta field the reasoning streamed in (its `reasoningFields` list), so it
+// can replay the thinking under that key. Nothing is signed, so the toolCall
+// args are free to rewrite. Any other value, an empty string included, keeps
+// the protection.
+const REASONING_FIELD_NAMES = new Set(["reasoning_content", "reasoning", "reasoning_text"]);
+
 function isSignedMessage(m: any): boolean {
   if (!Array.isArray(m?.content)) return false;
   return m.content.some(
     (b: any) =>
       b?.thoughtSignature !== undefined ||
       b?.textSignature !== undefined ||
-      b?.thinkingSignature !== undefined,
+      (b?.thinkingSignature !== undefined && !REASONING_FIELD_NAMES.has(b.thinkingSignature)),
   );
 }
 

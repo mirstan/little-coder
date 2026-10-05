@@ -485,6 +485,61 @@ describe("demoteMessages", () => {
     expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
   });
 
+  // pi-ai's openai-completions provider stores the name of the delta field
+  // the reasoning arrived in as thinkingSignature — a replay hint, not a
+  // signature.
+  function thinkingThenShell(id: string, command: string, thinkingSignature: string, callExtra = {}) {
+    return {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Compile it next.", thinkingSignature },
+        { type: "toolCall", id, name: "ShellSession", arguments: { command }, ...callExtra },
+      ],
+    };
+  }
+
+  for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+    it(`demotes the command when thinkingSignature is openai-completions' "${field}" field name`, () => {
+      const command = `cat > /tmp/c.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/c /tmp/c.c`;
+      const msgs = [
+        userMsg("t"),
+        thinkingThenShell("rc", command, field),
+        shellResult("rc", filler(8192, "out")),
+        ...pairs(4, "n"),
+      ];
+      const out = demoteMessages(msgs, memArchive(), opts());
+      const assistantOut = out.messages[1] as any;
+      expect(assistantOut.content[1].arguments.command).toContain(archiveId("rc"));
+      expect(assistantOut.content[0]).toEqual(msgs[1].content[0]);
+    });
+  }
+
+  it("never rewrites the command when thinkingSignature is an opaque signature", () => {
+    const command = `cat > /tmp/d.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/d /tmp/d.c`;
+    const msgs = [
+      userMsg("t"),
+      thinkingThenShell("op", command, "EqQBCkgIAxABGAIiQL2x9signedBlob"),
+      shellResult("op", filler(8192, "out")),
+      ...pairs(4, "n"),
+    ];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect((out.messages[1] as any).content[1].arguments.command).toBe(command);
+    expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+  });
+
+  it("never rewrites the command when a field-name thinkingSignature sits beside an encrypted reasoning detail", () => {
+    const command = `cat > /tmp/e.c <<'EOF'\n${filler(8192, "src")}\nEOF\ngcc -o /tmp/e /tmp/e.c`;
+    const detail = JSON.stringify({ type: "reasoning.encrypted", id: "en", data: "gAAAAB" });
+    const msgs = [
+      userMsg("t"),
+      thinkingThenShell("en", command, "reasoning", { thoughtSignature: detail }),
+      shellResult("en", filler(8192, "out")),
+      ...pairs(4, "n"),
+    ];
+    const out = demoteMessages(msgs, memArchive(), opts());
+    expect((out.messages[1] as any).content[1].arguments.command).toBe(command);
+  });
+
   it("honors env overrides for retainRaw and the size floor", () => {
     const prevRetain = process.env[ENV_RETAIN_RAW];
     const prevFloor = process.env[ENV_MIN_PAIR_BYTES];
