@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import {
   DEFAULT_CMD_KEEP,
   DEFAULT_DEMOTE_BATCH,
+  DEFAULT_DEMOTE_PENDING_BYTES,
   DEFAULT_KEEP_RESULT_HEAD,
   DEFAULT_KEEP_RESULT_TAIL,
   DEFAULT_MIN_PAIR_BYTES,
@@ -9,6 +10,7 @@ import {
   DEFAULT_STALE_DISTANCE,
   ENV_CMD_KEEP,
   ENV_DEMOTE_BATCH,
+  ENV_DEMOTE_PENDING_BYTES,
   ENV_KEEP_RESULT_HEAD,
   ENV_KEEP_RESULT_TAIL,
   ENV_MIN_PAIR_BYTES,
@@ -130,6 +132,7 @@ const PINNED_ENV: Record<string, string | undefined> = {
   [ENV_CMD_KEEP]: String(DEFAULT_CMD_KEEP),
   // The seeded fixture is one stale pair, which only per-pair demotion takes.
   [ENV_DEMOTE_BATCH]: "1",
+  [ENV_DEMOTE_PENDING_BYTES]: String(DEFAULT_DEMOTE_PENDING_BYTES),
   // Not from resolveOptions: index.ts reads these itself. A refused save
   // cancels the demotion; the kill switch registers no hooks at all.
   LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),

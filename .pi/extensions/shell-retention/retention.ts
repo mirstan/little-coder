@@ -35,6 +35,7 @@ export const ENV_CMD_KEEP = "LITTLE_CODER_SHELL_CMD_KEEP_BYTES";
 export const ENV_RECALL_DEFAULT = "LITTLE_CODER_SHELL_RECALL_DEFAULT_BYTES";
 export const ENV_RECALL_MAX = "LITTLE_CODER_SHELL_RECALL_MAX_BYTES";
 export const ENV_DEMOTE_BATCH = "LITTLE_CODER_SHELL_DEMOTE_BATCH";
+export const ENV_DEMOTE_PENDING_BYTES = "LITTLE_CODER_SHELL_DEMOTE_PENDING_BYTES";
 
 export const DEFAULT_RETAIN_RAW = 4;
 export const DEFAULT_MIN_PAIR_BYTES = 3072;
@@ -52,15 +53,20 @@ export const DEFAULT_RECALL_MAX = 49152;
 // breaks that per-pair demotion causes. The price is up to B - 1 older pairs
 // left raw that per-pair demotion would have shrunk. Each is at least
 // minPairBytes; a ShellSession result is capped at ~48KB and pi's built-in
-// bash output at 50KB, but a heredoc'd command has no cap. A stale pair whose
-// batch is not yet due stays raw at most until HARD_STALE_FACTOR x
-// staleDistance. 4 (= retainRaw) gets 75% of the saving for at most 3 extra
-// pairs; for a small context window, set 2, or 1 to restore per-pair demotion.
+// bash output at 50KB, but a heredoc'd command has no cap, so those raw bytes
+// are bounded by DEFAULT_DEMOTE_PENDING_BYTES rather than by their count.
+// 4 (= retainRaw) gets 75% of the saving for at most 3 extra pairs; for a
+// small context window, set 2, or 1 to restore per-pair demotion.
 export const DEFAULT_DEMOTE_BATCH = 4;
-// A pair still raw at this many times staleDistance is demoted on its own,
-// costing one extra break that late in history, rather than being stranded
-// for the session; in busy sessions batch jumps reach it long before.
-const HARD_STALE_FACTOR = 2;
+// Raw bytes allowed in pairs that per-pair demotion would already have shrunk
+// but whose batch is not yet due. Past it, every due pair demotes at once, so
+// those bytes never exceed this budget (<= 0 disables the flush). The trigger
+// is bytes, not age: a break late in history re-prefills the most of it, and
+// an age-triggered flush measured worse than per-pair demotion in sparse
+// sessions. A lone stale pair under the budget therefore stays raw for good;
+// it is cached, so it costs no prefill, only context. For a small context
+// window, lower this, or set the batch to 2 or 1.
+export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 
 export interface RetentionOptions {
   retainRaw: number;
@@ -70,6 +76,7 @@ export interface RetentionOptions {
   keepResultTailBytes: number;
   cmdKeepBytes: number;
   demoteBatch: number;
+  demotePendingBytes: number;
 }
 
 export interface RecallOptions {
@@ -99,6 +106,7 @@ export function resolveOptions(): RetentionOptions {
     keepResultTailBytes: envNumber(ENV_KEEP_RESULT_TAIL, DEFAULT_KEEP_RESULT_TAIL),
     cmdKeepBytes: envNumber(ENV_CMD_KEEP, DEFAULT_CMD_KEEP),
     demoteBatch: envNumber(ENV_DEMOTE_BATCH, DEFAULT_DEMOTE_BATCH),
+    demotePendingBytes: envNumber(ENV_DEMOTE_PENDING_BYTES, DEFAULT_DEMOTE_PENDING_BYTES),
   };
 }
 
@@ -423,9 +431,14 @@ export function demotedPrefixLength(target: number, batch: number): number {
  * set rewrites history mid-prompt and forces the server to re-prefill from the
  * first rewritten pair on, so growing in jumps keeps the prompt byte-identical,
  * and its prefix cache warm, for every turn between jumps. The one exception
- * is a pair more than HARD_STALE_FACTOR x staleDistance from the end: the
- * prefix always reaches it, so a stale pair whose batch never fills is not
- * left raw for the rest of the session.
+ * is byte pressure: when the due pairs past the last whole batch (not yet
+ * demoted) hold more than demotePendingBytes raw, the prefix takes all of
+ * them, so raw-but-due bytes never exceed that budget. Bytes, not age, because
+ * a late break re-prefills the most history. Until the batch boundary passes
+ * them, those pending pairs only gain members as history is appended, so once
+ * a flush fires every later call flushes again or the boundary has already
+ * moved past them. A due pair under the budget waits for its batch, however
+ * long that takes.
  *
  * A pair that cannot shrink, or whose archive save is refused, keeps its slot
  * and stays raw; the boundary is never pulled past it, so which pairs demote
@@ -448,17 +461,25 @@ export function demoteMessages(
     .filter(({ p, done }) => done || byteLen(p.command) + byteLen(p.resultText) >= opts.minPairBytes);
 
   let target = 0;
-  let hardTarget = 0;
   for (let k = 0; k < slots.length; k++) {
     const rank = slots.length - 1 - k;
     const distance = messages.length - 1 - slots[k].p.resultIdx;
     if (rank >= opts.retainRaw || distance > opts.staleDistance) target = k + 1;
-    if (distance > HARD_STALE_FACTOR * opts.staleDistance) hardTarget = k + 1;
   }
 
+  // Batch 1 gives batched === target, so nothing is pending and the flush
+  // cannot change per-pair output.
+  const batched = demotedPrefixLength(target, opts.demoteBatch);
+  let pending = 0;
+  for (let k = batched; k < target; k++) {
+    const { p, done } = slots[k];
+    if (!done) pending += byteLen(p.command) + byteLen(p.resultText);
+  }
+  const budget = opts.demotePendingBytes;
+  const flush = Number.isFinite(budget) && budget > 0 && pending > budget;
+  const prefix = flush ? target : batched;
+
   let demotedCount = 0;
-  // Every hard-stale slot is also in target, so batch 1 still gives target.
-  const prefix = Math.max(demotedPrefixLength(target, opts.demoteBatch), hardTarget);
   for (let k = 0; k < prefix; k++) {
     const { p, done } = slots[k];
     if (done) continue;

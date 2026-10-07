@@ -13,6 +13,7 @@ import {
   CMD_DEMOTED_INFIX,
   DEFAULT_CMD_KEEP,
   DEFAULT_DEMOTE_BATCH,
+  DEFAULT_DEMOTE_PENDING_BYTES,
   DEFAULT_KEEP_RESULT_HEAD,
   DEFAULT_KEEP_RESULT_TAIL,
   DEFAULT_MIN_PAIR_BYTES,
@@ -21,6 +22,7 @@ import {
   DEFAULT_RETAIN_RAW,
   DEFAULT_STALE_DISTANCE,
   ENV_DEMOTE_BATCH,
+  ENV_DEMOTE_PENDING_BYTES,
   ENV_MIN_PAIR_BYTES,
   ENV_RETAIN_RAW,
   REASONING_FIELD_NAMES,
@@ -44,6 +46,7 @@ const BASE: RetentionOptions = {
   keepResultTailBytes: DEFAULT_KEEP_RESULT_TAIL,
   cmdKeepBytes: DEFAULT_CMD_KEEP,
   demoteBatch: 1,
+  demotePendingBytes: DEFAULT_DEMOTE_PENDING_BYTES,
 };
 
 function opts(over: Partial<RetentionOptions> = {}): RetentionOptions {
@@ -671,7 +674,7 @@ describe("demoteMessages with the default batch", () => {
     const displaced = [userMsg("t"), ...pairs(R + B - 1, "p")];
     expect(demoteMessages(displaced, memArchive(), BATCHED)).toEqual({ messages: displaced, demotedCount: 0 });
 
-    // Past staleDistance but not yet twice it: a lone stale pair waits for its batch.
+    // Past staleDistance and under the pending budget: a lone stale pair waits for its batch.
     const loneStale = [userMsg("t"), assistantShell("g", "echo go"), shellResult("g", filler(8192, "big")), ...pairs(30, "tiny", 60)];
     expect(demoteMessages(loneStale, memArchive(), BATCHED).demotedCount).toBe(0);
 
@@ -679,21 +682,101 @@ describe("demoteMessages with the default batch", () => {
     expect(demoteMessages(staleBatch, memArchive(), BATCHED).demotedCount).toBe(B);
   });
 
-  it("reclaims a lone stale pair on its own once it is twice staleDistance old", () => {
+  it("leaves an under-budget lone stale pair raw however old it gets", () => {
     // pairs(n) appends 2n messages after the big result, so its distance is 2n.
     const lone = [
       userMsg("t"),
       assistantShell("g", "echo go"),
       shellResult("g", filler(8192, "big")),
-      ...pairs(DEFAULT_STALE_DISTANCE, "tiny", 60),
+      ...pairs(120, "tiny", 60),
     ];
-    expect(lone.length - 1 - 2).toBe(2 * DEFAULT_STALE_DISTANCE);
+    expect(lone.length - 1 - 2).toBeGreaterThan(2 * DEFAULT_STALE_DISTANCE);
     expect(demoteMessages(lone, memArchive(), BATCHED)).toEqual({ messages: lone, demotedCount: 0 });
+  });
 
-    const older = [...lone, userMsg("one more")];
-    const out = demoteMessages(older, memArchive(), BATCHED);
-    expect(out.demotedCount).toBe(1);
-    expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+  /** A heredoc'd source paste of about `bytes` bytes with a one-word result. */
+  function heredocPair(id: string, bytes: number): any[] {
+    return [
+      assistantShell(id, `cat > /tmp/${id}.c <<'EOF'\n${filler(bytes, `src-${id}`)}\nEOF\ngcc /tmp/${id}.c`),
+      shellResult(id, "compiled"),
+    ];
+  }
+
+  it("flushes every due pair once their raw bytes exceed the pending budget", () => {
+    // A lone due pair over the budget on its own, at distance 60: no batch is
+    // due, so only the byte budget can demote it.
+    const huge = [userMsg("t"), ...heredocPair("h", 70 * 1024), ...pairs(30, "tiny", 60)];
+    expect(Buffer.byteLength(commandOf(huge[1]))).toBeGreaterThan(65536);
+    const hugeOut = demoteMessages(huge, memArchive(), BATCHED);
+    expect(hugeOut.demotedCount).toBe(1);
+    expect(commandOf(hugeOut.messages[1])).toContain(CMD_DEMOTED_INFIX + archiveId("h"));
+
+    // Two 40KB pairs: one due is under the budget, both due is over it, and
+    // the flush takes both together.
+    const twoBig = [
+      userMsg("t"),
+      assistantShell("a", "make a"),
+      shellResult("a", filler(40 * 1024, "a")),
+      ...pairs(10, "mid", 60),
+      assistantShell("b", "make b"),
+      shellResult("b", filler(40 * 1024, "b")),
+      ...pairs(20, "tiny", 60),
+    ];
+    // a sits at distance 62 (due), b at 40 (not due, rank 0 < retainRaw).
+    expect(demoteMessages(twoBig, memArchive(), BATCHED)).toEqual({ messages: twoBig, demotedCount: 0 });
+    const bothDue = [...twoBig, ...pairs(6, "more", 60)];
+    const bothOut = demoteMessages(bothDue, memArchive(), BATCHED);
+    expect(bothOut.demotedCount).toBe(2);
+    expect(textOf(bothOut.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
+    expect(textOf(bothOut.messages[24])).toContain(RESULT_DEMOTED_PREFIX);
+
+    // A whole batch is due plus one huge pair past it: the flush takes all of
+    // [batched, target), not just the batch.
+    const pastBatch = [userMsg("t"), ...pairs(B, "old"), ...heredocPair("h", 70 * 1024), ...pairs(30, "tiny", 60)];
+    const pastOut = demoteMessages(pastBatch, memArchive(), BATCHED);
+    expect(pastOut.demotedCount).toBe(B + 1);
+    expect(commandOf(pastOut.messages[1 + 2 * B])).toContain(CMD_DEMOTED_INFIX + archiveId("h"));
+    // The same shape with an under-budget pair past the batch takes the batch only.
+    const underBatch = [
+      userMsg("t"),
+      ...pairs(B, "old"),
+      assistantShell("g", "echo go"),
+      shellResult("g", filler(8192, "big")),
+      ...pairs(30, "tiny", 60),
+    ];
+    expect(demoteMessages(underBatch, memArchive(), BATCHED).demotedCount).toBe(B);
+  });
+
+  it("reads the pending budget from LITTLE_CODER_SHELL_DEMOTE_PENDING_BYTES; 0 or negative disables the flush", () => {
+    const prevBudget = process.env[ENV_DEMOTE_PENDING_BYTES];
+    const prevBatch = process.env[ENV_DEMOTE_BATCH];
+    const huge = [userMsg("t"), ...heredocPair("h", 70 * 1024), ...pairs(30, "tiny", 60)];
+    const count = () => demoteMessages(huge, memArchive(), resolveOptions()).demotedCount;
+    try {
+      expect(ENV_DEMOTE_PENDING_BYTES).toBe("LITTLE_CODER_SHELL_DEMOTE_PENDING_BYTES");
+      expect(DEFAULT_DEMOTE_PENDING_BYTES).toBe(65536);
+      delete process.env[ENV_DEMOTE_BATCH];
+      delete process.env[ENV_DEMOTE_PENDING_BYTES];
+      expect(resolveOptions().demotePendingBytes).toBe(65536);
+      for (const [raw, want] of [["1000", 1000], ["0", 0], ["-5", -5], ["", 65536], ["  ", 65536], ["abc", 65536]] as const) {
+        process.env[ENV_DEMOTE_PENDING_BYTES] = raw;
+        expect(resolveOptions().demotePendingBytes).toBe(want);
+      }
+
+      delete process.env[ENV_DEMOTE_PENDING_BYTES];
+      expect(count()).toBe(1);
+      for (const v of ["0", "-1"]) {
+        process.env[ENV_DEMOTE_PENDING_BYTES] = v;
+        expect(count()).toBe(0);
+      }
+      process.env[ENV_DEMOTE_PENDING_BYTES] = String(1024 * 1024);
+      expect(count()).toBe(0);
+    } finally {
+      if (prevBudget === undefined) delete process.env[ENV_DEMOTE_PENDING_BYTES];
+      else process.env[ENV_DEMOTE_PENDING_BYTES] = prevBudget;
+      if (prevBatch === undefined) delete process.env[ENV_DEMOTE_BATCH];
+      else process.env[ENV_DEMOTE_BATCH] = prevBatch;
+    }
   });
 
   it("leaves a refused pair raw in its slot without pulling the next pair into the batch", () => {
@@ -827,17 +910,17 @@ function simulatedTurns(): any[][] {
 }
 
 /** Pairs at or over the size floor, oldest first — computed from the fixture, not the code under test. */
-function qualifyingSlots(history: any[], o: RetentionOptions): { id: string; resultIdx: number }[] {
+function qualifyingSlots(history: any[], o: RetentionOptions): { id: string; resultIdx: number; bytes: number }[] {
   const commands = new Map<string, string>();
   for (const m of history) {
     if (m.role !== "assistant") continue;
     for (const b of m.content) if (b.type === "toolCall") commands.set(b.id, b.arguments.command);
   }
-  const slots: { id: string; resultIdx: number }[] = [];
+  const slots: { id: string; resultIdx: number; bytes: number }[] = [];
   history.forEach((m, resultIdx) => {
     if (m.role !== "toolResult") return;
     const bytes = Buffer.byteLength(commands.get(m.toolCallId) ?? "") + Buffer.byteLength(textOf(m));
-    if (bytes >= o.minPairBytes) slots.push({ id: m.toolCallId, resultIdx });
+    if (bytes >= o.minPairBytes) slots.push({ id: m.toolCallId, resultIdx, bytes });
   });
   return slots;
 }
@@ -936,14 +1019,16 @@ describe("demoteMessages prefix-cache stability (simulated session)", () => {
     for (let t = 1; t < steps.length; t++) {
       const { history, projection, demoted, breakAt } = steps[t];
       const before = steps[t - 1].demoted;
-      const slots = qualifyingSlots(history, o).map((s) => s.id);
+      const qualifying = qualifyingSlots(history, o);
+      const slots = qualifying.map((s) => s.id);
       const legacy = legacyDemotedIds(history, o);
 
       expect(demoted).toEqual(slots.slice(0, demoted.length));
-      const hardCount = qualifyingSlots(history, o).filter(
-        (s) => history.length - 1 - s.resultIdx > 2 * DEFAULT_STALE_DISTANCE,
-      ).length;
-      expect(demoted.length).toBe(Math.max(demotedPrefixLength(legacy.length, DEFAULT_DEMOTE_BATCH), hardCount));
+      // Whole batches, unless the raw bytes of the due pairs past the last
+      // whole batch exceed the pending budget, which flushes them all.
+      const batchedLen = demotedPrefixLength(legacy.length, DEFAULT_DEMOTE_BATCH);
+      const pending = qualifying.slice(batchedLen, legacy.length).reduce((n, s) => n + s.bytes, 0);
+      expect(demoted.length).toBe(pending > DEFAULT_DEMOTE_PENDING_BYTES ? legacy.length : batchedLen);
       expect(legacy.slice(0, demoted.length)).toEqual(demoted);
       expect(slots.slice(-DEFAULT_RETAIN_RAW).some((id) => demoted.includes(id))).toBe(false);
       expect(demoted.slice(0, before.length)).toEqual(before);
@@ -956,6 +1041,77 @@ describe("demoteMessages prefix-cache stability (simulated session)", () => {
       }
     }
     expect(jumps).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// ── Sparse-session re-prefill simulation ───────────────────────────────────
+// 600 steps of one shell pair each: a `bigBytes` pair every 15th step (about
+// one every 30 messages), 300B pairs otherwise (under the size floor). Counts
+// re-prefill BYTES, not just breaks: a late break rewrites more history.
+function sparseTurns(bigBytes: number): any[][] {
+  const turns: any[][] = [];
+  for (let i = 0; i < 600; i++) {
+    const id = `sp${i}`;
+    const big = i % 15 === 0;
+    turns.push([assistantShell(id, `make step-${i}`), shellResult(id, filler(big ? bigBytes : 300, `o${i}`))]);
+  }
+  return turns;
+}
+
+/** Breaks, total re-prefilled bytes, and whether any step's demoted set lost a member. */
+function runReprefill(turns: any[][], o: RetentionOptions): { breaks: number; bytes: number; shrank: boolean } {
+  const archive = memArchive();
+  const history: any[] = [];
+  let prev: any[] | undefined;
+  let prevDemoted: string[] = [];
+  let breaks = 0;
+  let bytes = 0;
+  let shrank = false;
+  for (const turn of turns) {
+    history.push(...turn);
+    const projection = demoteMessages([...history], archive, o).messages;
+    if (prev) {
+      let first = -1;
+      for (let i = 0; i < prev.length; i++) {
+        if (projection[i] !== prev[i] && JSON.stringify(projection[i]) !== JSON.stringify(prev[i])) {
+          first = i;
+          break;
+        }
+      }
+      if (first >= 0) {
+        breaks++;
+        for (let i = first; i < prev.length; i++) bytes += JSON.stringify(prev[i]).length;
+      }
+    }
+    const demoted = demotedIdsIn(projection);
+    if (!prevDemoted.every((id) => demoted.includes(id))) shrank = true;
+    prev = projection;
+    prevDemoted = demoted;
+  }
+  return { breaks, bytes, shrank };
+}
+
+describe("demoteMessages re-prefill bytes (sparse simulated session)", () => {
+  it("re-prefills well under per-pair demotion when large pairs are sparse", () => {
+    // Measured: per-pair 39 breaks / 1,439,571 bytes; batched 9 breaks / 867,013 bytes (0.602x).
+    // The age hatch this replaced measured 1,903,320 batched bytes (1.32x per-pair).
+    const perPair = runReprefill(sparseTurns(10 * 1024), opts({ demoteBatch: 1 }));
+    const batched = runReprefill(sparseTurns(10 * 1024), opts({ demoteBatch: DEFAULT_DEMOTE_BATCH }));
+    expect(perPair.shrank).toBe(false);
+    expect(batched.shrank).toBe(false);
+    // 0.65 leaves headroom over the measured 0.602 and still fails the 1.32x hatch.
+    expect(batched.bytes).toBeLessThan(0.65 * perPair.bytes);
+    expect(batched.breaks).toBeLessThanOrEqual(perPair.breaks / 3);
+  });
+
+  it("degrades toward per-pair, never worse, when two due pairs exceed the pending budget", () => {
+    // Measured: per-pair 39 breaks / 3,870,019 bytes; batched 29 breaks / 3,387,425 bytes (0.875x).
+    const perPair = runReprefill(sparseTurns(40 * 1024), opts({ demoteBatch: 1 }));
+    const batched = runReprefill(sparseTurns(40 * 1024), opts({ demoteBatch: DEFAULT_DEMOTE_BATCH }));
+    expect(2 * 40 * 1024).toBeGreaterThan(DEFAULT_DEMOTE_PENDING_BYTES);
+    expect(perPair.shrank).toBe(false);
+    expect(batched.shrank).toBe(false);
+    expect(batched.bytes).toBeLessThanOrEqual(perPair.bytes);
   });
 });
 
