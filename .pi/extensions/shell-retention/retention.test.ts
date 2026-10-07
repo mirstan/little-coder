@@ -671,11 +671,29 @@ describe("demoteMessages with the default batch", () => {
     const displaced = [userMsg("t"), ...pairs(R + B - 1, "p")];
     expect(demoteMessages(displaced, memArchive(), BATCHED)).toEqual({ messages: displaced, demotedCount: 0 });
 
-    const loneStale = [userMsg("t"), assistantShell("g", "echo go"), shellResult("g", filler(8192, "big")), ...pairs(60, "tiny", 60)];
+    // Past staleDistance but not yet twice it: a lone stale pair waits for its batch.
+    const loneStale = [userMsg("t"), assistantShell("g", "echo go"), shellResult("g", filler(8192, "big")), ...pairs(30, "tiny", 60)];
     expect(demoteMessages(loneStale, memArchive(), BATCHED).demotedCount).toBe(0);
 
     const staleBatch = [userMsg("t"), ...pairs(B, "old"), ...pairs(60, "tiny", 60)];
     expect(demoteMessages(staleBatch, memArchive(), BATCHED).demotedCount).toBe(B);
+  });
+
+  it("reclaims a lone stale pair on its own once it is twice staleDistance old", () => {
+    // pairs(n) appends 2n messages after the big result, so its distance is 2n.
+    const lone = [
+      userMsg("t"),
+      assistantShell("g", "echo go"),
+      shellResult("g", filler(8192, "big")),
+      ...pairs(DEFAULT_STALE_DISTANCE, "tiny", 60),
+    ];
+    expect(lone.length - 1 - 2).toBe(2 * DEFAULT_STALE_DISTANCE);
+    expect(demoteMessages(lone, memArchive(), BATCHED)).toEqual({ messages: lone, demotedCount: 0 });
+
+    const older = [...lone, userMsg("one more")];
+    const out = demoteMessages(older, memArchive(), BATCHED);
+    expect(out.demotedCount).toBe(1);
+    expect(textOf(out.messages[2])).toContain(RESULT_DEMOTED_PREFIX);
   });
 
   it("leaves a refused pair raw in its slot without pulling the next pair into the batch", () => {
@@ -922,7 +940,10 @@ describe("demoteMessages prefix-cache stability (simulated session)", () => {
       const legacy = legacyDemotedIds(history, o);
 
       expect(demoted).toEqual(slots.slice(0, demoted.length));
-      expect(demoted.length).toBe(demotedPrefixLength(legacy.length, DEFAULT_DEMOTE_BATCH));
+      const hardCount = qualifyingSlots(history, o).filter(
+        (s) => history.length - 1 - s.resultIdx > 2 * DEFAULT_STALE_DISTANCE,
+      ).length;
+      expect(demoted.length).toBe(Math.max(demotedPrefixLength(legacy.length, DEFAULT_DEMOTE_BATCH), hardCount));
       expect(legacy.slice(0, demoted.length)).toEqual(demoted);
       expect(slots.slice(-DEFAULT_RETAIN_RAW).some((id) => demoted.includes(id))).toBe(false);
       expect(demoted.slice(0, before.length)).toEqual(before);

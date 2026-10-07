@@ -51,12 +51,16 @@ export const DEFAULT_RECALL_MAX = 49152;
 // first rewritten pair, so a jump of B pairs removes about 1 - 1/B of the
 // breaks that per-pair demotion causes. The price is up to B - 1 older pairs
 // left raw that per-pair demotion would have shrunk. Each is at least
-// minPairBytes, up to ~48KB of ShellSession result, and uncapped for GAIA's
-// bash output or a heredoc'd command. That includes a lone stale pair, which
-// stays raw until B pairs are due. 4 (= retainRaw) gets 75% of the saving for
-// at most 3 extra pairs; for a small context window, set 2, or 1 to restore
-// per-pair demotion.
+// minPairBytes; a ShellSession result is capped at ~48KB and pi's built-in
+// bash output at 50KB, but a heredoc'd command has no cap. A stale pair whose
+// batch is not yet due stays raw at most until HARD_STALE_FACTOR x
+// staleDistance. 4 (= retainRaw) gets 75% of the saving for at most 3 extra
+// pairs; for a small context window, set 2, or 1 to restore per-pair demotion.
 export const DEFAULT_DEMOTE_BATCH = 4;
+// A pair still raw at this many times staleDistance is demoted on its own,
+// costing one extra break that late in history, rather than being stranded
+// for the session; in busy sessions batch jumps reach it long before.
+const HARD_STALE_FACTOR = 2;
 
 export interface RetentionOptions {
   retainRaw: number;
@@ -418,7 +422,10 @@ export function demotedPrefixLength(target: number, batch: number): number {
  * that prefix are demoted (demotedPrefixLength): every growth of the demoted
  * set rewrites history mid-prompt and forces the server to re-prefill from the
  * first rewritten pair on, so growing in jumps keeps the prompt byte-identical,
- * and its prefix cache warm, for every turn between jumps.
+ * and its prefix cache warm, for every turn between jumps. The one exception
+ * is a pair more than HARD_STALE_FACTOR x staleDistance from the end: the
+ * prefix always reaches it, so a stale pair whose batch never fills is not
+ * left raw for the rest of the session.
  *
  * A pair that cannot shrink, or whose archive save is refused, keeps its slot
  * and stays raw; the boundary is never pulled past it, so which pairs demote
@@ -441,14 +448,17 @@ export function demoteMessages(
     .filter(({ p, done }) => done || byteLen(p.command) + byteLen(p.resultText) >= opts.minPairBytes);
 
   let target = 0;
+  let hardTarget = 0;
   for (let k = 0; k < slots.length; k++) {
     const rank = slots.length - 1 - k;
     const distance = messages.length - 1 - slots[k].p.resultIdx;
     if (rank >= opts.retainRaw || distance > opts.staleDistance) target = k + 1;
+    if (distance > HARD_STALE_FACTOR * opts.staleDistance) hardTarget = k + 1;
   }
 
   let demotedCount = 0;
-  const prefix = demotedPrefixLength(target, opts.demoteBatch);
+  // Every hard-stale slot is also in target, so batch 1 still gives target.
+  const prefix = Math.max(demotedPrefixLength(target, opts.demoteBatch), hardTarget);
   for (let k = 0; k < prefix; k++) {
     const { p, done } = slots[k];
     if (done) continue;
