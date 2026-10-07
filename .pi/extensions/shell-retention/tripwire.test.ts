@@ -1,12 +1,14 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import {
   DEFAULT_CMD_KEEP,
+  DEFAULT_DEMOTE_BATCH,
   DEFAULT_KEEP_RESULT_HEAD,
   DEFAULT_KEEP_RESULT_TAIL,
   DEFAULT_MIN_PAIR_BYTES,
   DEFAULT_RETAIN_RAW,
   DEFAULT_STALE_DISTANCE,
   ENV_CMD_KEEP,
+  ENV_DEMOTE_BATCH,
   ENV_KEEP_RESULT_HEAD,
   ENV_KEEP_RESULT_TAIL,
   ENV_MIN_PAIR_BYTES,
@@ -126,11 +128,29 @@ const PINNED_ENV: Record<string, string | undefined> = {
   [ENV_KEEP_RESULT_HEAD]: String(DEFAULT_KEEP_RESULT_HEAD),
   [ENV_KEEP_RESULT_TAIL]: String(DEFAULT_KEEP_RESULT_TAIL),
   [ENV_CMD_KEEP]: String(DEFAULT_CMD_KEEP),
+  // The seeded fixture is one stale pair, which only per-pair demotion takes.
+  [ENV_DEMOTE_BATCH]: "1",
   // Not from resolveOptions: index.ts reads these itself. A refused save
   // cancels the demotion; the kill switch registers no hooks at all.
   LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),
   LITTLE_CODER_NO_SHELL_RETENTION: undefined,
 };
+
+/** One big pair, then 60 user turns: stale under the per-pair rule, alone in its batch otherwise. */
+function staleSeedMessages(): any[] {
+  const filler = "x".repeat(50) + "\n";
+  const bigBody = filler.repeat(200); // well over the min-pair-bytes floor
+  return [
+    { role: "user", content: "go" },
+    {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc-1", name: "ShellSession", arguments: { command: "run big thing" } }],
+    },
+    { role: "toolResult", toolCallId: "tc-1", toolName: "ShellSession", content: [{ type: "text", text: bigBody }] },
+    // Enough later traffic to push the pair past staleDistance/retainRaw.
+    ...Array.from({ length: 60 }, (_, i) => ({ role: "user", content: `turn ${i}` })),
+  ];
+}
 
 describe("shell-retention tool_call tripwire (wired)", () => {
   let handlers: Record<string, Array<(event: any, ctx: any) => any>>;
@@ -158,18 +178,7 @@ describe("shell-retention tool_call tripwire (wired)", () => {
   /** Demote a big stale pair through the real context hook to get a live id. */
   async function seedLiveId(): Promise<string> {
     handlers = wireExtension();
-    const filler = "x".repeat(50) + "\n";
-    const bigBody = filler.repeat(200); // well over the min-pair-bytes floor
-    const msgs = [
-      { role: "user", content: "go" },
-      {
-        role: "assistant",
-        content: [{ type: "toolCall", id: "tc-1", name: "ShellSession", arguments: { command: "run big thing" } }],
-      },
-      { role: "toolResult", toolCallId: "tc-1", toolName: "ShellSession", content: [{ type: "text", text: bigBody }] },
-      // Enough later traffic to push the pair past staleDistance/retainRaw.
-      ...Array.from({ length: 60 }, (_, i) => ({ role: "user", content: `turn ${i}` })),
-    ];
+    const msgs = staleSeedMessages();
     const ctxEvent = { messages: msgs };
     let out: any;
     for (const h of handlers.context ?? []) {
@@ -183,6 +192,23 @@ describe("shell-retention tool_call tripwire (wired)", () => {
     expect(m, "expected a demotion marker with an id in the projected result").toBeTruthy();
     return m![1];
   }
+
+  it("honors LITTLE_CODER_SHELL_DEMOTE_BATCH through the wired context hook", async () => {
+    handlers = wireExtension();
+    const project = async () => {
+      let out: any;
+      for (const h of handlers.context ?? []) {
+        const r = await h({ messages: staleSeedMessages() }, makeCtx());
+        if (r) out = r;
+      }
+      return out;
+    };
+    process.env[ENV_DEMOTE_BATCH] = String(DEFAULT_DEMOTE_BATCH);
+    expect(await project(), "a lone stale pair waits for a whole batch").toBeUndefined();
+    process.env[ENV_DEMOTE_BATCH] = "1";
+    const out = await project();
+    expect(out?.messages[2].content[0].text).toMatch(/^\[shell result demoted/);
+  });
 
   it("blocks a tool call echoing a live marker id (command-infix phrasing)", async () => {
     const id = await seedLiveId();
