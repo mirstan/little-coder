@@ -76,41 +76,38 @@ export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 // later turns. Measured on omlx (Harbor TB2.1 replay, 473 demotion breaks):
 // re-prefill costs a(p-c) + b(p²-c²)/2 seconds with a = 1.05e-3 and
 // b = 3.7e-8, so a break at 184K tokens that saved 9K cost 665 s, while 9K
-// fewer tokens speed each later turn up by ~2 s. Savings matter mostly when
-// they keep a trial under the compaction trigger. A due jump therefore goes
-// ahead only when one of these holds; otherwise its pairs stay raw (and
-// cached) and are judged again on the next request.
+// fewer tokens speed each later turn up by ~2 s. What savings buy is keeping
+// a trial under compaction, which costs a full re-prefill plus the summary
+// (946 s for a 187K-token compaction request, live 2026-10-08). A due jump
+// therefore goes ahead only when one of these holds; otherwise its pairs stay
+// raw (and cached) and are judged again on the next request.
 //  - S >= minSaveRatio * R: the break is shallow next to what it sheds.
-//  - context >= openAtPercent% of the window: near compaction, where shed
-//    tokens count. Below the harness trigger (min(220K, 84% of the window),
-//    benchmarks/rpc_client.py) for every window the gate runs on, and kept 5
-//    points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT.
+//  - context >= openAtPercent% of the window. Off by default (100): in the
+//    replay, demoting near compaction never avoided one, it only paid a deep
+//    break before the compaction re-prefilled everything anyway. When set, it
+//    is kept 5 points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT.
 //  - raw bytes pending in the jump >= forcePendingBytes: a burst of huge
 //    outputs. Never fired in the replay; a backstop only.
-// Replay (473 breaks, 57 trial segments): today's policy spent 7.1 h
-// re-prefilling. 0.1 / 75% saves 0.70 h of that, 0.36 h net of the slower
-// turns the context it keeps costs, with no new crossing of the 220K
-// trigger; 78% nets 0.90 h. Ratios 0.05 and 0.15+ came out net negative at
-// 75%, so the clause only pays in a narrow band.
+// Replay (57 trial segments, compaction at 220K priced in, accounting stopped
+// at the first one): today's policy costs 12.2 h (6.4 h re-prefill, 16
+// compactions). Never demoting costs 9.4 h with 20 compactions. The ratio
+// clause alone costs 8.3-8.8 h for ratios 0.1-0.15 with no extra compaction;
+// from 0.2 up compactions climb. A context clause at 75% added back 3 h.
 export const ENV_DEMOTE_MIN_SAVE_RATIO = "LITTLE_CODER_SHELL_DEMOTE_MIN_SAVE_RATIO";
 export const ENV_DEMOTE_OPEN_AT_PERCENT = "LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT";
 export const ENV_DEMOTE_FORCE_PENDING_BYTES = "LITTLE_CODER_SHELL_DEMOTE_FORCE_PENDING_BYTES";
-/** <= 0 disables the clause. */
-export const DEFAULT_DEMOTE_MIN_SAVE_RATIO = 0.1;
-/** <= 0 turns the whole gate off (today's behaviour); >= 100 never opens on context alone. */
-export const DEFAULT_DEMOTE_OPEN_AT_PERCENT = 75;
+/** <= 0 disables the clause. The middle of the replay's flat 0.1-0.15 optimum. */
+export const DEFAULT_DEMOTE_MIN_SAVE_RATIO = 0.12;
+/** <= 0 turns the whole gate off (today's behaviour); >= 100, the default, never opens on context. */
+export const DEFAULT_DEMOTE_OPEN_AT_PERCENT = 100;
 /** <= 0 disables the clause. Four times the batch flush budget. */
 export const DEFAULT_DEMOTE_FORCE_PENDING_BYTES = 262144;
 /**
- * The gate stays off below this window. Its defaults were fitted on a 262,144
- * window; at 32K, 75% sits ~3K tokens under the harness compaction trigger.
+ * The gate runs only on windows in [MIN_GATE_WINDOW, MAX_GATE_WINDOW]: its
+ * defaults were fitted on 262,144-token windows, and a small window reaches
+ * compaction in few turns, where per-turn savings weigh more.
  */
 export const MIN_GATE_WINDOW = 131072;
-/**
- * And above this one: the harness compacts at min(220K, 84% of the window)
- * (benchmarks/rpc_client.py), so past ~293K the 75% open point would sit
- * beyond compaction and the gate would defer every due pair into it.
- */
 export const MAX_GATE_WINDOW = 262144;
 /** The open point stays this many points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT. */
 const WATCHDOG_MARGIN_PERCENT = 5;
@@ -150,11 +147,11 @@ export function resolveGateOptions(): GateOptions {
   };
 }
 
-// An operator who lowers context-watchdog's threshold (default 80) below the
-// open point would otherwise have it compact before the gate could open.
+// An operator who lowers context-watchdog's threshold (default 80) below an
+// enabled open point would otherwise have it compact before the gate opened.
 function openAtPercent(): number {
   const open = envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT);
-  if (open <= 0 || process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return open;
+  if (open <= 0 || open >= 100 || process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return open;
   const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", 0);
   if (watchdog <= 0 || watchdog >= 100) return open;
   return Math.min(open, watchdog - WATCHDOG_MARGIN_PERCENT);

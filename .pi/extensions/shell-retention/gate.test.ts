@@ -44,6 +44,8 @@ const GATE: GateOptions = {
   openAtPercent: DEFAULT_DEMOTE_OPEN_AT_PERCENT,
   forcePendingBytes: DEFAULT_DEMOTE_FORCE_PENDING_BYTES,
 };
+/** The context clause is off by default; these tests turn it on where they exercise it. */
+const WITH_CONTEXT: GateOptions = { ...GATE, openAtPercent: 75 };
 
 const WINDOW = 262144;
 
@@ -112,14 +114,16 @@ describe("demotionGate", () => {
   });
 
   it("opens on the save ratio", () => {
-    expect(demotionGate({ ...base, estSaveTokens: 0.1 * base.estReprefillTokens }, GATE)).toBe("ratio");
-    expect(demotionGate({ ...base, estSaveTokens: 0.1 * base.estReprefillTokens - 1 }, GATE)).toBeNull();
+    expect(demotionGate({ ...base, estSaveTokens: DEFAULT_DEMOTE_MIN_SAVE_RATIO * base.estReprefillTokens }, GATE)).toBe("ratio");
+    expect(demotionGate({ ...base, estSaveTokens: DEFAULT_DEMOTE_MIN_SAVE_RATIO * base.estReprefillTokens - 1 }, GATE)).toBeNull();
   });
 
   it("opens once the context reaches openAtPercent of the window", () => {
-    const at = Math.ceil((DEFAULT_DEMOTE_OPEN_AT_PERCENT / 100) * WINDOW);
-    expect(demotionGate({ ...base, contextTokens: at }, GATE)).toBe("context");
-    expect(demotionGate({ ...base, contextTokens: at - 1 }, GATE)).toBeNull();
+    const at = Math.ceil(0.75 * WINDOW);
+    expect(demotionGate({ ...base, contextTokens: at }, WITH_CONTEXT)).toBe("context");
+    expect(demotionGate({ ...base, contextTokens: at - 1 }, WITH_CONTEXT)).toBeNull();
+    // Off by default: near compaction a deep break only precedes the compaction's own re-prefill.
+    expect(demotionGate({ ...base, contextTokens: WINDOW }, GATE)).toBeNull();
   });
 
   it("opens on pending raw bytes", () => {
@@ -157,11 +161,11 @@ describe("resolveGateOptions", () => {
     const watchdog = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
     delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
     try {
-      expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.1, openAtPercent: 75, forcePendingBytes: 262144 });
+      expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.12, openAtPercent: 100, forcePendingBytes: 262144 });
     } finally {
       if (watchdog !== undefined) process.env.LITTLE_CODER_COMPACT_AT_PERCENT = watchdog;
     }
-    expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.1, openAtPercent: 75, forcePendingBytes: 262144 });
+    expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.12, openAtPercent: 100, forcePendingBytes: 262144 });
     process.env[ENV_DEMOTE_MIN_SAVE_RATIO] = "0.5";
     process.env[ENV_DEMOTE_OPEN_AT_PERCENT] = "0";
     process.env[ENV_DEMOTE_FORCE_PENDING_BYTES] = "-1";
@@ -187,13 +191,13 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     expect(out.stats).toMatchObject({ due: B, prefix: 0, demoted: 0, gate: "deferred", gateReason: null, skippedCost: B });
     expect(out.stats.estReprefillTokens).toBeGreaterThan(100_000);
     expect(out.stats.estSaveTokens).toBeGreaterThan(0);
-    expect(out.stats.estSaveTokens).toBeLessThan(0.1 * out.stats.estReprefillTokens);
+    expect(out.stats.estSaveTokens).toBeLessThan(DEFAULT_DEMOTE_MIN_SAVE_RATIO * out.stats.estReprefillTokens);
     expect(out.stats.estContextTokens).toBe(120_000);
   });
 
   it("lets the same batch through near the compaction point", () => {
     const out = demoteMessagesWithStats(deep(), memArchive(), OPTS, {
-      options: GATE,
+      options: WITH_CONTEXT,
       context: { contextTokens: 0.8 * WINDOW, contextWindow: WINDOW },
     });
     expect(out.demotedCount).toBe(B);
@@ -214,7 +218,7 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     const archive = memArchive();
     const msgs = deep();
     const first = demoteMessagesWithStats(msgs, archive, OPTS, {
-      options: GATE,
+      options: WITH_CONTEXT,
       context: { contextTokens: 0.8 * WINDOW, contextWindow: WINDOW },
     });
     expect(first.demotedCount).toBe(B);
@@ -237,7 +241,7 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     const archive = memArchive();
     const msgs = deep();
     demoteMessagesWithStats(msgs, archive, OPTS, {
-      options: GATE,
+      options: WITH_CONTEXT,
       context: { contextTokens: 0.8 * WINDOW, contextWindow: WINDOW },
     });
     // B more big pairs make a second batch due; under the open point it is deferred,
@@ -299,7 +303,7 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     expect(switched.stats).toMatchObject({ gate: "open", gateReason: "cold" });
   });
 
-  it("stays off above MAX_GATE_WINDOW, where 75% of the window lies past the 220K harness trigger", () => {
+  it("stays off above MAX_GATE_WINDOW, past the windows its defaults were fitted on", () => {
     const out = demoteMessagesWithStats(deep(), memArchive(), OPTS, {
       options: GATE,
       context: { contextTokens: 120_000, contextWindow: MAX_GATE_WINDOW + 1 },
@@ -309,17 +313,23 @@ describe("demoteMessagesWithStats with the cost gate", () => {
   });
 
   it("opens below a lowered context-watchdog threshold, never at or past it", () => {
-    const prev = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    const names = ["LITTLE_CODER_COMPACT_AT_PERCENT", ENV_DEMOTE_OPEN_AT_PERCENT];
+    const prev = names.map((n) => process.env[n]);
     try {
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "70";
+      delete process.env[ENV_DEMOTE_OPEN_AT_PERCENT];
+      expect(resolveGateOptions().openAtPercent).toBe(100); // the clause is off; nothing to lower
+      process.env[ENV_DEMOTE_OPEN_AT_PERCENT] = "75";
       expect(resolveGateOptions().openAtPercent).toBe(65);
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "90";
-      expect(resolveGateOptions().openAtPercent).toBe(DEFAULT_DEMOTE_OPEN_AT_PERCENT);
+      expect(resolveGateOptions().openAtPercent).toBe(75);
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "0";
-      expect(resolveGateOptions().openAtPercent).toBe(DEFAULT_DEMOTE_OPEN_AT_PERCENT);
+      expect(resolveGateOptions().openAtPercent).toBe(75);
     } finally {
-      if (prev === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
-      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = prev;
+      names.forEach((n, i) => {
+        if (prev[i] === undefined) delete process.env[n];
+        else process.env[n] = prev[i];
+      });
     }
   });
 

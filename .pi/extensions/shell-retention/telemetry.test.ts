@@ -252,6 +252,7 @@ describe("shell-retention telemetry (wired)", () => {
 
   it("records the cost gate's verdict and estimates from pi's context usage", async () => {
     process.env[ENV_DEMOTE_BATCH] = "4";
+    process.env.LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT = "75"; // the context clause is off by default
     wired = wire();
     // Eight 4KB pairs then a long, shell-free tail: the oldest four are a due
     // batch whose break would re-prefill the whole tail.
