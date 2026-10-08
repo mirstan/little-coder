@@ -51,10 +51,13 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION=1                      opt in (default off)
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET=2048   omlx thinking cap; <=0 omits it
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S=240     no first token by then: a cache miss, fall back
-//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S=600          whole-request timeout
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S=360          whole-request timeout
 //
-// The two timeouts keep a slow replay plus pi's own fallback inside the
-// harness's 1800 s wait for a compaction (rpc_client PI_IDLE_WAIT_CAP_SEC).
+// The two timeouts aim to keep a slow replay plus pi's own fallback inside
+// the harness's 1800 s wait for a compaction (rpc_client PI_IDLE_WAIT_CAP_SEC).
+// That assumes pi's own request takes about what it measured at 190-200k
+// (820-955 s to first token, ~1000 s in all); it is not enforced, and a
+// fallback at a larger context can still overrun it.
 // A hit's TTFT is a normal turn's (5-50 s at 190-220k); a miss would prefill
 // the whole payload, kept tail and untruncated tool output included, which
 // costs more than pi's own request, so it is abandoned early.
@@ -71,7 +74,7 @@ export const ENV_THINKING_BUDGET = "LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING
 export const ENV_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S";
 export const ENV_TTFT_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S";
 const DEFAULT_THINKING_BUDGET = 2048;
-const DEFAULT_TIMEOUT_S = 600;
+const DEFAULT_TIMEOUT_S = 360;
 const DEFAULT_TTFT_TIMEOUT_S = 240;
 // Room the window must still have for the answer after the thinking budget.
 const MIN_ANSWER_TOKENS = 2048;
