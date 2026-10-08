@@ -1341,3 +1341,29 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     assert "n_deliberate_compactions" in source
     assert "preview_tool_result(" in source
     assert "[:400]" not in source, "raw slice should be gone from the log previews"
+
+
+def test_a_compaction_that_outlasts_the_wait_but_completes_is_recovered_not_failed():
+    """A cache-reuse attempt that falls back late can push pi's compaction past
+    PI_IDLE_WAIT_CAP_SEC. pi still finishes it; once pi is idle the late
+    response is picked up, so the compaction is reported ok and the trigger
+    re-arms instead of compaction being switched off for the trial."""
+    clock = _Clock()
+    seen = []
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(240_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[
+            TimeoutError("pi did not respond to request compact-0 within 1800s"),
+            {"tokensBefore": 230_000, "estimatedTokensAfter": 60_000},
+            {"tokensBefore": 240_000, "estimatedTokensAfter": 60_000},
+        ],
+    )
+    outcome = _run_compaction(rpc, clock, on_event=seen.append)
+    harness = [e for e in seen if e.get("type") == "lc_harness_compaction"]
+    assert [e["ok"] for e in harness] == [True, True]
+    # Re-armed: the second big turn compacted again.
+    assert len(rpc.compact_requests) == 2
+    assert outcome.n_deliberate_compactions == 2

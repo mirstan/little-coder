@@ -1637,8 +1637,10 @@ COMPACTION_CONTINUE_PROMPT = (
 #: Synthetic on_event event prompt_with_mid_run_compaction emits once per
 #: deliberate compaction, after the compact response settles. Not a pi event:
 #: pi's own compaction_start/compaction_end for a harness-requested compaction
-#: come after the run it aborted has ended, so they can sit in the queue until
-#: the next prompt's watermark trim in prompt_and_collect discards them.
+#: come after the run it aborted has ended. They are delivered from the queue
+#: once the compact response arrives (PiRpc.drain_compaction_events); only a
+#: compaction whose response never arrives leaves them to the next prompt's
+#: watermark trim.
 #: benchmarks/turn_ledger.py counts harness compactions from this alone.
 HARNESS_COMPACTION_EVENT = "lc_harness_compaction"
 
@@ -2079,11 +2081,33 @@ def prompt_with_mid_run_compaction(
         # session.prompt() refuses a message only while `isStreaming`, never
         # while `isCompacting`, so a continuation sent before the summary
         # lands is accepted and races pi rebuilding the transcript under it.
+        failure: Optional[BaseException] = None
+        data = None
         try:
             data = rpc.await_compact(
                 rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
             )
+        except TimeoutError as exc:
+            # pi may still be compacting, not wedged: a cache-reuse attempt
+            # that falls back late can push its own summary past the wait.
+            # Once pi is idle a finished compaction's response is already
+            # queued, so pick it up rather than recording a compaction pi
+            # completed as failed and switching compaction off for the trial.
+            failure = exc
+            if wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            ):
+                try:
+                    data = rpc.await_compact(rid, timeout=0)
+                    failure = None
+                    _log("compaction outlasted the wait but completed; using its late result")
+                except Exception:
+                    pass
         except Exception as exc:
+            failure = exc
+        if failure is not None:
+            exc = failure
             _drain_compaction_events(rpc, trigger, _log)
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
