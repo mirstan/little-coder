@@ -321,6 +321,41 @@ def test_once_writes_alerts_jsonl_returns_1_on_crit_and_does_not_repeat(tmp_path
     assert len((job / "alerts.jsonl").read_text().splitlines()) == 1
 
 
+def test_once_returns_2_when_alerts_jsonl_cannot_be_written_and_still_prints_the_alert(tmp_path):
+    job = make_job(tmp_path)
+    (job / TRIAL / "agent" / "turns.jsonl").write_text(json.dumps(rec(1, stop_reason="length", output=900)) + "\n")
+    (job / "alerts.jsonl").mkdir()
+    out = io.StringIO()
+    assert W.main([str(job), "--once"], out=out) == 2
+    assert "length_stop" in out.getvalue() and "could not write alerts.jsonl" in out.getvalue()
+
+
+def test_an_alert_whose_write_failed_is_raised_again_and_written_once(tmp_path, monkeypatch):
+    job = make_job(tmp_path)
+    (job / TRIAL / "agent" / "turns.jsonl").write_text(json.dumps(rec(1, stop_reason="length", output=900)) + "\n")
+    ws = W.WatchState(target=job, cfg=W.RuleConfig())
+    now = time.time()
+    real_append = W._append_alerts
+
+    def failing(job_dir, alerts):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(W, "_append_alerts", failing)
+    admitted, lines = W.poll_once(ws, now)
+    assert [a.rule for a in admitted] == ["length_stop"]
+    assert W._emit(ws, admitted, lines, io.StringIO()) is False
+    assert ("length_stop", TRIAL, "turn 1") not in ws.dedup.seen
+    assert ("length_stop", TRIAL) not in ws.dedup.last_emit
+
+    monkeypatch.setattr(W, "_append_alerts", real_append)
+    admitted2, lines2 = W.poll_once(ws, now + 1)
+    assert [a.rule for a in admitted2] == ["length_stop"]
+    assert W._emit(ws, admitted2, lines2, io.StringIO()) is True
+    assert W.poll_once(ws, now + 2)[0] == []
+    rows = [json.loads(line) for line in (job / "alerts.jsonl").read_text().splitlines()]
+    assert [(r["rule"], r["subject"]) for r in rows] == [("length_stop", "turn 1")]
+
+
 def test_rule_flags_beat_env_and_env_beats_defaults(tmp_path, monkeypatch):
     job = make_job(tmp_path)
     (job / TRIAL / "agent" / "turns.jsonl").write_text(json.dumps(rec(1, output=900, ttft_s=1.0)) + "\n")

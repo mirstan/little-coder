@@ -295,6 +295,41 @@ def test_matching_needs_the_prompt_count_not_just_the_time_window():
     assert W.classify_divergence(div_event(1201.0, 33_000, 1_000, 30_000, 32_000), st, W.RuleConfig(), now=1250.0) is None
 
 
+ABORTED = dict(ts_start=1200.0, ts_end=1300.0, usage_reported=False, prompt_tokens=0, input=0, output=0,
+               stop_reason="aborted")
+
+
+def test_an_aborted_turn_without_usage_matches_on_its_window_alone():
+    st = ledger(rec(1, **T1), rec(2, demoted_new=4, retention=retention(12, 8, 8), **ABORTED))
+    # now is inside the turn window's wait: decided because the record exists, not by timeout.
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1301.0)
+    assert rules(got) == [("info", "expected_divergence")]
+    assert got[0].data["turn"] == 2 and got[0].data["explained_by"] == ["demotion"]
+
+
+def test_an_unexplained_divergence_on_an_aborted_turn_names_that_turn():
+    st = ledger(rec(1, **T1), rec(2, **ABORTED))
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1301.0)
+    assert rules(got) == [("warn", "prefix_divergence")]
+    assert got[0].data["turn"] == 2 and "no matching turn record" not in got[0].message
+
+
+def test_a_prompt_size_match_beats_an_aborted_turn_in_the_same_window():
+    st = ledger(rec(1, **T1), rec(2, demoted_new=4, **ABORTED),
+                rec(3, ts_start=1250.0, ts_end=1300.0, prompt_tokens=70_000))
+    got = W.classify_divergence(div_event(1260.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1301.0)
+    assert rules(got) == [("warn", "prefix_divergence")] and got[0].data["turn"] == 3
+
+
+def test_the_in_output_check_skips_an_aborted_turn_for_the_previous_output():
+    st = ledger(rec(1, ts_start=1000.0, ts_end=1100.0, prompt_tokens=50_000, output=20_000),
+                rec(2, ts_start=1110.0, ts_end=1150.0, usage_reported=False, prompt_tokens=0, output=0,
+                    stop_reason="aborted"),
+                rec(3, ts_start=1200.0, ts_end=1300.0, prompt_tokens=71_000))
+    got = W.classify_divergence(div_event(1201.0, 71_000, 55_000, 70_000, 16_500), st, W.RuleConfig(), now=1400.0)
+    assert rules(got) == [("info", "divergence_in_output")] and got[0].data["turn"] == 3
+
+
 def test_divergence_counts_by_class_are_kept_on_the_trial():
     st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4))
     W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)

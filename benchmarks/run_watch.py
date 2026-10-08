@@ -23,15 +23,17 @@ trial whose agent/little_coder.log is non-empty (the adapter writes it once
 the agent has finished) is "verifying": no stall alerts.
 
 An omlx prefix-cache divergence deep in history is joined to the turn whose
-request produced it (same trial, timestamp inside the turn, same prompt size;
-see classify_divergence) and reported as expected_divergence when that turn
+request produced it (same trial, timestamp inside the turn, same prompt size
+when the turn reported usage; see classify_divergence) and reported as expected_divergence when that turn
 demoted, stubbed or followed a compaction, as divergence_in_output when it
 split the previous turn's generated output (jundot/omlx#4353), and as a
 prefix_divergence warning only when the ledger explains nothing.
 
 --once makes one pass over everything already written and exits 1 when it
-raised a crit alert, 2 when the pass itself failed, else 0. Alerts already in
-alerts.jsonl are not raised again, so cron can call it.
+raised a crit alert, 2 when the pass itself failed or its alerts could not be
+written to alerts.jsonl, else 0. Alerts already in alerts.jsonl are not raised
+again, so cron can call it; an alert whose write failed is not recorded as
+raised, so the next pass raises it again.
 
 Run a copy. CPython compiles this whole file before running it, and it
 imports only the standard library, all at the top (test_run_watch_io.py
@@ -221,7 +223,8 @@ class RuleConfig:
     divergence_gap_tokens: int = 8_192
     #: How long a divergence waits for the turn record that produced it.
     divergence_match_wait_s: float = 1800.0
-    #: |server prompt - ledger prompt_tokens| still counted as the same request.
+    #: |server prompt - ledger prompt_tokens| still counted as the same request
+    #: (only for turns that reported usage; see classify_divergence).
     divergence_match_tokens: int = 16
     cache_min_prompt_tokens: int = 40_000
     cache_min_hit_ratio: float = 0.5
@@ -261,7 +264,8 @@ class TrialState:
     turns_over_ctx: int = 0
     cache_reported: bool = False
     fired_once: set = field(default_factory=set)
-    #: Recent turns as {turn, ts_start, ts_end, prompt, output, explained_by}; the
+    #: Recent turns as {turn, ts_start, ts_end, prompt, output, usage_reported,
+    #: explained_by}; the
     #: join key for server-side prefix divergences (classify_divergence).
     turns: list = field(default_factory=list)
     #: Classified divergences by rule name.
@@ -398,7 +402,8 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
     if any(c.get("ok") for c in comps):
         explained_by.append("compaction")
     st.turns.append({"turn": rec.get("turn"), "ts_start": _num(rec.get("ts_start")) or ts, "ts_end": ts,
-                     "prompt": prompt, "output": output, "explained_by": explained_by})
+                     "prompt": prompt, "output": output, "usage_reported": bool(rec.get("usage_reported")),
+                     "explained_by": explained_by})
     del st.turns[:-MAX_REMEMBERED_TURNS]
 
     if st.max_demoted == 0 and "no_demotions" not in st.fired_once:
@@ -439,7 +444,9 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
     The match: the server line's timestamp falls inside a turn's
     [ts_start, ts_end] (+/- DIVERGENCE_WINDOW_SLACK_S) AND its prompt size
     ("re-prefills X of Y tokens", Y) is that turn's prompt_tokens within
-    divergence_match_tokens. omlx logs the line when prefill starts and the
+    divergence_match_tokens. A turn that reported no usage (aborted or
+    errored, prompt_tokens 0) matches on the window alone, used only when no
+    turn matches on prompt size. omlx logs the line when prefill starts and the
     ledger writes the record at turn_end, so an unmatched divergence waits
     (returns None) until the record lands. It is decided as unmatched once a
     later turn has started after it, or after divergence_match_wait_s.
@@ -449,7 +456,8 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
       length-truncated message, or followed a successful compaction; each
       rewrites history on purpose (shell-retention batching, #81).
     - divergence_in_output (info): the shared prefix ends inside the previous
-      turn's generated output, where omlx re-tokenizes the sampled tokens
+      turn's generated output (the nearest earlier turn that reported usage),
+      where omlx re-tokenizes the sampled tokens
       (jundot/omlx#4353); costly but not a harness defect.
     - prefix_divergence (warn): nothing in the ledger explains it.
     """
@@ -457,11 +465,15 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
     prompt, shared, comparable, reprefill = (_n(ev.get(k)) for k in ("prompt", "shared", "comparable", "reprefill"))
     gap = comparable - shared
     slack = DIVERGENCE_WINDOW_SLACK_S
-    matched = None
+    by_prompt = by_window = None
     for i, t in enumerate(st.turns):
-        if (t["ts_start"] - slack <= ts <= t["ts_end"] + slack
-                and abs(t["prompt"] - prompt) <= cfg.divergence_match_tokens):
-            matched = (i, t)
+        if not t["ts_start"] - slack <= ts <= t["ts_end"] + slack:
+            continue
+        if not t["usage_reported"]:
+            by_window = (i, t)
+        elif abs(t["prompt"] - prompt) <= cfg.divergence_match_tokens:
+            by_prompt = (i, t)
+    matched = by_prompt or by_window
     data = {"reprefill": reprefill, "shared": shared, "comparable": comparable, "prompt": prompt}
     subject = f"{ev.get('src')} {ts:.3f}"
     detail = f"{gap:,} tokens before its end; re-prefilling {reprefill:,} of {prompt:,}"
@@ -481,7 +493,7 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
         return out("info", "expected_divergence",
                    f"turn {t['turn']} rewrote history ({', '.join(t['explained_by'])}): diverged {detail}",
                    {"turn": t["turn"], "explained_by": list(t["explained_by"])})
-    prev = st.turns[i - 1] if i > 0 else None
+    prev = next((p for p in reversed(st.turns[:i]) if p["usage_reported"]), None)
     if (prev is not None and prev["output"] > 0
             and prev["prompt"] - OUTPUT_SPAN_SLACK_TOKENS <= shared
             <= prev["prompt"] + prev["output"] + OUTPUT_SPAN_SLACK_TOKENS):
@@ -549,8 +561,11 @@ def evaluate_stall(st: TrialState, now: float, last_turn_ts: float, live_log_ts:
                   f"no new turn for {idle_min:.0f} min ({note})", {"idle_min": round(idle_min, 1)})]
 
 
-def admit(state: DedupState, alert: Alert, cooldown_s: float) -> bool:
-    """False for an identical (rule, trial, subject) seen before, or a non-crit within cooldown."""
+def admit(state: DedupState, alert: Alert, cooldown_s: float, undo: Optional[list] = None) -> bool:
+    """False for an identical (rule, trial, subject) seen before, or a non-crit within cooldown.
+
+    An admitted alert appends what it changed to `undo`, for unadmit.
+    """
     ident = (alert.rule, alert.trial, alert.subject)
     if ident in state.seen:
         return False
@@ -563,8 +578,23 @@ def admit(state: DedupState, alert: Alert, cooldown_s: float) -> bool:
     held = state.suppressed.pop(key, 0)
     if held:
         alert.data["suppressed_before"] = held
+    if undo is not None:
+        undo.append((alert, ident, key, last, held))
     state.last_emit[key] = alert.ts
     return True
+
+
+def unadmit(state: DedupState, undo: list) -> None:
+    """Reverse admit() for the alerts in `undo`, newest first, so they can be admitted again."""
+    for alert, ident, key, last, held in reversed(undo):
+        state.seen.discard(ident)
+        if last is None:
+            state.last_emit.pop(key, None)
+        else:
+            state.last_emit[key] = last
+        if held:
+            state.suppressed[key] = state.suppressed.get(key, 0) + held
+            alert.data.pop("suppressed_before", None)
 
 
 def seed_dedup(state: DedupState, rows: list) -> None:
@@ -639,6 +669,10 @@ class WatchState:
     server_last: dict = field(default_factory=dict)
     #: (event, trial name) divergences waiting for their turn record.
     pending_divergences: list = field(default_factory=list)
+    #: What the last poll_once's admit() calls changed, for _emit to undo.
+    admit_undo: list = field(default_factory=list)
+    #: Alerts whose write to alerts.jsonl failed; offered to admit() again next poll.
+    unwritten: list = field(default_factory=list)
 
 
 def read_new_lines(st: TailState) -> list[str]:
@@ -852,13 +886,14 @@ def format_status(ws: WatchState, now: float) -> str:
 def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[list[Alert], list[str]]:
     """One pass: new turn records, finished trials, server lines, stalls; admitted alerts and output lines."""
     lines: list[str] = []
-    alerts: list[Alert] = []
     job = resolve_job_dir(ws.target)
     if job is not None and job != ws.job_dir:
-        ws.job_dir, ws.trials, ws.dedup = job, {}, DedupState()
+        ws.job_dir, ws.trials, ws.dedup, ws.unwritten = job, {}, DedupState(), []
         ws.job_start_ts = _mtime(job / "config.json")
         seed_dedup(ws.dedup, _load_alert_rows(job / ALERTS_FILENAME))
         lines.append(f"watching job {job}")
+    alerts: list[Alert] = ws.unwritten
+    ws.unwritten = []
     if ws.job_dir is not None:
         for tdir in discover_trials(ws.job_dir):
             tw = ws.trials.get(tdir.name)
@@ -890,7 +925,8 @@ def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[l
             last_turn = max(tw.state.start_ts, _mtime(tw.tail.path) or 0.0)
             live = _mtime(tw.dir / "agent" / LIVE_LOG_FILENAME)
             alerts.extend(evaluate_stall(tw.state, now, last_turn, live, ws.cfg))
-    admitted = [a for a in alerts if admit(ws.dedup, a, ws.cfg.cooldown_s)]
+    ws.admit_undo = []
+    admitted = [a for a in alerts if admit(ws.dedup, a, ws.cfg.cooldown_s, ws.admit_undo)]
     lines.extend(format_alert(a) for a in admitted)
     if force_status or ws.last_status_ts is None or now - ws.last_status_ts >= ws.status_interval_s:
         lines.append(format_status(ws, now))
@@ -916,14 +952,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _emit(ws: WatchState, admitted: list, lines: list, out: Any) -> None:
+def _emit(ws: WatchState, admitted: list, lines: list, out: Any) -> bool:
+    """Append admitted alerts to alerts.jsonl and print the lines; False when the append failed.
+
+    A failed append undoes those alerts' admission and queues them for the
+    next poll, so they are raised again rather than lost.
+    """
+    ok = True
     if admitted and ws.job_dir is not None:
         try:
             _append_alerts(ws.job_dir, admitted)
         except OSError as exc:
+            ok = False
+            unadmit(ws.dedup, ws.admit_undo)
+            ws.unwritten = list(admitted)
             print(f"could not write {ALERTS_FILENAME}: {exc}", file=out, flush=True)
     for line in lines:
         print(line, file=out, flush=True)
+    return ok
 
 
 def main(argv: Optional[list[str]] = None, *, now: Callable[[], float] = time.time, out: Any = None) -> int:
@@ -948,7 +994,8 @@ def main(argv: Optional[list[str]] = None, *, now: Callable[[], float] = time.ti
         except Exception as exc:
             print(f"poll failed: {type(exc).__name__}: {exc}", file=out, flush=True)
             return 2
-        _emit(ws, admitted, lines, out)
+        if not _emit(ws, admitted, lines, out):
+            return 2
         return 1 if any(a.level == "crit" for a in admitted) else 0
 
     stopping = False
