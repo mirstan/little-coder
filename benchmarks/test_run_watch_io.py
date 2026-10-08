@@ -97,6 +97,13 @@ def test_a_server_log_backlog_starts_near_the_end_on_a_line_boundary(tmp_path):
     assert W.read_new_lines(st) == ["line-three"]
 
 
+def test_a_backlog_that_starts_exactly_on_a_line_start_keeps_that_line(tmp_path):
+    p = tmp_path / "omlx.log"
+    p.write_bytes(b"line-one\nline-two\nline-three\n")
+    st = W.TailState(path=p, start_at_end_bytes=len(b"line-two\nline-three\n"))
+    assert W.read_new_lines(st) == ["line-two", "line-three"]
+
+
 def test_job_and_trial_discovery_use_harbor_config_keys(tmp_path):
     old = make_job(tmp_path, "2026-10-06__10-00-00")
     new = make_job(tmp_path, "2026-10-07__18-00-00", trials=(TRIAL, "regex-log__xyz789"))

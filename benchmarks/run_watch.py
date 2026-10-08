@@ -558,7 +558,8 @@ def read_new_lines(st: TailState) -> list[str]:
             st.inode, st.offset, st.partial = info.st_ino, 0, b""
             if first_open and st.start_at_end_bytes is not None and info.st_size > st.start_at_end_bytes:
                 st.offset = info.st_size - st.start_at_end_bytes
-                drop_first = True
+                fh.seek(st.offset - 1)
+                drop_first = fh.read(1) != b"\n"
         fh.seek(st.offset)
         data = fh.read()
     st.offset += len(data)
