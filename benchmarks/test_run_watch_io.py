@@ -426,3 +426,18 @@ def test_a_reuse_compactions_server_ttft_spike_is_dropped_and_reported_once(tmp_
         fh.write(json.dumps(rec(2, ts_start=at + 10, ts_end=at + 60, prompt_tokens=31_000, guards=[telemetry])) + "\n")
     alerts, _ = W.poll_once(ws, at + 65)
     assert [(a.level, a.rule) for a in alerts] == [("info", "compaction_reuse")]
+
+
+def test_a_held_ttft_spike_does_not_follow_the_watcher_into_a_new_job(tmp_path):
+    jobs = tmp_path / "runs"
+    old = make_job(jobs, name="2026-10-07__18-00-00")
+    ws = W.WatchState(target=jobs, cfg=W.RuleConfig())
+    W.poll_once(ws, time.time())
+    ev = {"src": "omlx", "kind": "completion", "ts": 1.0, "prompt": 1, "cached": None, "output": 1, "ttft_s": 999.0}
+    ws.pending_ttft.append((ev, TRIAL, W.evaluate_server_event(ev, TRIAL, ws.cfg)[0]))
+    new = make_job(jobs, name="2026-10-08__18-00-00")
+    later = time.time() + 10
+    os.utime(new / "config.json", (later, later))
+    alerts, _ = W.poll_once(ws, later + 1)
+    assert ws.job_dir == new and ws.pending_ttft == []
+    assert [a.rule for a in alerts if a.rule == "ttft_spike"] == []

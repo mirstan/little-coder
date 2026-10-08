@@ -1012,6 +1012,7 @@ def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[l
     job = resolve_job_dir(ws.target)
     if job is not None and job != ws.job_dir:
         ws.job_dir, ws.trials, ws.dedup, ws.unwritten = job, {}, DedupState(), []
+        ws.pending_ttft = []
         ws.job_start_ts = _mtime(job / "config.json")
         seed_dedup(ws.dedup, _load_alert_rows(job / ALERTS_FILENAME))
         lines.append(f"watching job {job}")
