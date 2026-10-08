@@ -82,8 +82,9 @@ export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 // cached) and are judged again on the next request.
 //  - S >= minSaveRatio * R: the break is shallow next to what it sheds.
 //  - context >= openAtPercent% of the window: near compaction, where shed
-//    tokens count. Below the harness's 220K trigger (84% of 262K) and the
-//    interactive context-watchdog's 80%.
+//    tokens count. Below the harness trigger (min(220K, 84% of the window),
+//    benchmarks/rpc_client.py) for every window the gate runs on, and kept 5
+//    points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT.
 //  - raw bytes pending in the jump >= forcePendingBytes: a burst of huge
 //    outputs. Never fired in the replay; a backstop only.
 // Replay (473 breaks, 57 trial segments): today's policy spent 7.1 h
@@ -105,6 +106,14 @@ export const DEFAULT_DEMOTE_FORCE_PENDING_BYTES = 262144;
  * window; at 32K, 75% sits ~3K tokens under the harness compaction trigger.
  */
 export const MIN_GATE_WINDOW = 131072;
+/**
+ * And above this one: the harness compacts at min(220K, 84% of the window)
+ * (benchmarks/rpc_client.py), so past ~293K the 75% open point would sit
+ * beyond compaction and the gate would defer every due pair into it.
+ */
+export const MAX_GATE_WINDOW = 262144;
+/** The open point stays this many points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT. */
+const WATCHDOG_MARGIN_PERCENT = 5;
 /** pi's estimateTokens convention (compaction.js), so estimates line up with getContextUsage's trailing part. */
 export const CHARS_PER_TOKEN = 4;
 
@@ -136,9 +145,19 @@ export type GateReason = "ratio" | "context" | "bytes" | "cold";
 export function resolveGateOptions(): GateOptions {
   return {
     minSaveRatio: envNumber(ENV_DEMOTE_MIN_SAVE_RATIO, DEFAULT_DEMOTE_MIN_SAVE_RATIO),
-    openAtPercent: envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT),
+    openAtPercent: openAtPercent(),
     forcePendingBytes: envNumber(ENV_DEMOTE_FORCE_PENDING_BYTES, DEFAULT_DEMOTE_FORCE_PENDING_BYTES),
   };
+}
+
+// An operator who lowers context-watchdog's threshold (default 80) below the
+// open point would otherwise have it compact before the gate could open.
+function openAtPercent(): number {
+  const open = envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT);
+  if (open <= 0 || process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return open;
+  const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", 0);
+  if (watchdog <= 0 || watchdog >= 100) return open;
+  return Math.min(open, watchdog - WATCHDOG_MARGIN_PERCENT);
 }
 
 /** Why a due jump may go ahead, or null to defer it. */
@@ -680,7 +699,7 @@ export function demoteMessagesWithStats(
   const window = gate?.context.contextWindow;
   if (
     gate && gate.options.openAtPercent > 0 &&
-    typeof window === "number" && Number.isFinite(window) && window >= MIN_GATE_WINDOW
+    typeof window === "number" && window >= MIN_GATE_WINDOW && window <= MAX_GATE_WINDOW
   ) {
     // The latch. Each request sees pristine history, and the gate's inputs
     // are not monotone in it (the context reading drops once a jump lands),

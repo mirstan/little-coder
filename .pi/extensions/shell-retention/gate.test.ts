@@ -15,6 +15,7 @@ import {
   DEFAULT_MIN_PAIR_BYTES,
   DEFAULT_RETAIN_RAW,
   DEFAULT_STALE_DISTANCE,
+  MAX_GATE_WINDOW,
   MIN_GATE_WINDOW,
   ENV_DEMOTE_FORCE_PENDING_BYTES,
   ENV_DEMOTE_MIN_SAVE_RATIO,
@@ -153,6 +154,13 @@ describe("resolveGateOptions", () => {
       "LITTLE_CODER_SHELL_DEMOTE_FORCE_PENDING_BYTES",
     ]);
     for (const n of names) delete process.env[n];
+    const watchdog = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    try {
+      expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.1, openAtPercent: 75, forcePendingBytes: 262144 });
+    } finally {
+      if (watchdog !== undefined) process.env.LITTLE_CODER_COMPACT_AT_PERCENT = watchdog;
+    }
     expect(resolveGateOptions()).toEqual({ minSaveRatio: 0.1, openAtPercent: 75, forcePendingBytes: 262144 });
     process.env[ENV_DEMOTE_MIN_SAVE_RATIO] = "0.5";
     process.env[ENV_DEMOTE_OPEN_AT_PERCENT] = "0";
@@ -289,6 +297,30 @@ describe("demoteMessagesWithStats with the cost gate", () => {
       context: { ...ctx, model: { provider: "omlx", id: "new-model" } },
     });
     expect(switched.stats).toMatchObject({ gate: "open", gateReason: "cold" });
+  });
+
+  it("stays off above MAX_GATE_WINDOW, where 75% of the window lies past the 220K harness trigger", () => {
+    const out = demoteMessagesWithStats(deep(), memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 120_000, contextWindow: MAX_GATE_WINDOW + 1 },
+    });
+    expect(out.stats.gate).toBe("off");
+    expect(out.demotedCount).toBe(B);
+  });
+
+  it("opens below a lowered context-watchdog threshold, never at or past it", () => {
+    const prev = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    try {
+      process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "70";
+      expect(resolveGateOptions().openAtPercent).toBe(65);
+      process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "90";
+      expect(resolveGateOptions().openAtPercent).toBe(DEFAULT_DEMOTE_OPEN_AT_PERCENT);
+      process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "0";
+      expect(resolveGateOptions().openAtPercent).toBe(DEFAULT_DEMOTE_OPEN_AT_PERCENT);
+    } finally {
+      if (prev === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = prev;
+    }
   });
 
   it("stays off below MIN_GATE_WINDOW, where its defaults were never fitted", () => {
