@@ -60,7 +60,8 @@ export const DEFAULT_RECALL_MAX = 49152;
 export const DEFAULT_DEMOTE_BATCH = 4;
 // Raw bytes allowed in pairs that per-pair demotion would already have shrunk
 // but whose batch is not yet due. Past it, every due pair demotes at once, so
-// those bytes never exceed this budget (<= 0 disables the flush). The trigger
+// those bytes never exceed this budget (<= 0 disables the flush), unless the
+// cost gate defers the flush, which forcePendingBytes then bounds. The trigger
 // is bytes, not age: a break late in history re-prefills the most of it, and
 // an age-triggered flush measured worse than per-pair demotion in sparse
 // sessions. A lone stale pair under the budget therefore stays raw for good;
@@ -118,6 +119,8 @@ export interface GateContext {
   /** pi's getContextUsage().tokens: the last request's usage plus an estimate of what followed; null when unknown. */
   contextTokens: number | null;
   contextWindow: number | null;
+  /** The model this request goes to; a history last answered by another one has no warm prefix there. */
+  model?: { provider?: string; id?: string } | null;
 }
 
 export interface GateInput {
@@ -523,7 +526,7 @@ export interface DemotionStats {
   prefix: number;
   /** Pairs replaced in this projection; equals demotedCount. */
   demoted: number;
-  /** True when the pending-bytes flush overrode the batch boundary. */
+  /** True when the pending-bytes flush overrode the batch boundary (the cost gate may still defer it). */
   flushed: boolean;
   /** Pairs in the prefix whose call message counts as signed, so their command is never rewritten. */
   signed: number;
@@ -570,7 +573,8 @@ export interface GateArgs {
  * and its prefix cache warm, for every turn between jumps. The one exception
  * is byte pressure: when the due pairs past the last whole batch (not yet
  * demoted) hold more than demotePendingBytes raw, the prefix takes all of
- * them, so raw-but-due bytes never exceed that budget. Bytes, not age, because
+ * them, so raw-but-due bytes never exceed that budget (unless the cost gate
+ * below defers the flush; then forcePendingBytes bounds them). Bytes, not age, because
  * a late break re-prefills the most history. Until the batch boundary passes
  * them, those pending pairs only gain members as history is appended, so once
  * a flush fires every later call flushes again or the boundary has already
@@ -714,7 +718,16 @@ export function demoteMessagesWithStats(
       }
       return n;
     };
-    const cold = gate.context.contextTokens === null;
+    // Cold when pi has no usage reading (between a compaction and the next
+    // response), or when the last response came from another model: either
+    // way the server this request goes to holds no prefix to break.
+    const lastAssistant = [...messages].reverse().find((m) => m?.role === "assistant");
+    const want = gate.context.model;
+    const switched = !!want && !!lastAssistant &&
+      ((typeof lastAssistant.provider === "string" && typeof want.provider === "string" &&
+        lastAssistant.provider !== want.provider) ||
+       (typeof lastAssistant.model === "string" && typeof want.id === "string" && lastAssistant.model !== want.id));
+    const cold = gate.context.contextTokens === null || switched;
     const contextTokens = gate.context.contextTokens ??
       Math.ceil((totalChars - savedChars(0, sticky)) / CHARS_PER_TOKEN);
     stats.estContextTokens = contextTokens;
@@ -746,8 +759,7 @@ export function demoteMessagesWithStats(
       };
       stats.estSaveTokens = input.estSaveTokens;
       stats.estReprefillTokens = input.estReprefillTokens;
-      // pi reads no usage only between a compaction and the first response
-      // after it, when the server's cache is cold anyway: a break is free.
+      // A break on a cold cache is free.
       const reason = cold ? "cold" : demotionGate(input, gate.options);
       stats.gateReason = reason;
       if (reason) {

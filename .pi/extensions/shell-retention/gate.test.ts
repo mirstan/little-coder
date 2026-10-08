@@ -275,6 +275,22 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     expect(out.stats.estContextTokens).toBeGreaterThan(100_000);
   });
 
+  it("treats the first request after a model switch as cold: the new server holds no prefix", () => {
+    const msgs = deep();
+    for (const m of msgs) if (m.role === "assistant") Object.assign(m, { provider: "omlx", model: "old-model" });
+    const ctx = { contextTokens: 120_000, contextWindow: WINDOW };
+    const same = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { ...ctx, model: { provider: "omlx", id: "old-model" } },
+    });
+    expect(same.stats.gate).toBe("deferred");
+    const switched = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { ...ctx, model: { provider: "omlx", id: "new-model" } },
+    });
+    expect(switched.stats).toMatchObject({ gate: "open", gateReason: "cold" });
+  });
+
   it("stays off below MIN_GATE_WINDOW, where its defaults were never fitted", () => {
     const msgs = deep();
     const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {

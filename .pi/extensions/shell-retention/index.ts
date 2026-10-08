@@ -135,7 +135,12 @@ function gateContext(ctx: any): GateContext {
     const usage = ctx?.getContextUsage?.();
     const tokens = typeof usage?.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null;
     const window = typeof usage?.contextWindow === "number" ? usage.contextWindow : ctx?.model?.contextWindow;
-    return { contextTokens: tokens, contextWindow: typeof window === "number" ? window : null };
+    const model = ctx?.model;
+    return {
+      contextTokens: tokens,
+      contextWindow: typeof window === "number" ? window : null,
+      model: model ? { provider: model.provider, id: model.id } : null,
+    };
   } catch {
     return { contextTokens: null, contextWindow: null };
   }
