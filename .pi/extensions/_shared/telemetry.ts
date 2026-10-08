@@ -36,7 +36,8 @@ export type TelemetryKind =
   | "length_stub"
   | "echo_block"
   | "guard_abort"
-  | "guard_stand_down";
+  | "guard_stand_down"
+  | "compaction_reuse";
 
 export function telemetryEnabled(): boolean {
   return process.env[ENV_TELEMETRY] === "1";
