@@ -252,6 +252,23 @@ describe("reuse path", () => {
     expect(instruction).toContain("Now fix the build in /app.");
   });
 
+  it("carries the file lists of an earlier extension-made compaction, which pi itself skips", async () => {
+    const s0 = await splitWithHistory();
+    // pi stores a compaction an extension returned with fromHook: true, and its
+    // extractFileOperations ignores such details on the next compaction.
+    s0.sm.appendCompaction("## Goal\nOLD\n\n## Next Steps\n1. go", s0.prep.firstKeptEntryId, 999, { readFiles: ["/old-read"], modifiedFiles: ["/old-mod"] }, true);
+    longTurn(s0.sm, "Your session context was compacted; continue.", 30, "e");
+    const { prepareCompaction } = await piCompaction();
+    const branch = s0.sm.getBranch();
+    const s: Scenario = { sm: s0.sm, branch, prep: prepareCompaction(branch, SETTINGS), payload: await realPayload(contextMessages(s0.sm)) };
+    reply = answer(both);
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, deps);
+    expect(out.ok).toBe(true);
+    expect((out as any).compaction.details.readFiles).toContain("/old-read");
+    expect((out as any).compaction.details.modifiedFiles).toContain("/old-mod");
+    expect((out as any).compaction.summary).toContain("/old-mod");
+  });
+
   it("serves a benchmark-shaped session whose cut lands on a telemetry custom entry", async () => {
     const s = await telemetrySplit();
     const kept = s.branch.find((e: any) => e.id === s.prep.firstKeptEntryId);

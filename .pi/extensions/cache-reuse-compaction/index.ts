@@ -24,8 +24,10 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 // replays it with one extra user message asking for pi's summary. The server
 // then prefills only the uncached tail and the instruction. The result is
 // returned in pi's own CompactionResult shape (pi's firstKeptEntryId,
-// tokensBefore, split-turn merge and file lists), so pi stores and reloads it
-// exactly as it would its own.
+// tokensBefore, split-turn merge and file lists). One difference pi imposes:
+// it stores a returned compaction with fromHook: true and does not carry its
+// file lists into the next compaction, so carriedFileOps() does that for the
+// next reuse compaction (a native fallback after one still loses them).
 //
 // What makes the prefix identical (replay.ts buildReplayBody):
 // - the captured body is cloned, one user message is appended, and only
@@ -205,6 +207,25 @@ export function planReuse(
   return { body: buildReplayBody(capture.payload, instruction, { maxTokens, thinkingBudget: thinking }), want, maxTokens };
 }
 
+/**
+ * pi's fileOps plus the file lists of the latest compaction when an extension
+ * made it. pi stores a returned compaction with fromHook: true, and its own
+ * extractFileOperations only carries details forward from compactions it made
+ * itself (compaction.js extractFileOperations), so without this every reuse
+ * compaction would reset the file record. A native fallback after a reuse
+ * compaction still loses them: that is pi's code path.
+ */
+export function carriedFileOps(fileOps: any, branchEntries: any[]): any {
+  const out = { read: new Set<string>(fileOps.read), written: new Set<string>(fileOps.written), edited: new Set<string>(fileOps.edited) };
+  let last: any;
+  for (const e of branchEntries) if (e?.type === "compaction") last = e;
+  if (last?.fromHook && last.details) {
+    for (const f of Array.isArray(last.details.readFiles) ? last.details.readFiles : []) if (typeof f === "string") out.read.add(f);
+    for (const f of Array.isArray(last.details.modifiedFiles) ? last.details.modifiedFiles : []) if (typeof f === "string") out.edited.add(f);
+  }
+  return out;
+}
+
 function toUsage(u: StreamUsage | null, model: any) {
   const cacheRead = u?.cachedTokens ?? 0;
   const input = Math.max(0, (u?.promptTokens ?? 0) - cacheRead);
@@ -356,7 +377,7 @@ export async function runReuse(
   let summary = plan.want.prefix
     ? mergeSplitTurn(parsed.history ?? PI_NO_PRIOR_HISTORY, parsed.prefix as string)
     : (parsed.history as string);
-  const { readFiles, modifiedFiles } = computeFileLists(prep.fileOps);
+  const { readFiles, modifiedFiles } = computeFileLists(carriedFileOps(prep.fileOps, event.branchEntries ?? []));
   summary += formatFileOperations(readFiles, modifiedFiles);
   return {
     ok: true,
