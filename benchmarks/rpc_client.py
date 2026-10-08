@@ -280,6 +280,11 @@ class PiRpc:
         # Required api-key envs (pi requires SOMETHING even for local providers)
         full_env.setdefault("LLAMACPP_API_KEY", "noop")
         full_env.setdefault("OLLAMA_API_KEY", "noop")
+        # Extension telemetry (lc-telemetry entries, read by turn_ledger.py)
+        # is opt-in inside pi so interactive sessions don't grow their
+        # session files. Every benchmark harness spawns pi through here, so
+        # turn it on unless the caller or the environment chose otherwise.
+        full_env.setdefault("LITTLE_CODER_TELEMETRY", "1")
         # Not setdefault: an exported value must also skip the mkdir.
         if "PI_CODING_AGENT_DIR" not in full_env:
             full_env["PI_CODING_AGENT_DIR"] = _bench_agent_dir()
@@ -1598,6 +1603,31 @@ COMPACTION_CONTINUE_PROMPT = (
 )
 
 
+#: Synthetic on_event event prompt_with_mid_run_compaction emits once per
+#: deliberate compaction, after the compact response settles. Not a pi event:
+#: pi's own compaction_start/compaction_end for a harness-requested compaction
+#: come after the run it aborted has ended, so they can sit in the queue until
+#: the next prompt's watermark trim in prompt_and_collect discards them.
+#: benchmarks/turn_ledger.py counts harness compactions from this alone.
+HARNESS_COMPACTION_EVENT = "lc_harness_compaction"
+
+
+def _notify_harness_compaction(
+    on_event: Optional[Callable[[dict], None]],
+    payload: dict,
+    log: Callable[[str], None],
+) -> None:
+    """Hand on_event one HARNESS_COMPACTION_EVENT; a raise is logged, never propagated."""
+    if on_event is None:
+        return
+    try:
+        on_event({"type": HARNESS_COMPACTION_EVENT, **payload})
+    except Exception as exc:
+        # The callback is telemetry here: it must not end the trial the
+        # compaction was meant to extend.
+        log(f"on_event raised on {HARNESS_COMPACTION_EVENT}: {type(exc).__name__}: {exc}")
+
+
 def _turn_context_tokens(event: dict) -> Optional[int]:
     """Context-token estimate carried by one `turn_end` event, or None.
 
@@ -2009,8 +2039,20 @@ def prompt_with_mid_run_compaction(
         except Exception as exc:
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
+            _notify_harness_compaction(on_event, {
+                "n": n_compactions, "ok": False,
+                "tokens_before": None, "tokens_after": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }, _log)
         else:
             after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
+            before = data.get("tokensBefore") if isinstance(data, dict) else None
+            _notify_harness_compaction(on_event, {
+                "n": n_compactions, "ok": True,
+                "tokens_before": before if isinstance(before, (int, float)) else None,
+                "tokens_after": after if isinstance(after, (int, float)) else None,
+                "error": None,
+            }, _log)
             # Measured against the threshold that actually fired, not the
             # flat trigger: on a window smaller than trigger_tokens the two
             # differ, and a bound that never fires cannot say whether this

@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { harnessIntervention } from "../_shared/intervention.ts";
+import { emitTelemetry } from "../_shared/telemetry.ts";
 import { resolveDeadlineEpochMs } from "../_shared/deadline.ts";
 import { resolveTurnCap } from "../_shared/turn-cap.ts";
 import { envNumber } from "../_shared/env-number.ts";
@@ -769,6 +770,14 @@ export default function (pi: ExtensionAPI) {
       if (!aborted && toolcallMaxCharsForRun > 0 && priorChars > 0 && argChars > toolcallMaxCharsForRun) {
         aborted = true;
         const name: string = ev.partial?.content?.[index]?.name || "tool";
+        // Before the abort, never after: ctx.abort() can replace the session
+        // and leave `pi` stale (Issue #8 header above).
+        emitTelemetry(pi, "guard_abort", {
+          trigger: "toolcall_cap",
+          tool: name,
+          argChars,
+          capChars: toolcallMaxCharsForRun,
+        });
         sendFollowUpAndAbort(
           pi,
           ctx,
@@ -833,6 +842,7 @@ export default function (pi: ExtensionAPI) {
         if (inFinalizeWarnWindow(now)) {
           if (!guardSuppressionNotified) {
             guardSuppressionNotified = true;
+            emitTelemetry(pi, "guard_stand_down", { trigger: "wall_clock", reason: "finalize_window" });
             harnessIntervention(
               ctx,
               "turn wall-clock guard standing down: inside the finalize-warn window, " +
@@ -840,9 +850,17 @@ export default function (pi: ExtensionAPI) {
             );
           }
         } else if (generationElapsedMs <= breakerGuardMs) {
+          if (!breakerNotified) {
+            emitTelemetry(pi, "guard_stand_down", { trigger: "wall_clock", reason: "breaker" });
+          }
           notifyBreakerOnce(ctx);
         } else {
           aborted = true;
+          emitTelemetry(pi, "guard_abort", {
+            trigger: "wall_clock",
+            generationMs: generationElapsedMs,
+            guardMs: Math.round(guardMs),
+          });
           runBreachRecovery(
             pi,
             ctx,
@@ -873,6 +891,7 @@ export default function (pi: ExtensionAPI) {
     if (inFinalizeWarnWindow(Date.now())) {
       if (!budgetSuppressionNotified) {
         budgetSuppressionNotified = true;
+        emitTelemetry(pi, "guard_stand_down", { trigger: "thinking_budget", reason: "finalize_window" });
         harnessIntervention(
           ctx,
           "thinking-budget cap standing down: inside the finalize-warn window, " +
@@ -883,6 +902,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (breakerHolding) {
+      if (!breakerNotified) {
+        emitTelemetry(pi, "guard_stand_down", { trigger: "thinking_budget", reason: "breaker" });
+      }
       notifyBreakerOnce(ctx);
       return;
     }
@@ -903,6 +925,7 @@ export default function (pi: ExtensionAPI) {
     if (forcedOff || adaptiveOff) {
       if (!futilityNotified) {
         futilityNotified = true;
+        emitTelemetry(pi, "guard_stand_down", { trigger: "thinking_budget", reason: "futility" });
         harnessIntervention(
           ctx,
           "thinking-budget cap standing down: thinking is already off and the model is " +
@@ -915,6 +938,11 @@ export default function (pi: ExtensionAPI) {
     // Breach. Do the entire recovery now, while `pi` is still live — BEFORE
     // ctx.abort() triggers the session replacement that would make `pi` stale.
     aborted = true;
+    emitTelemetry(pi, "guard_abort", {
+      trigger: "thinking_budget",
+      thinkingChars,
+      budgetTokens: budgetForTurn,
+    });
     runBreachRecovery(
       pi,
       ctx,
