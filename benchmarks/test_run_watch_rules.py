@@ -114,6 +114,50 @@ def test_a_demotion_seen_once_silences_no_demotions():
     assert W.evaluate_turn(st, rec(2, retention=retention(20, 0, 0)), cfg) == []
 
 
+def test_long_context_alone_does_not_page_when_too_few_pairs_were_ever_due():
+    # The live adaptive-rejection-sampler trial: 40+ turns over 60K tokens with
+    # one large pair out of 58, so the batch could never fill.
+    st, cfg = trial(), W.RuleConfig()
+    assert cfg.no_demotion_min_due == 4
+    seen = []
+    for n in range(1, 61):
+        r = retention(1 if n < 50 else 3, 0, 0)
+        r["due"] = 1 if n < 50 else 3
+        seen += rules(W.evaluate_turn(st, rec(n, prompt_tokens=120_000, retention=r), cfg))
+    assert seen == []
+
+    st2 = trial()
+    seen = []
+    for n in range(1, 41):
+        r = retention(6, 0, 0)
+        r["due"] = 4
+        seen += [(n, x) for x in rules(W.evaluate_turn(st2, rec(n, prompt_tokens=61_000, retention=r), cfg))]
+    # prefix 0 with due 4 is not "stalled" (that needs prefix >= 1); the long
+    # context with a full batch due and nothing demoted is still worth a warning.
+    assert seen == [(40, ("warn", "no_demotions"))]
+
+
+def gated(large, due, skipped, est_s=3000, est_r=140_000, ctx=184_000):
+    r = retention(large, due - skipped, 0)
+    r.update({"due": due, "skippedNoShrink": 0, "gate": "deferred" if skipped else "none",
+              "gateReason": None, "skippedCost": skipped, "estSaveTokens": est_s,
+              "estReprefillTokens": est_r, "estContextTokens": ctx})
+    return r
+
+
+def test_a_cost_deferral_explains_no_demotions_and_is_reported_once():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, prompt_tokens=184_000, retention=gated(13, 8, 8)), cfg)
+    assert rules(got) == [("info", "demotion_deferred")]
+    assert got[0].data == {"skippedCost": 8, "estSaveTokens": 3000, "estReprefillTokens": 140_000,
+                           "estContextTokens": 184_000}
+    assert "3,000" in got[0].message and "140,000" in got[0].message
+    seen = []
+    for n in range(2, 60):
+        seen += rules(W.evaluate_turn(st, rec(n, prompt_tokens=184_000, retention=gated(13, 8, 8)), cfg))
+    assert seen == []
+
+
 def test_guard_and_stub_telemetry_raise_info_alerts():
     st, cfg = trial(), W.RuleConfig()
     guard = {"v": 1, "kind": "guard_abort", "trigger": "toolcall_cap", "tool": "ShellSession",

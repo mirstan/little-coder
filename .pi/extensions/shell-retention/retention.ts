@@ -68,6 +68,92 @@ export const DEFAULT_DEMOTE_BATCH = 4;
 // window, lower this, or set the batch to 2 or 1.
 export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 
+// ── Cost gate ───────────────────────────────────────────────────────────────
+//
+// Every growth of the demoted prefix makes a prefix-caching server re-prefill
+// everything after the first rewritten message (R tokens) to save S tokens on
+// later turns. Measured on omlx (Harbor TB2.1 replay, 473 demotion breaks):
+// re-prefill costs a(p-c) + b(p²-c²)/2 seconds with a = 1.05e-3 and
+// b = 3.7e-8, so a break at 184K tokens that saved 9K cost 665 s, while 9K
+// fewer tokens speed each later turn up by ~2 s. Savings matter mostly when
+// they keep a trial under the compaction trigger. A due jump therefore goes
+// ahead only when one of these holds; otherwise its pairs stay raw (and
+// cached) and are judged again on the next request.
+//  - S >= minSaveRatio * R: the break is shallow next to what it sheds.
+//  - context >= openAtPercent% of the window: near compaction, where shed
+//    tokens count. Kept below context-watchdog's 80% default.
+//  - raw bytes pending in the jump >= forcePendingBytes: a burst of huge
+//    outputs. Never fired in the replay; a backstop only.
+// Replay: today's policy spent 7.1 h re-prefilling; 0.1 / 75% saves 0.7 h with
+// no new crossing of the 220K harness compaction trigger (78% saved 1.3 h; 80%
+// and above added crossings), and an oracle could save 2.4 h. Ratios 0.25 and
+// up never fired, so the ratio clause only works at small values.
+export const ENV_DEMOTE_MIN_SAVE_RATIO = "LITTLE_CODER_SHELL_DEMOTE_MIN_SAVE_RATIO";
+export const ENV_DEMOTE_OPEN_AT_PERCENT = "LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT";
+export const ENV_DEMOTE_FORCE_PENDING_BYTES = "LITTLE_CODER_SHELL_DEMOTE_FORCE_PENDING_BYTES";
+/** <= 0 disables the clause. */
+export const DEFAULT_DEMOTE_MIN_SAVE_RATIO = 0.1;
+/** <= 0 turns the whole gate off (today's behaviour); >= 100 never opens on context alone. */
+export const DEFAULT_DEMOTE_OPEN_AT_PERCENT = 75;
+/** <= 0 disables the clause. Four times the batch flush budget. */
+export const DEFAULT_DEMOTE_FORCE_PENDING_BYTES = 262144;
+/** pi's estimateTokens convention (compaction.js), so estimates line up with getContextUsage's trailing part. */
+export const CHARS_PER_TOKEN = 4;
+
+export interface GateOptions {
+  minSaveRatio: number;
+  openAtPercent: number;
+  forcePendingBytes: number;
+}
+
+/** What the hook knows about the prompt pi is about to send. */
+export interface GateContext {
+  /** pi's getContextUsage().tokens: the last request's usage plus an estimate of what followed; null when unknown. */
+  contextTokens: number | null;
+  contextWindow: number | null;
+}
+
+export interface GateInput {
+  estSaveTokens: number;
+  estReprefillTokens: number;
+  contextTokens: number;
+  contextWindow: number;
+  pendingBytes: number;
+}
+
+export type GateReason = "ratio" | "context" | "bytes";
+
+export function resolveGateOptions(): GateOptions {
+  return {
+    minSaveRatio: envNumber(ENV_DEMOTE_MIN_SAVE_RATIO, DEFAULT_DEMOTE_MIN_SAVE_RATIO),
+    openAtPercent: envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT),
+    forcePendingBytes: envNumber(ENV_DEMOTE_FORCE_PENDING_BYTES, DEFAULT_DEMOTE_FORCE_PENDING_BYTES),
+  };
+}
+
+/** Why a due jump may go ahead, or null to defer it. */
+export function demotionGate(input: GateInput, o: GateOptions): GateReason | null {
+  if (o.minSaveRatio > 0 && input.estSaveTokens >= o.minSaveRatio * input.estReprefillTokens) return "ratio";
+  if (o.openAtPercent < 100 && input.contextTokens >= (o.openAtPercent / 100) * input.contextWindow) return "context";
+  if (o.forcePendingBytes > 0 && input.pendingBytes >= o.forcePendingBytes) return "bytes";
+  return null;
+}
+
+/** Characters pi would count for a message (estimateTokens' fields; images at its 4800-char flat rate). */
+function messageChars(m: any, uptoBlock = Infinity): number {
+  if (typeof m?.content === "string") return m.content.length;
+  if (!Array.isArray(m?.content)) return 0;
+  let n = 0;
+  m.content.forEach((b: any, i: number) => {
+    if (i >= uptoBlock) return;
+    if (b?.type === "text" && typeof b.text === "string") n += b.text.length;
+    else if (b?.type === "thinking" && typeof b.thinking === "string") n += b.thinking.length;
+    else if (b?.type === "toolCall") n += String(b.name ?? "").length + JSON.stringify(b.arguments ?? {}).length;
+    else if (b?.type === "image") n += 4800;
+  });
+  return n;
+}
+
 export interface RetentionOptions {
   retainRaw: number;
   minPairBytes: number;
@@ -441,6 +527,25 @@ export interface DemotionStats {
   /** Command + result bytes of the demoted pairs, before and after. */
   bytesBefore: number;
   bytesAfter: number;
+  /**
+   * Cost gate verdict: "off" (no gate input, unknown window, or disabled),
+   * "none" (nothing due past the latched prefix), "open" or "deferred".
+   */
+  gate: "off" | "none" | "open" | "deferred";
+  gateReason: GateReason | null;
+  /** Due pairs the gate kept raw on this request. */
+  skippedCost: number;
+  /** Pairs latched demoted by earlier requests (see demoteMessagesWithStats). */
+  sticky: number;
+  /** Estimates for the jump the gate judged, chars / CHARS_PER_TOKEN; 0 when it judged none. */
+  estSaveTokens: number;
+  estReprefillTokens: number;
+  estContextTokens: number;
+}
+
+export interface GateArgs {
+  options: GateOptions;
+  context: GateContext;
 }
 
 /**
@@ -486,6 +591,7 @@ export function demoteMessagesWithStats(
   messages: any[],
   archive: RetentionArchive,
   opts: RetentionOptions = resolveOptions(),
+  gate?: GateArgs,
 ): { messages: any[]; demotedCount: number; stats: DemotionStats } {
   const result = [...messages];
   const pairs = collectPairs(messages);
@@ -510,13 +616,33 @@ export function demoteMessagesWithStats(
   }
   const budget = opts.demotePendingBytes;
   const flush = Number.isFinite(budget) && budget > 0 && pending > budget;
-  const prefix = flush ? target : batched;
+  const candidate = flush ? target : batched;
+
+  // Replacement texts, computed once: the gate's saving estimate and the
+  // rewrite below must agree on what each pair turns into.
+  const plans = new Map<number, { id: string; nextResult: string | null; nextCommand: string | null }>();
+  const planFor = (k: number) => {
+    let plan = plans.get(k);
+    if (!plan) {
+      const { p } = slots[k];
+      const id = archiveId(p.toolCallId);
+      plan = {
+        id,
+        nextResult: demoteResultText(p.resultText, p.toolName, id, opts),
+        // Google-style providers replay a thoughtSignature bound to the original
+        // args, so a rewritten command would be replayed against a stale signature.
+        nextCommand: p.signed || p.callIdx < 0 ? null : demoteCommandText(p.command, id, opts),
+      };
+      plans.set(k, plan);
+    }
+    return plan;
+  };
 
   const stats: DemotionStats = {
     pairs: pairs.length,
     large: slots.length,
     due: target,
-    prefix,
+    prefix: candidate,
     demoted: 0,
     flushed: flush,
     signed: 0,
@@ -524,7 +650,91 @@ export function demoteMessagesWithStats(
     skippedArchive: 0,
     bytesBefore: 0,
     bytesAfter: 0,
+    gate: "off",
+    gateReason: null,
+    skippedCost: 0,
+    sticky: 0,
+    estSaveTokens: 0,
+    estReprefillTokens: 0,
+    estContextTokens: 0,
   };
+
+  let prefix = candidate;
+  const window = gate?.context.contextWindow;
+  if (gate && gate.options.openAtPercent > 0 && typeof window === "number" && Number.isFinite(window) && window > 0) {
+    // The latch. Each request sees pristine history, and the gate's inputs
+    // are not monotone in it (the context reading drops once a jump lands),
+    // so a jump approved on one request could be denied on the next and its
+    // pairs return to raw: a second prefix break. A pair demoted by an
+    // earlier request has an archive entry (save precedes every rewrite, and
+    // nothing else saves), so the prefix never shrinks below the newest one.
+    let sticky = 0;
+    for (let k = 0; k < slots.length; k++) {
+      if (slots[k].done || archive.size(archiveId(slots[k].p.toolCallId)) !== undefined) sticky = k + 1;
+    }
+    stats.sticky = sticky;
+    prefix = Math.max(sticky, candidate);
+
+    let totalChars = 0;
+    const before: number[] = [];
+    for (const m of messages) {
+      before.push(totalChars);
+      totalChars += messageChars(m);
+    }
+    const savedChars = (from: number, to: number) => {
+      let n = 0;
+      for (let k = from; k < to; k++) {
+        const { p, done } = slots[k];
+        if (done) continue;
+        const { nextResult, nextCommand } = planFor(k);
+        if (nextResult !== null) n += p.resultText.length - nextResult.length;
+        if (nextCommand !== null) n += p.command.length - nextCommand.length;
+      }
+      return n;
+    };
+    const contextTokens = gate.context.contextTokens ??
+      Math.ceil((totalChars - savedChars(0, sticky)) / CHARS_PER_TOKEN);
+    stats.estContextTokens = contextTokens;
+
+    if (candidate <= sticky) {
+      stats.gate = "none";
+    } else {
+      // The break starts at the first message the jump rewrites: the call's
+      // toolCall block when its command shrinks, else the result.
+      let breakAt = totalChars;
+      let pendingBytes = 0;
+      for (let k = sticky; k < candidate; k++) {
+        const { p, done } = slots[k];
+        if (done) continue;
+        pendingBytes += byteLen(p.command) + byteLen(p.resultText);
+        const { nextResult, nextCommand } = planFor(k);
+        if (nextCommand !== null) {
+          breakAt = Math.min(breakAt, before[p.callIdx] + messageChars(messages[p.callIdx], p.blockIdx));
+        } else if (nextResult !== null) {
+          breakAt = Math.min(breakAt, before[p.resultIdx]);
+        }
+      }
+      const input: GateInput = {
+        estSaveTokens: Math.ceil(savedChars(sticky, candidate) / CHARS_PER_TOKEN),
+        estReprefillTokens: Math.ceil((totalChars - breakAt) / CHARS_PER_TOKEN),
+        contextTokens,
+        contextWindow: window,
+        pendingBytes,
+      };
+      stats.estSaveTokens = input.estSaveTokens;
+      stats.estReprefillTokens = input.estReprefillTokens;
+      const reason = demotionGate(input, gate.options);
+      stats.gateReason = reason;
+      if (reason) {
+        stats.gate = "open";
+      } else {
+        stats.gate = "deferred";
+        stats.skippedCost = candidate - sticky;
+        prefix = sticky;
+      }
+    }
+    stats.prefix = prefix;
+  }
 
   let demotedCount = 0;
   for (let k = 0; k < prefix; k++) {
@@ -532,13 +742,7 @@ export function demoteMessagesWithStats(
     if (done) continue;
     if (p.signed) stats.signed++;
 
-    const id = archiveId(p.toolCallId);
-    const nextResult = demoteResultText(p.resultText, p.toolName, id, opts);
-    // Google-style providers replay a thoughtSignature bound to the original
-    // args, so a rewritten command would be replayed against a stale signature.
-    const nextCommand = p.signed || p.callIdx < 0
-      ? null
-      : demoteCommandText(p.command, id, opts);
+    const { id, nextResult, nextCommand } = planFor(k);
     if (nextResult === null && nextCommand === null) {
       stats.skippedNoShrink++;
       continue;

@@ -144,6 +144,9 @@ const PINNED_ENV: Record<string, string | undefined> = {
   [ENV_CMD_KEEP]: String(DEFAULT_CMD_KEEP),
   [ENV_DEMOTE_BATCH]: "1",
   [ENV_DEMOTE_PENDING_BYTES]: String(DEFAULT_DEMOTE_PENDING_BYTES),
+  LITTLE_CODER_SHELL_DEMOTE_MIN_SAVE_RATIO: undefined,
+  LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT: undefined,
+  LITTLE_CODER_SHELL_DEMOTE_FORCE_PENDING_BYTES: undefined,
   LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),
   LITTLE_CODER_NO_SHELL_RETENTION: undefined,
   LITTLE_CODER_TELEMETRY: "1",
@@ -240,8 +243,36 @@ describe("shell-retention telemetry (wired)", () => {
       {
         v: 1, kind: "shell_retention", pairs: 0, large: 0, due: 0, prefix: 0, demoted: 0, flushed: false,
         signed: 0, skippedNoShrink: 0, skippedArchive: 0, bytesBefore: 0, bytesAfter: 0,
+        gate: "off", gateReason: null, skippedCost: 0, sticky: 0,
+        estSaveTokens: 0, estReprefillTokens: 0, estContextTokens: 0,
       },
     ]);
+  });
+
+  it("records the cost gate's verdict and estimates from pi's context usage", async () => {
+    process.env[ENV_DEMOTE_BATCH] = "4";
+    wired = wire();
+    // Eight 4KB pairs then a long, shell-free tail: the oldest four are a due
+    // batch whose break would re-prefill the whole tail.
+    const msgs: any[] = [{ role: "user", content: "go" }];
+    for (let i = 0; i < 8; i++) msgs.push(call(`g${i}`, `echo ${i}`), result(`g${i}`, body(4096, `g${i}`)));
+    for (let i = 0; i < 10; i++) msgs.push({ role: "assistant", content: [{ type: "thinking", thinking: "t".repeat(40_000) }] });
+    const ctxAt = (tokens: number) => ({
+      ...makeCtx(),
+      getContextUsage: () => ({ tokens, contextWindow: 262144, percent: (100 * tokens) / 262144 }),
+    });
+
+    for (const h of wired.handlers.context ?? []) await h({ messages: msgs }, ctxAt(150_000));
+    expect(wired.entries.at(-1)?.data).toMatchObject({
+      kind: "shell_retention", due: 4, prefix: 0, demoted: 0, gate: "deferred", gateReason: null,
+      skippedCost: 4, estContextTokens: 150_000,
+    });
+    expect(wired.entries.at(-1)?.data.estReprefillTokens).toBeGreaterThan(100_000);
+
+    let out: any;
+    for (const h of wired.handlers.context ?? []) out = await h({ messages: msgs }, ctxAt(200_000));
+    expect(wired.entries.at(-1)?.data).toMatchObject({ demoted: 4, gate: "open", gateReason: "context", skippedCost: 0 });
+    expect(out?.messages[2].content[0].text).toMatch(/^\[shell result demoted/);
   });
 
   it("emits echo_block when it blocks a call quoting a live placeholder", async () => {
