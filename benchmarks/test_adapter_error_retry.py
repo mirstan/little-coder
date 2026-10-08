@@ -985,6 +985,64 @@ def test_a_failed_compaction_still_gets_its_continuation(failure):
     assert outcome.n_deliberate_compactions == 1
 
 
+def test_a_deliberate_compaction_is_reported_to_on_event():
+    """pi's own compaction_start/end for a harness compaction can be trimmed
+    by the next prompt's watermark (rpc_client.prompt_and_collect), so the
+    turn ledger learns about it from this synthetic event instead."""
+    clock = _Clock()
+    seen = []
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(60_000)], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[{"tokensBefore": 230_000, "estimatedTokensAfter": 60_000}],
+    )
+    _run_compaction(rpc, clock, on_event=seen.append)
+    assert [e for e in seen if e.get("type") == "lc_harness_compaction"] == [
+        {"type": "lc_harness_compaction", "n": 1, "ok": True,
+         "tokens_before": 230_000, "tokens_after": 60_000, "error": None},
+    ]
+    assert [e.get("type") for e in seen] == ["turn_end", "lc_harness_compaction", "turn_end"]
+
+
+def test_a_failed_deliberate_compaction_is_reported_with_its_error():
+    clock = _Clock()
+    seen = []
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[RuntimeError("pi rejected compact: Already compacted")],
+    )
+    _run_compaction(rpc, clock, on_event=seen.append)
+    assert [e for e in seen if e.get("type") == "lc_harness_compaction"] == [
+        {"type": "lc_harness_compaction", "n": 1, "ok": False, "tokens_before": None,
+         "tokens_after": None, "error": "RuntimeError: pi rejected compact: Already compacted"},
+    ]
+
+
+def test_an_on_event_that_raises_on_the_compaction_mark_does_not_end_the_trial():
+    clock = _Clock()
+    seen = []
+
+    def on_event(ev):
+        seen.append(ev)
+        if ev.get("type") == "lc_harness_compaction":
+            raise ValueError("ledger bug")
+
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(60_000)], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[{"tokensBefore": 230_000, "estimatedTokensAfter": 60_000}],
+    )
+    outcome = _run_compaction(rpc, clock, on_event=on_event)
+    assert any(e.get("type") == "lc_harness_compaction" for e in seen)
+    assert outcome.n_deliberate_compactions == 1
+    assert len(rpc.calls) == 2
+    assert outcome.result.stop_reason == "agent_end"
+
+
 def test_continuation_gives_up_gracefully_if_pi_stays_busy_past_the_wait_bound():
     """Regression pin for the post-compaction idle-wait gap, both before
     and after the fix -- it pins an observable shape, not the bug

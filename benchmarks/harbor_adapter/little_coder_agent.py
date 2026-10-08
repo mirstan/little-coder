@@ -106,6 +106,13 @@ from rpc_client import (  # noqa: E402
     prompt_with_mid_run_compaction,
     resolve_thinking_level,
 )
+from turn_ledger import (  # noqa: E402
+    LEDGER_FILENAME,
+    make_ledger_sink,
+    sink_close,
+    sink_metadata,
+    sink_on_event,
+)
 
 
 DEFAULT_ALLOWED_TOOLS = ["ShellSession", "ShellSessionCwd", "ShellSessionReset", "ShellRecall"]
@@ -1763,6 +1770,13 @@ class LittleCoderAgent(BaseAgent):
         # trial can actually be watched live, not just post-mortemed.
         live_log_path = self.logs_dir / "little_coder.live.log"
         live_log_fh = live_log_path.open("w") if self.logs_dir else None
+        # Structured per-turn ledger (benchmarks/turn_ledger.py): one JSON
+        # record per model turn in agent/turns.jsonl, tailed live by
+        # benchmarks/run_watch.py. Every sink_* call swallows its own errors.
+        ledger = make_ledger_sink(
+            self.logs_dir / LEDGER_FILENAME if self.logs_dir else None,
+            log=self.logger.warning,
+        )
         pending_text: list[str] = []
         # Turn boundary counter for the markers below. One prompt_and_collect
         # call can legitimately span several agent_end events (an
@@ -1791,6 +1805,7 @@ class LittleCoderAgent(BaseAgent):
 
         def on_event(ev: dict) -> None:
             nonlocal turn_counter, heartbeat_last_ts, heartbeat_turn_start_ts, heartbeat_delta_chars
+            sink_on_event(ledger, ev)
             if live_log_fh is None:
                 return
             t = ev.get("type")
@@ -2227,6 +2242,9 @@ class LittleCoderAgent(BaseAgent):
                     "benchmark": _derive_benchmark_label(self.logs_dir),
                     "token_usage": tokens["raw"],
                     "token_source": tokens["token_source"],
+                    # Peak context, max output, stopReason histogram, demotion,
+                    # guard and stub counts from turns.jsonl (turn_ledger.py).
+                    "turn_ledger": sink_metadata(ledger),
                 }
             finally:
                 await asyncio.to_thread(rpc.close, 3)
@@ -2252,6 +2270,7 @@ class LittleCoderAgent(BaseAgent):
             # -- one empty 0700 dir leaked per trial that ever byte-capped,
             # forever, on the shared harness host.
             proxy.cleanup_overflow_staging()
+            sink_close(ledger)
             if log_fh:
                 log_fh.flush()
                 log_fh.close()

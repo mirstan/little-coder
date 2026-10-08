@@ -786,3 +786,24 @@ def test_concurrent_sends_each_write_one_whole_line():
     writes = rpc._proc.stdin.writes
     assert len(writes) == 24
     assert {json.loads(w)["id"] for w in writes} == {f"r{i}" for i in range(24)}
+
+
+def test_pirpc_turns_extension_telemetry_on_unless_the_caller_set_it(fake_pi, tmp_path, monkeypatch):
+    """lc-telemetry is opt-in inside pi (.pi/extensions/_shared/telemetry.ts);
+    every benchmark harness spawns pi through PiRpc, so it switches it on."""
+    seen = []
+    real_popen = rpc_client.subprocess.Popen
+
+    def spy(*args, **kwargs):
+        seen.append(dict(kwargs.get("env") or {}))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(rpc_client.subprocess, "Popen", spy)
+    monkeypatch.delenv("LITTLE_CODER_TELEMETRY", raising=False)
+    with fake_pi("clean", tmp_path):
+        pass
+    assert seen[-1].get("LITTLE_CODER_TELEMETRY") == "1"
+    monkeypatch.setenv("LITTLE_CODER_TELEMETRY", "0")
+    with fake_pi("clean", tmp_path):
+        pass
+    assert seen[-1].get("LITTLE_CODER_TELEMETRY") == "0"
