@@ -45,22 +45,32 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 //
 // Every doubt falls back to pi's native compaction by returning nothing:
 // overflow recovery, a missing/stale/foreign capture, an anchor the payload
-// does not hold, no room in the window, a network/HTTP error, abort, timeout,
+// does not hold, no room in the window or decode budget, a network/HTTP error,
+// abort, no first token or a stalled stream,
 // a tool call, a truncated answer or an unusable summary.
 //
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION=1                      opt in (default off)
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET=2048   omlx thinking cap; <=0 omits it
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S=240     no first token by then: a cache miss, fall back
-//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S=360          whole-request timeout
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_STALL_TIMEOUT_S=60     no token for this long once they flow: fall back
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_GEN_BUDGET_S=600       time the answer may take to decode ...
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_DECODE_TOK_S=20        ... at this rate; their product caps max_tokens
 //
-// The two timeouts aim to keep a slow replay plus pi's own fallback inside
-// the harness's 1800 s wait for a compaction (rpc_client PI_IDLE_WAIT_CAP_SEC).
-// That assumes pi's own request takes about what it measured at 190-200k
-// (820-955 s to first token, ~1000 s in all); it is not enforced, and a
-// fallback at a larger context can still overrun it.
-// A hit's TTFT is a normal turn's (5-50 s at 190-220k); a miss would prefill
-// the whole payload, kept tail and untruncated tool output included, which
-// costs more than pi's own request, so it is abandoned early.
+// Time. A cache hit's TTFT is a normal turn's (5-50 s at 190-220k); a miss
+// would prefill the whole payload, kept tail and untruncated tool output
+// included, which costs more than pi's own request, so no first token within
+// the TTFT timeout abandons it. Once tokens flow there is no total timeout:
+// cutting a genuine hit off mid-answer and then paying for pi's own
+// compaction (820-955 s to first token at 190-200k, plus 165-325 s of
+// generation, plus a split turn's second request: ~1,150-1,500 s) is the
+// worst outcome, and would overrun the harness's 1800 s compaction wait
+// (rpc_client PI_IDLE_WAIT_CAP_SEC), after which it stops compacting for the
+// rest of the trial. Instead the answer is bounded up front: max_tokens is
+// at most GEN_BUDGET_S x DECODE_TOK_S (decode measured at ~20 tok/s at 170k+
+// on the TB2.1 runs, p10/p50/p90 19.6/20.8/22.9), and only a stalled stream
+// is abandoned. A TTFT fallback (240 s + pi's own) fits the 1800 s wait; an
+// answer that runs most of its budget and is then rejected (truncated,
+// garbage) can still overrun it.
 //
 // Capture choice: the harness asks for a compaction at turn_end while pi is
 // already sending the next request, which compact() then aborts. That request
@@ -71,11 +81,15 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 
 export const ENV_ENABLE = "LITTLE_CODER_CACHE_REUSE_COMPACTION";
 export const ENV_THINKING_BUDGET = "LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET";
-export const ENV_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S";
 export const ENV_TTFT_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S";
+export const ENV_STALL_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_STALL_TIMEOUT_S";
+export const ENV_GEN_BUDGET_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_GEN_BUDGET_S";
+export const ENV_DECODE_TOK_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_DECODE_TOK_S";
 const DEFAULT_THINKING_BUDGET = 2048;
-const DEFAULT_TIMEOUT_S = 360;
 const DEFAULT_TTFT_TIMEOUT_S = 240;
+const DEFAULT_STALL_TIMEOUT_S = 60;
+const DEFAULT_GEN_BUDGET_S = 600;
+const DEFAULT_DECODE_TOK_S = 20;
 // Room the window must still have for the answer after the thinking budget.
 const MIN_ANSWER_TOKENS = 2048;
 const WINDOW_MARGIN_TOKENS = 1024;
@@ -102,7 +116,8 @@ export type Fallback =
   | "auth"
   | "http_error"
   | "aborted"
-  | "timeout"
+  | "budget"
+  | "stall"
   | "ttft_timeout"
   | "tool_call"
   | "truncated"
@@ -139,6 +154,7 @@ export function planReuse(
   ctx: any,
   capture: Capture | null,
   thinkingBudget: number,
+  maxOutputTokens: number = Number.POSITIVE_INFINITY,
 ): ReusePlan | { fallback: Fallback } {
   if (event.reason === "overflow" || event.willRetry) return { fallback: "overflow" };
   const model = ctx.model;
@@ -205,7 +221,10 @@ export function planReuse(
   const room =
     (model.contextWindow ?? 0) - (prep.tokensBefore ?? 0) - Math.ceil(instruction.length / 3) - WINDOW_MARGIN_TOKENS;
   if (room < thinking + MIN_ANSWER_TOKENS) return { fallback: "window" };
-  const maxTokens = Math.min(desired, room);
+  // What the generation budget can decode (see "Time" above).
+  const budget = Math.floor(maxOutputTokens);
+  if (budget < thinking + MIN_ANSWER_TOKENS) return { fallback: "budget" };
+  const maxTokens = Math.min(desired, room, budget);
 
   return { body: buildReplayBody(capture.payload, instruction, { maxTokens, thinkingBudget: thinking }), want, maxTokens };
 }
@@ -248,8 +267,12 @@ function toUsage(u: StreamUsage | null, model: any) {
 export interface RunDeps {
   fetch: typeof fetch;
   now: () => number;
-  timeoutMs: number;
+  /** No token at all by then: a cache miss. */
   ttftTimeoutMs: number;
+  /** No token for this long once they flow. */
+  stallTimeoutMs: number;
+  /** Cap on max_tokens: generation budget x decode rate. */
+  maxOutputTokens: number;
 }
 
 export type ReuseOutcome =
@@ -291,7 +314,7 @@ export async function runReuse(
   for (const c of list.length > 0 ? list : [null]) {
     let p: ReusePlan | { fallback: Fallback };
     try {
-      p = planReuse(event, ctx, c, thinkingBudget);
+      p = planReuse(event, ctx, c, thinkingBudget, deps.maxOutputTokens);
     } catch {
       p = { fallback: "anchor_missing" };
     }
@@ -321,17 +344,27 @@ export async function runReuse(
     ...(auth.headers ?? {}),
   };
   const url = `${String(model.baseUrl).replace(/\/+$/, "")}/chat/completions`;
-  const ttft = new AbortController();
-  let ttftExpired = false;
-  const ttftTimer = setTimeout(() => {
-    ttftExpired = true;
-    ttft.abort();
+  // One timer: the TTFT deadline until the first token, then a stall timer
+  // re-armed by every token.
+  const watchdog = new AbortController();
+  let expired: "ttft_timeout" | "stall" | null = null;
+  let timer = setTimeout(() => {
+    expired = "ttft_timeout";
+    watchdog.abort();
   }, deps.ttftTimeoutMs);
-  const signals = [AbortSignal.timeout(deps.timeoutMs), ttft.signal];
+  const onToken = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      expired = "stall";
+      watchdog.abort();
+    }, deps.stallTimeoutMs);
+  };
+  const signals = [watchdog.signal];
   if (event.signal) signals.push(event.signal);
   const signal = AbortSignal.any(signals);
 
   let result;
+  let firstTokenAt: number | null = null;
   try {
     const res = await deps.fetch(url, { method: "POST", headers, body: JSON.stringify(plan.body), signal });
     if (!res.ok || !res.body) {
@@ -342,14 +375,17 @@ export async function runReuse(
       }
       return fail("http_error", { status: res.status });
     }
-    result = await readChatCompletionStream(res.body as ReadableStream<Uint8Array>, deps.now, () => clearTimeout(ttftTimer));
+    result = await readChatCompletionStream(res.body as ReadableStream<Uint8Array>, deps.now, () => {
+      if (firstTokenAt === null) firstTokenAt = deps.now();
+      onToken();
+    });
   } catch (err) {
-    if (event.signal?.aborted) return fail("aborted");
-    if (ttftExpired) return fail("ttft_timeout");
-    if (signal.aborted) return fail("timeout");
-    return fail("http_error", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+    const ttftS = firstTokenAt === null ? null : (firstTokenAt - tsStart) / 1000;
+    if (event.signal?.aborted) return fail("aborted", { ttft_s: ttftS });
+    if (expired) return fail(expired, { ttft_s: ttftS });
+    return fail("http_error", { ttft_s: ttftS, error: String((err as Error)?.message ?? err).slice(0, 200) });
   } finally {
-    clearTimeout(ttftTimer);
+    clearTimeout(timer);
   }
 
   const tsEnd = deps.now();
@@ -446,8 +482,11 @@ export default function (pi: ExtensionAPI) {
     const outcome = await runReuse(event, ctx, captures, envNumber(ENV_THINKING_BUDGET, DEFAULT_THINKING_BUDGET), {
       fetch: globalThis.fetch,
       now: Date.now,
-      timeoutMs: Math.max(1, envNumber(ENV_TIMEOUT_S, DEFAULT_TIMEOUT_S)) * 1000,
       ttftTimeoutMs: Math.max(1, envNumber(ENV_TTFT_TIMEOUT_S, DEFAULT_TTFT_TIMEOUT_S)) * 1000,
+      stallTimeoutMs: Math.max(1, envNumber(ENV_STALL_TIMEOUT_S, DEFAULT_STALL_TIMEOUT_S)) * 1000,
+      maxOutputTokens:
+        Math.max(0, envNumber(ENV_GEN_BUDGET_S, DEFAULT_GEN_BUDGET_S)) *
+        Math.max(0, envNumber(ENV_DECODE_TOK_S, DEFAULT_DECODE_TOK_S)),
     });
     emitTelemetry(pi, "compaction_reuse", outcome.telemetry);
     if (outcome.ok) return { compaction: outcome.compaction };

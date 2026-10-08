@@ -28,7 +28,8 @@ function num(v: unknown): number {
 export async function readChatCompletionStream(
   body: ReadableStream<Uint8Array>,
   clock: () => number,
-  onFirstToken?: () => void,
+  /** Called for every delta that carries a token (content, reasoning or a tool call). */
+  onToken?: () => void,
 ): Promise<StreamResult> {
   const out: StreamResult = {
     content: "",
@@ -79,9 +80,9 @@ export async function readChatCompletionStream(
       }
       token = token || delta.tool_calls.length > 0;
     }
-    if (token && out.firstTokenAt === null) {
-      out.firstTokenAt = clock();
-      onFirstToken?.();
+    if (token) {
+      if (out.firstTokenAt === null) out.firstTokenAt = clock();
+      onToken?.();
     }
     if (typeof choice.finish_reason === "string") out.finishReason = choice.finish_reason;
   };

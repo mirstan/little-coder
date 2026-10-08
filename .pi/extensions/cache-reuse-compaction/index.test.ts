@@ -141,7 +141,7 @@ const capture = (s: Scenario, over: Partial<Capture> = {}): Capture => ({
   ...over,
 });
 
-const deps = { fetch: globalThis.fetch, now: Date.now, timeoutMs: 5000, ttftTimeoutMs: 5000 };
+const deps = { fetch: globalThis.fetch, now: Date.now, ttftTimeoutMs: 5000, stallTimeoutMs: 5000, maxOutputTokens: 1_000_000 };
 
 const HISTORY =
   "## Goal\nBuild the thing\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] read sources\n\n" +
@@ -458,12 +458,62 @@ describe("fallbacks hand the compaction to pi (return nothing)", () => {
     });
   });
 
-  it("timeout when the server never answers in time", async () => {
+  it("ttft_timeout when the server never answers at all", async () => {
     const s = await nonSplit();
     reply = (_q, res) => setTimeout(() => res.end(), 2000);
-    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, timeoutMs: 50 })).toMatchObject({
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, ttftTimeoutMs: 50 })).toMatchObject({
       ok: false,
-      fallback: "timeout",
+      fallback: "ttft_timeout",
+    });
+  });
+
+  it("stall when tokens stop arriving after the first one", async () => {
+    const s = await nonSplit();
+    reply = (_q, res) => {
+      sse(res, [{ choices: [{ delta: { reasoning_content: "thinking" } }] }], { end: false });
+      setTimeout(() => res.end(), 2000);
+    };
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, stallTimeoutMs: 50 });
+    expect(out).toMatchObject({ ok: false, fallback: "stall" });
+    expect((out as any).telemetry.ttft_s).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a slow but steady answer is not cut off: no total timeout once tokens flow", async () => {
+    const s = await nonSplit();
+    reply = (_q, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const parts = HISTORY.match(/[\s\S]{1,40}/g)!;
+      let i = 0;
+      const tick = setInterval(() => {
+        if (i < parts.length) {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: parts[i++] } }] })}\n\n`);
+          return;
+        }
+        clearInterval(tick);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+        res.end();
+      }, 20);
+    };
+    // Each gap (20 ms) is under the stall timeout; the whole answer takes far longer than it.
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, ttftTimeoutMs: 100, stallTimeoutMs: 80 });
+    expect(out.ok).toBe(true);
+  });
+
+  it("caps max_tokens at what the generation budget can decode", async () => {
+    const s = await splitWithHistory();
+    reply = answer(both);
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, maxOutputTokens: 9_000 });
+    expect(out.ok).toBe(true);
+    const sent = JSON.parse(received[0].body);
+    expect(sent.max_completion_tokens ?? sent.max_tokens).toBe(9_000);
+    expect((out as any).telemetry.max_tokens).toBe(9_000);
+  });
+
+  it("budget when the generation budget cannot cover the thinking cap plus an answer", async () => {
+    const s = await nonSplit();
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, maxOutputTokens: 3_000 })).toMatchObject({
+      ok: false,
+      fallback: "budget",
     });
   });
 
