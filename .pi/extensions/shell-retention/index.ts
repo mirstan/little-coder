@@ -12,8 +12,10 @@ import {
   demoteMessagesWithStats,
   findMarkerEchoIds,
   recallSlice,
+  resolveGateOptions,
   resolveOptions,
   resolveRecallOptions,
+  type GateContext,
   type RetentionArchive,
 } from "./retention.ts";
 
@@ -124,6 +126,26 @@ const hostArchive: RetentionArchive = {
   },
 };
 
+// What pi compacts on: the last request's usage plus an estimate of what
+// followed. The window comes from the model; without one the gate stays off.
+function gateContext(ctx: any): GateContext {
+  // ctx accessors throw once the session has been replaced; the gate must
+  // never break the hook, so any failure reads as "unknown" (gate off).
+  try {
+    const usage = ctx?.getContextUsage?.();
+    const tokens = typeof usage?.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null;
+    const window = typeof usage?.contextWindow === "number" ? usage.contextWindow : ctx?.model?.contextWindow;
+    const model = ctx?.model;
+    return {
+      contextTokens: tokens,
+      contextWindow: typeof window === "number" ? window : null,
+      model: model ? { provider: model.provider, id: model.id } : null,
+    };
+  } catch {
+    return { contextTokens: null, contextWindow: null };
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   if (process.env.LITTLE_CODER_NO_SHELL_RETENTION === "1") return;
 
@@ -167,11 +189,12 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  pi.on("context", async (event) => {
+  pi.on("context", async (event, ctx) => {
     const { messages, demotedCount, stats } = demoteMessagesWithStats(
       (event as any).messages || [],
       hostArchive,
       resolveOptions(),
+      { options: resolveGateOptions(), context: gateContext(ctx) },
     );
     // One snapshot per request, emitted even when nothing is due: the watcher
     // needs `large` with `demoted == 0` to see demotion silently disabled.

@@ -219,6 +219,10 @@ class RuleConfig:
     no_demotion_large_pairs: int = 12
     no_demotion_turns: int = 40
     no_demotion_context_tokens: int = 60_000
+    #: Due pairs a trial must have reached before the long-context branch of
+    #: no_demotions applies: fewer than a batch (LITTLE_CODER_SHELL_DEMOTE_BATCH,
+    #: default 4) never demote by design.
+    no_demotion_min_due: int = 4
     divergence_reprefill_tokens: int = 16_384
     divergence_gap_tokens: int = 8_192
     #: How long a divergence waits for the turn record that produced it.
@@ -261,6 +265,11 @@ class TrialState:
     telemetry_seen: bool = False
     max_large_pairs: int = 0
     max_demoted: int = 0
+    max_due: int = 0
+    #: True once a shell_retention snapshot arrived (telemetry_seen is set by any extension).
+    retention_seen: bool = False
+    #: True once shell-retention's cost gate kept a due jump raw (skippedCost).
+    cost_deferred: bool = False
     turns_over_ctx: int = 0
     cache_reported: bool = False
     fired_once: set = field(default_factory=set)
@@ -331,6 +340,14 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         # leaves the prompt growing from the same baseline.
         if any(c.get("ok") for c in comps):
             st.last_prompt_tokens = None
+            # By default the cost gate does not open near compaction (a deep
+            # break there only precedes the compaction's own full re-prefill),
+            # so this is expected; it records that demotion bought nothing here.
+            if st.cost_deferred and st.max_demoted == 0 and once("deferred_into_compaction"):
+                add("info", "deferred_into_compaction",
+                    f"compacted with {st.max_due} due shell pair(s) never demoted: the cost gate held them "
+                    f"(the compaction re-prefills everything anyway)",
+                    subj="once", data={"due": st.max_due})
 
     prompt, output = _n(rec.get("prompt_tokens")), _n(rec.get("output"))
     if rec.get("usage_reported"):
@@ -362,9 +379,21 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
     ret = rec.get("retention")
     if isinstance(ret, dict):
         st.telemetry_seen = True
+        st.retention_seen = True
         large, prefix, demoted, signed = (_n(ret.get(k)) for k in ("large", "prefix", "demoted", "signed"))
         st.max_large_pairs = max(st.max_large_pairs, large)
         st.max_demoted = max(st.max_demoted, demoted)
+        st.max_due = max(st.max_due, _n(ret.get("due")))
+        skipped = _n(ret.get("skippedCost"))
+        if skipped > 0:
+            st.cost_deferred = True
+            if once("demotion_deferred"):
+                est = {k: _n(ret.get(k)) for k in ("estSaveTokens", "estReprefillTokens", "estContextTokens")}
+                add("info", "demotion_deferred",
+                    f"cost gate kept {skipped} due shell pair(s) raw: demoting would save "
+                    f"~{est['estSaveTokens']:,} tokens but re-prefill ~{est['estReprefillTokens']:,} "
+                    f"(context ~{est['estContextTokens']:,})",
+                    subj="once", data={"skippedCost": skipped, **est})
         if prefix >= 1 and demoted == 0 and once("retention_stalled"):
             add("crit", "retention_stalled",
                 f"{prefix} shell pair(s) due for demotion and none demoted (signed={signed}, "
@@ -406,13 +435,17 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
                      "explained_by": explained_by})
     del st.turns[:-MAX_REMEMBERED_TURNS]
 
-    if st.max_demoted == 0 and "no_demotions" not in st.fired_once:
+    # A cost-gate deferral is the intended reason for none demoted. Without
+    # shell_retention snapshots nothing says how many pairs were due, so the
+    # long-context branch still stands in for it.
+    if st.max_demoted == 0 and not st.cost_deferred and "no_demotions" not in st.fired_once:
         if st.max_large_pairs >= cfg.no_demotion_large_pairs:
             st.fired_once.add("no_demotions")
             add("crit", "no_demotions",
                 f"{st.max_large_pairs} large shell outputs in history and none ever demoted",
                 subj="once", data={"large": st.max_large_pairs})
-        elif st.turns_over_ctx >= cfg.no_demotion_turns:
+        elif st.turns_over_ctx >= cfg.no_demotion_turns and (
+                not st.retention_seen or st.max_due >= cfg.no_demotion_min_due):
             st.fired_once.add("no_demotions")
             add("warn", "no_demotions",
                 f"{st.turns_over_ctx} turns over {cfg.no_demotion_context_tokens:,} prompt tokens "
