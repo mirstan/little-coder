@@ -341,6 +341,8 @@ class PiRpc:
         # Demultiplexer state
         self._responses: dict[str, dict] = {}
         self._event_q: list[dict] = []
+        #: _event_q_watermark of the last compact response; see drain_compaction_events.
+        self._compact_watermark = 0
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         # Not _cv's lock: a blocked write would stall event demultiplexing.
@@ -1091,9 +1093,38 @@ class PiRpc:
         mostly want `estimatedTokensAfter`, which pi marks optional.
         """
         resp = self._await_response(rid, timeout=timeout)
+        with self._cv:
+            self._compact_watermark = resp.get("_event_q_watermark", 0)
         if not resp.get("success"):
             raise RuntimeError(f"pi rejected compact: {resp.get('error')}")
         return resp.get("data", {})
+
+    def drain_compaction_events(self, on_event: Callable[[dict], None]) -> int:
+        """Hand `on_event` every event pi queued before the last compact response.
+
+        pi emits a compaction's session events -- compaction_start, any
+        extension telemetry (cache-reuse-compaction's lc-telemetry entry),
+        compaction_end -- while the harness is blocked in await_compact,
+        which drains nothing. The continuation prompt's watermark trim
+        (prompt_and_collect) would then delete them unseen. Called between
+        the two, this delivers exactly the events that preceded the
+        response, in order; an on_event failure is skipped, not raised,
+        since this is telemetry and must not end the trial.
+        """
+        with self._cv:
+            n, self._compact_watermark = self._compact_watermark, 0
+        delivered = 0
+        for _ in range(n):
+            with self._cv:
+                if not self._event_q:
+                    break
+                ev = self._event_q.pop(0)
+            delivered += 1
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+        return delivered
 
     def session_stats(self, timeout: float = 10) -> Optional[dict]:
         """Query pi's own cumulative token/cost accounting for this session.
@@ -1628,6 +1659,22 @@ def _notify_harness_compaction(
         log(f"on_event raised on {HARNESS_COMPACTION_EVENT}: {type(exc).__name__}: {exc}")
 
 
+def _drain_compaction_events(rpc: "PiRpc", on_event: Callable[[dict], None], log: Callable[[str], None]) -> None:
+    """Deliver the session events pi emitted during a harness compaction.
+
+    Without this the continuation prompt's watermark trim discards them, and
+    with them the cache-reuse-compaction telemetry (PiRpc.drain_compaction_events).
+    A stand-in rpc without the method delivers nothing.
+    """
+    drain = getattr(rpc, "drain_compaction_events", None)
+    if drain is None:
+        return
+    try:
+        drain(on_event)
+    except Exception as exc:
+        log(f"could not deliver compaction events: {type(exc).__name__}: {exc}")
+
+
 def _turn_context_tokens(event: dict) -> Optional[int]:
     """Context-token estimate carried by one `turn_end` event, or None.
 
@@ -2037,6 +2084,7 @@ def prompt_with_mid_run_compaction(
                 rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
             )
         except Exception as exc:
+            _drain_compaction_events(rpc, trigger, _log)
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
             _notify_harness_compaction(on_event, {
@@ -2045,6 +2093,7 @@ def prompt_with_mid_run_compaction(
                 "error": f"{type(exc).__name__}: {exc}",
             }, _log)
         else:
+            _drain_compaction_events(rpc, trigger, _log)
             after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
             before = data.get("tokensBefore") if isinstance(data, dict) else None
             _notify_harness_compaction(on_event, {
