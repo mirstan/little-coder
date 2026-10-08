@@ -261,9 +261,36 @@ def test_an_omlx_mid_history_divergence_is_attributed_by_timestamp(tmp_path):
         "2026-10-07 18:04:07,398 - omlx.scheduler - INFO - prefix cache: request 964228db-3670-4e00-b06b-efba8572ae77 "
         "re-prefills 40220 of 71530 tokens (reused 31310); closest stored sequence "
         "0fbf9c00-2858-4e1e-9f2f-3847d517846d shares the first 31310 of 69632 comparable tokens before diverging\n")
+    at = datetime(2026, 10, 7, 18, 4, 7).timestamp()
+    turns = job / TRIAL / "agent" / "turns.jsonl"
+    turns.write_text(json.dumps(rec(1, ts_start=at - 60, ts_end=at - 10, prompt_tokens=60_000)) + "\n")
     ws = W.WatchState(target=job, cfg=W.RuleConfig(), server=W.TailState(path=log), server_kind="omlx")
-    alerts, _ = W.poll_once(ws, start + 300)
+    # The server logs the divergence at prefill start; the turn's record lands at turn_end.
+    assert W.poll_once(ws, at + 5)[0] == []
+    with turns.open("a") as fh:
+        fh.write(json.dumps(rec(2, ts_start=at - 1, ts_end=at + 40, prompt_tokens=71530)) + "\n")
+    alerts, _ = W.poll_once(ws, at + 45)
     assert [(a.rule, a.trial) for a in alerts] == [("prefix_divergence", TRIAL)]
+
+
+def test_a_divergence_the_ledger_explains_is_reported_as_expected(tmp_path):
+    job = make_job(tmp_path)
+    start = datetime(2026, 10, 7, 18, 0, 0).timestamp()
+    for p in (job / "config.json", job / TRIAL / "config.json"):
+        os.utime(p, (start, start))
+    log = tmp_path / "omlx.log"
+    log.write_text(
+        "2026-10-07 18:04:07,398 - omlx.scheduler - INFO - prefix cache: request 964228db-3670-4e00-b06b-efba8572ae77 "
+        "re-prefills 40220 of 71530 tokens (reused 31310); closest stored sequence "
+        "0fbf9c00-2858-4e1e-9f2f-3847d517846d shares the first 31310 of 69632 comparable tokens before diverging\n")
+    at = datetime(2026, 10, 7, 18, 4, 7).timestamp()
+    (job / TRIAL / "agent" / "turns.jsonl").write_text(
+        json.dumps(rec(1, ts_start=at - 60, ts_end=at - 10, prompt_tokens=60_000)) + "\n"
+        + json.dumps(rec(2, ts_start=at - 1, ts_end=at + 40, prompt_tokens=71530, demoted_new=4)) + "\n")
+    ws = W.WatchState(target=job, cfg=W.RuleConfig(), server=W.TailState(path=log), server_kind="omlx")
+    alerts, lines = W.poll_once(ws, at + 45, force_status=True)
+    assert [(a.level, a.rule) for a in alerts] == [("info", "expected_divergence")]
+    assert any("div 1 expected/0 output/0 unexplained" in line for line in lines if line.startswith("[status"))
 
 
 def test_the_status_line_reports_progress_the_current_trial_and_the_server(tmp_path):

@@ -22,6 +22,13 @@ first: --context-jump-tokens / RUN_WATCH_CONTEXT_JUMP_TOKENS, and so on. A
 trial whose agent/little_coder.log is non-empty (the adapter writes it once
 the agent has finished) is "verifying": no stall alerts.
 
+An omlx prefix-cache divergence deep in history is joined to the turn whose
+request produced it (same trial, timestamp inside the turn, same prompt size;
+see classify_divergence) and reported as expected_divergence when that turn
+demoted, stubbed or followed a compaction, as divergence_in_output when it
+split the previous turn's generated output (jundot/omlx#4353), and as a
+prefix_divergence warning only when the ledger explains nothing.
+
 --once makes one pass over everything already written and exits 1 when it
 raised a crit alert, 2 when the pass itself failed, else 0. Alerts already in
 alerts.jsonl are not raised again, so cron can call it.
@@ -212,6 +219,10 @@ class RuleConfig:
     no_demotion_context_tokens: int = 60_000
     divergence_reprefill_tokens: int = 16_384
     divergence_gap_tokens: int = 8_192
+    #: How long a divergence waits for the turn record that produced it.
+    divergence_match_wait_s: float = 1800.0
+    #: |server prompt - ledger prompt_tokens| still counted as the same request.
+    divergence_match_tokens: int = 16
     cache_min_prompt_tokens: int = 40_000
     cache_min_hit_ratio: float = 0.5
     ttft_max_s: float = 120.0
@@ -250,6 +261,11 @@ class TrialState:
     turns_over_ctx: int = 0
     cache_reported: bool = False
     fired_once: set = field(default_factory=set)
+    #: Recent turns as {turn, ts_start, ts_end, prompt, output, explained_by}; the
+    #: join key for server-side prefix divergences (classify_divergence).
+    turns: list = field(default_factory=list)
+    #: Classified divergences by rule name.
+    divergences: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -374,6 +390,16 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
 
     st.n_turns += 1
     st.last_turn_ts = ts
+    explained_by = []
+    if _n(rec.get("demoted_new")) > 0:
+        explained_by.append("demotion")
+    if stubbed_new > 0:
+        explained_by.append("stub")
+    if any(c.get("ok") for c in comps):
+        explained_by.append("compaction")
+    st.turns.append({"turn": rec.get("turn"), "ts_start": _num(rec.get("ts_start")) or ts, "ts_end": ts,
+                     "prompt": prompt, "output": output, "explained_by": explained_by})
+    del st.turns[:-MAX_REMEMBERED_TURNS]
 
     if st.max_demoted == 0 and "no_demotions" not in st.fired_once:
         if st.max_large_pairs >= cfg.no_demotion_large_pairs:
@@ -390,6 +416,80 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         add("info", "telemetry_missing",
             f"{st.n_turns} turns and no lc-telemetry: the demotion rules cannot see this trial", subj="once")
     return alerts
+
+
+MAX_REMEMBERED_TURNS = 200
+#: Clock slack when placing a server line inside a turn's [ts_start, ts_end].
+DIVERGENCE_WINDOW_SLACK_S = 5.0
+#: Tokens of slack around the previous output's span for divergence_in_output.
+OUTPUT_SPAN_SLACK_TOKENS = 64
+
+
+def is_mid_history_divergence(ev: dict, cfg: RuleConfig) -> bool:
+    """An omlx prefix-cache line that diverged deep in history and re-prefills a lot."""
+    if ev.get("kind") != "prefix_cache":
+        return False
+    reprefill, shared, comparable = (_n(ev.get(k)) for k in ("reprefill", "shared", "comparable"))
+    return comparable - shared >= cfg.divergence_gap_tokens and reprefill >= cfg.divergence_reprefill_tokens
+
+
+def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -> Optional[list[Alert]]:
+    """Join one mid-history divergence to the turn whose request produced it.
+
+    The match: the server line's timestamp falls inside a turn's
+    [ts_start, ts_end] (+/- DIVERGENCE_WINDOW_SLACK_S) AND its prompt size
+    ("re-prefills X of Y tokens", Y) is that turn's prompt_tokens within
+    divergence_match_tokens. omlx logs the line when prefill starts and the
+    ledger writes the record at turn_end, so an unmatched divergence waits
+    (returns None) until the record lands. It is decided as unmatched once a
+    later turn has started after it, or after divergence_match_wait_s.
+
+    Classes, by what the matched turn's own record says:
+    - expected_divergence (info): the turn demoted shell pairs, stubbed a
+      length-truncated message, or followed a successful compaction; each
+      rewrites history on purpose (shell-retention batching, #81).
+    - divergence_in_output (info): the shared prefix ends inside the previous
+      turn's generated output, where omlx re-tokenizes the sampled tokens
+      (jundot/omlx#4353); costly but not a harness defect.
+    - prefix_divergence (warn): nothing in the ledger explains it.
+    """
+    ts = _num(ev.get("ts")) or 0.0
+    prompt, shared, comparable, reprefill = (_n(ev.get(k)) for k in ("prompt", "shared", "comparable", "reprefill"))
+    gap = comparable - shared
+    slack = DIVERGENCE_WINDOW_SLACK_S
+    matched = None
+    for i, t in enumerate(st.turns):
+        if (t["ts_start"] - slack <= ts <= t["ts_end"] + slack
+                and abs(t["prompt"] - prompt) <= cfg.divergence_match_tokens):
+            matched = (i, t)
+    data = {"reprefill": reprefill, "shared": shared, "comparable": comparable, "prompt": prompt}
+    subject = f"{ev.get('src')} {ts:.3f}"
+    detail = f"{gap:,} tokens before its end; re-prefilling {reprefill:,} of {prompt:,}"
+
+    def out(level: str, rule: str, message: str, extra: dict) -> list[Alert]:
+        st.divergences[rule] = st.divergences.get(rule, 0) + 1
+        return [Alert(ts, level, rule, st.name, subject, message, {**data, **extra})]
+
+    if matched is None:
+        later = any(t["ts_start"] - slack > ts for t in st.turns)
+        if not later and now - ts <= cfg.divergence_match_wait_s:
+            return None
+        return out("warn", "prefix_divergence",
+                   f"prompt diverged from the cached prefix {detail} (no matching turn record)", {"turn": None})
+    i, t = matched
+    if t["explained_by"]:
+        return out("info", "expected_divergence",
+                   f"turn {t['turn']} rewrote history ({', '.join(t['explained_by'])}): diverged {detail}",
+                   {"turn": t["turn"], "explained_by": list(t["explained_by"])})
+    prev = st.turns[i - 1] if i > 0 else None
+    if (prev is not None and prev["output"] > 0
+            and prev["prompt"] - OUTPUT_SPAN_SLACK_TOKENS <= shared
+            <= prev["prompt"] + prev["output"] + OUTPUT_SPAN_SLACK_TOKENS):
+        return out("info", "divergence_in_output",
+                   f"turn {t['turn']} diverged inside the previous output (tokens {prev['prompt']:,}-"
+                   f"{prev['prompt'] + prev['output']:,}): omlx re-tokenized it (jundot/omlx#4353); {detail}",
+                   {"turn": t["turn"]})
+    return out("warn", "prefix_divergence", f"prompt diverged from the cached prefix {detail}", {"turn": t["turn"]})
 
 
 def evaluate_server_event(ev: dict, trial: Optional[str], cfg: RuleConfig) -> list[Alert]:
@@ -537,6 +637,8 @@ class WatchState:
     dedup: DedupState = field(default_factory=DedupState)
     last_status_ts: Optional[float] = None
     server_last: dict = field(default_factory=dict)
+    #: (event, trial name) divergences waiting for their turn record.
+    pending_divergences: list = field(default_factory=list)
 
 
 def read_new_lines(st: TailState) -> list[str]:
@@ -681,7 +783,26 @@ def _poll_server(ws: WatchState, now: float) -> list:
             ws.server_last = {"ttft_s": e.get("ttft_s"), "prompt": e.get("prompt"), "cached": e.get("cached")}
         if e["ts"] < floor:
             continue  # before this job: status context only, never an alert
-        out.extend(evaluate_server_event(e, attribute_trial(e["ts"], windows), ws.cfg))
+        trial = attribute_trial(e["ts"], windows)
+        if trial is not None and is_mid_history_divergence(e, ws.cfg):
+            ws.pending_divergences.append((e, trial))  # classified against the ledger in poll_once
+            continue
+        out.extend(evaluate_server_event(e, trial, ws.cfg))
+    return out
+
+
+def _resolve_divergences(ws: WatchState, now: float) -> list:
+    out, waiting = [], []
+    for ev, trial in ws.pending_divergences:
+        tw = ws.trials.get(trial)
+        got = classify_divergence(ev, tw.state, ws.cfg, now) if tw is not None else None
+        if got is None and tw is not None and tw.state.finished:
+            got = classify_divergence(ev, tw.state, ws.cfg, float("inf"))
+        if got is None:
+            waiting.append((ev, trial))
+        else:
+            out.extend(got)
+    ws.pending_divergences = waiting
     return out
 
 
@@ -709,6 +830,13 @@ def format_status(ws: WatchState, now: float) -> str:
                    f"ctx {_k(t.last_prompt_tokens)} peak {_k(t.peak_prompt_tokens)}, "
                    f"{t.compactions} cmp, demoted {t.max_demoted})"
                    f"{' verifying' if t.verifying else ''}")
+    divs = {}
+    for t in trials:
+        for k, v in t.divergences.items():
+            divs[k] = divs.get(k, 0) + v
+    if divs:
+        current += (f" | div {divs.get('expected_divergence', 0)} expected/"
+                    f"{divs.get('divergence_in_output', 0)} output/{divs.get('prefix_divergence', 0)} unexplained")
     server = ""
     ttft, prompt, cached = (ws.server_last.get(k) for k in ("ttft_s", "prompt", "cached"))
     if isinstance(ttft, (int, float)):
@@ -756,6 +884,7 @@ def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[l
                 lines.append(f"trial {_task(tdir.name)} agent done, verifying")
     if ws.server is not None:
         alerts.extend(_poll_server(ws, now))
+    alerts.extend(_resolve_divergences(ws, now))
     for tw in ws.trials.values():
         if not tw.state.finished and not tw.state.verifying:
             last_turn = max(tw.state.start_ts, _mtime(tw.tail.path) or 0.0)

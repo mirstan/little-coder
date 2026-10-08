@@ -214,3 +214,88 @@ def test_format_alert_and_row():
         "ts": 1000.0, "level": "crit", "rule": "length_stop", "trial": TRIAL, "subject": "turn 3",
         "message": "response hit the output limit", "data": {"suppressed_before": 2}}
     assert isinstance(row["iso"], str) and row["iso"]
+
+
+# ── prefix-divergence classification against the turn ledger ──────────────
+
+def div_event(ts, prompt, shared, comparable, reprefill):
+    return {"src": "omlx", "kind": "prefix_cache", "ts": ts, "request": "r", "prompt": prompt,
+            "reused": shared, "reprefill": reprefill, "shared": shared, "comparable": comparable}
+
+
+def ledger(*recs):
+    """Fold turn records into a TrialState the way the watcher does."""
+    st, cfg = trial(), W.RuleConfig()
+    for r in recs:
+        W.evaluate_turn(st, r, cfg)
+    return st
+
+
+T1 = dict(ts_start=1000.0, ts_end=1100.0, prompt_tokens=50_000, output=900)
+
+
+def test_a_divergence_on_a_turn_that_demoted_is_expected_not_an_alert():
+    st = ledger(rec(1, **T1),
+                rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4,
+                    retention=retention(12, 8, 8)))
+    got = W.classify_divergence(div_event(1201.5, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
+    assert rules(got) == [("info", "expected_divergence")]
+    assert got[0].data["explained_by"] == ["demotion"] and got[0].data["turn"] == 2
+    assert got[0].subject == "omlx 1201.500"
+
+
+def test_a_divergence_after_a_compaction_or_a_stub_is_expected():
+    for extra, why in (({"compactions": [{"source": "pi", "reason": "threshold", "ok": True}]}, "compaction"),
+                       ({"stubbed_new": 1, "stubs": {"v": 1, "kind": "length_stub", "stubbed": 1}}, "stub")):
+        st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=40_000, **extra))
+        got = W.classify_divergence(div_event(1202.0, 40_000, 5_000, 48_000, 35_000), st, W.RuleConfig(), now=1400.0)
+        assert rules(got) == [("info", "expected_divergence")], why
+        assert got[0].data["explained_by"] == [why]
+
+
+def test_a_failed_compaction_explains_nothing():
+    st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000,
+                                  compactions=[{"source": "harness", "reason": "manual", "ok": False}]))
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
+    assert rules(got) == [("warn", "prefix_divergence")]
+
+
+def test_an_unexplained_mid_history_divergence_stays_a_warning():
+    st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=0))
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
+    assert rules(got) == [("warn", "prefix_divergence")]
+    assert got[0].data["turn"] == 2 and "30,000 tokens before its end" in got[0].message
+
+
+def test_a_divergence_inside_the_previous_output_gets_its_own_label():
+    # Turn 1 prompted 50,000 and generated 20,000; omlx re-tokenized that output
+    # (jundot/omlx#4353), so turn 2's prompt shares 55,000 of the stored 70,000.
+    st = ledger(rec(1, ts_start=1000.0, ts_end=1100.0, prompt_tokens=50_000, output=20_000),
+                rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=71_000))
+    got = W.classify_divergence(div_event(1201.0, 71_000, 55_000, 70_000, 16_500), st, W.RuleConfig(), now=1400.0)
+    assert rules(got) == [("info", "divergence_in_output")]
+    assert "previous output" in got[0].message and "omlx#4353" in got[0].message
+
+
+def test_a_divergence_waits_for_its_turn_record_then_times_out_as_unmatched():
+    st = ledger(rec(1, **T1))
+    ev = div_event(1201.0, 70_000, 30_000, 60_000, 40_000)
+    cfg = W.RuleConfig()
+    assert W.classify_divergence(ev, st, cfg, now=1300.0) is None  # turn 2 still running
+    late = W.classify_divergence(ev, st, cfg, now=1201.0 + cfg.divergence_match_wait_s + 1)
+    assert rules(late) == [("warn", "prefix_divergence")] and "no matching turn" in late[0].message
+    # A later turn already recorded means the window has passed: decide now.
+    st2 = ledger(rec(1, **T1), rec(3, ts_start=1500.0, ts_end=1600.0, prompt_tokens=90_000))
+    assert rules(W.classify_divergence(ev, st2, cfg, now=1600.0)) == [("warn", "prefix_divergence")]
+
+
+def test_matching_needs_the_prompt_count_not_just_the_time_window():
+    st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4))
+    # Same window, different prompt size: another request (e.g. a subagent), not turn 2.
+    assert W.classify_divergence(div_event(1201.0, 33_000, 1_000, 30_000, 32_000), st, W.RuleConfig(), now=1250.0) is None
+
+
+def test_divergence_counts_by_class_are_kept_on_the_trial():
+    st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4))
+    W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
+    assert st.divergences == {"expected_divergence": 1}
