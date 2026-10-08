@@ -300,16 +300,17 @@ ABORTED = dict(ts_start=1200.0, ts_end=1300.0, usage_reported=False, prompt_toke
 
 
 def test_an_aborted_turn_without_usage_matches_on_its_window_alone():
-    st = ledger(rec(1, **T1), rec(2, demoted_new=4, retention=retention(12, 8, 8), **ABORTED))
-    # now is inside the turn window's wait: decided because the record exists, not by timeout.
-    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1301.0)
+    st = ledger(rec(1, **T1), rec(2, demoted_new=4, retention=retention(12, 8, 8), **ABORTED),
+                rec(3, ts_start=1400.0, ts_end=1500.0, prompt_tokens=90_000))
+    # now is inside the wait: decided because a later turn has started, not by timeout.
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1501.0)
     assert rules(got) == [("info", "expected_divergence")]
     assert got[0].data["turn"] == 2 and got[0].data["explained_by"] == ["demotion"]
 
 
 def test_an_unexplained_divergence_on_an_aborted_turn_names_that_turn():
-    st = ledger(rec(1, **T1), rec(2, **ABORTED))
-    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1301.0)
+    st = ledger(rec(1, **T1), rec(2, **ABORTED), rec(3, ts_start=1400.0, ts_end=1500.0, prompt_tokens=90_000))
+    got = W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1501.0)
     assert rules(got) == [("warn", "prefix_divergence")]
     assert got[0].data["turn"] == 2 and "no matching turn record" not in got[0].message
 
@@ -328,6 +329,27 @@ def test_the_in_output_check_skips_an_aborted_turn_for_the_previous_output():
                 rec(3, ts_start=1200.0, ts_end=1300.0, prompt_tokens=71_000))
     got = W.classify_divergence(div_event(1201.0, 71_000, 55_000, 70_000, 16_500), st, W.RuleConfig(), now=1400.0)
     assert rules(got) == [("info", "divergence_in_output")] and got[0].data["turn"] == 3
+
+
+def test_a_retry_divergence_in_an_aborted_turns_slack_waits_for_the_retry_record():
+    # pi retries 2 s after turn 2 aborts; omlx logs the retry's prefix line before
+    # its record exists, inside turn 2's trailing slack.
+    st, cfg = ledger(rec(1, **T1), rec(2, **ABORTED)), W.RuleConfig()
+    ev = div_event(1302.0, 70_000, 30_000, 60_000, 40_000)
+    assert W.classify_divergence(ev, st, cfg, now=1310.0) is None
+    W.evaluate_turn(st, rec(3, ts_start=1301.0, ts_end=1400.0, prompt_tokens=70_000, demoted_new=4), cfg)
+    got = W.classify_divergence(ev, st, cfg, now=1401.0)
+    assert rules(got) == [("info", "expected_divergence")] and got[0].data["turn"] == 3
+
+
+def test_a_divergence_that_belongs_to_the_aborted_turn_matches_it_once_the_next_turn_lands():
+    st, cfg = ledger(rec(1, **T1), rec(2, **ABORTED)), W.RuleConfig()
+    ev = div_event(1201.0, 70_000, 30_000, 60_000, 40_000)
+    assert W.classify_divergence(ev, st, cfg, now=1310.0) is None
+    W.evaluate_turn(st, rec(3, ts_start=1303.0, ts_end=1400.0, prompt_tokens=90_000), cfg)
+    got = W.classify_divergence(ev, st, cfg, now=1401.0)
+    assert rules(got) == [("warn", "prefix_divergence")] and got[0].data["turn"] == 2
+    assert "no matching turn record" not in got[0].message
 
 
 def test_divergence_counts_by_class_are_kept_on_the_trial():

@@ -447,9 +447,12 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
     divergence_match_tokens. A turn that reported no usage (aborted or
     errored, prompt_tokens 0) matches on the window alone, used only when no
     turn matches on prompt size. omlx logs the line when prefill starts and the
-    ledger writes the record at turn_end, so an unmatched divergence waits
-    (returns None) until the record lands. It is decided as unmatched once a
-    later turn has started after it, or after divergence_match_wait_s.
+    ledger writes the record at turn_end, so a divergence with no prompt-size
+    match waits (returns None) until the record lands: a retry or follow-up can
+    start inside an aborted turn's trailing slack before its own record exists.
+    Once a later turn has started after the line, or after
+    divergence_match_wait_s, it falls back to a window-alone match, else is
+    decided as unmatched.
 
     Classes, by what the matched turn's own record says:
     - expected_divergence (info): the turn demoted shell pairs, stubbed a
@@ -482,10 +485,11 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
         st.divergences[rule] = st.divergences.get(rule, 0) + 1
         return [Alert(ts, level, rule, st.name, subject, message, {**data, **extra})]
 
-    if matched is None:
+    if by_prompt is None:
         later = any(t["ts_start"] - slack > ts for t in st.turns)
         if not later and now - ts <= cfg.divergence_match_wait_s:
             return None
+    if matched is None:
         return out("warn", "prefix_divergence",
                    f"prompt diverged from the cached prefix {detail} (no matching turn record)", {"turn": None})
     i, t = matched
