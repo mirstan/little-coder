@@ -275,6 +275,27 @@ describe("shell-retention telemetry (wired)", () => {
     expect(out?.messages[2].content[0].text).toMatch(/^\[shell result demoted/);
   });
 
+  it("reads the window from ctx.model when usage is unavailable, and turns the gate off when ctx throws", async () => {
+    wired = wire();
+    const msgs = staleSeedMessages();
+    for (const h of wired.handlers.context ?? []) {
+      await h({ messages: msgs }, { ...makeCtx(), getContextUsage: () => undefined, model: { contextWindow: 262144 } });
+    }
+    expect(wired.entries.at(-1)?.data).toMatchObject({ gate: "open", gateReason: "cold", demoted: 1 });
+
+    const stale = {
+      ...makeCtx(),
+      getContextUsage: () => {
+        throw new Error("stale ctx");
+      },
+      get model(): unknown {
+        throw new Error("stale ctx");
+      },
+    };
+    for (const h of wired.handlers.context ?? []) await h({ messages: msgs }, stale);
+    expect(wired.entries.at(-1)?.data).toMatchObject({ gate: "off", demoted: 1 });
+  });
+
   it("emits echo_block when it blocks a call quoting a live placeholder", async () => {
     wired = wire();
     const out = await project(wired.handlers, staleSeedMessages());

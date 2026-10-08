@@ -129,15 +129,16 @@ const hostArchive: RetentionArchive = {
 // What pi compacts on: the last request's usage plus an estimate of what
 // followed. The window comes from the model; without one the gate stays off.
 function gateContext(ctx: any): GateContext {
-  let usage: any;
+  // ctx accessors throw once the session has been replaced; the gate must
+  // never break the hook, so any failure reads as "unknown" (gate off).
   try {
-    usage = ctx?.getContextUsage?.();
+    const usage = ctx?.getContextUsage?.();
+    const tokens = typeof usage?.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null;
+    const window = typeof usage?.contextWindow === "number" ? usage.contextWindow : ctx?.model?.contextWindow;
+    return { contextTokens: tokens, contextWindow: typeof window === "number" ? window : null };
   } catch {
-    usage = undefined;
+    return { contextTokens: null, contextWindow: null };
   }
-  const tokens = typeof usage?.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null;
-  const window = typeof usage?.contextWindow === "number" ? usage.contextWindow : ctx?.model?.contextWindow;
-  return { contextTokens: tokens, contextWindow: typeof window === "number" ? window : null };
 }
 
 export default function (pi: ExtensionAPI) {

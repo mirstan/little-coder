@@ -338,6 +338,13 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         # leaves the prompt growing from the same baseline.
         if any(c.get("ok") for c in comps):
             st.last_prompt_tokens = None
+            # The cost gate is meant to open before compaction; reaching one
+            # with every due pair still raw means it never did.
+            if st.cost_deferred and st.max_demoted == 0 and once("deferred_into_compaction"):
+                add("warn", "deferred_into_compaction",
+                    f"compacted with {st.max_due} due shell pair(s) never demoted: the cost gate "
+                    f"deferred them all the way (check LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT and the window)",
+                    subj="once", data={"due": st.max_due})
 
     prompt, output = _n(rec.get("prompt_tokens")), _n(rec.get("output"))
     if rec.get("usage_reported"):

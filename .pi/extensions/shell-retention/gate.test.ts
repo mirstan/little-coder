@@ -15,6 +15,7 @@ import {
   DEFAULT_MIN_PAIR_BYTES,
   DEFAULT_RETAIN_RAW,
   DEFAULT_STALE_DISTANCE,
+  MIN_GATE_WINDOW,
   ENV_DEMOTE_FORCE_PENDING_BYTES,
   ENV_DEMOTE_MIN_SAVE_RATIO,
   ENV_DEMOTE_OPEN_AT_PERCENT,
@@ -263,16 +264,83 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     expect(disabled.stats.gate).toBe("off");
   });
 
-  it("estimates the context from the messages when pi has no usage yet", () => {
-    const msgs = deep();
-    const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+  it("opens on a cold cache: pi has no usage between a compaction and the next response", () => {
+    const out = demoteMessagesWithStats(deep(), memArchive(), OPTS, {
       options: GATE,
       context: { contextTokens: null, contextWindow: WINDOW },
     });
-    // ~430K chars at 4 chars/token is ~108K tokens, under 75% of the window.
+    expect(out.demotedCount).toBe(B);
+    expect(out.stats).toMatchObject({ gate: "open", gateReason: "cold" });
+    // ~430K chars at 4 chars/token, from the messages themselves.
     expect(out.stats.estContextTokens).toBeGreaterThan(100_000);
-    expect(out.stats.estContextTokens).toBeLessThan(0.75 * WINDOW);
-    expect(out.stats.gate).toBe("deferred");
+  });
+
+  it("stays off below MIN_GATE_WINDOW, where its defaults were never fitted", () => {
+    const msgs = deep();
+    const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 20_000, contextWindow: MIN_GATE_WINDOW - 1 },
+    });
+    expect(out.stats.gate).toBe("off");
+    expect(out.demotedCount).toBe(B);
+  });
+
+  it("does not count history the server has not cached yet as re-prefill", () => {
+    // The same due batch with the long tail arriving as new tool output after the
+    // last response: the server prefills it on this request either way.
+    const msgs: any[] = history(B + R, 4096, 0);
+    msgs.push(call("late", "cat big"), result("late", "y".repeat(400_000)));
+    const atEnd = demoteMessagesWithStats(msgs.slice(0, -1).concat([{ role: "user", content: "z".repeat(400_000) }]), memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 50_000, contextWindow: WINDOW },
+    });
+    expect(atEnd.stats.estReprefillTokens).toBeLessThan(20_000);
+    expect(atEnd.stats).toMatchObject({ gate: "open", gateReason: "ratio" });
+  });
+
+  it("never lets the latch reach past today's candidate (compaction, a changed knob, a reused id)", () => {
+    const archive = memArchive();
+    // Every pair archived by an earlier projection, but only the oldest B are due now.
+    const msgs = history(B + R, 4096, 400_000);
+    for (let i = 0; i < B + R; i++) archive.save(archiveId(`p${i}`), "x");
+    const out = demoteMessagesWithStats(msgs, archive, OPTS, {
+      options: GATE,
+      context: { contextTokens: 120_000, contextWindow: WINDOW },
+    });
+    expect(out.stats).toMatchObject({ sticky: B, prefix: B, gate: "none" });
+    expect(demotedIds(out.messages)).toEqual(Array.from({ length: B }, (_, i) => `p${i}`));
+  });
+
+  it("defers a pending-bytes flush like any other jump", () => {
+    // Under the force budget but over the 64 KiB flush: the flush makes the jump
+    // due, the gate still judges it.
+    const msgs: any[] = [{ role: "user", content: "go" }];
+    msgs.push(call("big", `cat > /tmp/a <<'EOF'\n${body(70 * 1024, "src")}\nEOF`), result("big", "ok"));
+    for (let i = 0; i < 30; i++) msgs.push({ role: "user", content: `u${i}` }, { role: "assistant", content: [{ type: "thinking", thinking: "t".repeat(40_000) }] });
+    const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 150_000, contextWindow: WINDOW },
+    });
+    expect(out.stats).toMatchObject({ due: 1, flushed: true, gate: "deferred", skippedCost: 1, prefix: 0 });
+    // The break would start inside the call message, at its toolCall block.
+    expect(out.stats.estReprefillTokens).toBeGreaterThan(290_000);
+  });
+
+  it("ignores pairs that rewrite nothing when placing the break", () => {
+    // A signed heredoc whose result is tiny cannot shrink; the break is the next pair's result.
+    const msgs: any[] = [{ role: "user", content: "go" }];
+    msgs.push(
+      { role: "assistant", content: [{ type: "toolCall", id: "s0", name: "ShellSession", arguments: { command: body(5000, "h") }, thoughtSignature: "sig" }] },
+      result("s0", "ok"),
+    );
+    msgs.push({ role: "assistant", content: [{ type: "thinking", thinking: "t".repeat(200_000) }] });
+    for (let i = 1; i < B + R; i++) msgs.push(call(`p${i}`, `echo ${i}`), result(`p${i}`, body(4096, `p${i}`)));
+    const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 60_000, contextWindow: WINDOW },
+    });
+    expect(out.stats.estReprefillTokens).toBeLessThan(20_000);
+    expect(out.stats).toMatchObject({ gate: "open", skippedNoShrink: 1, signed: 1 });
   });
 
   it("archives nothing for a deferred pair, so the latch cannot claim it", () => {

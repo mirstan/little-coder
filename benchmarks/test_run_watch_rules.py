@@ -158,6 +158,22 @@ def test_a_cost_deferral_explains_no_demotions_and_is_reported_once():
     assert seen == []
 
 
+def test_a_compaction_reached_with_every_due_pair_still_deferred_warns_once():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, prompt_tokens=200_000, retention=gated(13, 8, 8)), cfg)
+    comp = [{"source": "harness", "reason": "manual", "ok": True, "tokens_before": 221_000, "tokens_after": 30_000}]
+    got = W.evaluate_turn(st, rec(2, prompt_tokens=30_000, compactions=comp, retention=gated(2, 0, 0)), cfg)
+    assert rules(got) == [("warn", "deferred_into_compaction")]
+    assert W.evaluate_turn(st, rec(3, prompt_tokens=31_000, compactions=comp, retention=gated(2, 0, 0)), cfg) == []
+
+    # A demotion before the compaction means the gate did open: nothing to say.
+    st2 = trial()
+    W.evaluate_turn(st2, rec(1, prompt_tokens=200_000, retention=gated(13, 8, 4)), cfg)
+    W.evaluate_turn(st2, rec(2, prompt_tokens=205_000, retention={**retention(13, 8, 8), "skippedCost": 0}), cfg)
+    assert "deferred_into_compaction" not in rules(
+        W.evaluate_turn(st2, rec(3, prompt_tokens=30_000, compactions=comp), cfg))
+
+
 def test_guard_and_stub_telemetry_raise_info_alerts():
     st, cfg = trial(), W.RuleConfig()
     guard = {"v": 1, "kind": "guard_abort", "trigger": "toolcall_cap", "tool": "ShellSession",
