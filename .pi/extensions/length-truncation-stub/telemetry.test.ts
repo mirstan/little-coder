@@ -57,20 +57,25 @@ describe("length-truncation-stub telemetry", () => {
     }
   });
 
-  it("emits a length_stub snapshot only for requests that stub, and none under the kill switch", async () => {
+  it("emits a length_stub snapshot on every request, zeros included, and none with telemetry off", async () => {
     const { handlers, entries } = wire();
     await fireContext(handlers, [{ role: "user", content: "hi" }]);
-    expect(entries).toEqual([]);
+    expect(entries).toEqual([
+      { customType: "lc-telemetry", data: { v: 1, kind: "length_stub", stubbed: 0, bytesBefore: 0, bytesAfter: 0 } },
+    ]);
 
     const projected = await fireContext(handlers, [{ role: "user", content: "write it" }, truncated]);
-    expect(entries.map((e) => [e.customType, e.data.kind, e.data.stubbed])).toEqual([["lc-telemetry", "length_stub", 1]]);
-    expect(entries[0].data.bytesBefore).toBeGreaterThan(20_000);
-    expect(entries[0].data.bytesAfter).toBeLessThan(2_000);
+    expect(entries.map((e) => [e.customType, e.data.kind, e.data.stubbed])).toEqual([
+      ["lc-telemetry", "length_stub", 0],
+      ["lc-telemetry", "length_stub", 1],
+    ]);
+    expect(entries[1].data.bytesBefore).toBeGreaterThan(20_000);
+    expect(entries[1].data.bytesAfter).toBeLessThan(2_000);
     expect(JSON.stringify(projected)).toContain(STUB_ECHO_PHRASE);
 
     delete process.env.LITTLE_CODER_TELEMETRY;
     const still = await fireContext(handlers, [{ role: "user", content: "write it" }, truncated]);
-    expect(entries).toHaveLength(1);
+    expect(entries).toHaveLength(2);
     expect(JSON.stringify(still)).toContain(STUB_ECHO_PHRASE);
   });
 

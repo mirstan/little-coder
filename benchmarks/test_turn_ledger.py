@@ -218,6 +218,22 @@ def test_summary_folds_peaks_histogram_ttft_and_stubs():
     assert s["max_ttft_s"] == 0.5
 
 
+def test_a_stub_after_compaction_counts_as_new_once_a_zero_snapshot_arrives():
+    ok = assistant([], usage(input=10))
+
+    def stub(n):
+        return telemetry({"kind": "length_stub", "stubbed": n, "bytesBefore": n * 9000, "bytesAfter": n * 1200})
+
+    st, recs = run([
+        (0, {"type": "turn_start"}), (0.1, stub(3)), (1, turn_end(ok)),
+        (2, {"type": "lc_harness_compaction", "n": 1, "ok": True, "tokens_before": 221000, "tokens_after": 38000, "error": None}),
+        (3, {"type": "turn_start"}), (3.1, stub(0)), (4, turn_end(ok)),
+        (5, {"type": "turn_start"}), (5.1, stub(1)), (6, turn_end(ok)),
+    ])
+    assert [r["stubbed_new"] for r in recs] == [3, 0, 1]
+    assert L.summarize(st)["stubbed_new_total"] == 4
+
+
 def test_a_turn_start_without_turn_end_is_counted_and_its_telemetry_kept():
     ok = assistant([], usage(input=10))
     st, recs = run([

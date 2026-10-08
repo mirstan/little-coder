@@ -43,22 +43,24 @@ export default function (pi: ExtensionAPI) {
   pi.on("context", async (event) => {
     const input: any[] = (event as any).messages || [];
     const { messages, stubbedCount } = stubTruncatedMessages(input);
+    // stubTruncatedMessages returns every untouched message as the same
+    // object, so identity picks out exactly the stubbed ones.
+    let bytesBefore = 0;
+    let bytesAfter = 0;
+    messages.forEach((m, i) => {
+      if (m !== input[i]) {
+        bytesBefore += jsonBytes(input[i]);
+        bytesAfter += jsonBytes(m);
+      }
+    });
+    // pi hands this hook pristine stored history on every request, so
+    // `stubbed` is how many stubbed messages this projection carries, not
+    // how many are new; benchmarks/turn_ledger.py diffs the snapshots.
+    // Emitted on every request, zeros included: after a compaction drops the
+    // stubbed messages, the zero snapshot is what lets the next stub diff as new.
+    emitTelemetry(pi, "length_stub", { stubbed: stubbedCount, bytesBefore, bytesAfter });
     if (stubbedCount > 0) {
       stubEmitted = true;
-      // stubTruncatedMessages returns every untouched message as the same
-      // object, so identity picks out exactly the stubbed ones.
-      let bytesBefore = 0;
-      let bytesAfter = 0;
-      messages.forEach((m, i) => {
-        if (m !== input[i]) {
-          bytesBefore += jsonBytes(input[i]);
-          bytesAfter += jsonBytes(m);
-        }
-      });
-      // pi hands this hook pristine stored history on every request, so
-      // `stubbed` is how many stubbed messages this projection carries, not
-      // how many are new; benchmarks/turn_ledger.py diffs the snapshots.
-      emitTelemetry(pi, "length_stub", { stubbed: stubbedCount, bytesBefore, bytesAfter });
       return { messages };
     }
   });
