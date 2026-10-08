@@ -572,7 +572,7 @@ export function demoteMessagesWithStats(
   return { messages: result, demotedCount, stats };
 }
 
-/** demoteMessagesWithStats without the stats: the shape every existing caller and test uses. */
+/** demoteMessagesWithStats without the stats: the shape the existing tests use. */
 export function demoteMessages(
   messages: any[],
   archive: RetentionArchive,

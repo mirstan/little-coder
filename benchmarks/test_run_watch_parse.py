@@ -1,5 +1,4 @@
-"""run_watch parsers over real omlx / Splash log lines (brief, omlx.log and
-scratchpad splash/serve-*-tb.log) and turns.jsonl records."""
+"""run_watch parsers over real omlx / Splash log lines and turns.jsonl records."""
 import json
 import os
 import sys

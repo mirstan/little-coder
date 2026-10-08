@@ -45,8 +45,8 @@ so tracebacks show the code that is actually running:
       python3 "$d/run_watch.py" benchmarks/harbor_runs \
         --server-log /opt/homebrew/var/log/omlx.log &
 
-Parsing and rules are pure functions over strings, dicts and an injected
-clock; read_new_lines, poll_once and main are the only IO.
+Parsing and rules read no files and take the clock as an argument; all
+file IO lives below the IO section marker.
 """
 from __future__ import annotations
 
@@ -457,7 +457,7 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
     Classes, by what the matched turn's own record says:
     - expected_divergence (info): the turn demoted shell pairs, stubbed a
       length-truncated message, or followed a successful compaction; each
-      rewrites history on purpose (shell-retention batching, #81).
+      rewrites history on purpose (shell-retention batching).
     - divergence_in_output (info): the shared prefix ends inside the previous
       turn's generated output (the nearest earlier turn that reported usage),
       where omlx re-tokenizes the sampled tokens

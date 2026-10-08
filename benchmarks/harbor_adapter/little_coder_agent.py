@@ -2243,7 +2243,7 @@ class LittleCoderAgent(BaseAgent):
                     "token_usage": tokens["raw"],
                     "token_source": tokens["token_source"],
                     # Peak context, max output, stopReason histogram, demotion,
-                    # guard and stub counts from turns.jsonl (turn_ledger.py).
+                    # guard and stub counts (turn_ledger.summarize).
                     "turn_ledger": sink_metadata(ledger),
                 }
             finally:

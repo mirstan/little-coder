@@ -20,8 +20,9 @@ Sources, all authoritative, none parsed from prose:
   agent-session.js:353 forwards the raw agent event; turnIndex lives only on
   the extension event, :435-452, and resets every agent_start).
 
-observe() is pure: state and one event in, finished records out. The LedgerSink
-half at the bottom is the only IO, and it never raises into a trial.
+observe() does no IO: it folds one event into state and returns finished
+records. The LedgerSink half at the bottom is the only IO, and it never raises
+into a trial.
 """
 from __future__ import annotations
 
