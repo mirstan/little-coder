@@ -92,9 +92,19 @@ export function toolResult(id: string, name: string, text: string): any {
 }
 
 /** One TB-shaped turn: a user prompt then `steps` tool calls with large outputs. */
-export function longTurn(sm: SessionManager, prompt: string, steps: number, tag: string, outputChars = 12_000): void {
+export function longTurn(
+  sm: SessionManager,
+  prompt: string,
+  steps: number,
+  tag: string,
+  outputChars = 12_000,
+  telemetry = false,
+): void {
   sm.appendMessage(userMsg(prompt));
   for (let i = 0; i < steps; i++) {
+    // What a benchmark run's session looks like: shell-retention's context hook
+    // appends an lc-telemetry entry before every request (LITTLE_CODER_TELEMETRY=1).
+    if (telemetry) sm.appendCustomEntry("lc-telemetry", { kind: "shell_retention", v: 1 });
     const id = `call_${tag}_${i}`;
     const name = i % 3 === 0 ? "read" : "bash";
     const args = name === "read" ? { path: `/app/src/file_${tag}_${i}.c` } : { command: `make step_${tag}_${i}` };

@@ -149,8 +149,20 @@ export function planReuse(
     if (!messages.some((m: any) => m?.role === "user" && norm(textOf(m)).includes(needle))) return { fallback: "stale" };
   }
 
-  const entry = (event.branchEntries ?? []).find((e: any) => e?.id === prep.firstKeptEntryId);
-  const cutMsg = entry ? convertToLlm(sessionEntryToContextMessages(entry))[0] : undefined;
+  // pi's findCutPoint walks the cut back over adjacent entries that put
+  // nothing in context (lc-telemetry custom entries precede every request in
+  // a benchmark run), so firstKeptEntryId often names one of those. The first
+  // message the model will still see is the next context-visible entry.
+  const branch: any[] = event.branchEntries ?? [];
+  let cutMsg: any;
+  for (let i = branch.findIndex((e) => e?.id === prep.firstKeptEntryId); i >= 0 && i < branch.length; i++) {
+    if (branch[i]?.type === "compaction") break;
+    const visible = sessionEntryToContextMessages(branch[i]);
+    if (visible.length > 0) {
+      cutMsg = convertToLlm(visible)[0];
+      break;
+    }
+  }
   if (!cutMsg) return { fallback: "anchor_missing" };
   const split = !!prep.isSplitTurn && prep.turnPrefixMessages.length > 0;
   const summarized = convertToLlm(prep.messagesToSummarize);

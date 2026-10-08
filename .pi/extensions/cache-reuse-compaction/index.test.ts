@@ -183,6 +183,12 @@ const splitWithHistory = () =>
   });
 const splitNoHistory = () => scenario((sm) => longTurn(sm, "Fix the build in /app.", 30, "c"));
 
+const telemetrySplit = () =>
+  scenario((sm) => {
+    longTurn(sm, "Set up the toolchain in /app.", 12, "a", 12_000, true);
+    longTurn(sm, "Now fix the build in /app.", 24, "b", 12_000, true);
+  });
+
 describe("scenario shapes (sanity: these are the cases the suite claims to cover)", () => {
   it("non-split, split with history, split without history", async () => {
     const a = await nonSplit();
@@ -244,6 +250,18 @@ describe("reuse path", () => {
     expect(instruction).toContain("<history-summary>");
     expect(instruction).toContain("<turn-prefix-summary>");
     expect(instruction).toContain("Now fix the build in /app.");
+  });
+
+  it("serves a benchmark-shaped session whose cut lands on a telemetry custom entry", async () => {
+    const s = await telemetrySplit();
+    const kept = s.branch.find((e: any) => e.id === s.prep.firstKeptEntryId);
+    expect(kept.type).toBe("custom");
+    reply = answer(both);
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, deps);
+    expect(out).toMatchObject({ ok: true });
+    const ref = await piReference(s);
+    expect((out as any).compaction.summary).toBe(ref.summary);
+    expect((out as any).compaction.firstKeptEntryId).toBe(ref.firstKeptEntryId);
   });
 
   it("matches pi's 'No prior history.' split when nothing precedes the turn", async () => {
