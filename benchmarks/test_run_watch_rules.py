@@ -169,12 +169,12 @@ def test_a_cost_deferral_explains_no_demotions_and_is_reported_once():
     assert seen == []
 
 
-def test_a_compaction_reached_with_every_due_pair_still_deferred_warns_once():
+def test_a_compaction_reached_with_every_due_pair_still_deferred_is_noted_once():
     st, cfg = trial(), W.RuleConfig()
     W.evaluate_turn(st, rec(1, prompt_tokens=200_000, retention=gated(13, 8, 8)), cfg)
     comp = [{"source": "harness", "reason": "manual", "ok": True, "tokens_before": 221_000, "tokens_after": 30_000}]
     got = W.evaluate_turn(st, rec(2, prompt_tokens=30_000, compactions=comp, retention=gated(2, 0, 0)), cfg)
-    assert rules(got) == [("warn", "deferred_into_compaction")]
+    assert rules(got) == [("info", "deferred_into_compaction")]
     assert W.evaluate_turn(st, rec(3, prompt_tokens=31_000, compactions=comp, retention=gated(2, 0, 0)), cfg) == []
 
     # A demotion before the compaction means the gate did open: nothing to say.
