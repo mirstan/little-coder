@@ -580,6 +580,12 @@ export interface GateArgs {
  * such as compaction recomputes it from scratch and may return pairs to raw,
  * but that edit has already invalidated the cached prefix anyway.
  *
+ * With `gate`, the jump from the latched prefix to the one above must also
+ * pass demotionGate, or it is deferred and its pairs stay raw. The gate's
+ * inputs are not monotone in history, so this mode reads one piece of
+ * cross-call state: the archive, whose entries mark pairs an earlier request
+ * demoted. Without `gate`, or with no context window, it is unchanged.
+ *
  * `stats` describes this one projection. pi's context hook receives stored,
  * undemoted history on every request (pi-agent-core agent-loop.js:178-185:
  * transformContext's result goes only to convertToLlm), so `demoted` is how
