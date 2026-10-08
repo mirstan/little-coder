@@ -672,7 +672,8 @@ def _poll_server(ws: WatchState, now: float) -> list:
             e["ts"] = ts
     windows = [(tw.state.name, tw.state.start_ts, tw.state.end_ts if tw.state.end_ts is not None else now)
                for tw in ws.trials.values()]
-    floor = ws.job_start_ts if ws.job_start_ts is not None else float("-inf")
+    # No job yet means nothing to attribute to: the backlog is all earlier work.
+    floor = ws.job_start_ts if ws.job_start_ts is not None else float("inf")
     out = []
     for e in events:
         if e.get("kind") == "completion":

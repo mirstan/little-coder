@@ -320,3 +320,16 @@ def test_a_lone_copy_of_the_script_runs_and_imports_only_the_stdlib(tmp_path):
     nested = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) and n not in tree.body]
     assert nested == []
     assert top <= set(sys.stdlib_module_names) | {"__future__"}
+
+
+def test_server_lines_never_alert_before_a_job_exists(tmp_path):
+    """Live regression: started ahead of harbor, the watcher alerted on the
+    whole 1 MiB omlx backlog because no job start bounded it yet."""
+    jobs = tmp_path / "harbor_runs"
+    jobs.mkdir()
+    log = tmp_path / "omlx.log"
+    log.write_text("2026-10-07 17:10:00,000 - omlx.server - ERROR - prefill_memory_exceeded: request rejected\n")
+    ws = W.WatchState(target=jobs, cfg=W.RuleConfig(), server=W.TailState(path=log), server_kind="omlx")
+    alerts, lines = W.poll_once(ws, datetime(2026, 10, 7, 18, 0, 0).timestamp())
+    assert alerts == []
+    assert any("no Harbor job" in line for line in lines)
