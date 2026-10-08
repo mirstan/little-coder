@@ -141,7 +141,14 @@ const capture = (s: Scenario, over: Partial<Capture> = {}): Capture => ({
   ...over,
 });
 
-const deps = { fetch: globalThis.fetch, now: Date.now, ttftTimeoutMs: 5000, stallTimeoutMs: 5000, maxOutputTokens: 1_000_000 };
+const deps = {
+  fetch: globalThis.fetch,
+  now: Date.now,
+  ttftTimeoutMs: 5000,
+  stallTimeoutMs: 5000,
+  maxOutputTokens: 1_000_000,
+  genDeadlineMs: 60_000,
+};
 
 const HISTORY =
   "## Goal\nBuild the thing\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] read sources\n\n" +
@@ -497,6 +504,20 @@ describe("fallbacks hand the compaction to pi (return nothing)", () => {
     // Each gap (20 ms) is under the stall timeout; the whole answer takes far longer than it.
     const out = await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, ttftTimeoutMs: 100, stallTimeoutMs: 80 });
     expect(out.ok).toBe(true);
+  });
+
+  it("gen_timeout when a trickling stream outlives the backstop past the generation budget", async () => {
+    const s = await nonSplit();
+    let tick: NodeJS.Timeout | undefined;
+    reply = (_q, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // A backend ignoring max_tokens: a token every 10 ms, forever.
+      tick = setInterval(() => res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "x" } }] })}\n\n`), 10);
+      res.on("close", () => clearInterval(tick));
+    };
+    const out = await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, stallTimeoutMs: 1000, genDeadlineMs: 150 });
+    clearInterval(tick);
+    expect(out).toMatchObject({ ok: false, fallback: "gen_timeout" });
   });
 
   it("caps max_tokens at what the generation budget can decode", async () => {

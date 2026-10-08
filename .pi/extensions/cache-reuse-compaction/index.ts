@@ -68,7 +68,8 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 // rest of the trial. Instead the answer is bounded up front: max_tokens is
 // at most GEN_BUDGET_S x DECODE_TOK_S (decode measured at ~20 tok/s at 170k+
 // on the TB2.1 runs, p10/p50/p90 19.6/20.8/22.9), and only a stalled stream
-// is abandoned. A TTFT fallback (240 s + pi's own) fits the 1800 s wait; an
+// is abandoned, plus a backstop at twice the budget from the first token for
+// a server that ignores max_tokens or trickles. A TTFT fallback (240 s + pi's own) fits the 1800 s wait; an
 // answer that runs most of its budget and is then rejected (truncated,
 // garbage) can still overrun it.
 //
@@ -118,6 +119,7 @@ export type Fallback =
   | "aborted"
   | "budget"
   | "stall"
+  | "gen_timeout"
   | "ttft_timeout"
   | "tool_call"
   | "truncated"
@@ -273,6 +275,12 @@ export interface RunDeps {
   stallTimeoutMs: number;
   /** Cap on max_tokens: generation budget x decode rate. */
   maxOutputTokens: number;
+  /**
+   * Backstop from the first token: a server honouring max_tokens finishes
+   * within the generation budget, so this only fires on one that ignores it
+   * or trickles. Set to twice the budget.
+   */
+  genDeadlineMs: number;
 }
 
 export type ReuseOutcome =
@@ -347,7 +355,8 @@ export async function runReuse(
   // One timer: the TTFT deadline until the first token, then a stall timer
   // re-armed by every token.
   const watchdog = new AbortController();
-  let expired: "ttft_timeout" | "stall" | null = null;
+  let expired: "ttft_timeout" | "stall" | "gen_timeout" | null = null;
+  let backstop: ReturnType<typeof setTimeout> | undefined;
   let timer = setTimeout(() => {
     expired = "ttft_timeout";
     watchdog.abort();
@@ -376,7 +385,13 @@ export async function runReuse(
       return fail("http_error", { status: res.status });
     }
     result = await readChatCompletionStream(res.body as ReadableStream<Uint8Array>, deps.now, () => {
-      if (firstTokenAt === null) firstTokenAt = deps.now();
+      if (firstTokenAt === null) {
+        firstTokenAt = deps.now();
+        backstop = setTimeout(() => {
+          expired = "gen_timeout";
+          watchdog.abort();
+        }, deps.genDeadlineMs);
+      }
       onToken();
     });
   } catch (err) {
@@ -386,6 +401,7 @@ export async function runReuse(
     return fail("http_error", { ttft_s: ttftS, error: String((err as Error)?.message ?? err).slice(0, 200) });
   } finally {
     clearTimeout(timer);
+    clearTimeout(backstop);
   }
 
   const tsEnd = deps.now();
@@ -487,6 +503,7 @@ export default function (pi: ExtensionAPI) {
       maxOutputTokens:
         Math.max(0, envNumber(ENV_GEN_BUDGET_S, DEFAULT_GEN_BUDGET_S)) *
         Math.max(0, envNumber(ENV_DECODE_TOK_S, DEFAULT_DECODE_TOK_S)),
+      genDeadlineMs: 2 * Math.max(1, envNumber(ENV_GEN_BUDGET_S, DEFAULT_GEN_BUDGET_S)) * 1000,
     });
     emitTelemetry(pi, "compaction_reuse", outcome.telemetry);
     if (outcome.ok) return { compaction: outcome.compaction };
