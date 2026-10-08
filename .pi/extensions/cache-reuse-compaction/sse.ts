@@ -28,6 +28,7 @@ function num(v: unknown): number {
 export async function readChatCompletionStream(
   body: ReadableStream<Uint8Array>,
   clock: () => number,
+  onFirstToken?: () => void,
 ): Promise<StreamResult> {
   const out: StreamResult = {
     content: "",
@@ -78,7 +79,10 @@ export async function readChatCompletionStream(
       }
       token = token || delta.tool_calls.length > 0;
     }
-    if (token && out.firstTokenAt === null) out.firstTokenAt = clock();
+    if (token && out.firstTokenAt === null) {
+      out.firstTokenAt = clock();
+      onFirstToken?.();
+    }
     if (typeof choice.finish_reason === "string") out.finishReason = choice.finish_reason;
   };
 

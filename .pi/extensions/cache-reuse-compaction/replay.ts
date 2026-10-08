@@ -41,11 +41,15 @@ export function buildReplayBody(captured: Payload, instruction: string, budget: 
 /**
  * Text the template must not see as a control sequence. The Qwen template
  * scans every user message for `<|think_*|>` and moves the thinking state
- * that renders at the top of the system block, and `<|im_end|>`-style text
- * would tokenize as a special token.
+ * that renders at the top of the system block, `<|im_end|>`-style text
+ * tokenizes as a special token, and quoted `<tool_call>` / `<function=…>` /
+ * `<think>` markup reads as the model's own structure.
  */
 export function sanitizeForTemplate(text: string): string {
-  return text.replace(/<\|/g, "< |").replace(/\|>/g, "| >");
+  return text
+    .replace(/<\|/g, "< |")
+    .replace(/\|>/g, "| >")
+    .replace(/<(\/?)(tool_call|tool_response|think|function|parameter)\b/g, "< $1$2");
 }
 
 // ── Anchors ────────────────────────────────────────────────────────────────
@@ -60,10 +64,13 @@ export interface AnchorSpec {
   before: LlmMessage[];
 }
 
-export type AnchorResult = { index: number; excerpt: string } | { error: "anchor_missing" };
+export type AnchorResult = { index: number; excerpt: string } | { error: "anchor_missing" | "anchor_ambiguous" };
 
 const SNIPPET_CHARS = 160;
-const EXCERPT_CHARS = 120;
+// Excerpt lengths tried in turn until the quoted text names few enough messages.
+const EXCERPT_CHARS = [120, 300];
+// More look-alikes than this and "the k-th of n" is not something a model can count reliably.
+const MAX_NUMBERED = 3;
 
 function normalize(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -100,16 +107,78 @@ function payloadRole(role: string): string {
   return role === "toolResult" ? "tool" : role;
 }
 
-function excerptOf(m: LlmMessage): string {
-  const ids = toolCallIds(m);
-  if (ids.length > 0) {
-    const call: any = (m.content as any[]).find((b) => b?.type === "toolCall");
-    const args = JSON.stringify(call.arguments ?? {});
-    return sanitizeForTemplate(`your tool call ${call.name}(${args.slice(0, EXCERPT_CHARS)}${args.length > EXCERPT_CHARS ? "…" : ""})`);
+// What the model sees of a message, as (label, quoted text, does a payload message show the same).
+interface Visible {
+  describe: (quoted: string) => string;
+  full: string;
+  shows: (m: any, quoted: string) => boolean;
+}
+
+function argText(v: unknown): string {
+  return typeof v === "string" ? v : JSON.stringify(v ?? "");
+}
+
+function parseArgs(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+  try {
+    const v = JSON.parse(String(raw ?? "{}"));
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
   }
-  const text = normalize(messageText(m));
+}
+
+function visibleOf(m: LlmMessage): Visible {
+  const call: any = Array.isArray(m.content) ? (m.content as any[]).find((b) => b?.type === "toolCall") : undefined;
+  if (call) {
+    // The template renders a call as <function=NAME><parameter=KEY>VALUE…, so
+    // quote the first argument's value, never the JSON form.
+    const [key, value] = Object.entries(call.arguments ?? {})[0] ?? ["", ""];
+    const name = String(call.name);
+    return {
+      describe: (q) => (key ? `your ${name} call whose ${key} argument begins "${q}"` : `your ${name} call`),
+      full: normalize(argText(value)),
+      shows: (pm, q) =>
+        pm?.role === "assistant" &&
+        Array.isArray(pm.tool_calls) &&
+        pm.tool_calls.some((t: any) => {
+          const fn = t?.function ?? {};
+          if (fn.name !== name) return false;
+          if (!key) return true;
+          return normalize(argText(parseArgs(fn.arguments)[key])).startsWith(q);
+        }),
+    };
+  }
+  const role = payloadRole(m.role);
   const who = m.role === "assistant" ? "your reply" : "the message";
-  return sanitizeForTemplate(`${who} that begins "${text.slice(0, EXCERPT_CHARS)}${text.length > EXCERPT_CHARS ? "…" : ""}"`);
+  return {
+    describe: (q) => `${who} that begins "${q}"`,
+    full: normalize(messageText(m)),
+    shows: (pm, q) => pm?.role === role && normalize(payloadText(pm)).startsWith(q),
+  };
+}
+
+const ordinal = (n: number) => `${n}${n % 10 === 1 && n !== 11 ? "st" : n % 10 === 2 && n !== 12 ? "nd" : n % 10 === 3 && n !== 13 ? "rd" : "th"}`;
+
+/**
+ * The words that point the model at payload message `index`: a quote long
+ * enough that few other messages look the same, numbered when a handful do.
+ * Null when too many look alike for a model to pick the right one.
+ */
+function excerptFor(payloadMessages: unknown[], index: number, m: LlmMessage): string | null {
+  const v = visibleOf(m);
+  for (const chars of EXCERPT_CHARS) {
+    const quoted = v.full.slice(0, chars);
+    const same = payloadMessages.map((pm, i) => (v.shows(pm, quoted) ? i : -1)).filter((i) => i >= 0);
+    const rank = same.indexOf(index) + 1;
+    const text = sanitizeForTemplate(v.describe(quoted + (v.full.length > chars ? "…" : "")));
+    if (same.length <= 1) return text;
+    if (chars === EXCERPT_CHARS[EXCERPT_CHARS.length - 1] || v.full.length <= chars) {
+      if (rank === 0 || same.length > MAX_NUMBERED) return null;
+      return `${text} (the ${ordinal(rank)} of ${same.length} messages that look like that)`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -141,7 +210,10 @@ export function locateAnchor(payloadMessages: unknown[], spec: AnchorSpec): Anch
   let seen = 0;
   for (let i = 0; i < payloadMessages.length; i++) {
     if (!matches(payloadMessages[i])) continue;
-    if (seen === skip) return { index: i, excerpt: excerptOf(spec.message) };
+    if (seen === skip) {
+      const excerpt = excerptFor(payloadMessages, i, spec.message);
+      return excerpt === null ? { error: "anchor_ambiguous" } : { index: i, excerpt };
+    }
     seen++;
   }
   return { error: "anchor_missing" };
@@ -180,7 +252,8 @@ export function buildInstruction(spec: InstructionSpec): string {
   );
   out.push(
     `Scope: ${spec.cut.excerpt} and everything after it is kept verbatim and must NOT be summarized. ` +
-      "Summarize only what comes before it.",
+      "Summarize only what comes before it. If you are unsure exactly where that boundary is, include more " +
+      "rather than less: anything left out of the summary before it is lost.",
   );
   if (spec.wantHistory) {
     const span = spec.turnStart

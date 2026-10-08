@@ -48,15 +48,29 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 //
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION=1                      opt in (default off)
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET=2048   omlx thinking cap; <=0 omits it
-//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S=1800         whole-request timeout
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S=240     no first token by then: a cache miss, fall back
+//   LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S=600          whole-request timeout
+//
+// The two timeouts keep a slow replay plus pi's own fallback inside the
+// harness's 1800 s wait for a compaction (rpc_client PI_IDLE_WAIT_CAP_SEC).
+// A hit's TTFT is a normal turn's (5-50 s at 190-220k); a miss would prefill
+// the whole payload, kept tail and untruncated tool output included, which
+// costs more than pi's own request, so it is abandoned early.
+//
+// Capture choice: the harness asks for a compaction at turn_end while pi is
+// already sending the next request, which compact() then aborts. That request
+// may never have been prefilled, and may carry a fresh shell-retention
+// demotion deep in history. The last two payloads are kept and the newest one
+// whose response completed is preferred; the turn after it lies in the kept
+// tail, which the anchor check confirms.
 
 export const ENV_ENABLE = "LITTLE_CODER_CACHE_REUSE_COMPACTION";
 export const ENV_THINKING_BUDGET = "LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET";
 export const ENV_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TIMEOUT_S";
+export const ENV_TTFT_TIMEOUT_S = "LITTLE_CODER_CACHE_REUSE_COMPACTION_TTFT_TIMEOUT_S";
 const DEFAULT_THINKING_BUDGET = 2048;
-// A cache miss costs a full prefill, about what pi's own request costs;
-// abandoning it early would then pay for both.
-const DEFAULT_TIMEOUT_S = 1800;
+const DEFAULT_TIMEOUT_S = 600;
+const DEFAULT_TTFT_TIMEOUT_S = 240;
 // Room the window must still have for the answer after the thinking budget.
 const MIN_ANSWER_TOKENS = 2048;
 const WINDOW_MARGIN_TOKENS = 1024;
@@ -66,6 +80,8 @@ export interface Capture {
   provider: string;
   modelId: string;
   sessionId: string;
+  /** An assistant response to this payload finished (not aborted, not an error). */
+  completed?: boolean;
 }
 
 export type Fallback =
@@ -76,11 +92,13 @@ export type Fallback =
   | "session_mismatch"
   | "stale"
   | "anchor_missing"
+  | "anchor_ambiguous"
   | "window"
   | "auth"
   | "http_error"
   | "aborted"
   | "timeout"
+  | "ttft_timeout"
   | "tool_call"
   | "garbage";
 
@@ -139,12 +157,13 @@ export function planReuse(
     message: cutMsg as any,
     before: [...summarized, ...(split ? convertToLlm(prep.turnPrefixMessages) : [])] as any,
   });
-  if ("error" in cut) return { fallback: "anchor_missing" };
+  if ("error" in cut) return { fallback: cut.error };
   let turnStart: { index: number; excerpt: string } | null = null;
   if (split) {
     const startMsg = convertToLlm([prep.turnPrefixMessages[0]])[0];
     const found = startMsg ? locateAnchor(messages, { message: startMsg as any, before: summarized as any }) : null;
-    if (!found || "error" in found || found.index >= cut.index) return { fallback: "anchor_missing" };
+    if (found && "error" in found) return { fallback: found.error };
+    if (!found || found.index >= cut.index) return { fallback: "anchor_missing" };
     turnStart = found;
   }
 
@@ -193,6 +212,7 @@ export interface RunDeps {
   fetch: typeof fetch;
   now: () => number;
   timeoutMs: number;
+  ttftTimeoutMs: number;
 }
 
 export type ReuseOutcome =
@@ -203,7 +223,7 @@ export type ReuseOutcome =
 export async function runReuse(
   event: any,
   ctx: any,
-  capture: Capture | null,
+  captures: Capture | Capture[] | null,
   thinkingBudget: number,
   deps: RunDeps,
 ): Promise<ReuseOutcome> {
@@ -224,13 +244,29 @@ export async function runReuse(
     };
   };
 
-  let plan: ReusePlan | { fallback: Fallback };
-  try {
-    plan = planReuse(event, ctx, capture, thinkingBudget);
-  } catch {
-    plan = { fallback: "anchor_missing" };
+  // Completed responses first, newest first; then whatever was in flight.
+  const list = (Array.isArray(captures) ? captures : captures ? [captures] : [])
+    .map((c, i) => ({ c, i }))
+    .sort((a, b) => Number(!!b.c.completed) - Number(!!a.c.completed) || b.i - a.i)
+    .map((x) => x.c);
+  let plan: ReusePlan | { fallback: Fallback } = { fallback: "no_capture" };
+  let used: Capture | undefined;
+  for (const c of list.length > 0 ? list : [null]) {
+    let p: ReusePlan | { fallback: Fallback };
+    try {
+      p = planReuse(event, ctx, c, thinkingBudget);
+    } catch {
+      p = { fallback: "anchor_missing" };
+    }
+    if (!("fallback" in p)) {
+      plan = p;
+      used = c ?? undefined;
+      break;
+    }
+    if (c === list[0] || c === null) plan = p;
   }
   if ("fallback" in plan) return fail(plan.fallback);
+  base.capture = used?.completed ? "completed" : "in_flight";
 
   const model = ctx.model;
   let auth: any;
@@ -248,7 +284,13 @@ export async function runReuse(
     ...(auth.headers ?? {}),
   };
   const url = `${String(model.baseUrl).replace(/\/+$/, "")}/chat/completions`;
-  const signals = [AbortSignal.timeout(deps.timeoutMs)];
+  const ttft = new AbortController();
+  let ttftExpired = false;
+  const ttftTimer = setTimeout(() => {
+    ttftExpired = true;
+    ttft.abort();
+  }, deps.ttftTimeoutMs);
+  const signals = [AbortSignal.timeout(deps.timeoutMs), ttft.signal];
   if (event.signal) signals.push(event.signal);
   const signal = AbortSignal.any(signals);
 
@@ -263,11 +305,14 @@ export async function runReuse(
       }
       return fail("http_error", { status: res.status });
     }
-    result = await readChatCompletionStream(res.body as ReadableStream<Uint8Array>, deps.now);
+    result = await readChatCompletionStream(res.body as ReadableStream<Uint8Array>, deps.now, () => clearTimeout(ttftTimer));
   } catch (err) {
     if (event.signal?.aborted) return fail("aborted");
+    if (ttftExpired) return fail("ttft_timeout");
     if (signal.aborted) return fail("timeout");
     return fail("http_error", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+  } finally {
+    clearTimeout(ttftTimer);
   }
 
   const tsEnd = deps.now();
@@ -313,9 +358,10 @@ export async function runReuse(
 export default function (pi: ExtensionAPI) {
   if (process.env[ENV_ENABLE] !== "1") return;
 
-  let capture: Capture | null = null;
+  // The last two payloads sent (see "Capture choice" above).
+  let captures: Capture[] = [];
   const forget = async () => {
-    capture = null;
+    captures = [];
   };
 
   // Registered for its side effect only: returning undefined keeps whatever
@@ -325,26 +371,36 @@ export default function (pi: ExtensionAPI) {
     const model = (ctx as any).model;
     if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages) || !model) return;
     try {
-      capture = {
+      const next: Capture = {
         payload: structuredClone(payload),
         provider: String(model.provider),
         modelId: String(model.id),
         sessionId: String(sessionId(ctx)),
       };
+      captures = [...captures, next].slice(-2);
     } catch {
-      capture = null;
+      // An uncloneable payload is not replayable; keep what we had.
     }
+  });
+  pi.on("message_end", async (event) => {
+    const m: any = (event as any).message;
+    if (m?.role !== "assistant" || m.stopReason === "aborted" || m.stopReason === "error") return;
+    const last = captures[captures.length - 1];
+    if (last) last.completed = true;
   });
   pi.on("session_compact", forget);
   pi.on("session_start", forget);
   pi.on("session_shutdown", forget);
+  pi.on("session_tree", forget);
+  pi.on("session_before_fork", forget);
   pi.on("model_select", forget);
 
   pi.on("session_before_compact", async (event, ctx) => {
-    const outcome = await runReuse(event, ctx, capture, envNumber(ENV_THINKING_BUDGET, DEFAULT_THINKING_BUDGET), {
+    const outcome = await runReuse(event, ctx, captures, envNumber(ENV_THINKING_BUDGET, DEFAULT_THINKING_BUDGET), {
       fetch: globalThis.fetch,
       now: Date.now,
       timeoutMs: Math.max(1, envNumber(ENV_TIMEOUT_S, DEFAULT_TIMEOUT_S)) * 1000,
+      ttftTimeoutMs: Math.max(1, envNumber(ENV_TTFT_TIMEOUT_S, DEFAULT_TTFT_TIMEOUT_S)) * 1000,
     });
     emitTelemetry(pi, "compaction_reuse", outcome.telemetry);
     if (outcome.ok) return { compaction: outcome.compaction };

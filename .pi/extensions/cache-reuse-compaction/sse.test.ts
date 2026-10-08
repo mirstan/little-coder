@@ -36,6 +36,16 @@ describe("readChatCompletionStream", () => {
     expect(out.firstTokenAt).not.toBeNull();
   });
 
+  it("calls onFirstToken exactly once", async () => {
+    let calls = 0;
+    await readChatCompletionStream(
+      streamOf([line({ choices: [{ delta: { content: "a" } }] }), line({ choices: [{ delta: { content: "b" } }] })]),
+      () => 0,
+      () => calls++,
+    );
+    expect(calls).toBe(1);
+  });
+
   it("accepts the `reasoning` field and counts tool calls by index", async () => {
     const out = await readChatCompletionStream(
       streamOf([

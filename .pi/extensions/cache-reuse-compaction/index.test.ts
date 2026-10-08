@@ -141,7 +141,7 @@ const capture = (s: Scenario, over: Partial<Capture> = {}): Capture => ({
   ...over,
 });
 
-const deps = { fetch: globalThis.fetch, now: Date.now, timeoutMs: 5000 };
+const deps = { fetch: globalThis.fetch, now: Date.now, timeoutMs: 5000, ttftTimeoutMs: 5000 };
 
 const HISTORY = "## Goal\nBuild the thing\n\n## Progress\n### Done\n- [x] read sources\n\n## Next Steps\n1. run make";
 const PREFIX = "## Original Request\nFix the build\n\n## Early Progress\n- ran make\n\n## Context for Suffix\n- linker errors";
@@ -285,9 +285,9 @@ describe("reuse path", () => {
     expect((out as any).telemetry.tool_calls).toBe(1);
   });
 
-  it("forgets the capture on session_compact and model_select", async () => {
+  it("forgets the capture on session_compact, model_select, tree navigation and forks", async () => {
     const s = await nonSplit();
-    for (const ev of ["session_compact", "model_select"]) {
+    for (const ev of ["session_compact", "model_select", "session_tree", "session_before_fork", "session_start"]) {
       reply = answer(HISTORY);
       const w = wire();
       const ctx = makeCtx();
@@ -296,6 +296,40 @@ describe("reuse path", () => {
       expect(await w.fire("session_before_compact", event(s), ctx)).toBeUndefined();
       expect(w.entries.at(-1)!.data).toMatchObject({ path: "native", fallback: "no_capture" });
     }
+  });
+
+  it("prefers the newest payload whose response completed over one aborted in flight", async () => {
+    const s = await splitWithHistory();
+    reply = answer(both);
+    const inFlight = { ...capture(s), payload: { ...structuredClone(s.payload), marker: "in-flight" } };
+    const done = { ...capture(s), completed: true };
+    const out = await runReuse(event(s), makeCtx(), [done, inFlight], 2048, deps);
+    expect(out.ok).toBe(true);
+    expect(JSON.parse(received[0].body)).not.toHaveProperty("marker");
+    expect((out as any).telemetry.capture).toBe("completed");
+  });
+
+  it("falls through to the in-flight payload when the completed one cannot serve", async () => {
+    const s = await splitWithHistory();
+    reply = answer(both);
+    const early = await realPayload(contextMessages(s.sm).slice(0, 5));
+    const out = await runReuse(event(s), makeCtx(), [{ ...capture(s), payload: early, completed: true }, capture(s)], 2048, deps);
+    expect(out.ok).toBe(true);
+    expect((out as any).telemetry.capture).toBe("in_flight");
+  });
+
+  it("the wired capture marks a payload completed on a finished assistant message only", async () => {
+    const s = await splitWithHistory();
+    reply = answer(both);
+    const w = wire();
+    const ctx = makeCtx();
+    await w.fire("before_provider_request", { payload: s.payload }, ctx);
+    await w.fire("message_end", { message: { role: "assistant", stopReason: "toolUse" } }, ctx);
+    await w.fire("before_provider_request", { payload: { ...s.payload, marker: "aborted" } }, ctx);
+    await w.fire("message_end", { message: { role: "assistant", stopReason: "aborted" } }, ctx);
+    const r = await w.fire("session_before_compact", event(s), ctx);
+    expect(r?.compaction).toBeTruthy();
+    expect(JSON.parse(received[0].body)).not.toHaveProperty("marker");
   });
 
   it("does not alter the payload pi sends", async () => {
@@ -393,6 +427,19 @@ describe("fallbacks hand the compaction to pi (return nothing)", () => {
     expect(await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, timeoutMs: 50 })).toMatchObject({
       ok: false,
       fallback: "timeout",
+    });
+  });
+
+  it("ttft_timeout when no token arrives before the first-token deadline", async () => {
+    const s = await nonSplit();
+    reply = (_q, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(": prefill\n\n");
+      setTimeout(() => res.end(), 2000);
+    };
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, { ...deps, ttftTimeoutMs: 50 })).toMatchObject({
+      ok: false,
+      fallback: "ttft_timeout",
     });
   });
 
