@@ -418,6 +418,31 @@ export function demotedPrefixLength(target: number, batch: number): number {
   return b * Math.floor(target / b);
 }
 
+/** Counts from one projection; see demoteMessagesWithStats. */
+export interface DemotionStats {
+  /** Demotable (call, result) pairs in history. */
+  pairs: number;
+  /** Pairs at or over minPairBytes, plus any already carrying their own marker. */
+  large: number;
+  /** Pairs the per-pair rule selects (rank >= retainRaw or distance > staleDistance). */
+  due: number;
+  /** Pairs the batch/flush rule lets demote on this request. */
+  prefix: number;
+  /** Pairs replaced in this projection; equals demotedCount. */
+  demoted: number;
+  /** True when the pending-bytes flush overrode the batch boundary. */
+  flushed: boolean;
+  /** Pairs in the prefix whose call message counts as signed, so their command is never rewritten. */
+  signed: number;
+  /** Pairs in the prefix where neither the result nor the command could shrink. */
+  skippedNoShrink: number;
+  /** Pairs in the prefix whose archive save was refused. */
+  skippedArchive: number;
+  /** Command + result bytes of the demoted pairs, before and after. */
+  bytesBefore: number;
+  bytesAfter: number;
+}
+
 /**
  * Replace stale, oversized shell pairs with archived placeholders.
  *
@@ -449,14 +474,22 @@ export function demotedPrefixLength(target: number, batch: number): number {
  * The prefix only ever grows while history is appended to. A non-append edit
  * such as compaction recomputes it from scratch and may return pairs to raw,
  * but that edit has already invalidated the cached prefix anyway.
+ *
+ * `stats` describes this one projection. pi's context hook receives stored,
+ * undemoted history on every request (pi-agent-core agent-loop.js:178-185:
+ * transformContext's result goes only to convertToLlm), so `demoted` is how
+ * many pairs this request's prompt carries demoted, not how many are new, and
+ * `done` is true only for stored text that already carries its own marker.
+ * benchmarks/turn_ledger.py diffs consecutive snapshots for "new".
  */
-export function demoteMessages(
+export function demoteMessagesWithStats(
   messages: any[],
   archive: RetentionArchive,
   opts: RetentionOptions = resolveOptions(),
-): { messages: any[]; demotedCount: number } {
+): { messages: any[]; demotedCount: number; stats: DemotionStats } {
   const result = [...messages];
-  const slots = collectPairs(messages)
+  const pairs = collectPairs(messages);
+  const slots = pairs
     .map((p) => ({ p, done: alreadyDemoted(p) }))
     .filter(({ p, done }) => done || byteLen(p.command) + byteLen(p.resultText) >= opts.minPairBytes);
 
@@ -479,10 +512,25 @@ export function demoteMessages(
   const flush = Number.isFinite(budget) && budget > 0 && pending > budget;
   const prefix = flush ? target : batched;
 
+  const stats: DemotionStats = {
+    pairs: pairs.length,
+    large: slots.length,
+    due: target,
+    prefix,
+    demoted: 0,
+    flushed: flush,
+    signed: 0,
+    skippedNoShrink: 0,
+    skippedArchive: 0,
+    bytesBefore: 0,
+    bytesAfter: 0,
+  };
+
   let demotedCount = 0;
   for (let k = 0; k < prefix; k++) {
     const { p, done } = slots[k];
     if (done) continue;
+    if (p.signed) stats.signed++;
 
     const id = archiveId(p.toolCallId);
     const nextResult = demoteResultText(p.resultText, p.toolName, id, opts);
@@ -491,8 +539,14 @@ export function demoteMessages(
     const nextCommand = p.signed || p.callIdx < 0
       ? null
       : demoteCommandText(p.command, id, opts);
-    if (nextResult === null && nextCommand === null) continue;
-    if (!archive.save(id, archiveText(p.command, p.resultText))) continue;
+    if (nextResult === null && nextCommand === null) {
+      stats.skippedNoShrink++;
+      continue;
+    }
+    if (!archive.save(id, archiveText(p.command, p.resultText))) {
+      stats.skippedArchive++;
+      continue;
+    }
 
     if (nextResult !== null) {
       result[p.resultIdx] = {
@@ -509,10 +563,23 @@ export function demoteMessages(
       );
       result[p.callIdx] = { ...callMsg, content };
     }
+    stats.bytesBefore += byteLen(p.command) + byteLen(p.resultText);
+    stats.bytesAfter += byteLen(nextCommand ?? p.command) + byteLen(nextResult ?? p.resultText);
     demotedCount++;
   }
 
-  return { messages: result, demotedCount };
+  stats.demoted = demotedCount;
+  return { messages: result, demotedCount, stats };
+}
+
+/** demoteMessagesWithStats without the stats: the shape every existing caller and test uses. */
+export function demoteMessages(
+  messages: any[],
+  archive: RetentionArchive,
+  opts: RetentionOptions = resolveOptions(),
+): { messages: any[]; demotedCount: number } {
+  const { messages: out, demotedCount } = demoteMessagesWithStats(messages, archive, opts);
+  return { messages: out, demotedCount };
 }
 
 // UTF-8 continuation bytes span at most 3 extra bytes on either side of a

@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { echoesStubMarker, stubTruncatedMessages } from "./stub.ts";
 import { harnessIntervention } from "../_shared/intervention.ts";
+import { emitTelemetry } from "../_shared/telemetry.ts";
+
+const jsonBytes = (v: unknown): number => Buffer.byteLength(JSON.stringify(v) ?? "", "utf-8");
 
 // Hook wiring only; the rule lives in stub.ts.
 //
@@ -25,6 +28,7 @@ export default function (pi: ExtensionAPI) {
     if (!stubEmitted) return;
     const input = (event as any).input;
     if (input == null || !echoesStubMarker(input)) return;
+    emitTelemetry(pi, "echo_block", { source: "length_stub", tool: String((event as any).toolName ?? "") });
     harnessIntervention(ctx, "blocked a tool call echoing a length-truncation stub.");
     return {
       block: true,
@@ -37,9 +41,24 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event) => {
-    const { messages, stubbedCount } = stubTruncatedMessages((event as any).messages || []);
+    const input: any[] = (event as any).messages || [];
+    const { messages, stubbedCount } = stubTruncatedMessages(input);
     if (stubbedCount > 0) {
       stubEmitted = true;
+      // stubTruncatedMessages returns every untouched message as the same
+      // object, so identity picks out exactly the stubbed ones.
+      let bytesBefore = 0;
+      let bytesAfter = 0;
+      messages.forEach((m, i) => {
+        if (m !== input[i]) {
+          bytesBefore += jsonBytes(input[i]);
+          bytesAfter += jsonBytes(m);
+        }
+      });
+      // pi hands this hook pristine stored history on every request, so
+      // `stubbed` is how many stubbed messages this projection carries, not
+      // how many are new; benchmarks/turn_ledger.py diffs the snapshots.
+      emitTelemetry(pi, "length_stub", { stubbed: stubbedCount, bytesBefore, bytesAfter });
       return { messages };
     }
   });

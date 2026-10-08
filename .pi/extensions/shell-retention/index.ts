@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { harnessIntervention } from "../_shared/intervention.ts";
 import { envNumber } from "../_shared/env-number.ts";
+import { emitTelemetry } from "../_shared/telemetry.ts";
 import { byteLen } from "../shell-session/helpers.ts";
 import {
-  demoteMessages,
+  demoteMessagesWithStats,
   findMarkerEchoIds,
   recallSlice,
   resolveOptions,
@@ -143,6 +144,11 @@ export default function (pi: ExtensionAPI) {
     const liveIds = findMarkerEchoIds(input).filter((id) => hostArchive.size(id) !== undefined);
     if (liveIds.length === 0) return;
 
+    emitTelemetry(pi, "echo_block", {
+      source: "shell_retention",
+      tool: String((event as any).toolName ?? ""),
+      ids: liveIds.length,
+    });
     harnessIntervention(ctx, "blocked a tool call echoing a demoted shell-retention placeholder.");
     return {
       block: true,
@@ -162,11 +168,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event) => {
-    const { messages, demotedCount } = demoteMessages(
+    const { messages, demotedCount, stats } = demoteMessagesWithStats(
       (event as any).messages || [],
       hostArchive,
       resolveOptions(),
     );
+    // One snapshot per request, emitted even when nothing is due: the watcher
+    // needs `large` with `demoted == 0` to see demotion silently disabled.
+    emitTelemetry(pi, "shell_retention", { ...stats });
     if (demotedCount > 0) {
       return { messages };
     }
