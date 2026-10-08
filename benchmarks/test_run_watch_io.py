@@ -402,3 +402,27 @@ def test_server_lines_never_alert_before_a_job_exists(tmp_path):
     alerts, lines = W.poll_once(ws, datetime(2026, 10, 7, 18, 0, 0).timestamp())
     assert alerts == []
     assert any("no Harbor job" in line for line in lines)
+
+
+def test_a_reuse_compactions_server_ttft_spike_is_dropped_and_reported_once(tmp_path):
+    job = make_job(tmp_path)
+    start = datetime(2026, 10, 7, 18, 0, 0).timestamp()
+    for p in (job / "config.json", job / TRIAL / "config.json"):
+        os.utime(p, (start, start))
+    log = tmp_path / "omlx.log"
+    log.write_text(
+        "2026-10-07 18:10:30,000 - omlx.server - INFO - Chat completion: model=tiel-coder-oq6e-fp16, "
+        "1500 tokens in 160.00s (9.4 tok/s), prompt: 220000, finish_reason=stop, max_tokens=23347, "
+        "request_max_tokens=23347, stream_model_ttft=130.00s, stream_visible_ttft=131.00s\n")
+    at = datetime(2026, 10, 7, 18, 10, 30).timestamp()
+    turns = job / TRIAL / "agent" / "turns.jsonl"
+    turns.write_text(json.dumps(rec(1, ts_start=at - 400, ts_end=at - 200, prompt_tokens=219_000)) + "\n")
+    ws = W.WatchState(target=job, cfg=W.RuleConfig(), server=W.TailState(path=log), server_kind="omlx")
+    assert W.poll_once(ws, at + 5)[0] == []
+    telemetry = {"v": 1, "kind": "compaction_reuse", "source": "compaction", "path": "reuse", "reason": "manual",
+                 "ts_start": at - 161, "ts_end": at, "prompt_tokens": 220_000, "cache_read": 217_088,
+                 "summary_tokens": 1500, "ttft_s": 130.0, "duration_s": 161.0}
+    with turns.open("a") as fh:
+        fh.write(json.dumps(rec(2, ts_start=at + 10, ts_end=at + 60, prompt_tokens=31_000, guards=[telemetry])) + "\n")
+    alerts, _ = W.poll_once(ws, at + 65)
+    assert [(a.level, a.rule) for a in alerts] == [("info", "compaction_reuse")]

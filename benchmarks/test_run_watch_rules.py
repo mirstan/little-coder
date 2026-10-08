@@ -427,3 +427,70 @@ def test_divergence_counts_by_class_are_kept_on_the_trial():
     st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4))
     W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
     assert st.divergences == {"expected_divergence": 1}
+
+
+def reuse(path="reuse", **kw):
+    base = {"v": 1, "kind": "compaction_reuse", "source": "compaction", "path": path, "reason": "manual",
+            "split": True, "ts_start": 2000.0, "ts_end": 2030.0, "duration_s": 30.0}
+    if path == "reuse":
+        base.update(prompt_tokens=220_000, cache_read=217_088, summary_tokens=1500, ttft_s=12.4)
+    else:
+        base.update(fallback="anchor_missing")
+    base.update(kw)
+    return base
+
+
+def test_a_reuse_compaction_is_one_info_line_and_a_fallback_says_why():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, guards=[reuse()]), cfg)
+    assert rules(got) == [("info", "compaction_reuse")]
+    assert "TTFT 12s" in got[0].message and "217,088 of 220,000" in got[0].message
+    assert got[0].subject == "turn 1 compaction_reuse"
+    assert st.reuse_compactions == [{"ts_start": 2000.0, "ts_end": 2030.0, "prompt": 220_000}]
+    got = W.evaluate_turn(st, rec(2, guards=[reuse("native")]), cfg)
+    assert rules(got) == [("info", "compaction_reuse")]
+    assert "anchor_missing" in got[0].message
+    assert len(st.reuse_compactions) == 1
+
+
+def test_a_reuse_compaction_whose_cache_missed_is_a_warning():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, guards=[reuse(cache_read=4096)]), cfg)
+    assert rules(got) == [("warn", "compaction_reuse_miss")]
+
+
+def spike(ts, prompt=220_000, ttft=300.0):
+    ev = {"src": "omlx", "kind": "completion", "ts": ts, "prompt": prompt, "cached": None, "output": 1500,
+          "ttft_s": ttft}
+    return ev, W.evaluate_server_event(ev, TRIAL, W.RuleConfig())[0]
+
+
+def test_a_ttft_spike_on_a_reuse_compaction_is_dropped_once_the_ledger_shows_it():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    ev, alert = spike(2029.0)
+    assert alert.rule == "ttft_spike"
+    # The compaction's telemetry rides on the next turn record; until then, wait.
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2031.0) is None
+    W.evaluate_turn(st, rec(2, ts_start=2035.0, ts_end=2050.0, guards=[reuse()]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2051.0) == []
+
+
+def test_a_ttft_spike_the_ledger_does_not_explain_is_still_raised():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    ev, alert = spike(2029.0)
+    # Native fallback: no reuse window, so the next turn record settles it as a spike.
+    W.evaluate_turn(st, rec(2, ts_start=2035.0, ts_end=2050.0, guards=[reuse("native")]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2051.0) == [alert]
+    # A reuse window that does not hold the line, or a prompt that differs, does not claim it.
+    st2 = trial()
+    W.evaluate_turn(st2, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse(prompt_tokens=150_000)]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st2, cfg, now=2051.0) == [alert]
+    # Nothing ever lands: raised after the wait.
+    st3 = trial()
+    W.evaluate_turn(st3, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    assert W.classify_ttft_spike(ev, alert, st3, cfg, now=2029.0 + cfg.divergence_match_wait_s + 1) == [alert]
+    # A spike inside a normal turn is settled by that turn's own record.
+    ev4, alert4 = spike(1950.0, prompt=500)
+    assert W.classify_ttft_spike(ev4, alert4, st3, cfg, now=1995.0) == [alert4]
