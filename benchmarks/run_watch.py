@@ -588,7 +588,7 @@ def classify_ttft_spike(ev: dict, alert: Alert, st: TrialState, cfg: RuleConfig,
     reaches turns.jsonl with the next turn record, so the spike waits for a
     turn record that contains or follows it, then is dropped when a reuse
     compaction's [ts_start, ts_end] (+/- DIVERGENCE_WINDOW_SLACK_S) holds it and
-    the prompt sizes agree within divergence_match_tokens, else raised as it
+    both prompt sizes are known and agree within divergence_match_tokens, else raised as it
     always was. A spike nothing ever claims is raised after
     divergence_match_wait_s.
     """
@@ -598,7 +598,9 @@ def classify_ttft_spike(ev: dict, alert: Alert, st: TrialState, cfg: RuleConfig,
     for c in st.reuse_compactions:
         if not c["ts_start"] - slack <= ts <= c["ts_end"] + slack:
             continue
-        if not isinstance(prompt, int) or c["prompt"] is None or abs(c["prompt"] - prompt) <= cfg.divergence_match_tokens:
+        # omlx's completion line carries no request id, so the prompt size is
+        # the only identity; a window alone could hide an unrelated request.
+        if isinstance(prompt, int) and c["prompt"] is not None and abs(c["prompt"] - prompt) <= cfg.divergence_match_tokens:
             return []
     settled = any(t["ts_end"] + slack >= ts for t in st.turns)
     if settled or st.finished or now - ts > cfg.divergence_match_wait_s:

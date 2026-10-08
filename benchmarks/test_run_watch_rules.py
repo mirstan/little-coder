@@ -487,6 +487,14 @@ def test_a_ttft_spike_the_ledger_does_not_explain_is_still_raised():
     st2 = trial()
     W.evaluate_turn(st2, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse(prompt_tokens=150_000)]), cfg)
     assert W.classify_ttft_spike(ev, alert, st2, cfg, now=2051.0) == [alert]
+    # A window match alone does not claim it: the prompt sizes must both be known and agree.
+    st4 = trial()
+    W.evaluate_turn(st4, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse(prompt_tokens=None)]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st4, cfg, now=2051.0) == [alert]
+    st5 = trial()
+    W.evaluate_turn(st5, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse()]), cfg)
+    ev5, alert5 = spike(2029.0, prompt=None)
+    assert W.classify_ttft_spike(ev5, alert5, st5, cfg, now=2051.0) == [alert5]
     # Nothing ever lands: raised after the wait.
     st3 = trial()
     W.evaluate_turn(st3, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
