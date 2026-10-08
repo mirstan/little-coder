@@ -226,7 +226,9 @@ describe("buildInstruction", () => {
   });
 });
 
-const history = "## Goal\nShip it\n\n## Progress\n### Done\n- [x] a\n\n## Next Steps\n1. b\n\n## Critical Context\n- (none)";
+const history =
+  "## Goal\nShip it\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] a\n\n" +
+  "## Key Decisions\n- **x**: y\n\n## Next Steps\n1. b\n\n## Critical Context\n- (none)";
 const prefix = "## Original Request\nFix the build\n\n## Early Progress\n- ran ls\n\n## Context for Suffix\n- make next";
 
 describe("parseSummaryOutput", () => {
@@ -239,6 +241,16 @@ describe("parseSummaryOutput", () => {
     expect(parseSummaryOutput(`Here it is:\n${history}`, { history: true, prefix: false })).toEqual({
       history: `Here it is:\n${history}`,
     });
+  });
+
+  it("rejects a history summary missing any of pi's sections", () => {
+    for (const heading of ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
+      expect(parseSummaryOutput(history.replace(heading, "## Other"), { history: true, prefix: false })).toEqual({ error: "garbage" });
+    }
+    for (const heading of ["## Original Request", "## Early Progress", "## Context for Suffix"]) {
+      const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${prefix.replace(heading, "## X")}\n</turn-prefix-summary>`;
+      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ error: "garbage" });
+    }
   });
 
   it("rejects empty, unstructured or truncated output", () => {

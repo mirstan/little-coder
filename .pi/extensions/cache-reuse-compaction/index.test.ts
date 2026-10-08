@@ -32,16 +32,16 @@ const sse = (res: ServerResponse, chunks: unknown[], opts: { end?: boolean } = {
   }
 };
 
-const answer = (content: string, extra: { toolCalls?: boolean } = {}): Reply => (_req, res) =>
+const answer = (content: string, extra: { toolCalls?: boolean; finish?: string | null; done?: boolean } = {}): Reply => (_req, res) =>
   sse(res, [
     { choices: [{ delta: { reasoning_content: "brief" } }] },
     { choices: [{ delta: { content } }] },
     ...(extra.toolCalls
       ? [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "t", function: { name: "bash", arguments: "{}" } }] } }] }]
       : []),
-    { choices: [{ delta: {}, finish_reason: extra.toolCalls ? "tool_calls" : "stop" }] },
+    ...(extra.finish === null ? [] : [{ choices: [{ delta: {}, finish_reason: extra.finish ?? (extra.toolCalls ? "tool_calls" : "stop") }] }]),
     { choices: [], usage: { prompt_tokens: 120_000, completion_tokens: 900, prompt_tokens_details: { cached_tokens: 118_784 } } },
-  ]);
+  ], { end: extra.done !== false });
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -143,7 +143,9 @@ const capture = (s: Scenario, over: Partial<Capture> = {}): Capture => ({
 
 const deps = { fetch: globalThis.fetch, now: Date.now, timeoutMs: 5000, ttftTimeoutMs: 5000 };
 
-const HISTORY = "## Goal\nBuild the thing\n\n## Progress\n### Done\n- [x] read sources\n\n## Next Steps\n1. run make";
+const HISTORY =
+  "## Goal\nBuild the thing\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] read sources\n\n" +
+  "## Key Decisions\n- **make**: it is there\n\n## Next Steps\n1. run make\n\n## Critical Context\n- (none)";
 const PREFIX = "## Original Request\nFix the build\n\n## Early Progress\n- ran make\n\n## Context for Suffix\n- linker errors";
 const both = `<history-summary>\n${HISTORY}\n</history-summary>\n\n<turn-prefix-summary>\n${PREFIX}\n</turn-prefix-summary>`;
 
@@ -455,6 +457,20 @@ describe("fallbacks hand the compaction to pi (return nothing)", () => {
       ok: false,
       fallback: "garbage",
     });
+  });
+
+  it("truncated: a summary cut off by the output limit or a stream that ended early", async () => {
+    const s = await nonSplit();
+    reply = answer(HISTORY, { finish: "length" });
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, deps)).toMatchObject({ ok: false, fallback: "truncated" });
+    reply = answer(HISTORY, { finish: null });
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, deps)).toMatchObject({ ok: false, fallback: "truncated" });
+    reply = (_q, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: HISTORY } }] })}\n\n`);
+      res.destroy();
+    };
+    expect(await runReuse(event(s), makeCtx(), capture(s), 2048, deps)).toMatchObject({ ok: false });
   });
 
   it("the wired hook returns undefined and records the fallback", async () => {

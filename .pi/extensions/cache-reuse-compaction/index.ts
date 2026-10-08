@@ -44,7 +44,7 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 // Every doubt falls back to pi's native compaction by returning nothing:
 // overflow recovery, a missing/stale/foreign capture, an anchor the payload
 // does not hold, no room in the window, a network/HTTP error, abort, timeout,
-// a tool call or an unusable summary.
+// a tool call, a truncated answer or an unusable summary.
 //
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION=1                      opt in (default off)
 //   LITTLE_CODER_CACHE_REUSE_COMPACTION_THINKING_BUDGET=2048   omlx thinking cap; <=0 omits it
@@ -100,6 +100,7 @@ export type Fallback =
   | "timeout"
   | "ttft_timeout"
   | "tool_call"
+  | "truncated"
   | "garbage";
 
 export interface ReusePlan {
@@ -324,6 +325,11 @@ export async function runReuse(
     finish_reason: result.finishReason,
     max_tokens: plan.maxTokens,
   };
+  // Only an answer the server closed normally: "length" was cut off by the
+  // budget, and no finish reason at all means the stream ended early.
+  if (result.finishReason !== "stop" && result.finishReason !== "tool_calls") {
+    return fail("truncated", { ...metrics, tool_calls: result.toolCalls });
+  }
   const parsed = parseSummaryOutput(result.content, plan.want);
   if ("error" in parsed) {
     return fail(result.toolCalls > 0 ? "tool_call" : "garbage", { ...metrics, tool_calls: result.toolCalls });

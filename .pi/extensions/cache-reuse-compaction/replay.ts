@@ -298,12 +298,16 @@ function tagged(text: string, tag: string): string | null {
   return m ? m[1].trim() : null;
 }
 
+// Every section heading of pi's two formats (pi-compat.ts prompts).
+const HISTORY_HEADINGS = ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"];
+const PREFIX_HEADINGS = ["## Original Request", "## Early Progress", "## Context for Suffix"];
+
 function validHistory(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && s.includes("## Goal") && s.includes("## Next Steps");
+  return !!s && s.length >= MIN_SECTION_CHARS && HISTORY_HEADINGS.every((h) => s.includes(h));
 }
 
 function validPrefix(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && s.includes("## Original Request");
+  return !!s && s.length >= MIN_SECTION_CHARS && PREFIX_HEADINGS.every((h) => s.includes(h));
 }
 
 /** The model's sections, or `garbage` when one asked for is missing, cut off or unstructured. */
