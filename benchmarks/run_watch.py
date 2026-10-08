@@ -266,6 +266,8 @@ class TrialState:
     max_large_pairs: int = 0
     max_demoted: int = 0
     max_due: int = 0
+    #: True once a shell_retention snapshot arrived (telemetry_seen is set by any extension).
+    retention_seen: bool = False
     #: True once shell-retention's cost gate kept a due jump raw (skippedCost).
     cost_deferred: bool = False
     turns_over_ctx: int = 0
@@ -376,6 +378,7 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
     ret = rec.get("retention")
     if isinstance(ret, dict):
         st.telemetry_seen = True
+        st.retention_seen = True
         large, prefix, demoted, signed = (_n(ret.get(k)) for k in ("large", "prefix", "demoted", "signed"))
         st.max_large_pairs = max(st.max_large_pairs, large)
         st.max_demoted = max(st.max_demoted, demoted)
@@ -432,8 +435,8 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
     del st.turns[:-MAX_REMEMBERED_TURNS]
 
     # A cost-gate deferral is the intended reason for none demoted. Without
-    # telemetry nothing says how many pairs were due, so the long-context
-    # branch still stands in for it.
+    # shell_retention snapshots nothing says how many pairs were due, so the
+    # long-context branch still stands in for it.
     if st.max_demoted == 0 and not st.cost_deferred and "no_demotions" not in st.fired_once:
         if st.max_large_pairs >= cfg.no_demotion_large_pairs:
             st.fired_once.add("no_demotions")
@@ -441,7 +444,7 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
                 f"{st.max_large_pairs} large shell outputs in history and none ever demoted",
                 subj="once", data={"large": st.max_large_pairs})
         elif st.turns_over_ctx >= cfg.no_demotion_turns and (
-                not st.telemetry_seen or st.max_due >= cfg.no_demotion_min_due):
+                not st.retention_seen or st.max_due >= cfg.no_demotion_min_due):
             st.fired_once.add("no_demotions")
             add("warn", "no_demotions",
                 f"{st.turns_over_ctx} turns over {cfg.no_demotion_context_tokens:,} prompt tokens "

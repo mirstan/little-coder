@@ -137,6 +137,17 @@ def test_long_context_alone_does_not_page_when_too_few_pairs_were_ever_due():
     assert seen == [(40, ("warn", "no_demotions"))]
 
 
+def test_long_context_still_warns_when_only_other_extensions_report_telemetry():
+    # length-truncation-stub reports on every request; shell-retention silent
+    # (crashed, not loaded) must still page as it did before the cost gate.
+    st, cfg = trial(), W.RuleConfig()
+    seen = []
+    for n in range(1, 61):
+        seen += [(n, x) for x in rules(W.evaluate_turn(
+            st, rec(n, prompt_tokens=120_000, stubs={"v": 1, "kind": "length_stub", "stubbed": 0}), cfg))]
+    assert seen == [(40, ("warn", "no_demotions"))]
+
+
 def gated(large, due, skipped, est_s=3000, est_r=140_000, ctx=184_000):
     r = retention(large, due - skipped, 0)
     r.update({"due": due, "skippedNoShrink": 0, "gate": "deferred" if skipped else "none",
