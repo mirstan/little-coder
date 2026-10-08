@@ -339,12 +339,17 @@ export async function runReuse(
   };
   // Only an answer the server closed normally: "length" was cut off by the
   // budget, and no finish reason at all means the stream ended early.
-  if (result.finishReason !== "stop" && result.finishReason !== "tool_calls") {
+  // A tool call means the model went back to work instead of summarizing;
+  // whatever text came before it is not trusted as a finished summary.
+  if (result.toolCalls > 0 || result.finishReason === "tool_calls") {
+    return fail("tool_call", { ...metrics, tool_calls: result.toolCalls });
+  }
+  if (result.finishReason !== "stop") {
     return fail("truncated", { ...metrics, tool_calls: result.toolCalls });
   }
   const parsed = parseSummaryOutput(result.content, plan.want);
   if ("error" in parsed) {
-    return fail(result.toolCalls > 0 ? "tool_call" : "garbage", { ...metrics, tool_calls: result.toolCalls });
+    return fail("garbage", { ...metrics, tool_calls: result.toolCalls });
   }
 
   const prep = event.preparation;

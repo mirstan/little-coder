@@ -297,11 +297,11 @@ describe("reuse path", () => {
     expect(old).toMatchObject({ ok: false, fallback: "stale" });
   });
 
-  it("keeps a valid summary even if the model also started a tool call", async () => {
+  it("refuses an answer that ends in a tool call, even after a well-formed summary", async () => {
     const s = await nonSplit();
     reply = answer(HISTORY, { toolCalls: true });
     const out = await runReuse(event(s), makeCtx(), capture(s), 2048, deps);
-    expect(out.ok).toBe(true);
+    expect(out).toMatchObject({ ok: false, fallback: "tool_call" });
     expect((out as any).telemetry.tool_calls).toBe(1);
   });
 
