@@ -111,6 +111,8 @@ export const MIN_GATE_WINDOW = 131072;
 export const MAX_GATE_WINDOW = 262144;
 /** The open point stays this many points under context-watchdog's LITTLE_CODER_COMPACT_AT_PERCENT. */
 const WATCHDOG_MARGIN_PERCENT = 5;
+/** context-watchdog's DEFAULT_PERCENT, mirrored rather than imported: its index.ts is a pi extension entry point. */
+const WATCHDOG_DEFAULT_PERCENT = 80;
 /** pi's estimateTokens convention (compaction.js), so estimates line up with getContextUsage's trailing part. */
 export const CHARS_PER_TOKEN = 4;
 
@@ -152,7 +154,8 @@ export function resolveGateOptions(): GateOptions {
 function openAtPercent(): number {
   const open = envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT);
   if (open <= 0 || open >= 100 || process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return open;
-  const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", 0);
+  // Same resolution as context-watchdog's thresholdPercent(): unset means its default 80.
+  const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", WATCHDOG_DEFAULT_PERCENT);
   if (watchdog <= 0 || watchdog >= 100) return open;
   return Math.min(open, watchdog - WATCHDOG_MARGIN_PERCENT);
 }

@@ -223,8 +223,8 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     });
     expect(first.demotedCount).toBe(B);
 
-    // Next request: the context reading dropped below the open point (the
-    // demotion shrank the prompt) and the history grew. Without the latch the
+    // Next request: the default gate (no context clause) would now defer this
+    // jump, and the history grew. Without the latch the
     // pairs would go back to raw and break the prefix a second time.
     const next = [...msgs, { role: "user", content: "more" }];
     const second = demoteMessagesWithStats(next, archive, OPTS, {
@@ -244,7 +244,7 @@ describe("demoteMessagesWithStats with the cost gate", () => {
       options: WITH_CONTEXT,
       context: { contextTokens: 0.8 * WINDOW, contextWindow: WINDOW },
     });
-    // B more big pairs make a second batch due; under the open point it is deferred,
+    // B more big pairs make a second batch due; the default gate defers it,
     // and the first batch stays exactly as it was.
     const grown = [...msgs, ...history(B, 4096, 0, "q").slice(1)];
     const out = demoteMessagesWithStats(grown, archive, OPTS, {
@@ -324,6 +324,10 @@ describe("demoteMessagesWithStats with the cost gate", () => {
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "90";
       expect(resolveGateOptions().openAtPercent).toBe(75);
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "0";
+      expect(resolveGateOptions().openAtPercent).toBe(75);
+      // Unset means the watchdog's default 80, so an opted-in 78 opens at 75.
+      delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      process.env[ENV_DEMOTE_OPEN_AT_PERCENT] = "78";
       expect(resolveGateOptions().openAtPercent).toBe(75);
     } finally {
       names.forEach((n, i) => {
