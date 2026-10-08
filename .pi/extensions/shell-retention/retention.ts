@@ -168,8 +168,14 @@ export function demotionGate(input: GateInput, o: GateOptions): GateReason | nul
   return null;
 }
 
-/** Characters pi would count for a message (estimateTokens' fields; images at its 4800-char flat rate). */
+/**
+ * Characters pi would count for a message: estimateTokens' fields per role
+ * (compaction.js), images at its 4800-char flat rate.
+ */
 function messageChars(m: any, uptoBlock = Infinity): number {
+  const str = (v: unknown) => (typeof v === "string" ? v.length : 0);
+  if (m?.role === "bashExecution") return str(m.command) + str(m.output);
+  if (m?.role === "branchSummary" || m?.role === "compactionSummary") return str(m.summary);
   if (typeof m?.content === "string") return m.content.length;
   if (!Array.isArray(m?.content)) return 0;
   let n = 0;

@@ -374,6 +374,22 @@ describe("demoteMessagesWithStats with the cost gate", () => {
     expect(out.stats.estReprefillTokens).toBeGreaterThan(290_000);
   });
 
+  it("counts bashExecution and summary messages in the re-prefill, as pi's estimator does", () => {
+    const msgs: any[] = [{ role: "user", content: "go" }];
+    for (let i = 0; i < B + R; i++) msgs.push(call(`p${i}`, `echo ${i}`), result(`p${i}`, body(4096, `p${i}`)));
+    msgs.push(
+      { role: "bashExecution", command: "cat log", output: "o".repeat(200_000), exitCode: 0 },
+      { role: "compactionSummary", summary: "s".repeat(200_000), tokensBefore: 1 },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    );
+    const out = demoteMessagesWithStats(msgs, memArchive(), OPTS, {
+      options: GATE,
+      context: { contextTokens: 120_000, contextWindow: WINDOW },
+    });
+    expect(out.stats.estReprefillTokens).toBeGreaterThan(100_000);
+    expect(out.stats.gate).toBe("deferred");
+  });
+
   it("ignores pairs that rewrite nothing when placing the break", () => {
     // A signed heredoc whose result is tiny cannot shrink; the break is the next pair's result.
     const msgs: any[] = [{ role: "user", content: "go" }];
