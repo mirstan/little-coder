@@ -334,7 +334,8 @@ describe("stubTruncatedMessages", () => {
 
   it("leaves a stubbed ShellSession pair below shell-retention's demotion size", () => {
     const archive: RetentionArchive = { save: () => true, size: () => 0, readRange: () => undefined };
-    const eager = { ...resolveOptions(), retainRaw: 0, staleDistance: 0 };
+    // Per-pair: a single pair never fills a larger demotion batch.
+    const eager = { ...resolveOptions(), retainRaw: 0, staleDistance: 0, demoteBatch: 1 };
     const tail = [{ role: "user", content: "next", timestamp: 3 }];
     // Without thinking: shell-retention treats a thinkingSignature as signed
     // and would leave the command alone for that reason instead.

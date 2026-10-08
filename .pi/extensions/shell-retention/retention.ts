@@ -34,6 +34,8 @@ export const ENV_KEEP_RESULT_TAIL = "LITTLE_CODER_SHELL_KEEP_RESULT_TAIL_BYTES";
 export const ENV_CMD_KEEP = "LITTLE_CODER_SHELL_CMD_KEEP_BYTES";
 export const ENV_RECALL_DEFAULT = "LITTLE_CODER_SHELL_RECALL_DEFAULT_BYTES";
 export const ENV_RECALL_MAX = "LITTLE_CODER_SHELL_RECALL_MAX_BYTES";
+export const ENV_DEMOTE_BATCH = "LITTLE_CODER_SHELL_DEMOTE_BATCH";
+export const ENV_DEMOTE_PENDING_BYTES = "LITTLE_CODER_SHELL_DEMOTE_PENDING_BYTES";
 
 export const DEFAULT_RETAIN_RAW = 4;
 export const DEFAULT_MIN_PAIR_BYTES = 3072;
@@ -45,6 +47,26 @@ export const DEFAULT_RECALL_BYTES = 8192;
 // Equal to MAX_BODY_HEAD_BYTES + MAX_BODY_TAIL_BYTES, so a recall can never
 // reinject more than the tool result was allowed to carry in the first place.
 export const DEFAULT_RECALL_MAX = 49152;
+// Pairs demoted per jump of the demoted prefix. Each jump rewrites history
+// mid-prompt, and a prefix-caching server re-prefills everything after the
+// first rewritten pair, so a jump of B pairs removes about 1 - 1/B of the
+// breaks that per-pair demotion causes. The price is up to B - 1 older pairs
+// left raw that per-pair demotion would have shrunk. Each is at least
+// minPairBytes; a ShellSession result is capped at ~48KB and pi's built-in
+// bash output at 50KB, but a heredoc'd command has no cap, so those raw bytes
+// are bounded by DEFAULT_DEMOTE_PENDING_BYTES rather than by their count.
+// 4 (= retainRaw) gets 75% of the saving for at most 3 extra pairs; for a
+// small context window, set 2, or 1 to restore per-pair demotion.
+export const DEFAULT_DEMOTE_BATCH = 4;
+// Raw bytes allowed in pairs that per-pair demotion would already have shrunk
+// but whose batch is not yet due. Past it, every due pair demotes at once, so
+// those bytes never exceed this budget (<= 0 disables the flush). The trigger
+// is bytes, not age: a break late in history re-prefills the most of it, and
+// an age-triggered flush measured worse than per-pair demotion in sparse
+// sessions. A lone stale pair under the budget therefore stays raw for good;
+// it is cached, so it costs no prefill, only context. For a small context
+// window, lower this, or set the batch to 2 or 1.
+export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 
 export interface RetentionOptions {
   retainRaw: number;
@@ -53,6 +75,8 @@ export interface RetentionOptions {
   keepResultHeadBytes: number;
   keepResultTailBytes: number;
   cmdKeepBytes: number;
+  demoteBatch: number;
+  demotePendingBytes: number;
 }
 
 export interface RecallOptions {
@@ -81,6 +105,8 @@ export function resolveOptions(): RetentionOptions {
     keepResultHeadBytes: envNumber(ENV_KEEP_RESULT_HEAD, DEFAULT_KEEP_RESULT_HEAD),
     keepResultTailBytes: envNumber(ENV_KEEP_RESULT_TAIL, DEFAULT_KEEP_RESULT_TAIL),
     cmdKeepBytes: envNumber(ENV_CMD_KEEP, DEFAULT_CMD_KEEP),
+    demoteBatch: envNumber(ENV_DEMOTE_BATCH, DEFAULT_DEMOTE_BATCH),
+    demotePendingBytes: envNumber(ENV_DEMOTE_PENDING_BYTES, DEFAULT_DEMOTE_PENDING_BYTES),
   };
 }
 
@@ -380,11 +406,49 @@ export function findMarkerEchoIds(input: unknown): string[] {
 }
 
 /**
+ * How many leading slots of the ordered demotable-pair list to demote, given
+ * `target`, the count the per-pair rule (rank >= retainRaw or distance >
+ * staleDistance) selects. Rounding down to a multiple of `batch` makes the
+ * demoted prefix grow in jumps of `batch` pairs, so the rendered history stays
+ * byte-identical between jumps. A `batch` that is not a finite number >= 1
+ * means per-pair; a fractional one is floored.
+ */
+export function demotedPrefixLength(target: number, batch: number): number {
+  const b = Number.isFinite(batch) && batch >= 1 ? Math.floor(batch) : 1;
+  return b * Math.floor(target / b);
+}
+
+/**
  * Replace stale, oversized shell pairs with archived placeholders.
  *
  * Staleness is displacement by newer qualifying pairs plus a distance floor,
  * both recomputable from the messages alone — pi hands every LLM call a fresh
  * clone of pristine history, so no cross-call state may be relied on.
+ *
+ * Both triggers are monotone in age, so the pairs they select are always a
+ * prefix of the size-qualifying pairs in history order. Only whole batches of
+ * that prefix are demoted (demotedPrefixLength): every growth of the demoted
+ * set rewrites history mid-prompt and forces the server to re-prefill from the
+ * first rewritten pair on, so growing in jumps keeps the prompt byte-identical,
+ * and its prefix cache warm, for every turn between jumps. The one exception
+ * is byte pressure: when the due pairs past the last whole batch (not yet
+ * demoted) hold more than demotePendingBytes raw, the prefix takes all of
+ * them, so raw-but-due bytes never exceed that budget. Bytes, not age, because
+ * a late break re-prefills the most history. Until the batch boundary passes
+ * them, those pending pairs only gain members as history is appended, so once
+ * a flush fires every later call flushes again or the boundary has already
+ * moved past them. A due pair under the budget waits for its batch, however
+ * long that takes.
+ *
+ * A pair that cannot shrink, or whose archive save is refused, keeps its slot
+ * and stays raw; the boundary is never pulled past it, so which pairs demote
+ * depends on counts alone. A pair already carrying its own marker keeps its
+ * slot too, so this function's output fed back in selects the same prefix and
+ * demotes nothing further.
+ *
+ * The prefix only ever grows while history is appended to. A non-append edit
+ * such as compaction recomputes it from scratch and may return pairs to raw,
+ * but that edit has already invalidated the cached prefix anyway.
  */
 export function demoteMessages(
   messages: any[],
@@ -392,19 +456,33 @@ export function demoteMessages(
   opts: RetentionOptions = resolveOptions(),
 ): { messages: any[]; demotedCount: number } {
   const result = [...messages];
-  const pairs = collectPairs(messages);
-  const qualifying = pairs.filter(
-    (p) =>
-      !alreadyDemoted(p) &&
-      byteLen(p.command) + byteLen(p.resultText) >= opts.minPairBytes,
-  );
+  const slots = collectPairs(messages)
+    .map((p) => ({ p, done: alreadyDemoted(p) }))
+    .filter(({ p, done }) => done || byteLen(p.command) + byteLen(p.resultText) >= opts.minPairBytes);
+
+  let target = 0;
+  for (let k = 0; k < slots.length; k++) {
+    const rank = slots.length - 1 - k;
+    const distance = messages.length - 1 - slots[k].p.resultIdx;
+    if (rank >= opts.retainRaw || distance > opts.staleDistance) target = k + 1;
+  }
+
+  // Batch 1 gives batched === target, so nothing is pending and the flush
+  // cannot change per-pair output.
+  const batched = demotedPrefixLength(target, opts.demoteBatch);
+  let pending = 0;
+  for (let k = batched; k < target; k++) {
+    const { p, done } = slots[k];
+    if (!done) pending += byteLen(p.command) + byteLen(p.resultText);
+  }
+  const budget = opts.demotePendingBytes;
+  const flush = Number.isFinite(budget) && budget > 0 && pending > budget;
+  const prefix = flush ? target : batched;
 
   let demotedCount = 0;
-  for (let k = 0; k < qualifying.length; k++) {
-    const p = qualifying[k];
-    const rank = qualifying.length - 1 - k;
-    const distance = messages.length - 1 - p.resultIdx;
-    if (rank < opts.retainRaw && distance <= opts.staleDistance) continue;
+  for (let k = 0; k < prefix; k++) {
+    const { p, done } = slots[k];
+    if (done) continue;
 
     const id = archiveId(p.toolCallId);
     const nextResult = demoteResultText(p.resultText, p.toolName, id, opts);
