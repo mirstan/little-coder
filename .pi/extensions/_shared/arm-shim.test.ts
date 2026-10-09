@@ -62,7 +62,7 @@ describe("arm shim", () => {
     const rewriters = names.filter((n) => {
       try {
         return /pi\.on\(\s*["']before_provider_request["']/.test(readFileSync(join(extRoot, n, "index.ts"), "utf-8"))
-          && n !== "zzz-ab-observer" && n !== "cache-reuse-compaction";
+          && n !== "zzz-ab-observer" && n !== "zzz-ab-capture" && n !== "cache-reuse-compaction";
       } catch {
         return false;
       }
