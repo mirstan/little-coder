@@ -1,0 +1,5 @@
+{"compaction":"auto","compactionEngine":"blackhole","memory":false,
+ "compactAfterTokens":100000000,"midRunCompaction":"off",
+ "showPreCompactionMessage":false,"statusBar":false,"debug":false,"debugLog":false,
+ "retainedToolOutputMaxTokens":0,"tailBehavior":"pi-default",
+ "compactionSummaryMode":"default"}

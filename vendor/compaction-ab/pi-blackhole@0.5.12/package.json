@@ -1,0 +1,88 @@
+{
+  "name": "pi-blackhole",
+  "version": "0.5.12",
+  "description": "Unified compaction + observational memory extension for Pi — compresses conversation context while preserving durable observations and reflections",
+  "keywords": [
+    "agents",
+    "ai",
+    "blackhole",
+    "cli",
+    "compact",
+    "compaction",
+    "observational-memory",
+    "pi",
+    "pi-agent",
+    "pi-blackhole",
+    "pi-coding-agent",
+    "pi-extension",
+    "pi-package",
+    "recall"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k0valik/pi-blackhole.git"
+  },
+  "files": [
+    "dist/",
+    "*.ts",
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!tests/",
+    "tsup.config.ts",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "example-config.json"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint .",
+    "format": "oxfmt . && oxfmt scripts",
+    "format:check": "oxfmt . --check && oxfmt scripts --check",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "pnpm typecheck && pnpm lint && pnpm fmt:check",
+    "prepare": "node scripts/prepare.mjs",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt . --check",
+    "verify": "pnpm check && pnpm test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "lint-staged": "17.6.0",
+    "oxfmt": "^0.71.0",
+    "oxlint": "1.86.0",
+    "simple-git-hooks": "^2.14.0",
+    "tsup": "^8.5.1",
+    "typebox": "1.3.34",
+    "typescript": "6.0.3",
+    "vitest": "5.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": ">=0.85.1 <2.0.0",
+    "@earendil-works/pi-ai": ">=0.85.1 <2.0.0",
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <2.0.0",
+    "@earendil-works/pi-tui": ">=0.85.1 <2.0.0"
+  },
+  "lint-staged": {
+    "*.{ts,js,mjs,cjs}": [
+      "oxlint --fix"
+    ],
+    "*.{ts,js,mjs,cjs,json,jsonc,md}": [
+      "oxfmt --no-error-on-unmatched-pattern"
+    ]
+  },
+  "packageManager": "pnpm@12.10.0",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}
