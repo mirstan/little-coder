@@ -61,7 +61,8 @@ export const DEFAULT_DEMOTE_BATCH = 4;
 // Raw bytes allowed in pairs that per-pair demotion would already have shrunk
 // but whose batch is not yet due. Past it, every due pair demotes at once, so
 // those bytes never exceed this budget (<= 0 disables the flush), unless the
-// cost gate defers the flush, which forcePendingBytes then bounds. The trigger
+// cost gate defers the flush, which forcePendingBytes then bounds, unless the
+// re-prefill ceiling vetoes that too (then only compaction does). The trigger
 // is bytes, not age: a break late in history re-prefills the most of it, and
 // an age-triggered flush measured worse than per-pair demotion in sparse
 // sessions. A lone stale pair under the budget therefore stays raw for good;
@@ -79,8 +80,10 @@ export const DEFAULT_DEMOTE_PENDING_BYTES = 65536;
 // fewer tokens speed each later turn up by ~2 s. What savings buy is keeping
 // a trial under compaction, which costs a full re-prefill plus the summary
 // (946 s for a 187K-token compaction request, live 2026-10-08). A due jump
-// therefore goes ahead only when one of these holds; otherwise its pairs stay
-// raw (and cached) and are judged again on the next request.
+// therefore goes ahead only when one of these holds, and the re-prefill
+// ceiling below does not veto it; otherwise its pairs stay raw (and cached)
+// and are judged again on the next request. R starts at the 4096-token block
+// holding the break, counted back from pi's context reading.
 //  - S >= minSaveRatio * R: the break is shallow next to what it sheds.
 //  - context >= openAtPercent% of the window. Off by default (100): in the
 //    replay, demoting near compaction never avoided one, it only paid a deep
@@ -116,10 +119,72 @@ const WATCHDOG_DEFAULT_PERCENT = 80;
 /** pi's estimateTokens convention (compaction.js), so estimates line up with getContextUsage's trailing part. */
 export const CHARS_PER_TOKEN = 4;
 
+// ── Re-prefill ceiling ──────────────────────────────────────────────────────
+//
+// The ratio clause prices a break in tokens, but a token re-prefilled at 200K
+// costs ~6x one at 10K (~8x one at depth 0): omlx prefill time is a(p-c) + b(p²-c²)/2 seconds for
+// tokens c..p, refitted on 162 requests with >= 16K uncached tokens (Sept 20 -
+// Oct 8; median error 0%, p10 -9%, p90 +2%), about 950 tok/s at depth 0, 213
+// at 100K and 120 at 200K. omlx reuses whole 4096-token blocks only, so a break
+// at token d re-prefills from floor(d / 4096) * 4096.
+// On 2026-10-08 the ratio clause opened 320-500 s breaks at 124-210K
+// (gcode-to-text turns 97, 119, 122-124; make-doom-for-mips turn 88), and
+// both trials compacted anyway. A jump whose estimated re-prefill exceeds
+// ceilingSeconds is therefore deferred unless it saves at least
+// minTokensPerSecond tokens per second it costs, and never goes ahead within
+// nearCompactTokens of the compaction threshold, where the compaction is about
+// to re-prefill everything anyway. A flat ceiling is not used: in the #83
+// replay it held back the 200-475 s jumps at 85-141K that kept four trials
+// under compaction (8.67 h and 20 compactions, against 7.69 h and 16). This
+// rule: 7.02 h, 16 compactions; flat for ceilings 45-120 s and for
+// nearCompactTokens 30-60K, and minTokensPerSecond 45 costs a compaction.
+// The veto binds every clause but a cold cache, whose break is free, so an
+// opted-in context clause (openAtPercent) no longer pays an over-ceiling
+// break that close to compaction.
+export const ENV_DEMOTE_CEILING_SECONDS = "LITTLE_CODER_SHELL_DEMOTE_CEILING_SECONDS";
+export const ENV_DEMOTE_MIN_TOKENS_PER_SECOND = "LITTLE_CODER_SHELL_DEMOTE_MIN_TOKENS_PER_SECOND";
+export const ENV_DEMOTE_NEAR_COMPACT_TOKENS = "LITTLE_CODER_SHELL_DEMOTE_NEAR_COMPACT_TOKENS";
+export const ENV_PREFILL_LINEAR_SECONDS = "LITTLE_CODER_SHELL_PREFILL_LINEAR_SECONDS";
+export const ENV_PREFILL_QUADRATIC_SECONDS = "LITTLE_CODER_SHELL_PREFILL_QUADRATIC_SECONDS";
+export const ENV_PREFIX_BLOCK_TOKENS = "LITTLE_CODER_SHELL_PREFIX_BLOCK_TOKENS";
+/** <= 0 disables the veto (#83's gate, but for R's block alignment: PREFIX_BLOCK_TOKENS=1 restores that). */
+export const DEFAULT_DEMOTE_CEILING_SECONDS = 60;
+/** <= 0: every jump over the ceiling is deferred. Under the 42 tok/s of the slowest jump that avoided a compaction. */
+export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
+/**
+ * <= 0 disables the near-compaction clause. Measured from context-watchdog's
+ * threshold (80% = 209.7K of a 262K window); the Harbor harness compacts at
+ * 220K, about 50K past the clause. In the replay (harness at 220K) margins of
+ * 30-60K score the same, 80K costs a compaction; under +-20% noise on the
+ * estimates, minTokensPerSecond 30-40 and margins 40-60K all keep 16.
+ */
+export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 40000;
+/**
+ * With context-watchdog off, the only mid-run compaction in an autonomous run is
+ * the RPC harness's, at min(220K, 84% of the window) (benchmarks/rpc_client.py);
+ * pi's own threshold check runs only between prompts.
+ */
+const HARNESS_COMPACT_TOKENS = 220000;
+const HARNESS_COMPACT_FRACTION = 0.84;
+/** Seconds per prefilled token at depth 0. */
+export const DEFAULT_PREFILL_LINEAR_SECONDS = 1.05e-3;
+/** Extra seconds per prefilled token per token of depth. */
+export const DEFAULT_PREFILL_QUADRATIC_SECONDS = 3.64e-8;
+/** <= 1: reuse up to the exact divergence token. */
+export const DEFAULT_PREFIX_BLOCK_TOKENS = 4096;
+
 export interface GateOptions {
   minSaveRatio: number;
   openAtPercent: number;
   forcePendingBytes: number;
+  ceilingSeconds: number;
+  minTokensPerSecond: number;
+  nearCompactTokens: number;
+  /** context-watchdog's trigger, percent of the window; null when it is off (then the RPC harness's trigger applies). */
+  compactAtPercent: number | null;
+  prefillLinearSeconds: number;
+  prefillQuadraticSeconds: number;
+  prefixBlockTokens: number;
 }
 
 /** What the hook knows about the prompt pi is about to send. */
@@ -137,27 +202,68 @@ export interface GateInput {
   contextTokens: number;
   contextWindow: number;
   pendingBytes: number;
+  /** Seconds the server would spend re-prefilling estReprefillTokens (prefillSeconds). */
+  estReprefillSeconds: number;
 }
 
 export type GateReason = "ratio" | "context" | "bytes" | "cold";
+/** Why a jump some clause opened was deferred anyway. */
+export type VetoReason = "ceiling" | "near";
 
 export function resolveGateOptions(): GateOptions {
   return {
     minSaveRatio: envNumber(ENV_DEMOTE_MIN_SAVE_RATIO, DEFAULT_DEMOTE_MIN_SAVE_RATIO),
     openAtPercent: openAtPercent(),
     forcePendingBytes: envNumber(ENV_DEMOTE_FORCE_PENDING_BYTES, DEFAULT_DEMOTE_FORCE_PENDING_BYTES),
+    ceilingSeconds: envNumber(ENV_DEMOTE_CEILING_SECONDS, DEFAULT_DEMOTE_CEILING_SECONDS),
+    minTokensPerSecond: envNumber(ENV_DEMOTE_MIN_TOKENS_PER_SECOND, DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND),
+    nearCompactTokens: envNumber(ENV_DEMOTE_NEAR_COMPACT_TOKENS, DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS),
+    compactAtPercent: watchdogPercent(),
+    prefillLinearSeconds: envNumber(ENV_PREFILL_LINEAR_SECONDS, DEFAULT_PREFILL_LINEAR_SECONDS),
+    prefillQuadraticSeconds: envNumber(ENV_PREFILL_QUADRATIC_SECONDS, DEFAULT_PREFILL_QUADRATIC_SECONDS),
+    prefixBlockTokens: envNumber(ENV_PREFIX_BLOCK_TOKENS, DEFAULT_PREFIX_BLOCK_TOKENS),
   };
+}
+
+/** context-watchdog's trigger percent, or null when it is off or out of range. */
+function watchdogPercent(): number | null {
+  if (process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return null;
+  // Same resolution as context-watchdog's thresholdPercent(): unset means its default 80.
+  const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", WATCHDOG_DEFAULT_PERCENT);
+  return watchdog <= 0 || watchdog >= 100 ? null : watchdog;
 }
 
 // An operator who lowers context-watchdog's threshold (default 80) below an
 // enabled open point would otherwise have it compact before the gate opened.
 function openAtPercent(): number {
   const open = envNumber(ENV_DEMOTE_OPEN_AT_PERCENT, DEFAULT_DEMOTE_OPEN_AT_PERCENT);
-  if (open <= 0 || open >= 100 || process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG === "1") return open;
-  // Same resolution as context-watchdog's thresholdPercent(): unset means its default 80.
-  const watchdog = envNumber("LITTLE_CODER_COMPACT_AT_PERCENT", WATCHDOG_DEFAULT_PERCENT);
-  if (watchdog <= 0 || watchdog >= 100) return open;
-  return Math.min(open, watchdog - WATCHDOG_MARGIN_PERCENT);
+  if (open <= 0 || open >= 100) return open;
+  const watchdog = watchdogPercent();
+  return watchdog === null ? open : Math.min(open, watchdog - WATCHDOG_MARGIN_PERCENT);
+}
+
+/** omlx's prefill time for tokens [from, to): a(to-from) + b(to²-from²)/2 seconds; 0 when to <= from. */
+export function prefillSeconds(from: number, to: number, o: GateOptions): number {
+  if (!(to > from)) return 0;
+  return o.prefillLinearSeconds * (to - from) + (o.prefillQuadraticSeconds * (to * to - from * from)) / 2;
+}
+
+/** The first token a prefix cache of `block`-token blocks re-prefills after diverging at `token`. */
+export function blockStart(token: number, block: number): number {
+  const t = Math.max(0, token);
+  return Number.isFinite(block) && block > 1 ? Math.floor(t / block) * block : t;
+}
+
+/** Why a jump some clause opened must still wait, or null to let it go ahead. A cold cache never reaches here. */
+export function demotionVeto(input: GateInput, o: GateOptions): VetoReason | null {
+  if (!(o.ceilingSeconds > 0) || input.estReprefillSeconds <= o.ceilingSeconds) return null;
+  const compactAt =
+    o.compactAtPercent === null
+      ? Math.min(HARNESS_COMPACT_TOKENS, HARNESS_COMPACT_FRACTION * input.contextWindow)
+      : (Math.min(o.compactAtPercent, 100) / 100) * input.contextWindow;
+  if (o.nearCompactTokens > 0 && input.contextTokens >= compactAt - o.nearCompactTokens) return "near";
+  if (o.minTokensPerSecond > 0 && input.estSaveTokens >= o.minTokensPerSecond * input.estReprefillSeconds) return null;
+  return "ceiling";
 }
 
 /** Why a due jump may go ahead, or null to defer it. */
@@ -567,15 +673,25 @@ export interface DemotionStats {
    * "none" (nothing due past the latched prefix), "open" or "deferred".
    */
   gate: "off" | "none" | "open" | "deferred";
-  gateReason: GateReason | null;
+  /** The clause that opened the jump, or on "deferred" the veto that held it (null: no clause opened). */
+  gateReason: GateReason | VetoReason | null;
   /** Due pairs the gate kept raw on this request. */
   skippedCost: number;
   /** Pairs latched demoted by earlier requests (see demoteMessagesWithStats). */
   sticky: number;
-  /** Estimates for the jump the gate judged, chars / CHARS_PER_TOKEN; 0 when it judged none. */
+  /**
+   * Estimates for the jump the gate judged; 0 when it judged none. Save is chars / CHARS_PER_TOKEN;
+   * re-prefill runs from the break's 4096-token block to the end of the cached prefix.
+   */
   estSaveTokens: number;
   estReprefillTokens: number;
   estContextTokens: number;
+  /** prefillSeconds over the estReprefillTokens before the end of the cached prefix; 0 when it judged none. */
+  estReprefillSeconds: number;
+  /** The configured ceiling (GateOptions.ceilingSeconds) when the gate ran, else 0. */
+  ceilingSeconds: number;
+  /** First token the judged jump would re-prefill (block-aligned); 0 when it judged none. */
+  estReprefillFromToken: number;
 }
 
 export interface GateArgs {
@@ -599,7 +715,8 @@ export interface GateArgs {
  * is byte pressure: when the due pairs past the last whole batch (not yet
  * demoted) hold more than demotePendingBytes raw, the prefix takes all of
  * them, so raw-but-due bytes never exceed that budget (unless the cost gate
- * below defers the flush; then forcePendingBytes bounds them). Bytes, not age, because
+ * below defers the flush; then forcePendingBytes bounds them, unless the
+ * re-prefill ceiling vetoes that too). Bytes, not age, because
  * a late break re-prefills the most history. Until the batch boundary passes
  * them, those pending pairs only gain members as history is appended, so once
  * a flush fires every later call flushes again or the boundary has already
@@ -617,7 +734,7 @@ export interface GateArgs {
  * but that edit has already invalidated the cached prefix anyway.
  *
  * With `gate`, the jump from the latched prefix to the one above must also
- * pass demotionGate, or it is deferred and its pairs stay raw. The gate's
+ * pass demotionGate and escape demotionVeto, or it is deferred and its pairs stay raw. The gate's
  * inputs are not monotone in history, so this mode reads one piece of
  * cross-call state: the archive, whose entries mark pairs an earlier request
  * demoted. Without `gate`, or with no context window, it is unchanged.
@@ -699,6 +816,9 @@ export function demoteMessagesWithStats(
     estSaveTokens: 0,
     estReprefillTokens: 0,
     estContextTokens: 0,
+    estReprefillSeconds: 0,
+    ceilingSeconds: 0,
+    estReprefillFromToken: 0,
   };
 
   let prefix = candidate;
@@ -756,6 +876,7 @@ export function demoteMessagesWithStats(
     const contextTokens = gate.context.contextTokens ??
       Math.ceil((totalChars - savedChars(0, sticky)) / CHARS_PER_TOKEN);
     stats.estContextTokens = contextTokens;
+    stats.ceilingSeconds = gate.options.ceilingSeconds;
 
     if (candidate <= sticky) {
       stats.gate = "none";
@@ -775,18 +896,30 @@ export function demoteMessagesWithStats(
           breakAt = Math.min(breakAt, before[p.resultIdx]);
         }
       }
+      // Positions in the server's tokens, counted back from the end of the
+      // prompt: contextTokens is measured there, and the system prompt and
+      // tool definitions ahead of the first message are not in the chars.
+      const tokenAt = (chars: number) => contextTokens - Math.max(0, totalChars - chars) / CHARS_PER_TOKEN;
+      const cachedEndToken = Math.max(0, tokenAt(cachedEnd));
+      // A break past the cached prefix rewrites only what is prefilled anyway.
+      const from = breakAt >= cachedEnd ? cachedEndToken : blockStart(tokenAt(breakAt), gate.options.prefixBlockTokens);
       const input: GateInput = {
         estSaveTokens: Math.ceil(savedChars(sticky, candidate) / CHARS_PER_TOKEN),
-        estReprefillTokens: Math.ceil(Math.max(0, cachedEnd - breakAt) / CHARS_PER_TOKEN),
+        estReprefillTokens: Math.ceil(Math.max(0, cachedEndToken - from)),
         contextTokens,
         contextWindow: window,
         pendingBytes,
+        estReprefillSeconds: prefillSeconds(from, cachedEndToken, gate.options),
       };
       stats.estSaveTokens = input.estSaveTokens;
       stats.estReprefillTokens = input.estReprefillTokens;
+      stats.estReprefillSeconds = Math.round(input.estReprefillSeconds * 10) / 10;
+      stats.estReprefillFromToken = Math.floor(from);
       // A break on a cold cache is free.
-      const reason = cold ? "cold" : demotionGate(input, gate.options);
-      stats.gateReason = reason;
+      const opened = cold ? "cold" : demotionGate(input, gate.options);
+      const veto = opened && opened !== "cold" ? demotionVeto(input, gate.options) : null;
+      const reason = veto ? null : opened;
+      stats.gateReason = veto ?? opened;
       if (reason) {
         stats.gate = "open";
         prefix = candidate;
