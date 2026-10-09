@@ -13,7 +13,7 @@ const self = "cache-reuse-compaction";
 // Observers register before_provider_request but never return a payload, so
 // they rewrite nothing and may load after the capture (compaction A/B
 // experiment: zzz-ab-observer, zzz-ab-observer/index.ts).
-const observers = new Set(["zzz-ab-observer"]);
+const observers = new Set(["zzz-ab-observer", "zzz-ab-capture"]);
 
 describe("load order", () => {
   it("loads after every bundled extension with a before_provider_request handler", () => {
