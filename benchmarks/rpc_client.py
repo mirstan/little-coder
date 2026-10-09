@@ -1272,6 +1272,17 @@ PI_IDLE_POLL_SEC = 10.0
 #: budget waiting, and attempting the prompt anyway is strictly better than
 #: not attempting it at all.
 PI_IDLE_WAIT_CAP_SEC = 1800.0
+#: The one extra wait after a harness compaction's response outlasts
+#: PI_IDLE_WAIT_CAP_SEC, for pi to finish and go idle so the late response
+#: can be picked up (prompt_with_mid_run_compaction). 1800 + 2700 = 4500 s in
+#: all. Worst legitimate case at the 220K trigger: a cache-reuse-compaction
+#: attempt that hands back late (240 s first-token timeout, or a first token
+#: plus its 2 x 600 s decode backstop: 1,440 s), then pi's own summary
+#: (TTFT ~960-1,600 s extrapolated from 820-955 s measured at 190-200k, plus
+#: ~165-325 s of generation, plus a split turn's prefix request ~300-700 s:
+#: ~2,600 s), about 4,040 s. pi's own summarization retries (transient stream
+#: drops) are not covered; such a compaction may be recorded as failed.
+PI_COMPACTION_RECOVERY_WAIT_SEC = 2700.0
 
 
 def wait_for_pi_idle(
@@ -2083,27 +2094,39 @@ def prompt_with_mid_run_compaction(
         # lands is accepted and races pi rebuilding the transcript under it.
         failure: Optional[BaseException] = None
         data = None
+        # Per cycle: only THIS compaction's continuation skips the idle wait.
+        recovered_wait = False
         try:
             data = rpc.await_compact(
                 rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
             )
         except TimeoutError as exc:
             # pi may still be compacting, not wedged: a cache-reuse attempt
-            # that falls back late can push its own summary past the wait.
-            # Once pi is idle a finished compaction's response is already
-            # queued, so pick it up rather than recording a compaction pi
-            # completed as failed and switching compaction off for the trial.
+            # that falls back late, or pi's own summary of a ~220K context,
+            # can outlast the wait. Wait once more (bounded) for pi to go
+            # idle, then re-await once: pi writes the compact response in the
+            # same step that clears its compacting state, so after an idle
+            # reading a finished compaction's response is already queued.
+            # Only a TimeoutError means "still nothing"; a late rejection or
+            # pi's exit replaces it as the recorded outcome.
             failure = exc
-            if wait_for_pi_idle(
+            recovered_wait = True
+            wait_for_pi_idle(
                 rpc, deadline, min_remaining_sec=min_remaining_sec,
+                cap_sec=PI_COMPACTION_RECOVERY_WAIT_SEC,
                 now=now, sleep=sleep, log=log,
-            ):
-                try:
-                    data = rpc.await_compact(rid, timeout=0)
-                    failure = None
-                    _log("compaction outlasted the wait but completed; using its late result")
-                except Exception:
-                    pass
+            )
+            # A dead pi gets 2 s: is_alive() can go false before the reader
+            # thread reaches EOF, and only then does the await raise
+            # PiProcessExited instead of TimeoutError.
+            try:
+                data = rpc.await_compact(rid, timeout=0 if rpc.is_alive() else 2.0)
+                failure = None
+                _log("compaction outlasted the wait but completed; using its late result")
+            except TimeoutError:
+                pass
+            except Exception as late:
+                failure = late
         except Exception as exc:
             failure = exc
         if failure is not None:
@@ -2175,13 +2198,20 @@ def prompt_with_mid_run_compaction(
                 merged, n_error_retries, last_error, retry_exception, n_compactions
             )
 
-        # Unconditional, regardless of how await_compact ended: pi can still
-        # report isStreaming right after a compaction settles. Return value
-        # ignored on purpose -- a wrong idle read must not end a live trial.
-        wait_for_pi_idle(
-            rpc, deadline, min_remaining_sec=min_remaining_sec,
-            now=now, sleep=sleep, log=log,
-        )
+        # Regardless of how await_compact ended: pi can still report
+        # isStreaming right after a compaction settles. Return value ignored
+        # on purpose -- a wrong idle read must not end a live trial. Skipped
+        # after a late recovery: that wait already polled pi to idle or spent
+        # its whole bound, and a second one is what let a wedged compaction
+        # cost 5,400 s. Accepted race: a pi still compacting after 4,500 s
+        # gets the continuation anyway (pi refuses a prompt only while
+        # streaming, and RPC cannot abort a compaction); dev and the earlier
+        # code had the same race at 3,600 and 5,400 s.
+        if not recovered_wait:
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
 
         cycle_message = continue_message
         cycle_timeout = max(0.0, deadline - now())
