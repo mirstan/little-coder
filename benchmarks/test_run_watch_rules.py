@@ -162,7 +162,7 @@ def opened(reason="ratio", est_secs=400.0):
     r = retention(8, 4, 4)
     r.update({"due": 4, "skippedNoShrink": 0, "gate": "open", "gateReason": reason, "skippedCost": 0,
               "estSaveTokens": 9000, "estReprefillTokens": 80_000, "estContextTokens": 150_000,
-              "estReprefillSeconds": est_secs, "ceilingSeconds": 60})
+              "estReprefillSeconds": est_secs, "ceilingSeconds": 60, "estReprefillFromToken": 36_864})
     return r
 
 
@@ -471,3 +471,14 @@ def test_a_spike_the_gate_paid_for_and_predicted_is_info_not_warn():
         got = W.evaluate_turn(st, rec(4, prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, ttft_s=300.0,
                                       retention=ret), cfg)
         assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    # gcode-to-text 97: the server kept 14K where the gate planned a break at ~37K.
+    got = W.evaluate_turn(st, rec(5, prompt_tokens=150_000, cache_read=14_121, cache_hit=0.09, ttft_s=450.0,
+                                  retention=opened(est_secs=400.0)), cfg)
+    assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    # Snapshots from before the ceiling carry no estimate: never downgraded.
+    old = opened(est_secs=400.0)
+    for k in ("estReprefillSeconds", "ceilingSeconds", "estReprefillFromToken"):
+        del old[k]
+    got = W.evaluate_turn(st, rec(6, prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, ttft_s=300.0,
+                                  retention=old), cfg)
+    assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]

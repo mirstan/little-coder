@@ -183,7 +183,7 @@ describe("resolveGateOptions", () => {
     forcePendingBytes: 262144,
     ceilingSeconds: 60,
     minTokensPerSecond: 38,
-    nearCompactTokens: 50000,
+    nearCompactTokens: 40000,
     compactAtPercent: 80,
     prefillLinearSeconds: 1.05e-3,
     prefillQuadraticSeconds: 3.64e-8,
@@ -238,12 +238,13 @@ describe("resolveGateOptions", () => {
         prefillQuadraticSeconds: 4e-8,
         prefixBlockTokens: 1,
       });
-      // With the watchdog off, "near" is measured from the window.
+      // With the watchdog off something else compacts (the Harbor harness at
+      // 220K): "near" falls back to the watchdog's default 80%.
       process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG = "1";
-      expect(resolveGateOptions().compactAtPercent).toBe(100);
+      expect(resolveGateOptions().compactAtPercent).toBe(80);
       process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG = "0";
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "0";
-      expect(resolveGateOptions().compactAtPercent).toBe(100);
+      expect(resolveGateOptions().compactAtPercent).toBe(80);
     } finally {
       if (watchdog === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
       else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = watchdog;
@@ -545,7 +546,7 @@ describe("re-prefill ceiling", () => {
     };
   }
   const deferred: Array<[string, number, number, number, string]> = [
-    ["gcode-to-text 97 (493 s live)", 17371, 113469, 163953, "near"],
+    ["gcode-to-text 97 (493 s live)", 17371, 113469, 163953, "ceiling"],
     ["gcode-to-text 119 (477 s)", 15505, 95155, 204965, "near"],
     ["gcode-to-text 122 (321 s)", 22132, 70054, 209578, "near"],
     ["gcode-to-text 123 (328 s)", 12196, 51080, 203876, "near"],
@@ -586,7 +587,7 @@ describe("re-prefill ceiling", () => {
     expect(demotionVeto(live(22132, 70054, 209578), { ...GATE, nearCompactTokens: 0 })).toBeNull();
   });
 
-  it("measures 'near' from context-watchdog's threshold, or the window when the watchdog is off", () => {
+  it("measures 'near' from the compaction percent of the window", () => {
     const at = 0.8 * WINDOW - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS;
     const over = { ...live(1, 50_000, at), estReprefillSeconds: 61 };
     expect(demotionVeto(over, GATE)).toBe("near");
@@ -671,6 +672,51 @@ describe("demoteMessagesWithStats with the re-prefill ceiling", () => {
     });
     expect(out.stats).toMatchObject({ gate: "open", gateReason: "ratio", demoted: B });
     expect(out.stats.estReprefillSeconds).toBeLessThan(DEFAULT_DEMOTE_CEILING_SECONDS);
+  });
+
+  it("holds a new due batch near compaction and keeps the latched one exactly as it was", () => {
+    const archive = memArchive();
+    const msgs = deep();
+    const first = demoteMessagesWithStats(msgs, archive, OPTS, {
+      options: GATE,
+      context: { contextTokens: null, contextWindow: WINDOW },
+    });
+    expect(first.demotedCount).toBe(B);
+    const grown = [...msgs, ...history(B, 4096, 200_000, "q").slice(1)];
+    const out = demoteMessagesWithStats(grown, archive, OPTS, {
+      options: { ...GATE, minSaveRatio: 0.01 },
+      context: { contextTokens: 200_000, contextWindow: WINDOW },
+    });
+    expect(out.stats).toMatchObject({ due: 2 * B, sticky: B, prefix: B, demoted: B, gate: "deferred", gateReason: "near", skippedCost: B });
+    expect(out.messages.slice(0, msgs.length)).toEqual(first.messages);
+  });
+
+  it("places the break the same whether earlier pairs are latched or already demoted in storage", () => {
+    // pi's context reading counts the latched pairs demoted; pristine chars do
+    // not. Counting back from the end keeps them out of the estimate.
+    const archive = memArchive();
+    const msgs = deep();
+    const first = demoteMessagesWithStats(msgs, archive, OPTS, {
+      options: GATE,
+      context: { contextTokens: null, contextWindow: WINDOW },
+    });
+    const tail = history(B, 4096, 200_000, "q").slice(1);
+    const ctx = { contextTokens: 200_000, contextWindow: WINDOW };
+    const latched = demoteMessagesWithStats([...msgs, ...tail], archive, OPTS, { options: GATE, context: ctx });
+    const stored = demoteMessagesWithStats([...first.messages, ...tail], memArchive(), OPTS, { options: GATE, context: ctx });
+    expect(latched.stats.sticky).toBe(B);
+    expect(stored.stats.sticky).toBe(B);
+    expect(latched.stats.estReprefillTokens).toBeGreaterThan(0);
+    expect(latched.stats.estReprefillTokens).toBe(stored.stats.estReprefillTokens);
+    expect(latched.stats.estReprefillFromToken).toBe(stored.stats.estReprefillFromToken);
+  });
+
+  it("lets a pending-bytes flush through under the ceiling", () => {
+    const out = demoteMessagesWithStats(history(B + R, 4096, 0), memArchive(), OPTS, {
+      options: { ...GATE, minSaveRatio: 0, forcePendingBytes: 1 },
+      context: { contextTokens: 20_000, contextWindow: WINDOW },
+    });
+    expect(out.stats).toMatchObject({ gate: "open", gateReason: "bytes", demoted: B });
   });
 
   it("keeps a latched prefix demoted when the ceiling would now hold the jump", () => {

@@ -61,7 +61,8 @@ export const DEFAULT_DEMOTE_BATCH = 4;
 // Raw bytes allowed in pairs that per-pair demotion would already have shrunk
 // but whose batch is not yet due. Past it, every due pair demotes at once, so
 // those bytes never exceed this budget (<= 0 disables the flush), unless the
-// cost gate defers the flush, which forcePendingBytes then bounds. The trigger
+// cost gate defers the flush, which forcePendingBytes then bounds, unless the
+// re-prefill ceiling vetoes that too (then only compaction does). The trigger
 // is bytes, not age: a break late in history re-prefills the most of it, and
 // an age-triggered flush measured worse than per-pair demotion in sparse
 // sessions. A lone stale pair under the budget therefore stays raw for good;
@@ -137,7 +138,9 @@ export const CHARS_PER_TOKEN = 4;
 // under compaction (8.67 h and 20 compactions, against 7.69 h and 16). This
 // rule: 7.02 h, 16 compactions; flat for ceilings 45-120 s and for
 // nearCompactTokens 30-60K, and minTokensPerSecond 45 costs a compaction.
-// The veto binds every clause but a cold cache, whose break is free.
+// The veto binds every clause but a cold cache, whose break is free, so an
+// opted-in context clause (openAtPercent) no longer pays an over-ceiling
+// break that close to compaction.
 export const ENV_DEMOTE_CEILING_SECONDS = "LITTLE_CODER_SHELL_DEMOTE_CEILING_SECONDS";
 export const ENV_DEMOTE_MIN_TOKENS_PER_SECOND = "LITTLE_CODER_SHELL_DEMOTE_MIN_TOKENS_PER_SECOND";
 export const ENV_DEMOTE_NEAR_COMPACT_TOKENS = "LITTLE_CODER_SHELL_DEMOTE_NEAR_COMPACT_TOKENS";
@@ -148,8 +151,14 @@ export const ENV_PREFIX_BLOCK_TOKENS = "LITTLE_CODER_SHELL_PREFIX_BLOCK_TOKENS";
 export const DEFAULT_DEMOTE_CEILING_SECONDS = 60;
 /** <= 0: every jump over the ceiling is deferred. Under the 42 tok/s of the slowest jump that avoided a compaction. */
 export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
-/** <= 0 disables the near-compaction clause. */
-export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 50000;
+/**
+ * <= 0 disables the near-compaction clause. Measured from context-watchdog's
+ * threshold (80% = 209.7K of a 262K window); the Harbor harness compacts at
+ * 220K, about 50K past the clause. In the replay (harness at 220K) margins of
+ * 30-60K score the same, 80K costs a compaction; under +-20% noise on the
+ * estimates, minTokensPerSecond 30-40 and margins 40-60K all keep 16.
+ */
+export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 40000;
 /** Seconds per prefilled token at depth 0. */
 export const DEFAULT_PREFILL_LINEAR_SECONDS = 1.05e-3;
 /** Extra seconds per prefilled token per token of depth. */
@@ -164,7 +173,7 @@ export interface GateOptions {
   ceilingSeconds: number;
   minTokensPerSecond: number;
   nearCompactTokens: number;
-  /** context-watchdog's trigger, percent of the window; 100 when it is off. */
+  /** context-watchdog's trigger, percent of the window; its default 80 when it is off (something else compacts then). */
   compactAtPercent: number;
   prefillLinearSeconds: number;
   prefillQuadraticSeconds: number;
@@ -202,7 +211,7 @@ export function resolveGateOptions(): GateOptions {
     ceilingSeconds: envNumber(ENV_DEMOTE_CEILING_SECONDS, DEFAULT_DEMOTE_CEILING_SECONDS),
     minTokensPerSecond: envNumber(ENV_DEMOTE_MIN_TOKENS_PER_SECOND, DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND),
     nearCompactTokens: envNumber(ENV_DEMOTE_NEAR_COMPACT_TOKENS, DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS),
-    compactAtPercent: watchdogPercent() ?? 100,
+    compactAtPercent: watchdogPercent() ?? WATCHDOG_DEFAULT_PERCENT,
     prefillLinearSeconds: envNumber(ENV_PREFILL_LINEAR_SECONDS, DEFAULT_PREFILL_LINEAR_SECONDS),
     prefillQuadraticSeconds: envNumber(ENV_PREFILL_QUADRATIC_SECONDS, DEFAULT_PREFILL_QUADRATIC_SECONDS),
     prefixBlockTokens: envNumber(ENV_PREFIX_BLOCK_TOKENS, DEFAULT_PREFIX_BLOCK_TOKENS),
@@ -671,6 +680,8 @@ export interface DemotionStats {
   estReprefillSeconds: number;
   /** The configured ceiling (GateOptions.ceilingSeconds) when the gate ran, else 0. */
   ceilingSeconds: number;
+  /** First token the judged jump would re-prefill (block-aligned); 0 when it judged none. */
+  estReprefillFromToken: number;
 }
 
 export interface GateArgs {
@@ -694,7 +705,8 @@ export interface GateArgs {
  * is byte pressure: when the due pairs past the last whole batch (not yet
  * demoted) hold more than demotePendingBytes raw, the prefix takes all of
  * them, so raw-but-due bytes never exceed that budget (unless the cost gate
- * below defers the flush; then forcePendingBytes bounds them). Bytes, not age, because
+ * below defers the flush; then forcePendingBytes bounds them, unless the
+ * re-prefill ceiling vetoes that too). Bytes, not age, because
  * a late break re-prefills the most history. Until the batch boundary passes
  * them, those pending pairs only gain members as history is appended, so once
  * a flush fires every later call flushes again or the boundary has already
@@ -796,6 +808,7 @@ export function demoteMessagesWithStats(
     estContextTokens: 0,
     estReprefillSeconds: 0,
     ceilingSeconds: 0,
+    estReprefillFromToken: 0,
   };
 
   let prefix = candidate;
@@ -891,6 +904,7 @@ export function demoteMessagesWithStats(
       stats.estSaveTokens = input.estSaveTokens;
       stats.estReprefillTokens = input.estReprefillTokens;
       stats.estReprefillSeconds = Math.round(input.estReprefillSeconds * 10) / 10;
+      stats.estReprefillFromToken = Math.floor(from);
       // A break on a cold cache is free.
       const opened = cold ? "cold" : demotionGate(input, gate.options);
       const veto = opened && opened !== "cold" ? demotionVeto(input, gate.options) : null;

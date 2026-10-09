@@ -253,6 +253,7 @@ describe("shell-retention telemetry (wired)", () => {
         signed: 0, skippedNoShrink: 0, skippedArchive: 0, bytesBefore: 0, bytesAfter: 0,
         gate: "off", gateReason: null, skippedCost: 0, sticky: 0,
         estSaveTokens: 0, estReprefillTokens: 0, estContextTokens: 0, estReprefillSeconds: 0, ceilingSeconds: 0,
+        estReprefillFromToken: 0,
       },
     ]);
   });

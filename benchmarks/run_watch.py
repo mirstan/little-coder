@@ -316,14 +316,21 @@ def _n(v: Any) -> int:
 def _predicted_reprefill_s(rec: dict) -> Optional[float]:
     """The cost gate's re-prefill estimate when this turn's request broke the cached prefix on purpose.
 
-    A warm-cache open (not "cold", which predicts nothing) carries estReprefillSeconds;
-    turns before the re-prefill ceiling existed carry none.
+    A warm-cache open (not "cold", which predicts nothing) carries estReprefillSeconds and
+    estReprefillFromToken; turns before the re-prefill ceiling existed carry neither. A server
+    that reused less than the block before the predicted break lost cache the gate did not
+    plan for, so that turn predicts nothing either.
     """
     ret = rec.get("retention")
     if not isinstance(ret, dict) or ret.get("gate") != "open" or ret.get("gateReason") in (None, "cold"):
         return None
-    est = _num(ret.get("estReprefillSeconds"))
-    return est if est is not None and est > 0 else None
+    est, start = _num(ret.get("estReprefillSeconds")), _num(ret.get("estReprefillFromToken"))
+    if est is None or est <= 0 or start is None:
+        return None
+    reused = _num(rec.get("cache_read"))
+    if reused is None or reused < start - 4096:
+        return None
+    return est
 
 
 def _as_predicted(ttft: Optional[float], predicted: Optional[float]) -> bool:
