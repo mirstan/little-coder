@@ -29,6 +29,14 @@ demoted, stubbed or followed a compaction, as divergence_in_output when it
 split the previous turn's generated output (jundot/omlx#4353), and as a
 prefix_divergence warning only when the ledger explains nothing.
 
+A compaction the cache-reuse-compaction extension served is reported as one
+compaction_reuse info line (TTFT, cached share of the prompt, summary size),
+or compaction_reuse_miss when the server cached too little of it; its server
+completion line never raises ttft_spike. A server ttft_spike in a trial that
+has turn records waits for the next turn record to say whether it was that
+compaction, or the request of a turn reported as expected_reprefill (see
+classify_ttft_spike); otherwise it is raised as before.
+
 --once makes one pass over everything already written and exits 1 when it
 raised a crit alert, 2 when the pass itself failed or its alerts could not be
 written to alerts.jsonl, else 0. Alerts already in alerts.jsonl are not raised
@@ -279,6 +287,9 @@ class TrialState:
     turns: list = field(default_factory=list)
     #: Classified divergences by rule name.
     divergences: dict = field(default_factory=dict)
+    #: Compactions served from the server's prefix cache, as {ts_start, ts_end,
+    #: prompt}; the join key for their server completion lines (classify_ttft_spike).
+    reuse_compactions: list = field(default_factory=list)
 
 
 @dataclass
@@ -417,8 +428,10 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
             f"largest tool call {_n(rec.get('max_tool_arg_bytes')):,} bytes)", data={"output": output})
     if output > cfg.max_output_tokens:
         add("warn", "big_output", f"one response produced {output:,} output tokens", data={"output": output})
-    if paid_for and (ttft > cfg.ttft_max_s or (rec.get("usage_reported") and prompt > cfg.cache_min_prompt_tokens
-                                                and (_num(rec.get("cache_hit")) or 0) < cfg.cache_min_hit_ratio)):
+    expected_reprefill = bool(
+        paid_for and (ttft > cfg.ttft_max_s or (rec.get("usage_reported") and prompt > cfg.cache_min_prompt_tokens
+                                                and (_num(rec.get("cache_hit")) or 0) < cfg.cache_min_hit_ratio)))
+    if expected_reprefill:
         # Its own rule, so it neither rate-limits nor is rate-limited by the
         # ttft_spike / cache_collapse warns that a surprise still raises.
         add("info", "expected_reprefill",
@@ -468,6 +481,9 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         if not isinstance(g, dict):
             continue
         st.telemetry_seen = True
+        if g.get("kind") == "compaction_reuse":
+            alerts.extend(_compaction_reuse_alert(st, g, cfg, ts, subject))
+            continue
         kind = str(g.get("kind") or "telemetry")
         which = str(g.get("trigger") or g.get("source") or "?")
         detail = " ".join(f"{k}={v}" for k, v in sorted(g.items()) if k not in ("v", "kind", "trigger", "source"))
@@ -492,7 +508,7 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         explained_by.append("compaction")
     st.turns.append({"turn": rec.get("turn"), "ts_start": _num(rec.get("ts_start")) or ts, "ts_end": ts,
                      "prompt": prompt, "output": output, "usage_reported": bool(rec.get("usage_reported")),
-                     "explained_by": explained_by})
+                     "explained_by": explained_by, "expected_reprefill": expected_reprefill})
     del st.turns[:-MAX_REMEMBERED_TURNS]
 
     # A cost-gate deferral is the intended reason for none demoted. Without
@@ -514,6 +530,31 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         add("info", "telemetry_missing",
             f"{st.n_turns} turns and no lc-telemetry: the demotion rules cannot see this trial", subj="once")
     return alerts
+
+
+def _compaction_reuse_alert(st: TrialState, g: dict, cfg: RuleConfig, ts: float, subject: str) -> list[Alert]:
+    """The one line a cache-reuse-compaction telemetry record earns."""
+    subj = f"{subject} compaction_reuse"
+    data = {k: v for k, v in g.items() if k != "v"}
+    if g.get("path") != "reuse":
+        return [Alert(ts, "info", "compaction_reuse", st.name, subj,
+                      f"compaction fell back to pi's own summary request ({g.get('fallback') or '?'}, "
+                      f"{g.get('reason') or '?'})", data)]
+    start, end = _num(g.get("ts_start")), _num(g.get("ts_end"))
+    prompt, cached, summary = _n(g.get("prompt_tokens")), _n(g.get("cache_read")), _n(g.get("summary_tokens"))
+    if start is not None and end is not None:
+        st.reuse_compactions.append({"ts_start": start, "ts_end": end, "prompt": prompt or None})
+        del st.reuse_compactions[:-MAX_REMEMBERED_TURNS]
+    ttft = _num(g.get("ttft_s"))
+    dur = _num(g.get("duration_s"))
+    hit = cached / prompt if prompt else None
+    msg = (f"compaction reused the cached prefix: TTFT {'?' if ttft is None else f'{ttft:.0f}s'}, "
+           f"{cached:,} of {prompt:,} prompt tokens cached, {summary:,} summary tokens, "
+           f"{'?' if dur is None else f'{dur:.0f}s'} total")
+    if prompt > cfg.cache_min_prompt_tokens and hit is not None and hit < cfg.cache_min_hit_ratio:
+        return [Alert(ts, "warn", "compaction_reuse_miss", st.name, subj,
+                      msg.replace("reused the cached prefix", "replayed the conversation but the cache missed"), data)]
+    return [Alert(ts, "info", "compaction_reuse", st.name, subj, msg, data)]
 
 
 MAX_REMEMBERED_TURNS = 200
@@ -599,6 +640,46 @@ def classify_divergence(ev: dict, st: TrialState, cfg: RuleConfig, now: float) -
                    f"{prev['prompt'] + prev['output']:,}): omlx re-tokenized it (jundot/omlx#4353); {detail}",
                    {"turn": t["turn"]})
     return out("warn", "prefix_divergence", f"prompt diverged from the cached prefix {detail}", {"turn": t["turn"]})
+
+
+def classify_ttft_spike(ev: dict, alert: Alert, st: TrialState, cfg: RuleConfig, now: float) -> Optional[list[Alert]]:
+    """Decide a server ttft_spike held back until the ledger can say what it was.
+
+    A compaction served from the prefix cache (cache-reuse-compaction) is not a
+    spike to page about: its own compaction_reuse line reports the TTFT, and
+    compaction_reuse_miss covers a cache that did not hold. Nor is the server
+    line of a turn whose record became expected_reprefill (a demotion
+    re-prefill the cost gate paid for at the predicted cost): that turn's own
+    line already reports it, and a slower-than-predicted one warns there. Its telemetry
+    reaches turns.jsonl with the next turn record, so the spike waits for a
+    turn record that contains or follows it, then is dropped when a reuse
+    compaction's [ts_start, ts_end] (+/- DIVERGENCE_WINDOW_SLACK_S) holds it and
+    both prompt sizes are known and agree within divergence_match_tokens, else raised as it
+    always was. A spike nothing ever claims is raised after
+    divergence_match_wait_s.
+    """
+    ts = _num(ev.get("ts")) or 0.0
+    slack = DIVERGENCE_WINDOW_SLACK_S
+    prompt = ev.get("prompt")
+    for c in st.reuse_compactions:
+        if not c["ts_start"] - slack <= ts <= c["ts_end"] + slack:
+            continue
+        # omlx's completion line carries no request id, so the prompt size is
+        # the only identity; a window alone could hide an unrelated request.
+        if isinstance(prompt, int) and c["prompt"] is not None and abs(c["prompt"] - prompt) <= cfg.divergence_match_tokens:
+            return []
+    # The same request's turn record already reported it as expected_reprefill
+    # (a demotion re-prefill the cost gate paid for, at the predicted cost):
+    # the server line is that one stall seen from the other side.
+    for t in st.turns:
+        if (t.get("expected_reprefill") and t["usage_reported"] and isinstance(prompt, int)
+                and t["ts_start"] - slack <= ts <= t["ts_end"] + slack
+                and abs(t["prompt"] - prompt) <= cfg.divergence_match_tokens):
+            return []
+    settled = any(t["ts_end"] + slack >= ts for t in st.turns)
+    if settled or st.finished or now - ts > cfg.divergence_match_wait_s:
+        return [alert]
+    return None
 
 
 def evaluate_server_event(ev: dict, trial: Optional[str], cfg: RuleConfig) -> list[Alert]:
@@ -770,6 +851,8 @@ class WatchState:
     server_last: dict = field(default_factory=dict)
     #: (event, trial name) divergences waiting for their turn record.
     pending_divergences: list = field(default_factory=list)
+    #: (event, trial name, alert) server ttft_spikes waiting for their turn record.
+    pending_ttft: list = field(default_factory=list)
     #: What the last poll_once's admit() calls changed, for _emit to undo.
     admit_undo: list = field(default_factory=list)
     #: Alerts whose write to alerts.jsonl failed; offered to admit() again next poll.
@@ -922,7 +1005,26 @@ def _poll_server(ws: WatchState, now: float) -> list:
         if trial is not None and is_mid_history_divergence(e, ws.cfg):
             ws.pending_divergences.append((e, trial))  # classified against the ledger in poll_once
             continue
-        out.extend(evaluate_server_event(e, trial, ws.cfg))
+        got = evaluate_server_event(e, trial, ws.cfg)
+        tw = ws.trials.get(trial) if trial is not None else None
+        if tw is not None and tw.state.turns:
+            # Held until the ledger can say whether it was a cache-reuse compaction.
+            ws.pending_ttft.extend((e, trial, a) for a in got if a.rule == "ttft_spike")
+            got = [a for a in got if a.rule != "ttft_spike"]
+        out.extend(got)
+    return out
+
+
+def _resolve_ttft(ws: WatchState, now: float) -> list:
+    out, waiting = [], []
+    for ev, trial, alert in ws.pending_ttft:
+        tw = ws.trials.get(trial)
+        got = classify_ttft_spike(ev, alert, tw.state, ws.cfg, now) if tw is not None else [alert]
+        if got is None:
+            waiting.append((ev, trial, alert))
+        else:
+            out.extend(got)
+    ws.pending_ttft = waiting
     return out
 
 
@@ -990,6 +1092,7 @@ def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[l
     job = resolve_job_dir(ws.target)
     if job is not None and job != ws.job_dir:
         ws.job_dir, ws.trials, ws.dedup, ws.unwritten = job, {}, DedupState(), []
+        ws.pending_ttft = []
         ws.job_start_ts = _mtime(job / "config.json")
         seed_dedup(ws.dedup, _load_alert_rows(job / ALERTS_FILENAME))
         lines.append(f"watching job {job}")
@@ -1021,6 +1124,7 @@ def poll_once(ws: WatchState, now: float, force_status: bool = False) -> tuple[l
     if ws.server is not None:
         alerts.extend(_poll_server(ws, now))
     alerts.extend(_resolve_divergences(ws, now))
+    alerts.extend(_resolve_ttft(ws, now))
     for tw in ws.trials.values():
         if not tw.state.finished and not tw.state.verifying:
             last_turn = max(tw.state.start_ts, _mtime(tw.tail.path) or 0.0)

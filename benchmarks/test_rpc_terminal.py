@@ -807,3 +807,32 @@ def test_pirpc_turns_extension_telemetry_on_unless_the_caller_set_it(fake_pi, tm
     with fake_pi("clean", tmp_path):
         pass
     assert seen[-1].get("LITTLE_CODER_TELEMETRY") == "0"
+
+
+def test_harness_compaction_telemetry_reaches_the_ledger_and_run_watch(fake_pi, tmp_path):
+    """pi emits the cache-reuse-compaction extension's lc-telemetry entry while
+    the harness is blocked in await_compact. Those events must reach on_event
+    before the continuation prompt's watermark trim discards them."""
+    import turn_ledger
+    import run_watch
+    state = turn_ledger.new_ledger()
+    records = []
+    seen = []
+
+    def on_event(ev):
+        seen.append(ev.get("type"))
+        records.extend(turn_ledger.observe(state, ev, time.time()))
+
+    with fake_pi("compaction_cycle", tmp_path) as rpc:
+        outcome = rpc_client.prompt_with_mid_run_compaction(
+            rpc, "go", 3600, on_event=on_event, context_window=262_144)
+    assert outcome.n_deliberate_compactions == 1
+    assert "compaction_end" in seen
+    guards = [g for r in records for g in r["guards"]]
+    assert [g["kind"] for g in guards] == ["compaction_reuse"]
+    carrier = next(r for r in records if r["guards"])
+    assert {(c["source"], c["reason"]) for c in carrier["compactions"]} == {("harness", "manual"), ("pi", "manual")}
+    st, cfg = run_watch.TrialState(name="t__x", start_ts=0.0), run_watch.RuleConfig()
+    alerts = [a for r in records for a in run_watch.evaluate_turn(st, json.loads(json.dumps(r)), cfg)]
+    assert ("info", "compaction_reuse") in [(a.level, a.rule) for a in alerts]
+    assert st.reuse_compactions and st.reuse_compactions[0]["prompt"] == 225_000

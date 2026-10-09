@@ -341,6 +341,8 @@ class PiRpc:
         # Demultiplexer state
         self._responses: dict[str, dict] = {}
         self._event_q: list[dict] = []
+        #: _event_q_watermark of the last compact response; see drain_compaction_events.
+        self._compact_watermark = 0
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         # Not _cv's lock: a blocked write would stall event demultiplexing.
@@ -1091,9 +1093,38 @@ class PiRpc:
         mostly want `estimatedTokensAfter`, which pi marks optional.
         """
         resp = self._await_response(rid, timeout=timeout)
+        with self._cv:
+            self._compact_watermark = resp.get("_event_q_watermark", 0)
         if not resp.get("success"):
             raise RuntimeError(f"pi rejected compact: {resp.get('error')}")
         return resp.get("data", {})
+
+    def drain_compaction_events(self, on_event: Callable[[dict], None]) -> int:
+        """Hand `on_event` every event pi queued before the last compact response.
+
+        pi emits a compaction's session events -- compaction_start, any
+        extension telemetry (cache-reuse-compaction's lc-telemetry entry),
+        compaction_end -- while the harness is blocked in await_compact,
+        which drains nothing. The continuation prompt's watermark trim
+        (prompt_and_collect) would then delete them unseen. Called between
+        the two, this delivers exactly the events that preceded the
+        response, in order; an on_event failure is skipped, not raised,
+        since this is telemetry and must not end the trial.
+        """
+        with self._cv:
+            n, self._compact_watermark = self._compact_watermark, 0
+        delivered = 0
+        for _ in range(n):
+            with self._cv:
+                if not self._event_q:
+                    break
+                ev = self._event_q.pop(0)
+            delivered += 1
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+        return delivered
 
     def session_stats(self, timeout: float = 10) -> Optional[dict]:
         """Query pi's own cumulative token/cost accounting for this session.
@@ -1241,6 +1272,17 @@ PI_IDLE_POLL_SEC = 10.0
 #: budget waiting, and attempting the prompt anyway is strictly better than
 #: not attempting it at all.
 PI_IDLE_WAIT_CAP_SEC = 1800.0
+#: The one extra wait after a harness compaction's response outlasts
+#: PI_IDLE_WAIT_CAP_SEC, for pi to finish and go idle so the late response
+#: can be picked up (prompt_with_mid_run_compaction). 1800 + 2700 = 4500 s in
+#: all. Worst legitimate case at the 220K trigger: a cache-reuse-compaction
+#: attempt that hands back late (240 s first-token timeout, or a first token
+#: plus its 2 x 600 s decode backstop: 1,440 s), then pi's own summary
+#: (TTFT ~960-1,600 s extrapolated from 820-955 s measured at 190-200k, plus
+#: ~165-325 s of generation, plus a split turn's prefix request ~300-700 s:
+#: ~2,600 s), about 4,040 s. pi's own summarization retries (transient stream
+#: drops) are not covered; such a compaction may be recorded as failed.
+PI_COMPACTION_RECOVERY_WAIT_SEC = 2700.0
 
 
 def wait_for_pi_idle(
@@ -1606,8 +1648,10 @@ COMPACTION_CONTINUE_PROMPT = (
 #: Synthetic on_event event prompt_with_mid_run_compaction emits once per
 #: deliberate compaction, after the compact response settles. Not a pi event:
 #: pi's own compaction_start/compaction_end for a harness-requested compaction
-#: come after the run it aborted has ended, so they can sit in the queue until
-#: the next prompt's watermark trim in prompt_and_collect discards them.
+#: come after the run it aborted has ended. They are delivered from the queue
+#: once the compact response arrives (PiRpc.drain_compaction_events); only a
+#: compaction whose response never arrives leaves them to the next prompt's
+#: watermark trim.
 #: benchmarks/turn_ledger.py counts harness compactions from this alone.
 HARNESS_COMPACTION_EVENT = "lc_harness_compaction"
 
@@ -1626,6 +1670,22 @@ def _notify_harness_compaction(
         # The callback is telemetry here: it must not end the trial the
         # compaction was meant to extend.
         log(f"on_event raised on {HARNESS_COMPACTION_EVENT}: {type(exc).__name__}: {exc}")
+
+
+def _drain_compaction_events(rpc: "PiRpc", on_event: Callable[[dict], None], log: Callable[[str], None]) -> None:
+    """Deliver the session events pi emitted during a harness compaction.
+
+    Without this the continuation prompt's watermark trim discards them, and
+    with them the cache-reuse-compaction telemetry (PiRpc.drain_compaction_events).
+    A stand-in rpc without the method delivers nothing.
+    """
+    drain = getattr(rpc, "drain_compaction_events", None)
+    if drain is None:
+        return
+    try:
+        drain(on_event)
+    except Exception as exc:
+        log(f"could not deliver compaction events: {type(exc).__name__}: {exc}")
 
 
 def _turn_context_tokens(event: dict) -> Optional[int]:
@@ -2032,11 +2092,46 @@ def prompt_with_mid_run_compaction(
         # session.prompt() refuses a message only while `isStreaming`, never
         # while `isCompacting`, so a continuation sent before the summary
         # lands is accepted and races pi rebuilding the transcript under it.
+        failure: Optional[BaseException] = None
+        data = None
+        # Per cycle: only THIS compaction's continuation skips the idle wait.
+        recovered_wait = False
         try:
             data = rpc.await_compact(
                 rid, timeout=max(0.0, min(deadline - now(), PI_IDLE_WAIT_CAP_SEC))
             )
+        except TimeoutError as exc:
+            # pi may still be compacting, not wedged: a cache-reuse attempt
+            # that falls back late, or pi's own summary of a ~220K context,
+            # can outlast the wait. Wait once more (bounded) for pi to go
+            # idle, then re-await once: pi writes the compact response in the
+            # same step that clears its compacting state, so after an idle
+            # reading a finished compaction's response is already queued.
+            # Only a TimeoutError means "still nothing"; a late rejection or
+            # pi's exit replaces it as the recorded outcome.
+            failure = exc
+            recovered_wait = True
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                cap_sec=PI_COMPACTION_RECOVERY_WAIT_SEC,
+                now=now, sleep=sleep, log=log,
+            )
+            # A dead pi gets 2 s: is_alive() can go false before the reader
+            # thread reaches EOF, and only then does the await raise
+            # PiProcessExited instead of TimeoutError.
+            try:
+                data = rpc.await_compact(rid, timeout=0 if rpc.is_alive() else 2.0)
+                failure = None
+                _log("compaction outlasted the wait but completed; using its late result")
+            except TimeoutError:
+                pass
+            except Exception as late:
+                failure = late
         except Exception as exc:
+            failure = exc
+        if failure is not None:
+            exc = failure
+            _drain_compaction_events(rpc, trigger, _log)
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
             _notify_harness_compaction(on_event, {
@@ -2045,6 +2140,7 @@ def prompt_with_mid_run_compaction(
                 "error": f"{type(exc).__name__}: {exc}",
             }, _log)
         else:
+            _drain_compaction_events(rpc, trigger, _log)
             after = data.get("estimatedTokensAfter") if isinstance(data, dict) else None
             before = data.get("tokensBefore") if isinstance(data, dict) else None
             _notify_harness_compaction(on_event, {
@@ -2102,13 +2198,20 @@ def prompt_with_mid_run_compaction(
                 merged, n_error_retries, last_error, retry_exception, n_compactions
             )
 
-        # Unconditional, regardless of how await_compact ended: pi can still
-        # report isStreaming right after a compaction settles. Return value
-        # ignored on purpose -- a wrong idle read must not end a live trial.
-        wait_for_pi_idle(
-            rpc, deadline, min_remaining_sec=min_remaining_sec,
-            now=now, sleep=sleep, log=log,
-        )
+        # Regardless of how await_compact ended: pi can still report
+        # isStreaming right after a compaction settles. Return value ignored
+        # on purpose -- a wrong idle read must not end a live trial. Skipped
+        # after a late recovery: that wait already polled pi to idle or spent
+        # its whole bound, and a second one is what let a wedged compaction
+        # cost 5,400 s. Accepted race: a pi still compacting after 4,500 s
+        # gets the continuation anyway (pi refuses a prompt only while
+        # streaming, and RPC cannot abort a compaction); dev and the earlier
+        # code had the same race at 3,600 and 5,400 s.
+        if not recovered_wait:
+            wait_for_pi_idle(
+                rpc, deadline, min_remaining_sec=min_remaining_sec,
+                now=now, sleep=sleep, log=log,
+            )
 
         cycle_message = continue_message
         cycle_timeout = max(0.0, deadline - now())

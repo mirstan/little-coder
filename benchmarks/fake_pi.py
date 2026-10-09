@@ -126,6 +126,64 @@ def main():
         sys.stderr.flush()
         os._exit(3)
 
+    if mode == "compaction_cycle":
+        # The harness's deliberate compaction, as real pi sequences it: one
+        # big turn (the trigger fires on its turn_end), the run unwinds,
+        # then the compact request is served -- and pi emits session events
+        # (compaction_start, the cache-reuse-compaction extension's
+        # lc-telemetry entry, compaction_end) BEFORE the compact response,
+        # while the harness is blocked in await_compact. Then the
+        # continuation prompt runs one small turn.
+        msg = read_prompt()
+        if msg is None:
+            return
+        emit({"type": "response", "id": msg.get("id"), "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_start"})
+        emit_text("working")
+        emit_turn_end(usage={**TURN_USAGE, "input": 225_000})
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if req.get("type") == "get_state":
+                emit({"type": "response", "id": req.get("id"), "command": "get_state", "success": True,
+                      "data": {"isStreaming": False, "isCompacting": False}})
+                continue
+            if req.get("type") == "compact":
+                emit({"type": "compaction_start", "reason": "manual"})
+                emit({"type": "entry_appended", "entry": {
+                    "type": "custom", "customType": "lc-telemetry",
+                    "data": {"v": 1, "kind": "compaction_reuse", "source": "compaction", "path": "reuse",
+                             "reason": "manual", "split": True, "prompt_tokens": 225_000,
+                             "cache_read": 221_184, "summary_tokens": 4000, "ttft_s": 18.0,
+                             "duration_s": 210.0, "ts_start": time.time() - 210, "ts_end": time.time()}}})
+                emit({"type": "compaction_end", "reason": "manual", "aborted": False,
+                      "result": {"tokensBefore": 225_000, "estimatedTokensAfter": 30_000}})
+                emit({"type": "response", "id": req.get("id"), "command": "compact", "success": True,
+                      "data": {"summary": "s", "firstKeptEntryId": "e", "tokensBefore": 225_000,
+                               "estimatedTokensAfter": 30_000}})
+                continue
+            if req.get("type") == "prompt":
+                emit({"type": "response", "id": req.get("id"), "success": True})
+                emit({"type": "agent_start"})
+                emit({"type": "turn_start"})
+                emit_text("continued")
+                emit_turn_end(usage={**TURN_USAGE, "input": 31_000})
+                emit({"type": "agent_end"})
+                emit({"type": "agent_settled"})
+                serve_requests()
+                return
+            if req.get("id"):
+                emit({"type": "response", "id": req.get("id"), "success": True, "data": {}})
+        return
+
     if mode in ("compact_ok", "compact_fails"):
         # Answers compact requests without ever being prompted: the
         # compaction round-trip is an RPC pair, not a turn.

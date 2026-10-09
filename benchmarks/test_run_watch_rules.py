@@ -440,6 +440,81 @@ def test_divergence_counts_by_class_are_kept_on_the_trial():
     assert st.divergences == {"expected_divergence": 1}
 
 
+def reuse(path="reuse", **kw):
+    base = {"v": 1, "kind": "compaction_reuse", "source": "compaction", "path": path, "reason": "manual",
+            "split": True, "ts_start": 2000.0, "ts_end": 2030.0, "duration_s": 30.0}
+    if path == "reuse":
+        base.update(prompt_tokens=220_000, cache_read=217_088, summary_tokens=1500, ttft_s=12.4)
+    else:
+        base.update(fallback="anchor_missing")
+    base.update(kw)
+    return base
+
+
+def test_a_reuse_compaction_is_one_info_line_and_a_fallback_says_why():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, guards=[reuse()]), cfg)
+    assert rules(got) == [("info", "compaction_reuse")]
+    assert "TTFT 12s" in got[0].message and "217,088 of 220,000" in got[0].message
+    assert got[0].subject == "turn 1 compaction_reuse"
+    assert st.reuse_compactions == [{"ts_start": 2000.0, "ts_end": 2030.0, "prompt": 220_000}]
+    got = W.evaluate_turn(st, rec(2, guards=[reuse("native")]), cfg)
+    assert rules(got) == [("info", "compaction_reuse")]
+    assert "anchor_missing" in got[0].message
+    assert len(st.reuse_compactions) == 1
+
+
+def test_a_reuse_compaction_whose_cache_missed_is_a_warning():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, guards=[reuse(cache_read=4096)]), cfg)
+    assert rules(got) == [("warn", "compaction_reuse_miss")]
+
+
+def spike(ts, prompt=220_000, ttft=300.0):
+    ev = {"src": "omlx", "kind": "completion", "ts": ts, "prompt": prompt, "cached": None, "output": 1500,
+          "ttft_s": ttft}
+    return ev, W.evaluate_server_event(ev, TRIAL, W.RuleConfig())[0]
+
+
+def test_a_ttft_spike_on_a_reuse_compaction_is_dropped_once_the_ledger_shows_it():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    ev, alert = spike(2029.0)
+    assert alert.rule == "ttft_spike"
+    # The compaction's telemetry rides on the next turn record; until then, wait.
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2031.0) is None
+    W.evaluate_turn(st, rec(2, ts_start=2035.0, ts_end=2050.0, guards=[reuse()]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2051.0) == []
+
+
+def test_a_ttft_spike_the_ledger_does_not_explain_is_still_raised():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    ev, alert = spike(2029.0)
+    # Native fallback: no reuse window, so the next turn record settles it as a spike.
+    W.evaluate_turn(st, rec(2, ts_start=2035.0, ts_end=2050.0, guards=[reuse("native")]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st, cfg, now=2051.0) == [alert]
+    # A reuse window that does not hold the line, or a prompt that differs, does not claim it.
+    st2 = trial()
+    W.evaluate_turn(st2, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse(prompt_tokens=150_000)]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st2, cfg, now=2051.0) == [alert]
+    # A window match alone does not claim it: the prompt sizes must both be known and agree.
+    st4 = trial()
+    W.evaluate_turn(st4, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse(prompt_tokens=None)]), cfg)
+    assert W.classify_ttft_spike(ev, alert, st4, cfg, now=2051.0) == [alert]
+    st5 = trial()
+    W.evaluate_turn(st5, rec(1, ts_start=2035.0, ts_end=2050.0, guards=[reuse()]), cfg)
+    ev5, alert5 = spike(2029.0, prompt=None)
+    assert W.classify_ttft_spike(ev5, alert5, st5, cfg, now=2051.0) == [alert5]
+    # Nothing ever lands: raised after the wait.
+    st3 = trial()
+    W.evaluate_turn(st3, rec(1, ts_start=1900.0, ts_end=1990.0), cfg)
+    assert W.classify_ttft_spike(ev, alert, st3, cfg, now=2029.0 + cfg.divergence_match_wait_s + 1) == [alert]
+    # A spike inside a normal turn is settled by that turn's own record.
+    ev4, alert4 = spike(1950.0, prompt=500)
+    assert W.classify_ttft_spike(ev4, alert4, st3, cfg, now=1995.0) == [alert4]
+
+
 def test_a_ceiling_deferral_names_its_reason_and_each_reason_is_reported_once():
     st, cfg = trial(), W.RuleConfig()
     got = W.evaluate_turn(st, rec(1, prompt_tokens=200_000,
@@ -506,3 +581,79 @@ def test_each_deferral_reason_survives_the_sinks_dedup():
     assert [a.subject for a in got] == ["once", "once:ceiling", "once:near"]
     # Once per trial already: a cooldown would lose them for good.
     assert [W.admit(d, a, cfg.cooldown_s) for a in got] == [True, True, True]
+
+
+# ── #84 x #85: a held server ttft_spike vs the turn-ledger rules ─────────────
+# Two sources report one slow request: the turn record (turn-level
+# ttft_spike, or #85's expected_reprefill info when the cost gate paid for the
+# break) and the server's completion line (a ttft_spike held by #84 until the
+# ledger can explain it). Each must be reported once or suppressed once.
+
+PAID = dict(prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, demoted_new=4)
+
+
+def _settle(st, held, cfg, now):
+    """Resolve held server spikes as _resolve_ttft does; return what is raised."""
+    out = []
+    for ev, alert in held:
+        got = W.classify_ttft_spike(ev, alert, st, cfg, now)
+        assert got is not None, "every held spike is settled once the ledger has the later turn"
+        out.extend(got)
+    return out
+
+
+def test_neither_explained_each_source_reports_its_spike_once():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2400.0, ttft_s=300.0, prompt_tokens=150_000), cfg)
+    assert rules(turn) == [("warn", "ttft_spike")]
+    raised = _settle(st, [spike(2310.0, prompt=150_000)], cfg, now=2401.0)
+    assert rules(raised) == [("warn", "ttft_spike")]
+
+
+def test_a_predicted_demotion_reprefill_is_one_info_and_its_server_spike_is_dropped():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                                   **PAID), cfg)
+    assert rules(turn) == [("info", "expected_reprefill")]
+    assert _settle(st, [spike(2460.0, prompt=150_000, ttft=450.0)], cfg, now=2501.0) == []
+
+
+def test_a_surprise_demotion_reprefill_still_warns_from_both_sources():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2750.0, ttft_s=700.0, retention=opened(est_secs=400.0),
+                                   **PAID), cfg)
+    assert rules(turn) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    assert rules(_settle(st, [spike(2710.0, prompt=150_000, ttft=700.0)], cfg, now=2751.0)) == [("warn", "ttft_spike")]
+
+
+def test_a_reuse_compaction_and_a_predicted_reprefill_in_one_window_each_drop_their_own_spike():
+    """The compaction (prompt 220,000) and the predicted re-prefill turn
+    (150,000) overlap in time; prompt size decides which explanation claims
+    which server line, and a third line neither explains is still raised."""
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                                   guards=[reuse(ts_start=2000.0, ts_end=2400.0)], **PAID), cfg)
+    assert rules(turn) == [("info", "expected_reprefill"), ("info", "compaction_reuse")]
+    compaction = spike(2390.0, prompt=220_000)
+    reprefill = spike(2460.0, prompt=150_000, ttft=450.0)
+    unrelated = spike(2395.0, prompt=90_000)
+    assert _settle(st, [compaction, reprefill], cfg, now=2501.0) == []
+    assert rules(_settle(st, [unrelated], cfg, now=2501.0)) == [("warn", "ttft_spike")]
+
+
+def test_a_reuse_compaction_spike_is_not_claimed_by_a_predicted_turn_of_another_size():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    # A reuse compaction whose cache missed: its own rule warns, and the server
+    # spike it explains is dropped -- not raised again, not claimed by the turn.
+    W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                            guards=[reuse(ts_start=2000.0, ts_end=2400.0, cache_read=4096)], **PAID), cfg)
+    assert _settle(st, [spike(2390.0, prompt=220_000)], cfg, now=2501.0) == []

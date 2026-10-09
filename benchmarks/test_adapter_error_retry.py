@@ -29,6 +29,7 @@ from rpc_client import (  # noqa: E402
     COMPACTION_CONTINUE_PROMPT,
     ERROR_RETRY_PROMPT,
     PiBusyError,
+    PiProcessExited,
     PromptResult,
     prompt_with_error_retry,
     prompt_with_mid_run_compaction,
@@ -612,7 +613,8 @@ class _CycleRpc:
 
     def __init__(self, cycles, clock=None, compact_results=(), alive=True,
                  die_on_prompt=False, busy_for_sec_after_compact=0.0,
-                 busy_on_first_n_continuation_sends=0):
+                 busy_on_first_n_continuation_sends=0, compacting_until=None,
+                 dies_at=None, busy_after_compact=None, compaction_events=None):
         self._cycles = list(cycles)
         self._clock = clock
         self._compact_results = list(compact_results)
@@ -639,6 +641,27 @@ class _CycleRpc:
         self.compact_requests = []
         self.awaited = []
         self.state_calls = 0
+        #: The timeout of every await_compact call, in order.
+        self.awaited_timeouts = []
+        #: Absolute clock time until which pi reports isCompacting and holds
+        #: back a scripted response (data or a rejection), the way the real
+        #: response queue does: until then await_compact raises TimeoutError.
+        self._compacting_until = compacting_until
+        #: Absolute clock time from which pi is dead: is_alive() is False,
+        #: get_state raises PiProcessExited, and await_compact raises
+        #: TimeoutError below a 2 s timeout (the reader has not seen EOF yet)
+        #: and PiProcessExited otherwise. Checked before the compacting gate.
+        self._dies_at = dies_at
+        #: Residual isStreaming seconds armed after compaction i's successful
+        #: await (by index), for tests that need one compaction busy, not all.
+        self._busy_after_compact = list(busy_after_compact or [])
+        #: Events per compaction (by index) that drain_compaction_events
+        #: delivers once that compaction produced a response -- data or a
+        #: rejection RuntimeError, never PiProcessExited/TimeoutError, which
+        #: is PiRpc's watermark rule.
+        self._compaction_events = list(compaction_events or [])
+        self._drainable = []
+        self.drain_calls = 0
 
     def prompt_and_collect(self, message, timeout=900, on_event=None):
         self.calls.append((message, timeout))
@@ -668,13 +691,26 @@ class _CycleRpc:
             "('steer' or 'followUp') to queue the message."
         )
 
+    def _dead(self):
+        return self._dies_at is not None and self._clock.now() >= self._dies_at
+
     def is_alive(self):
-        return self.alive
+        return self.alive and not self._dead()
 
     def get_state(self):
         self.state_calls += 1
+        if self._dead():
+            raise PiProcessExited("pi exited")
         busy = self._busy_until is not None and self._clock.now() < self._busy_until
-        return {"isStreaming": busy, "isCompacting": False}
+        compacting = self._compacting_until is not None and self._clock.now() < self._compacting_until
+        return {"isStreaming": busy, "isCompacting": compacting}
+
+    def drain_compaction_events(self, on_event):
+        self.drain_calls += 1
+        events, self._drainable = self._drainable, []
+        for ev in events:
+            on_event(ev)
+        return len(events)
 
     def request_compact(self):
         rid = f"compact-{len(self.compact_requests)}"
@@ -683,10 +719,31 @@ class _CycleRpc:
 
     def await_compact(self, rid, timeout=600):
         self.awaited.append(rid)
+        self.awaited_timeouts.append(timeout)
+        n = len(self.compact_requests) - 1
+        if self._dead():
+            if timeout < 2.0:
+                raise TimeoutError(f"pi did not respond to request {rid} within {timeout}s")
+            if self._compact_results and isinstance(self._compact_results[0], PiProcessExited):
+                raise self._compact_results.pop(0)
+            raise PiProcessExited(f"pi exited before acknowledging request {rid}")
         assert self._compact_results, "await_compact called more often than scripted"
+        if (self._compacting_until is not None and self._clock.now() < self._compacting_until
+                and not isinstance(self._compact_results[0], TimeoutError)):
+            self._clock.t += timeout
+            raise TimeoutError(f"pi did not respond to request {rid} within {timeout}s")
         nxt = self._compact_results.pop(0)
-        if isinstance(nxt, Exception):
+        if isinstance(nxt, TimeoutError):
+            self._clock.t += timeout
             raise nxt
+        if isinstance(nxt, Exception):
+            if not isinstance(nxt, PiProcessExited) and n < len(self._compaction_events):
+                self._drainable = list(self._compaction_events[n])
+            raise nxt
+        if n < len(self._compaction_events):
+            self._drainable = list(self._compaction_events[n])
+        if n < len(self._busy_after_compact) and self._busy_after_compact[n]:
+            self._busy_until = self._clock.now() + self._busy_after_compact[n]
         if self._busy_for_sec_after_compact:
             self._busy_until = self._clock.now() + self._busy_for_sec_after_compact
         if self._busy_on_first_n_continuation_sends:
@@ -964,8 +1021,8 @@ def test_the_deliberate_compaction_cap_is_enforced():
 
 
 @pytest.mark.parametrize("failure", [
-    TimeoutError("compact never answered"),
-    RuntimeError("pi rejected compact: Nothing to compact (session too small)"),
+    [TimeoutError("compact never answered"), TimeoutError("still nothing")],
+    [RuntimeError("pi rejected compact: Nothing to compact (session too small)")],
 ])
 def test_a_failed_compaction_still_gets_its_continuation(failure):
     """session.compact() aborts the active run BEFORE any of these failures
@@ -976,13 +1033,20 @@ def test_a_failed_compaction_still_gets_its_continuation(failure):
         [([_turn(230_000)], _ok()),
          ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
         clock,
-        compact_results=[failure],
+        compact_results=failure,
     )
-    outcome = _run_compaction(rpc, clock)
+    seen = []
+    outcome = _run_compaction(rpc, clock, on_event=seen.append)
     assert len(rpc.calls) == 2
     assert rpc.calls[1][0] == COMPACTION_CONTINUE_PROMPT
     assert outcome.result.stop_reason == "agent_end"
     assert outcome.n_deliberate_compactions == 1
+    # Every scripted await was made, and no more: a TimeoutError gets exactly
+    # one late re-await, a rejection none.
+    assert len(rpc.awaited) == len(failure)
+    [harness] = [e for e in seen if e.get("type") == "lc_harness_compaction"]
+    assert harness["ok"] is False
+    assert harness["error"] == f"{type(failure[0]).__name__}: {failure[0]}"
 
 
 def test_a_deliberate_compaction_is_reported_to_on_event():
@@ -1341,3 +1405,108 @@ def test_adapter_uses_the_shared_retry_and_records_it(path):
     assert "n_deliberate_compactions" in source
     assert "preview_tool_result(" in source
     assert "[:400]" not in source, "raw slice should be gone from the log previews"
+
+
+def _late(clock, **kw):
+    """_CycleRpc for the late-compaction cases: a big turn, then two cycles."""
+    return _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(240_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock, **kw)
+
+
+def _harness(seen):
+    return [e for e in seen if e.get("type") == "lc_harness_compaction"]
+
+
+DATA = {"tokensBefore": 230_000, "estimatedTokensAfter": 60_000}
+
+
+def test_a_compaction_that_outlasts_the_wait_but_completes_is_recovered_not_failed():
+    """pi still compacting when the 1800 s await gives up, idle at +4000 s: the
+    one recovery wait (PI_COMPACTION_RECOVERY_WAIT_SEC) covers it, the late
+    response is picked up with a zero-timeout re-await, and the trigger re-arms."""
+    clock = _Clock()
+    t0 = clock.now()
+    seen = []
+    rpc = _late(clock, compacting_until=t0 + 4000,
+                compact_results=[TimeoutError("compact-0 not within 1800s"), DATA, DATA])
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0, on_event=seen.append)
+    assert [e["ok"] for e in _harness(seen)] == [True, True]
+    assert rpc.awaited_timeouts[:2] == [1800.0, 0]
+    assert len(rpc.compact_requests) == 2 and outcome.n_deliberate_compactions == 2
+
+
+def test_a_wedged_compaction_waits_once_more_then_continues():
+    """Never idle: one recovery wait, one late re-await, recorded as the
+    original timeout, and the continuation goes out at +4500 s -- not after
+    a second full idle wait (+5400 s)."""
+    clock = _Clock()
+    seen = []
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock, compacting_until=float("inf"),
+        compact_results=[TimeoutError("compact-0 not within 1800s"), TimeoutError("late")],
+    )
+    _run_compaction(rpc, clock, timeout=36_000.0, on_event=seen.append)
+    [h] = _harness(seen)
+    assert h["ok"] is False and h["error"] == "TimeoutError: compact-0 not within 1800s"
+    assert rpc.awaited_timeouts == [1800.0, 0]
+    assert rpc.calls[1][1] == 36_000 - 4_500
+
+
+def test_a_late_rejection_replaces_the_timeout_and_its_events_are_delivered():
+    clock = _Clock()
+    t0 = clock.now()
+    seen = []
+    failed_end = {"type": "compaction_end", "reason": "manual", "aborted": False, "result": None,
+                  "errorMessage": "Compaction failed: Nothing to compact"}
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock, compacting_until=t0 + 2500,
+        compact_results=[TimeoutError("compact-0 not within 1800s"),
+                         RuntimeError("pi rejected compact: Nothing to compact (session too small)")],
+        compaction_events=[[failed_end]],
+    )
+    _run_compaction(rpc, clock, timeout=36_000.0, on_event=seen.append)
+    [h] = _harness(seen)
+    assert h["ok"] is False
+    assert h["error"] == "RuntimeError: pi rejected compact: Nothing to compact (session too small)"
+    types = [e.get("type") for e in seen]
+    assert types.index("compaction_end") < types.index("lc_harness_compaction")
+
+
+def test_pi_dying_during_the_recovery_wait_is_recorded_as_its_exit():
+    """is_alive() goes false before the reader thread reaches EOF, so a 0 s
+    re-await would still say TimeoutError; a dead pi gets 2 s, enough for
+    _await_response to raise PiProcessExited."""
+    clock = _Clock()
+    t0 = clock.now()
+    seen = []
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok())],
+        clock, compacting_until=float("inf"), dies_at=t0 + 2500,
+        compact_results=[TimeoutError("compact-0 not within 1800s"), PiProcessExited("pi exited")],
+    )
+    _run_compaction(rpc, clock, timeout=36_000.0, on_event=seen.append)
+    assert rpc.awaited_timeouts == [1800.0, 2.0]
+    [h] = _harness(seen)
+    assert h["ok"] is False and h["error"] == "PiProcessExited: pi exited"
+    assert len(rpc.calls) == 1, "no continuation into a dead pi"
+
+
+def test_the_skipped_post_compaction_wait_applies_only_to_the_late_cycle():
+    """Guard (passes before the change too): compaction 1 is recovered late, so
+    its continuation skips the idle wait; compaction 2 succeeds normally and
+    leaves pi busy for 30 s, which the regular post-compaction wait must still
+    absorb. Red only if the skip leaked into the next cycle."""
+    clock = _Clock()
+    t0 = clock.now()
+    rpc = _late(clock, compacting_until=t0 + 2500, busy_after_compact=[0, 30],
+                compact_results=[TimeoutError("compact-0 not within 1800s"), DATA, DATA])
+    outcome = _run_compaction(rpc, clock, timeout=36_000.0)
+    assert len(rpc.calls) == 3
+    assert "PiBusyError" not in (outcome.retry_exception or "")
