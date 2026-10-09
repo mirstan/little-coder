@@ -533,6 +533,21 @@ def _initial_snapshot_advertisement(
     return text
 
 
+#: Opt-in: "1" makes each trial's pi persist its session under the trial's
+#: agent logs dir (<logs_dir>/pi-session/) instead of running --no-session,
+#: so a run can be replayed offline at its real compaction points.
+ENV_PI_SESSION_IN_LOGS = "LITTLE_CODER_PI_SESSION_DIR_IN_LOGS"
+
+
+def _pi_session_dir(logs_dir) -> "str | None":
+    """<logs_dir>/pi-session when ENV_PI_SESSION_IN_LOGS is "1", else None."""
+    if os.environ.get(ENV_PI_SESSION_IN_LOGS) != "1" or not logs_dir:
+        return None
+    path = Path(logs_dir) / "pi-session"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def _pi_env(
     *,
     budget_start_epoch_ms: int,
@@ -2103,6 +2118,7 @@ class LittleCoderAgent(BaseAgent):
                 # "qwen").
                 thinking=thinking_level,
                 tb_shell_handler=tb_shell_handler,
+                session_dir=_pi_session_dir(self.logs_dir),
                 env=_pi_env(
                     budget_start_epoch_ms=budget_start_epoch_ms,
                     deadline_epoch_ms=deadline_epoch_ms,

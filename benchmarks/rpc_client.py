@@ -267,7 +267,13 @@ class PiRpc:
         max_turns: Optional[int] = None,
         thinking: Optional[str] = None,
         tb_shell_handler: Optional[Callable[[dict], str]] = None,
+        session_dir: Optional[str] = None,
     ):
+        """`session_dir`: when set, pi persists the session there
+        (`--session-dir`) instead of running `--no-session`, and
+        LITTLE_CODER_PI_SESSION_DIR names it for extensions that write
+        alongside it (the compaction A/B observer). Opt-in: the default
+        None keeps the ephemeral session every harness has always used."""
         if not PI_BIN.exists():
             raise FileNotFoundError(f"pi CLI not found at {PI_BIN}. Run `npm install` in {REPO_ROOT}.")
 
@@ -306,7 +312,12 @@ class PiRpc:
             # string "0" correctly: Number("0") == 0, so a cap of 0 is applied.
             full_env["LITTLE_CODER_MAX_TURNS"] = str(max_turns)
 
-        cmd = [str(PI_BIN), "--mode", "rpc", "--no-session", "--model", model]
+        if session_dir:
+            full_env["LITTLE_CODER_PI_SESSION_DIR"] = str(session_dir)
+            session_args = ["--session-dir", str(session_dir)]
+        else:
+            session_args = ["--no-session"]
+        cmd = [str(PI_BIN), "--mode", "rpc", *session_args, "--model", model]
         if thinking:
             cmd.extend(["--thinking", thinking])
         for ext in _extension_paths():

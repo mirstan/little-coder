@@ -378,3 +378,44 @@ def test_the_redirect_guard_runs_before_the_mkdir_it_protects(tmp_path, monkeypa
         RC._bench_agent_dir()
     assert not (fake_home / ".pi" / "pi-bench-agent").exists()
     assert sorted(p.name for p in (fake_home / ".pi").iterdir()) == ["agent"]
+
+
+class _ArgvFakeProc(_FakeProc):
+    captured_argv: list | None = None
+
+    def __init__(self, *args, **kwargs):
+        _ArgvFakeProc.captured_argv = list(args[0]) if args else kwargs.get("args")
+        super().__init__(*args, **kwargs)
+
+
+def test_default_session_stays_ephemeral(tmp_path, monkeypatch):
+    """Without session_dir, pi runs --no-session exactly as before."""
+    monkeypatch.delenv("LITTLE_CODER_PI_SESSION_DIR", raising=False)
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC.subprocess, "Popen", _ArgvFakeProc)
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path))
+    try:
+        argv = _ArgvFakeProc.captured_argv
+        assert "--no-session" in argv and "--session-dir" not in argv
+        assert "LITTLE_CODER_PI_SESSION_DIR" not in _ArgvFakeProc.captured_env
+    finally:
+        rpc.close(timeout=1)
+
+
+def test_session_dir_replaces_no_session_and_is_exported(tmp_path, monkeypatch):
+    """session_dir persists the session there and names it for extensions."""
+    pi_bin = tmp_path / "pi"
+    pi_bin.write_text("")
+    monkeypatch.setattr(RC, "PI_BIN", pi_bin)
+    monkeypatch.setattr(RC.subprocess, "Popen", _ArgvFakeProc)
+    sdir = tmp_path / "pi-session"
+    rpc = PiRpc(model="llamacpp/qwen3.6-35b-a3b", cwd=str(tmp_path), session_dir=str(sdir))
+    try:
+        argv = _ArgvFakeProc.captured_argv
+        assert "--no-session" not in argv
+        assert argv[argv.index("--session-dir") + 1] == str(sdir)
+        assert _ArgvFakeProc.captured_env["LITTLE_CODER_PI_SESSION_DIR"] == str(sdir)
+    finally:
+        rpc.close(timeout=1)
