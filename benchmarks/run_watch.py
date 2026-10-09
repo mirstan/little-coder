@@ -34,7 +34,8 @@ compaction_reuse info line (TTFT, cached share of the prompt, summary size),
 or compaction_reuse_miss when the server cached too little of it; its server
 completion line never raises ttft_spike. A server ttft_spike in a trial that
 has turn records waits for the next turn record to say whether it was that
-compaction (see classify_ttft_spike).
+compaction, or the request of a turn reported as expected_reprefill (see
+classify_ttft_spike); otherwise it is raised as before.
 
 --once makes one pass over everything already written and exits 1 when it
 raised a crit alert, 2 when the pass itself failed or its alerts could not be
@@ -427,8 +428,10 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
             f"largest tool call {_n(rec.get('max_tool_arg_bytes')):,} bytes)", data={"output": output})
     if output > cfg.max_output_tokens:
         add("warn", "big_output", f"one response produced {output:,} output tokens", data={"output": output})
-    if paid_for and (ttft > cfg.ttft_max_s or (rec.get("usage_reported") and prompt > cfg.cache_min_prompt_tokens
-                                                and (_num(rec.get("cache_hit")) or 0) < cfg.cache_min_hit_ratio)):
+    expected_reprefill = bool(
+        paid_for and (ttft > cfg.ttft_max_s or (rec.get("usage_reported") and prompt > cfg.cache_min_prompt_tokens
+                                                and (_num(rec.get("cache_hit")) or 0) < cfg.cache_min_hit_ratio)))
+    if expected_reprefill:
         # Its own rule, so it neither rate-limits nor is rate-limited by the
         # ttft_spike / cache_collapse warns that a surprise still raises.
         add("info", "expected_reprefill",
@@ -505,7 +508,7 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         explained_by.append("compaction")
     st.turns.append({"turn": rec.get("turn"), "ts_start": _num(rec.get("ts_start")) or ts, "ts_end": ts,
                      "prompt": prompt, "output": output, "usage_reported": bool(rec.get("usage_reported")),
-                     "explained_by": explained_by})
+                     "explained_by": explained_by, "expected_reprefill": expected_reprefill})
     del st.turns[:-MAX_REMEMBERED_TURNS]
 
     # A cost-gate deferral is the intended reason for none demoted. Without
@@ -644,7 +647,10 @@ def classify_ttft_spike(ev: dict, alert: Alert, st: TrialState, cfg: RuleConfig,
 
     A compaction served from the prefix cache (cache-reuse-compaction) is not a
     spike to page about: its own compaction_reuse line reports the TTFT, and
-    compaction_reuse_miss covers a cache that did not hold. Its telemetry
+    compaction_reuse_miss covers a cache that did not hold. Nor is the server
+    line of a turn whose record became expected_reprefill (a demotion
+    re-prefill the cost gate paid for at the predicted cost): that turn's own
+    line already reports it, and a slower-than-predicted one warns there. Its telemetry
     reaches turns.jsonl with the next turn record, so the spike waits for a
     turn record that contains or follows it, then is dropped when a reuse
     compaction's [ts_start, ts_end] (+/- DIVERGENCE_WINDOW_SLACK_S) holds it and
@@ -661,6 +667,14 @@ def classify_ttft_spike(ev: dict, alert: Alert, st: TrialState, cfg: RuleConfig,
         # omlx's completion line carries no request id, so the prompt size is
         # the only identity; a window alone could hide an unrelated request.
         if isinstance(prompt, int) and c["prompt"] is not None and abs(c["prompt"] - prompt) <= cfg.divergence_match_tokens:
+            return []
+    # The same request's turn record already reported it as expected_reprefill
+    # (a demotion re-prefill the cost gate paid for, at the predicted cost):
+    # the server line is that one stall seen from the other side.
+    for t in st.turns:
+        if (t.get("expected_reprefill") and t["usage_reported"] and isinstance(prompt, int)
+                and t["ts_start"] - slack <= ts <= t["ts_end"] + slack
+                and abs(t["prompt"] - prompt) <= cfg.divergence_match_tokens):
             return []
     settled = any(t["ts_end"] + slack >= ts for t in st.turns)
     if settled or st.finished or now - ts > cfg.divergence_match_wait_s:

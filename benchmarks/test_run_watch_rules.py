@@ -581,3 +581,79 @@ def test_each_deferral_reason_survives_the_sinks_dedup():
     assert [a.subject for a in got] == ["once", "once:ceiling", "once:near"]
     # Once per trial already: a cooldown would lose them for good.
     assert [W.admit(d, a, cfg.cooldown_s) for a in got] == [True, True, True]
+
+
+# ── #84 x #85: a held server ttft_spike vs the turn-ledger rules ─────────────
+# Two sources report one slow request: the turn record (turn-level
+# ttft_spike, or #85's expected_reprefill info when the cost gate paid for the
+# break) and the server's completion line (a ttft_spike held by #84 until the
+# ledger can explain it). Each must be reported once or suppressed once.
+
+PAID = dict(prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, demoted_new=4)
+
+
+def _settle(st, held, cfg, now):
+    """Resolve held server spikes as _resolve_ttft does; return what is raised."""
+    out = []
+    for ev, alert in held:
+        got = W.classify_ttft_spike(ev, alert, st, cfg, now)
+        assert got is not None, "every held spike is settled once the ledger has the later turn"
+        out.extend(got)
+    return out
+
+
+def test_neither_explained_each_source_reports_its_spike_once():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2400.0, ttft_s=300.0, prompt_tokens=150_000), cfg)
+    assert rules(turn) == [("warn", "ttft_spike")]
+    raised = _settle(st, [spike(2310.0, prompt=150_000)], cfg, now=2401.0)
+    assert rules(raised) == [("warn", "ttft_spike")]
+
+
+def test_a_predicted_demotion_reprefill_is_one_info_and_its_server_spike_is_dropped():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                                   **PAID), cfg)
+    assert rules(turn) == [("info", "expected_reprefill")]
+    assert _settle(st, [spike(2460.0, prompt=150_000, ttft=450.0)], cfg, now=2501.0) == []
+
+
+def test_a_surprise_demotion_reprefill_still_warns_from_both_sources():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2750.0, ttft_s=700.0, retention=opened(est_secs=400.0),
+                                   **PAID), cfg)
+    assert rules(turn) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    assert rules(_settle(st, [spike(2710.0, prompt=150_000, ttft=700.0)], cfg, now=2751.0)) == [("warn", "ttft_spike")]
+
+
+def test_a_reuse_compaction_and_a_predicted_reprefill_in_one_window_each_drop_their_own_spike():
+    """The compaction (prompt 220,000) and the predicted re-prefill turn
+    (150,000) overlap in time; prompt size decides which explanation claims
+    which server line, and a third line neither explains is still raised."""
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    turn = W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                                   guards=[reuse(ts_start=2000.0, ts_end=2400.0)], **PAID), cfg)
+    assert rules(turn) == [("info", "expected_reprefill"), ("info", "compaction_reuse")]
+    compaction = spike(2390.0, prompt=220_000)
+    reprefill = spike(2460.0, prompt=150_000, ttft=450.0)
+    unrelated = spike(2395.0, prompt=90_000)
+    assert _settle(st, [compaction, reprefill], cfg, now=2501.0) == []
+    assert rules(_settle(st, [unrelated], cfg, now=2501.0)) == [("warn", "ttft_spike")]
+
+
+def test_a_reuse_compaction_spike_is_not_claimed_by_a_predicted_turn_of_another_size():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, ts_start=1900.0, ts_end=1990.0, prompt_tokens=148_000, cache_read=145_000,
+                            cache_hit=0.98), cfg)
+    # A reuse compaction whose cache missed: its own rule warns, and the server
+    # spike it explains is dropped -- not raised again, not claimed by the turn.
+    W.evaluate_turn(st, rec(2, ts_start=2000.0, ts_end=2500.0, ttft_s=450.0, retention=opened(est_secs=400.0),
+                            guards=[reuse(ts_start=2000.0, ts_end=2400.0, cache_read=4096)], **PAID), cfg)
+    assert _settle(st, [spike(2390.0, prompt=220_000)], cfg, now=2501.0) == []
