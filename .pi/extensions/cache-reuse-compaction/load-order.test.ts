@@ -10,12 +10,16 @@ import { describe, expect, it } from "vitest";
 const here = dirname(fileURLToPath(import.meta.url));
 const extRoot = join(here, "..");
 const self = "cache-reuse-compaction";
+// Observers register before_provider_request but never return a payload, so
+// they rewrite nothing and may load after the capture (compaction A/B
+// experiment: zzz-ab-observer, zzz-ab-observer/index.ts).
+const observers = new Set(["zzz-ab-observer"]);
 
 describe("load order", () => {
   it("loads after every bundled extension with a before_provider_request handler", () => {
     const rewriters = readdirSync(extRoot)
       .sort()
-      .filter((name) => name !== self && existsSync(join(extRoot, name, "index.ts")))
+      .filter((name) => name !== self && !observers.has(name) && existsSync(join(extRoot, name, "index.ts")))
       .filter((name) => /pi\.on\(\s*["']before_provider_request["']/.test(readFileSync(join(extRoot, name, "index.ts"), "utf-8")));
     expect(rewriters).toContain("benchmark-profiles");
     for (const name of rewriters) expect([name, self].sort()[0]).toBe(name);
