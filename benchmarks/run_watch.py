@@ -313,6 +313,31 @@ def _n(v: Any) -> int:
     return int(x) if x is not None and x > 0 else 0
 
 
+def _predicted_reprefill_s(rec: dict) -> Optional[float]:
+    """The cost gate's re-prefill estimate when this turn's request broke the cached prefix on purpose.
+
+    A warm-cache open (not "cold", which predicts nothing) carries estReprefillSeconds;
+    turns before the re-prefill ceiling existed carry none.
+    """
+    ret = rec.get("retention")
+    if not isinstance(ret, dict) or ret.get("gate") != "open" or ret.get("gateReason") in (None, "cold"):
+        return None
+    est = _num(ret.get("estReprefillSeconds"))
+    return est if est is not None and est > 0 else None
+
+
+def _as_predicted(ttft: Optional[float], predicted: Optional[float]) -> bool:
+    """A TTFT within what the gate predicted (half again, plus 15 s for the new tail and queueing)."""
+    return ttft is not None and predicted is not None and ttft <= 1.5 * predicted + 15
+
+
+_DEFER_WHY = {
+    None: "the save ratio was not met",
+    "ceiling": "the re-prefill is over the {ceiling:g} s ceiling and saves too little per second",
+    "near": "the re-prefill is over the {ceiling:g} s ceiling and the trial is near compaction",
+}
+
+
 def _task(trial_name: str) -> str:
     return trial_name.split("__", 1)[0]
 
@@ -350,6 +375,11 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
                     subj="once", data={"due": st.max_due})
 
     prompt, output = _n(rec.get("prompt_tokens")), _n(rec.get("output"))
+    # A break the cost gate opened, at about the cost it predicted, is the
+    # trade it chose; only a surprise warns.
+    predicted = _predicted_reprefill_s(rec)
+    ttft = _num(rec.get("ttft_s"))
+    paid_for = _as_predicted(ttft, predicted)
     if rec.get("usage_reported"):
         prev = st.last_prompt_tokens
         if prev is not None and prompt - prev > cfg.context_jump_tokens:
@@ -358,7 +388,8 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         hit = _num(rec.get("cache_hit"))
         if (st.cache_reported and prompt > cfg.cache_min_prompt_tokens
                 and hit is not None and hit < cfg.cache_min_hit_ratio):
-            add("warn", "cache_collapse", f"cache hit {hit:.0%} on a {prompt:,}-token prompt",
+            add("info" if paid_for else "warn", "cache_collapse", f"cache hit {hit:.0%} on a {prompt:,}-token prompt"
+                + (f" (demotion, ~{predicted:.0f} s predicted)" if paid_for else ""),
                 data={"prompt": prompt, "cache_hit": hit})
         if _n(rec.get("cache_read")) > 0:
             st.cache_reported = True
@@ -372,9 +403,12 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
             f"largest tool call {_n(rec.get('max_tool_arg_bytes')):,} bytes)", data={"output": output})
     if output > cfg.max_output_tokens:
         add("warn", "big_output", f"one response produced {output:,} output tokens", data={"output": output})
-    ttft = _num(rec.get("ttft_s"))
     if ttft is not None and ttft > cfg.ttft_max_s:
-        add("warn", "ttft_spike", f"time to first token {ttft:.0f}s", data={"ttft_s": ttft})
+        if paid_for:
+            add("info", "ttft_spike", f"time to first token {ttft:.0f}s (demotion, ~{predicted:.0f} s predicted)",
+                data={"ttft_s": ttft, "predicted_s": predicted})
+        else:
+            add("warn", "ttft_spike", f"time to first token {ttft:.0f}s", data={"ttft_s": ttft})
 
     ret = rec.get("retention")
     if isinstance(ret, dict):
@@ -387,13 +421,20 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         skipped = _n(ret.get("skippedCost"))
         if skipped > 0:
             st.cost_deferred = True
-            if once("demotion_deferred"):
+            reason = ret.get("gateReason")
+            reason = reason if reason in _DEFER_WHY else None
+            # Once per reason: a trial held by the ratio early and by the
+            # ceiling later reports both.
+            if once("demotion_deferred" if reason is None else f"demotion_deferred:{reason}"):
                 est = {k: _n(ret.get(k)) for k in ("estSaveTokens", "estReprefillTokens", "estContextTokens")}
+                secs = _num(ret.get("estReprefillSeconds")) or 0.0
+                why = _DEFER_WHY[reason].format(ceiling=_num(ret.get("ceilingSeconds")) or 0)
                 add("info", "demotion_deferred",
-                    f"cost gate kept {skipped} due shell pair(s) raw: demoting would save "
-                    f"~{est['estSaveTokens']:,} tokens but re-prefill ~{est['estReprefillTokens']:,} "
-                    f"(context ~{est['estContextTokens']:,})",
-                    subj="once", data={"skippedCost": skipped, **est})
+                    f"cost gate kept {skipped} due shell pair(s) raw ({why}): demoting would save "
+                    f"~{est['estSaveTokens']:,} tokens but re-prefill ~{est['estReprefillTokens']:,}"
+                    + (f" (~{secs:.0f} s)" if secs > 0 else "")
+                    + f" (context ~{est['estContextTokens']:,})",
+                    subj="once", data={"skippedCost": skipped, **est, "gateReason": reason, "estReprefillSeconds": secs})
         if prefix >= 1 and demoted == 0 and once("retention_stalled"):
             add("crit", "retention_stalled",
                 f"{prefix} shell pair(s) due for demotion and none demoted (signed={signed}, "

@@ -147,7 +147,14 @@ const PINNED_ENV: Record<string, string | undefined> = {
   LITTLE_CODER_SHELL_DEMOTE_MIN_SAVE_RATIO: undefined,
   LITTLE_CODER_SHELL_DEMOTE_OPEN_AT_PERCENT: undefined,
   LITTLE_CODER_SHELL_DEMOTE_FORCE_PENDING_BYTES: undefined,
+  LITTLE_CODER_SHELL_DEMOTE_CEILING_SECONDS: undefined,
+  LITTLE_CODER_SHELL_DEMOTE_MIN_TOKENS_PER_SECOND: undefined,
+  LITTLE_CODER_SHELL_DEMOTE_NEAR_COMPACT_TOKENS: undefined,
+  LITTLE_CODER_SHELL_PREFILL_LINEAR_SECONDS: undefined,
+  LITTLE_CODER_SHELL_PREFILL_QUADRATIC_SECONDS: undefined,
+  LITTLE_CODER_SHELL_PREFIX_BLOCK_TOKENS: undefined,
   LITTLE_CODER_COMPACT_AT_PERCENT: undefined,
+  LITTLE_CODER_NO_COMPACT_WATCHDOG: undefined,
   LITTLE_CODER_SHELL_RETENTION_BUDGET_BYTES: String(256 * 1024 * 1024),
   LITTLE_CODER_NO_SHELL_RETENTION: undefined,
   LITTLE_CODER_TELEMETRY: "1",
@@ -245,7 +252,7 @@ describe("shell-retention telemetry (wired)", () => {
         v: 1, kind: "shell_retention", pairs: 0, large: 0, due: 0, prefix: 0, demoted: 0, flushed: false,
         signed: 0, skippedNoShrink: 0, skippedArchive: 0, bytesBefore: 0, bytesAfter: 0,
         gate: "off", gateReason: null, skippedCost: 0, sticky: 0,
-        estSaveTokens: 0, estReprefillTokens: 0, estContextTokens: 0,
+        estSaveTokens: 0, estReprefillTokens: 0, estContextTokens: 0, estReprefillSeconds: 0, ceilingSeconds: 0,
       },
     ]);
   });
@@ -271,9 +278,17 @@ describe("shell-retention telemetry (wired)", () => {
     });
     expect(wired.entries.at(-1)?.data.estReprefillTokens).toBeGreaterThan(100_000);
 
+    // At 200K the context clause opens, but the break is minutes long and
+    // compaction is near: the re-prefill ceiling holds it.
+    for (const h of wired.handlers.context ?? []) await h({ messages: msgs }, ctxAt(200_000));
+    const held = wired.entries.at(-1)?.data;
+    expect(held).toMatchObject({ demoted: 0, gate: "deferred", gateReason: "near", skippedCost: 4, ceilingSeconds: 60 });
+    expect(held.estReprefillSeconds).toBeGreaterThan(60);
+
+    process.env.LITTLE_CODER_SHELL_DEMOTE_CEILING_SECONDS = "0";
     let out: any;
     for (const h of wired.handlers.context ?? []) out = await h({ messages: msgs }, ctxAt(200_000));
-    expect(wired.entries.at(-1)?.data).toMatchObject({ demoted: 4, gate: "open", gateReason: "context", skippedCost: 0 });
+    expect(wired.entries.at(-1)?.data).toMatchObject({ demoted: 4, gate: "open", gateReason: "context", skippedCost: 0, ceilingSeconds: 0 });
     expect(out?.messages[2].content[0].text).toMatch(/^\[shell result demoted/);
   });
 
