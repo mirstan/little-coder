@@ -122,7 +122,7 @@ export const CHARS_PER_TOKEN = 4;
 // ── Re-prefill ceiling ──────────────────────────────────────────────────────
 //
 // The ratio clause prices a break in tokens, but a token re-prefilled at 200K
-// costs ~9x one at 10K: omlx prefill time is a(p-c) + b(p²-c²)/2 seconds for
+// costs ~6x one at 10K (~8x one at depth 0): omlx prefill time is a(p-c) + b(p²-c²)/2 seconds for
 // tokens c..p, refitted on 162 requests with >= 16K uncached tokens (Sept 20 -
 // Oct 8; median error 0%, p10 -9%, p90 +2%), about 950 tok/s at depth 0, 213
 // at 100K and 120 at 200K. omlx reuses whole 4096-token blocks only, so a break
@@ -147,7 +147,7 @@ export const ENV_DEMOTE_NEAR_COMPACT_TOKENS = "LITTLE_CODER_SHELL_DEMOTE_NEAR_CO
 export const ENV_PREFILL_LINEAR_SECONDS = "LITTLE_CODER_SHELL_PREFILL_LINEAR_SECONDS";
 export const ENV_PREFILL_QUADRATIC_SECONDS = "LITTLE_CODER_SHELL_PREFILL_QUADRATIC_SECONDS";
 export const ENV_PREFIX_BLOCK_TOKENS = "LITTLE_CODER_SHELL_PREFIX_BLOCK_TOKENS";
-/** <= 0 disables the veto (#83's gate). */
+/** <= 0 disables the veto (#83's gate, but for R's block alignment: PREFIX_BLOCK_TOKENS=1 restores that). */
 export const DEFAULT_DEMOTE_CEILING_SECONDS = 60;
 /** <= 0: every jump over the ceiling is deferred. Under the 42 tok/s of the slowest jump that avoided a compaction. */
 export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
@@ -159,6 +159,8 @@ export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
  * estimates, minTokensPerSecond 30-40 and margins 40-60K all keep 16.
  */
 export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 40000;
+/** pi's default compaction reserveTokens (compaction.js): it compacts past window - reserve. */
+const PI_RESERVE_TOKENS = 16384;
 /** Seconds per prefilled token at depth 0. */
 export const DEFAULT_PREFILL_LINEAR_SECONDS = 1.05e-3;
 /** Extra seconds per prefilled token per token of depth. */
@@ -173,8 +175,8 @@ export interface GateOptions {
   ceilingSeconds: number;
   minTokensPerSecond: number;
   nearCompactTokens: number;
-  /** context-watchdog's trigger, percent of the window; its default 80 when it is off (something else compacts then). */
-  compactAtPercent: number;
+  /** context-watchdog's trigger, percent of the window; null when it is off and pi's own compaction (window - reserve) applies. */
+  compactAtPercent: number | null;
   prefillLinearSeconds: number;
   prefillQuadraticSeconds: number;
   prefixBlockTokens: number;
@@ -211,7 +213,7 @@ export function resolveGateOptions(): GateOptions {
     ceilingSeconds: envNumber(ENV_DEMOTE_CEILING_SECONDS, DEFAULT_DEMOTE_CEILING_SECONDS),
     minTokensPerSecond: envNumber(ENV_DEMOTE_MIN_TOKENS_PER_SECOND, DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND),
     nearCompactTokens: envNumber(ENV_DEMOTE_NEAR_COMPACT_TOKENS, DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS),
-    compactAtPercent: watchdogPercent() ?? WATCHDOG_DEFAULT_PERCENT,
+    compactAtPercent: watchdogPercent(),
     prefillLinearSeconds: envNumber(ENV_PREFILL_LINEAR_SECONDS, DEFAULT_PREFILL_LINEAR_SECONDS),
     prefillQuadraticSeconds: envNumber(ENV_PREFILL_QUADRATIC_SECONDS, DEFAULT_PREFILL_QUADRATIC_SECONDS),
     prefixBlockTokens: envNumber(ENV_PREFIX_BLOCK_TOKENS, DEFAULT_PREFIX_BLOCK_TOKENS),
@@ -250,7 +252,10 @@ export function blockStart(token: number, block: number): number {
 /** Why a jump some clause opened must still wait, or null to let it go ahead. A cold cache never reaches here. */
 export function demotionVeto(input: GateInput, o: GateOptions): VetoReason | null {
   if (!(o.ceilingSeconds > 0) || input.estReprefillSeconds <= o.ceilingSeconds) return null;
-  const compactAt = (Math.min(o.compactAtPercent, 100) / 100) * input.contextWindow;
+  const compactAt =
+    o.compactAtPercent === null
+      ? input.contextWindow - PI_RESERVE_TOKENS
+      : (Math.min(o.compactAtPercent, 100) / 100) * input.contextWindow;
   if (o.nearCompactTokens > 0 && input.contextTokens >= compactAt - o.nearCompactTokens) return "near";
   if (o.minTokensPerSecond > 0 && input.estSaveTokens >= o.minTokensPerSecond * input.estReprefillSeconds) return null;
   return "ceiling";

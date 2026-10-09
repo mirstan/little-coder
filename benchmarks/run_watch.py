@@ -324,6 +324,9 @@ def _predicted_reprefill_s(rec: dict) -> Optional[float]:
     ret = rec.get("retention")
     if not isinstance(ret, dict) or ret.get("gate") != "open" or ret.get("gateReason") in (None, "cold"):
         return None
+    # An open whose rewrite demoted nothing new (signed, no-shrink, archive refused) broke nothing.
+    if _n(rec.get("demoted_new")) <= 0:
+        return None
     est, start = _num(ret.get("estReprefillSeconds")), _num(ret.get("estReprefillFromToken"))
     if est is None or est <= 0 or start is None:
         return None
@@ -339,7 +342,7 @@ def _as_predicted(ttft: Optional[float], predicted: Optional[float]) -> bool:
 
 
 _DEFER_WHY = {
-    None: "the save ratio was not met",
+    None: "no clause (ratio, context, bytes) opened it",
     "ceiling": "the re-prefill is over the {ceiling:g} s ceiling and saves too little per second",
     "near": "the re-prefill is over the {ceiling:g} s ceiling and the trial is near compaction",
 }
@@ -395,9 +398,9 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
         hit = _num(rec.get("cache_hit"))
         if (st.cache_reported and prompt > cfg.cache_min_prompt_tokens
                 and hit is not None and hit < cfg.cache_min_hit_ratio):
-            add("info" if paid_for else "warn", "cache_collapse", f"cache hit {hit:.0%} on a {prompt:,}-token prompt"
-                + (f" (demotion, ~{predicted:.0f} s predicted)" if paid_for else ""),
-                data={"prompt": prompt, "cache_hit": hit})
+            if not paid_for:
+                add("warn", "cache_collapse", f"cache hit {hit:.0%} on a {prompt:,}-token prompt",
+                    data={"prompt": prompt, "cache_hit": hit})
         if _n(rec.get("cache_read")) > 0:
             st.cache_reported = True
         st.last_prompt_tokens = prompt
@@ -410,12 +413,16 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
             f"largest tool call {_n(rec.get('max_tool_arg_bytes')):,} bytes)", data={"output": output})
     if output > cfg.max_output_tokens:
         add("warn", "big_output", f"one response produced {output:,} output tokens", data={"output": output})
-    if ttft is not None and ttft > cfg.ttft_max_s:
-        if paid_for:
-            add("info", "ttft_spike", f"time to first token {ttft:.0f}s (demotion, ~{predicted:.0f} s predicted)",
-                data={"ttft_s": ttft, "predicted_s": predicted})
-        else:
-            add("warn", "ttft_spike", f"time to first token {ttft:.0f}s", data={"ttft_s": ttft})
+    if paid_for and (ttft > cfg.ttft_max_s or (rec.get("usage_reported") and prompt > cfg.cache_min_prompt_tokens
+                                                and (_num(rec.get("cache_hit")) or 0) < cfg.cache_min_hit_ratio)):
+        # Its own rule, so it neither rate-limits nor is rate-limited by the
+        # ttft_spike / cache_collapse warns that a surprise still raises.
+        add("info", "expected_reprefill",
+            f"demotion re-prefill as predicted: time to first token {ttft:.0f}s (~{predicted:.0f} s predicted), "
+            f"cache hit {(_num(rec.get('cache_hit')) or 0):.0%} on a {prompt:,}-token prompt",
+            data={"ttft_s": ttft, "predicted_s": predicted, "prompt": prompt, "cache_hit": _num(rec.get("cache_hit"))})
+    elif ttft is not None and ttft > cfg.ttft_max_s:
+        add("warn", "ttft_spike", f"time to first token {ttft:.0f}s", data={"ttft_s": ttft})
 
     ret = rec.get("retention")
     if isinstance(ret, dict):
@@ -441,7 +448,8 @@ def evaluate_turn(st: TrialState, rec: dict, cfg: RuleConfig) -> list[Alert]:
                     f"~{est['estSaveTokens']:,} tokens but re-prefill ~{est['estReprefillTokens']:,}"
                     + (f" (~{secs:.0f} s)" if secs > 0 else "")
                     + f" (context ~{est['estContextTokens']:,})",
-                    subj="once", data={"skippedCost": skipped, **est, "gateReason": reason, "estReprefillSeconds": secs})
+                    subj="once" if reason is None else f"once:{reason}",
+                    data={"skippedCost": skipped, **est, "gateReason": reason, "estReprefillSeconds": secs})
         if prefix >= 1 and demoted == 0 and once("retention_stalled"):
             add("crit", "retention_stalled",
                 f"{prefix} shell pair(s) due for demotion and none demoted (signed={signed}, "
@@ -649,6 +657,9 @@ def evaluate_stall(st: TrialState, now: float, last_turn_ts: float, live_log_ts:
 def admit(state: DedupState, alert: Alert, cooldown_s: float, undo: Optional[list] = None) -> bool:
     """False for an identical (rule, trial, subject) seen before, or a non-crit within cooldown.
 
+    A once-per-trial alert (subject "once" or "once:<variant>") skips the cooldown: a
+    suppressed one would never come back.
+
     An admitted alert appends what it changed to `undo`, for unadmit.
     """
     ident = (alert.rule, alert.trial, alert.subject)
@@ -657,7 +668,8 @@ def admit(state: DedupState, alert: Alert, cooldown_s: float, undo: Optional[lis
     state.seen.add(ident)
     key = (alert.rule, alert.trial)
     last = state.last_emit.get(key)
-    if alert.level != "crit" and last is not None and alert.ts - last < cooldown_s:
+    once_only = alert.subject == "once" or alert.subject.startswith("once:")
+    if alert.level != "crit" and not once_only and last is not None and alert.ts - last < cooldown_s:
         state.suppressed[key] = state.suppressed.get(key, 0) + 1
         return False
     held = state.suppressed.pop(key, 0)

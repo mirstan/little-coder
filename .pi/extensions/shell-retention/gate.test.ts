@@ -238,13 +238,12 @@ describe("resolveGateOptions", () => {
         prefillQuadraticSeconds: 4e-8,
         prefixBlockTokens: 1,
       });
-      // With the watchdog off something else compacts (the Harbor harness at
-      // 220K): "near" falls back to the watchdog's default 80%.
+      // With the watchdog off, pi's own compaction (window - reserve) is the one to measure from.
       process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG = "1";
-      expect(resolveGateOptions().compactAtPercent).toBe(80);
+      expect(resolveGateOptions().compactAtPercent).toBeNull();
       process.env.LITTLE_CODER_NO_COMPACT_WATCHDOG = "0";
       process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "0";
-      expect(resolveGateOptions().compactAtPercent).toBe(80);
+      expect(resolveGateOptions().compactAtPercent).toBeNull();
     } finally {
       if (watchdog === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
       else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = watchdog;
@@ -593,8 +592,10 @@ describe("re-prefill ceiling", () => {
     expect(demotionVeto(over, GATE)).toBe("near");
     expect(demotionVeto({ ...over, contextTokens: at - 1 }, GATE)).toBe("ceiling");
     expect(demotionVeto({ ...over, contextTokens: at - 1, estSaveTokens: 1e9 }, GATE)).toBeNull();
-    expect(demotionVeto({ ...over, contextTokens: WINDOW - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS - 1, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: 100 })).toBeNull();
-    expect(demotionVeto({ ...over, contextTokens: WINDOW - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: 100 })).toBe("near");
+    // Watchdog off: pi compacts at window - 16384 (its default reserveTokens).
+    const piAt = WINDOW - 16384 - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS;
+    expect(demotionVeto({ ...over, contextTokens: piAt - 1, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: null })).toBeNull();
+    expect(demotionVeto({ ...over, contextTokens: piAt, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: null })).toBe("near");
   });
 
   it("treats non-positive knobs as off: no ceiling, no per-second override, no near clause", () => {
