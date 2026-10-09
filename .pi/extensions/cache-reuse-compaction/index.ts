@@ -61,17 +61,18 @@ import { readChatCompletionStream, type StreamUsage } from "./sse.ts";
 // included, which costs more than pi's own request, so no first token within
 // the TTFT timeout abandons it. Once tokens flow there is no total timeout:
 // cutting a genuine hit off mid-answer and then paying for pi's own
-// compaction (820-955 s to first token at 190-200k, plus 165-325 s of
-// generation, plus a split turn's second request: ~1,150-1,500 s) is the
-// worst outcome, and would overrun the harness's 1800 s compaction wait
-// (rpc_client PI_IDLE_WAIT_CAP_SEC), after which it stops compacting for the
-// rest of the trial. Instead the answer is bounded up front: max_tokens is
-// at most GEN_BUDGET_S x DECODE_TOK_S (decode measured at ~20 tok/s at 170k+
-// on the TB2.1 runs, p10/p50/p90 19.6/20.8/22.9), and only a stalled stream
-// is abandoned, plus a backstop at twice the budget from the first token for
-// a server that ignores max_tokens or trickles. A TTFT fallback (240 s + pi's own) fits the 1800 s wait; an
-// answer that runs most of its budget and is then rejected (truncated,
-// garbage) can still overrun it.
+// compaction is the worst outcome. pi's own takes 820-955 s to first token
+// measured at 190-200k (~960-1,600 s extrapolated to the 220K harness
+// trigger), plus 165-325 s of generation, plus a split turn's prefix request:
+// up to ~2,600 s. Instead the answer is bounded up front: max_tokens is at
+// most GEN_BUDGET_S x DECODE_TOK_S (decode measured at ~20 tok/s at 170k+ on
+// the TB2.1 runs, p10/p50/p90 19.6/20.8/22.9), and only a stalled stream is
+// abandoned, plus a backstop at twice the budget from the first token for a
+// server that ignores max_tokens or trickles. The harness waits up to 4,500 s
+// in all for a compaction (rpc_client PI_IDLE_WAIT_CAP_SEC +
+// PI_COMPACTION_RECOVERY_WAIT_SEC) and picks up a late result, which covers
+// the worst case here (~1,440 s + ~2,600 s); only a compaction that takes
+// longer is recorded as failed, which disarms deliberate compaction.
 //
 // Capture choice: the harness asks for a compaction at turn_end while pi is
 // already sending the next request, which compact() then aborts. That request
