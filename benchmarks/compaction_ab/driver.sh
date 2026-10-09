@@ -27,7 +27,7 @@ for ((i=START; i<n; i++)); do
 
   ENVV=(env -u LC_COMPACTION_ARM -u LITTLE_CODER_CACHE_REUSE_COMPACTION)
   for v in $(env | sed -n 's/^\(PI_BLACKHOLE_[A-Z_]*\)=.*/\1/p'); do ENVV+=(-u "$v"); done
-  ENVV+=(LITTLE_CODER_PI_SESSION_DIR_IN_LOGS=1 LITTLE_CODER_AB_OBSERVER=1)
+  ENVV+=(LITTLE_CODER_PI_SESSION_DIR_IN_LOGS=1 LITTLE_CODER_AB_OBSERVER=1 GIT_OPTIONAL_LOCKS=0)
   BH_AGENT=$ROOT/.cache/pi-bench-agent/pi-blackhole
   case $ARM in
     native) ;;

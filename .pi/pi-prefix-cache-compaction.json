@@ -1,1 +1,1 @@
-{"warmup": false, "notify": true}
+{"warmup": false, "notify": true, "baseUrlIncludes": ["127.0.0.1:8000"]}

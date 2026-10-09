@@ -65,6 +65,7 @@ def main() -> int:
     sdir.mkdir(parents=True, exist_ok=True)
     env = {
         "LITTLE_CODER_AB_OBSERVER": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
         **ARM_ENV[args.arm],
     }
     for k in ("LC_COMPACTION_ARM", "LITTLE_CODER_CACHE_REUSE_COMPACTION"):
