@@ -327,6 +327,10 @@ def _predicted_reprefill_s(rec: dict) -> Optional[float]:
     # An open whose rewrite demoted nothing new (signed, no-shrink, archive refused) broke nothing.
     if _n(rec.get("demoted_new")) <= 0:
         return None
+    # The estimate covers every pair of the jump; one the archive refused stayed raw,
+    # so the break the server saw is not the one predicted.
+    if _n(ret.get("skippedArchive")) > 0:
+        return None
     est, start = _num(ret.get("estReprefillSeconds")), _num(ret.get("estReprefillFromToken"))
     if est is None or est <= 0 or start is None:
         return None

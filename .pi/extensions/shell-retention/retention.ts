@@ -159,8 +159,13 @@ export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
  * estimates, minTokensPerSecond 30-40 and margins 40-60K all keep 16.
  */
 export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 40000;
-/** pi's default compaction reserveTokens (compaction.js): it compacts past window - reserve. */
-const PI_RESERVE_TOKENS = 16384;
+/**
+ * With context-watchdog off, the only mid-run compaction in an autonomous run is
+ * the RPC harness's, at min(220K, 84% of the window) (benchmarks/rpc_client.py);
+ * pi's own threshold check runs only between prompts.
+ */
+const HARNESS_COMPACT_TOKENS = 220000;
+const HARNESS_COMPACT_FRACTION = 0.84;
 /** Seconds per prefilled token at depth 0. */
 export const DEFAULT_PREFILL_LINEAR_SECONDS = 1.05e-3;
 /** Extra seconds per prefilled token per token of depth. */
@@ -175,7 +180,7 @@ export interface GateOptions {
   ceilingSeconds: number;
   minTokensPerSecond: number;
   nearCompactTokens: number;
-  /** context-watchdog's trigger, percent of the window; null when it is off and pi's own compaction (window - reserve) applies. */
+  /** context-watchdog's trigger, percent of the window; null when it is off (then the RPC harness's trigger applies). */
   compactAtPercent: number | null;
   prefillLinearSeconds: number;
   prefillQuadraticSeconds: number;
@@ -254,7 +259,7 @@ export function demotionVeto(input: GateInput, o: GateOptions): VetoReason | nul
   if (!(o.ceilingSeconds > 0) || input.estReprefillSeconds <= o.ceilingSeconds) return null;
   const compactAt =
     o.compactAtPercent === null
-      ? input.contextWindow - PI_RESERVE_TOKENS
+      ? Math.min(HARNESS_COMPACT_TOKENS, HARNESS_COMPACT_FRACTION * input.contextWindow)
       : (Math.min(o.compactAtPercent, 100) / 100) * input.contextWindow;
   if (o.nearCompactTokens > 0 && input.contextTokens >= compactAt - o.nearCompactTokens) return "near";
   if (o.minTokensPerSecond > 0 && input.estSaveTokens >= o.minTokensPerSecond * input.estReprefillSeconds) return null;

@@ -467,7 +467,10 @@ def test_a_spike_the_gate_paid_for_and_predicted_is_one_info_not_two_warns():
     assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
     # A cold-cache open predicts nothing; neither does a turn without a gate estimate,
     # nor an open that demoted nothing new (no break was paid for).
-    for ret, new in ((opened(reason="cold", est_secs=400.0), 4), (retention(8, 4, 4), 4), (opened(est_secs=400.0), 0)):
+    refused = opened(est_secs=400.0)
+    refused["skippedArchive"] = 1
+    for ret, new in ((opened(reason="cold", est_secs=400.0), 4), (retention(8, 4, 4), 4), (opened(est_secs=400.0), 0),
+                     (refused, 3)):
         got = W.evaluate_turn(st, rec(4, ttft_s=300.0, retention=ret, **dict(paid, demoted_new=new)), cfg)
         assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
     # gcode-to-text 97: the server kept 14K where the gate planned a break at ~37K.
