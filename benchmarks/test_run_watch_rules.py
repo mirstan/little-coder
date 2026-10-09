@@ -148,11 +148,21 @@ def test_long_context_still_warns_when_only_other_extensions_report_telemetry():
     assert seen == [(40, ("warn", "no_demotions"))]
 
 
-def gated(large, due, skipped, est_s=3000, est_r=140_000, ctx=184_000):
+def gated(large, due, skipped, est_s=3000, est_r=140_000, ctx=184_000, reason=None, est_secs=None):
     r = retention(large, due - skipped, 0)
     r.update({"due": due, "skippedNoShrink": 0, "gate": "deferred" if skipped else "none",
-              "gateReason": None, "skippedCost": skipped, "estSaveTokens": est_s,
+              "gateReason": reason, "skippedCost": skipped, "estSaveTokens": est_s,
               "estReprefillTokens": est_r, "estContextTokens": ctx})
+    if est_secs is not None:
+        r.update({"estReprefillSeconds": est_secs, "ceilingSeconds": 60})
+    return r
+
+
+def opened(reason="ratio", est_secs=400.0):
+    r = retention(8, 4, 4)
+    r.update({"due": 4, "skippedNoShrink": 0, "gate": "open", "gateReason": reason, "skippedCost": 0,
+              "estSaveTokens": 9000, "estReprefillTokens": 80_000, "estContextTokens": 150_000,
+              "estReprefillSeconds": est_secs, "ceilingSeconds": 60, "estReprefillFromToken": 36_864})
     return r
 
 
@@ -161,8 +171,9 @@ def test_a_cost_deferral_explains_no_demotions_and_is_reported_once():
     got = W.evaluate_turn(st, rec(1, prompt_tokens=184_000, retention=gated(13, 8, 8)), cfg)
     assert rules(got) == [("info", "demotion_deferred")]
     assert got[0].data == {"skippedCost": 8, "estSaveTokens": 3000, "estReprefillTokens": 140_000,
-                           "estContextTokens": 184_000}
+                           "estContextTokens": 184_000, "gateReason": None, "estReprefillSeconds": 0.0}
     assert "3,000" in got[0].message and "140,000" in got[0].message
+    assert "no clause" in got[0].message
     seen = []
     for n in range(2, 60):
         seen += rules(W.evaluate_turn(st, rec(n, prompt_tokens=184_000, retention=gated(13, 8, 8)), cfg))
@@ -427,3 +438,71 @@ def test_divergence_counts_by_class_are_kept_on_the_trial():
     st = ledger(rec(1, **T1), rec(2, ts_start=1200.0, ts_end=1300.0, prompt_tokens=70_000, demoted_new=4))
     W.classify_divergence(div_event(1201.0, 70_000, 30_000, 60_000, 40_000), st, W.RuleConfig(), now=1400.0)
     assert st.divergences == {"expected_divergence": 1}
+
+
+def test_a_ceiling_deferral_names_its_reason_and_each_reason_is_reported_once():
+    st, cfg = trial(), W.RuleConfig()
+    got = W.evaluate_turn(st, rec(1, prompt_tokens=200_000,
+                                  retention=gated(13, 8, 8, est_s=11_044, ctx=124_103, reason="ceiling", est_secs=357.2)), cfg)
+    assert rules(got) == [("info", "demotion_deferred")]
+    assert got[0].data["gateReason"] == "ceiling" and got[0].data["estReprefillSeconds"] == 357.2
+    assert "~357 s" in got[0].message and "60 s ceiling" in got[0].message
+    assert rules(W.evaluate_turn(st, rec(2, prompt_tokens=201_000,
+                                         retention=gated(13, 8, 8, reason="ceiling", est_secs=360.0)), cfg)) == []
+    near = W.evaluate_turn(st, rec(3, prompt_tokens=205_000,
+                                   retention=gated(13, 8, 8, ctx=204_965, reason="near", est_secs=662.0)), cfg)
+    assert rules(near) == [("info", "demotion_deferred")]
+    assert "near compaction" in near[0].message
+
+
+def test_a_spike_the_gate_paid_for_and_predicted_is_one_info_not_two_warns():
+    st, cfg = trial(), W.RuleConfig()
+    W.evaluate_turn(st, rec(1, prompt_tokens=148_000, cache_read=145_000, cache_hit=0.98), cfg)
+    paid = dict(prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, demoted_new=4)
+    got = W.evaluate_turn(st, rec(2, ttft_s=450.0, retention=opened(est_secs=400.0), **paid), cfg)
+    assert rules(got) == [("info", "expected_reprefill")]
+    assert got[0].data == {"ttft_s": 450.0, "predicted_s": 400.0, "prompt": 150_000, "cache_hit": 0.27}
+    # Slower than the gate predicted: a surprise, so it still warns.
+    got = W.evaluate_turn(st, rec(3, ttft_s=700.0, retention=opened(est_secs=400.0), **paid), cfg)
+    assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    # A cold-cache open predicts nothing; neither does a turn without a gate estimate,
+    # nor an open that demoted nothing new (no break was paid for).
+    refused = opened(est_secs=400.0)
+    refused["skippedArchive"] = 1
+    for ret, new in ((opened(reason="cold", est_secs=400.0), 4), (retention(8, 4, 4), 4), (opened(est_secs=400.0), 0),
+                     (refused, 3)):
+        got = W.evaluate_turn(st, rec(4, ttft_s=300.0, retention=ret, **dict(paid, demoted_new=new)), cfg)
+        assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    # gcode-to-text 97: the server kept 14K where the gate planned a break at ~37K.
+    got = W.evaluate_turn(st, rec(5, ttft_s=450.0, retention=opened(est_secs=400.0),
+                                  **dict(paid, cache_read=14_121, cache_hit=0.09)), cfg)
+    assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+    # Snapshots from before the ceiling carry no estimate: never downgraded.
+    old = opened(est_secs=400.0)
+    for k in ("estReprefillSeconds", "ceilingSeconds", "estReprefillFromToken"):
+        del old[k]
+    got = W.evaluate_turn(st, rec(6, ttft_s=300.0, retention=old, **paid), cfg)
+    assert rules(got) == [("warn", "cache_collapse"), ("warn", "ttft_spike")]
+
+
+def test_an_expected_reprefill_does_not_start_the_warn_cooldown():
+    d, cfg = W.DedupState(), W.RuleConfig()
+    st = trial()
+    W.evaluate_turn(st, rec(1, prompt_tokens=148_000, cache_read=145_000, cache_hit=0.98), cfg)
+    paid = dict(prompt_tokens=150_000, cache_read=40_000, cache_hit=0.27, demoted_new=4)
+    first = W.evaluate_turn(st, rec(2, ttft_s=450.0, retention=opened(est_secs=400.0), **paid), cfg)
+    surprise = W.evaluate_turn(st, rec(3, ttft_s=700.0, retention=opened(est_secs=400.0), **paid), cfg)
+    assert [W.admit(d, a, cfg.cooldown_s) for a in first + surprise] == [True, True, True]
+
+
+def test_each_deferral_reason_survives_the_sinks_dedup():
+    d, cfg = W.DedupState(), W.RuleConfig()
+    st = trial()
+    got = W.evaluate_turn(st, rec(1, prompt_tokens=184_000, retention=gated(13, 8, 8)), cfg)
+    got += W.evaluate_turn(st, rec(2, prompt_tokens=185_000,
+                                   retention=gated(13, 8, 8, reason="ceiling", est_secs=357.2)), cfg)
+    got += W.evaluate_turn(st, rec(3, prompt_tokens=186_000,
+                                   retention=gated(13, 8, 8, reason="near", est_secs=662.0)), cfg)
+    assert [a.subject for a in got] == ["once", "once:ceiling", "once:near"]
+    # Once per trial already: a cooldown would lose them for good.
+    assert [W.admit(d, a, cfg.cooldown_s) for a in got] == [True, True, True]
