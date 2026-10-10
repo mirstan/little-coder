@@ -243,14 +243,25 @@ describe("parseSummaryOutput", () => {
     });
   });
 
-  it("rejects a history summary missing any of pi's sections", () => {
-    for (const heading of ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
+  it("accepts a summary that skips one of pi's optional sections", () => {
+    for (const heading of ["## Constraints & Preferences", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
+      const h = history.replace(heading, "## Other");
+      const out = `<history-summary>\n${h}\n</history-summary>\n<turn-prefix-summary>\n${prefix}\n</turn-prefix-summary>`;
+      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ history: h, prefix });
+    }
+    for (const heading of ["## Early Progress", "## Context for Suffix"]) {
+      const p = prefix.replace(heading, "## X");
+      const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${p}\n</turn-prefix-summary>`;
+      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ history, prefix: p });
+    }
+  });
+
+  it("rejects a summary missing a required section", () => {
+    for (const heading of ["## Goal", "## Progress"]) {
       expect(parseSummaryOutput(history.replace(heading, "## Other"), { history: true, prefix: false })).toEqual({ error: "garbage" });
     }
-    for (const heading of ["## Original Request", "## Early Progress", "## Context for Suffix"]) {
-      const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${prefix.replace(heading, "## X")}\n</turn-prefix-summary>`;
-      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ error: "garbage" });
-    }
+    const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${prefix.replace("## Original Request", "## X")}\n</turn-prefix-summary>`;
+    expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ error: "garbage" });
   });
 
   it("rejects empty, unstructured or truncated output", () => {

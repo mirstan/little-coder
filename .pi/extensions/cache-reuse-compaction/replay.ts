@@ -298,16 +298,14 @@ function tagged(text: string, tag: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-// Every section heading of pi's two formats (pi-compat.ts prompts).
-const HISTORY_HEADINGS = ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"];
-const PREFIX_HEADINGS = ["## Original Request", "## Early Progress", "## Context for Suffix"];
+// The sections of pi's two formats (pi-compat.ts prompts) that must be present.
+// At ~215K context the model sometimes drops a minor one such as "## Next Steps";
+// such a summary is still usable, and native compaction costs ~15 minutes there.
+const HISTORY_REQUIRED = ["## Goal", "## Progress"];
+const PREFIX_REQUIRED = ["## Original Request"];
 
-function validHistory(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && HISTORY_HEADINGS.every((h) => s.includes(h));
-}
-
-function validPrefix(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && PREFIX_HEADINGS.every((h) => s.includes(h));
+function valid(s: string | null, required: string[]): s is string {
+  return !!s && s.length >= MIN_SECTION_CHARS && required.every((h) => s.includes(h));
 }
 
 /** The model's sections, or `garbage` when one asked for is missing, cut off or unstructured. */
@@ -316,12 +314,12 @@ export function parseSummaryOutput(content: string, want: { history: boolean; pr
   if (want.history) {
     let h = tagged(content, "history-summary");
     if (h === null && !want.prefix && !content.includes("<history-summary>")) h = content.trim();
-    if (!validHistory(h)) return { error: "garbage" };
+    if (!valid(h, HISTORY_REQUIRED)) return { error: "garbage" };
     out.history = h;
   }
   if (want.prefix) {
     const p = tagged(content, "turn-prefix-summary");
-    if (!validPrefix(p)) return { error: "garbage" };
+    if (!valid(p, PREFIX_REQUIRED)) return { error: "garbage" };
     out.prefix = p;
   }
   return out;
