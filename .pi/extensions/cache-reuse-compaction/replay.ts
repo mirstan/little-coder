@@ -298,16 +298,29 @@ function tagged(text: string, tag: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-// Every section heading of pi's two formats (pi-compat.ts prompts).
-const HISTORY_HEADINGS = ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"];
-const PREFIX_HEADINGS = ["## Original Request", "## Early Progress", "## Context for Suffix"];
+// The sections of pi's two formats (pi-compat.ts prompts) that must be present,
+// each with non-blank body text (`- (none)` counts). ## Next Steps is the one
+// optional section: it can be re-derived from ## Progress, and rejecting a summary
+// that omits it would cost a native fallback (~15 min at ~215K tokens). This
+// checks headings and bodies only, not that a section is complete.
+const HISTORY_REQUIRED = ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Critical Context"];
+const PREFIX_REQUIRED = ["## Original Request", "## Early Progress", "## Context for Suffix"];
 
-function validHistory(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && HISTORY_HEADINGS.every((h) => s.includes(h));
+/** Whether `lines` has a line starting with `heading` followed by non-blank text before the next `## ` line. */
+function hasSectionBody(lines: string[], heading: string): boolean {
+  const start = lines.findIndex((l) => l.startsWith(heading));
+  if (start === -1) return false;
+  for (const line of lines.slice(start + 1)) {
+    if (line.startsWith("## ")) return false;
+    if (line.trim()) return true;
+  }
+  return false;
 }
 
-function validPrefix(s: string | null): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && PREFIX_HEADINGS.every((h) => s.includes(h));
+function valid(s: string | null, required: string[]): s is string {
+  if (!s || s.length < MIN_SECTION_CHARS) return false;
+  const lines = s.split("\n").map((l) => l.trimStart());
+  return required.every((h) => hasSectionBody(lines, h));
 }
 
 /** The model's sections, or `garbage` when one asked for is missing, cut off or unstructured. */
@@ -316,12 +329,12 @@ export function parseSummaryOutput(content: string, want: { history: boolean; pr
   if (want.history) {
     let h = tagged(content, "history-summary");
     if (h === null && !want.prefix && !content.includes("<history-summary>")) h = content.trim();
-    if (!validHistory(h)) return { error: "garbage" };
+    if (!valid(h, HISTORY_REQUIRED)) return { error: "garbage" };
     out.history = h;
   }
   if (want.prefix) {
     const p = tagged(content, "turn-prefix-summary");
-    if (!validPrefix(p)) return { error: "garbage" };
+    if (!valid(p, PREFIX_REQUIRED)) return { error: "garbage" };
     out.prefix = p;
   }
   return out;
