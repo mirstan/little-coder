@@ -298,15 +298,29 @@ function tagged(text: string, tag: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-// The sections of pi's two formats (pi-compat.ts prompts) that must be present.
-// Only sections the next turn can re-derive (Key Decisions, Next Steps, Early
-// Progress) may be missing. Each format's last section is required, so a summary
-// the model stopped early is rejected.
-const HISTORY_REQUIRED = ["## Goal", "## Constraints & Preferences", "## Progress", "## Critical Context"];
-const PREFIX_REQUIRED = ["## Original Request", "## Context for Suffix"];
+// The sections of pi's two formats (pi-compat.ts prompts) that must be present,
+// each with non-blank body text (`- (none)` counts). ## Next Steps is the one
+// optional section: it can be re-derived from ## Progress, and rejecting a summary
+// that omits it would cost a native fallback (~15 min at ~215K tokens). This
+// checks headings and bodies only, not that a section is complete.
+const HISTORY_REQUIRED = ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Critical Context"];
+const PREFIX_REQUIRED = ["## Original Request", "## Early Progress", "## Context for Suffix"];
+
+/** Whether `lines` has a line starting with `heading` followed by non-blank text before the next `## ` line. */
+function hasSectionBody(lines: string[], heading: string): boolean {
+  const start = lines.findIndex((l) => l.startsWith(heading));
+  if (start === -1) return false;
+  for (const line of lines.slice(start + 1)) {
+    if (line.startsWith("## ")) return false;
+    if (line.trim()) return true;
+  }
+  return false;
+}
 
 function valid(s: string | null, required: string[]): s is string {
-  return !!s && s.length >= MIN_SECTION_CHARS && required.every((h) => s.includes(h));
+  if (!s || s.length < MIN_SECTION_CHARS) return false;
+  const lines = s.split("\n").map((l) => l.trimStart());
+  return required.every((h) => hasSectionBody(lines, h));
 }
 
 /** The model's sections, or `garbage` when one asked for is missing, cut off or unstructured. */
