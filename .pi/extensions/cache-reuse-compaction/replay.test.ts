@@ -231,6 +231,17 @@ const history =
   "## Key Decisions\n- **x**: y\n\n## Next Steps\n1. b\n\n## Critical Context\n- (none)";
 const prefix = "## Original Request\nFix the build\n\n## Early Progress\n- ran ls\n\n## Context for Suffix\n- make next";
 
+/** `text` with the section under `heading` (the heading and its body) deleted. */
+function without(text: string, heading: string): string {
+  const i = text.indexOf(heading);
+  if (i === -1) throw new Error(`no ${heading}`);
+  const j = text.indexOf("\n\n## ", i + 1);
+  return j === -1 ? text.slice(0, i).trimEnd() : text.slice(0, i) + text.slice(j + 2);
+}
+
+const both = (h: string, p: string) =>
+  `<history-summary>\n${h}\n</history-summary>\n<turn-prefix-summary>\n${p}\n</turn-prefix-summary>`;
+
 describe("parseSummaryOutput", () => {
   it("extracts both tagged sections", () => {
     const out = `<history-summary>\n${history}\n</history-summary>\n\n<turn-prefix-summary>\n${prefix}\n</turn-prefix-summary>`;
@@ -243,25 +254,32 @@ describe("parseSummaryOutput", () => {
     });
   });
 
-  it("accepts a summary that skips one of pi's optional sections", () => {
-    for (const heading of ["## Constraints & Preferences", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
-      const h = history.replace(heading, "## Other");
-      const out = `<history-summary>\n${h}\n</history-summary>\n<turn-prefix-summary>\n${prefix}\n</turn-prefix-summary>`;
-      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ history: h, prefix });
+  it("accepts a summary that leaves out a section that can be re-derived", () => {
+    for (const heading of ["## Key Decisions", "## Next Steps"]) {
+      const h = without(history, heading);
+      expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ history: h, prefix });
     }
-    for (const heading of ["## Early Progress", "## Context for Suffix"]) {
-      const p = prefix.replace(heading, "## X");
-      const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${p}\n</turn-prefix-summary>`;
-      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ history, prefix: p });
-    }
+    const p = without(prefix, "## Early Progress");
+    expect(parseSummaryOutput(both(history, p), { history: true, prefix: true })).toEqual({ history, prefix: p });
   });
 
   it("rejects a summary missing a required section", () => {
-    for (const heading of ["## Goal", "## Progress"]) {
-      expect(parseSummaryOutput(history.replace(heading, "## Other"), { history: true, prefix: false })).toEqual({ error: "garbage" });
+    for (const heading of ["## Goal", "## Constraints & Preferences", "## Progress", "## Critical Context"]) {
+      const h = without(history, heading);
+      expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ error: "garbage" });
+      expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ error: "garbage" });
     }
-    const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${prefix.replace("## Original Request", "## X")}\n</turn-prefix-summary>`;
-    expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ error: "garbage" });
+    for (const heading of ["## Original Request", "## Context for Suffix"]) {
+      expect(parseSummaryOutput(both(history, without(prefix, heading)), { history: true, prefix: true })).toEqual({
+        error: "garbage",
+      });
+    }
+  });
+
+  it("rejects a history summary the model stopped after ## Progress", () => {
+    const h = "## Goal\nShip it\n\n## Progress\n### Done\n- [x] a";
+    expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ error: "garbage" });
+    expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ error: "garbage" });
   });
 
   it("rejects empty, unstructured or truncated output", () => {

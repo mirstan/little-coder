@@ -299,10 +299,11 @@ function tagged(text: string, tag: string): string | null {
 }
 
 // The sections of pi's two formats (pi-compat.ts prompts) that must be present.
-// At ~215K context the model sometimes drops a minor one such as "## Next Steps";
-// such a summary is still usable, and native compaction costs ~15 minutes there.
-const HISTORY_REQUIRED = ["## Goal", "## Progress"];
-const PREFIX_REQUIRED = ["## Original Request"];
+// Only sections the next turn can re-derive (Key Decisions, Next Steps, Early
+// Progress) may be missing. Each format's last section is required, so a summary
+// the model stopped early is rejected.
+const HISTORY_REQUIRED = ["## Goal", "## Constraints & Preferences", "## Progress", "## Critical Context"];
+const PREFIX_REQUIRED = ["## Original Request", "## Context for Suffix"];
 
 function valid(s: string | null, required: string[]): s is string {
   return !!s && s.length >= MIN_SECTION_CHARS && required.every((h) => s.includes(h));
