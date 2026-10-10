@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execSync } from "node:child_process";
 import { formatOutput, DEFAULT_TIMEOUT } from "./helpers.ts";
+import { TB_PROXY_PREFIX, inTbMode, tbProxyRun } from "../_shared/tb-proxy.ts";
 
 // Port of local/tools/shell_session.py. Two backends implemented:
 //   1. tmux-proxy — when LITTLE_CODER_TB_MODE=1, route every command to the
@@ -14,27 +15,37 @@ import { formatOutput, DEFAULT_TIMEOUT } from "./helpers.ts";
 // bash process with state between calls) is deliberately skipped because
 // neither Terminal-Bench nor GAIA requires it; TB uses tmux, GAIA uses Bash.
 
-const TB_MODE_ENV = "LITTLE_CODER_TB_MODE";
-const TB_PROXY_PREFIX = "__LC_TB_SHELL__:";
+// Quoted as "~10MB" by helpers.ts's Partial-output note and by the tool
+// description below; change all three together.
+const EXEC_MAX_BUFFER = 10 * 1024 * 1024;
 
-function inTbMode(): boolean {
-  return process.env[TB_MODE_ENV] === "1";
-}
-
-async function execSubprocess(command: string, timeoutSec: number): Promise<string> {
+export async function execSubprocess(command: string, timeoutSec: number): Promise<string> {
   try {
     const buf = execSync(command, {
       shell: "/bin/bash",
       timeout: timeoutSec * 1000,
       encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: EXEC_MAX_BUFFER,
     });
-    return formatOutput(String(buf), 0, process.cwd(), false, "backend=subprocess");
+    return formatOutput(String(buf), 0, process.cwd(), false, "backend=subprocess", {
+      overflowFile: true,
+    });
   } catch (err: any) {
     const out = (err.stdout?.toString?.() ?? "") + (err.stderr?.toString?.() ?? "");
-    const timedOut = err.code === "ETIMEDOUT" || err.signal === "SIGTERM";
+    // Node SIGTERMs the child on maxBuffer overflow too, so the signal test
+    // alone reports a too-loud command as a too-slow one and sends the model
+    // back with a longer timeout that cannot help. err.stdout/err.stderr then
+    // hold only the first maxBuffer bytes, which is why the overflow file is
+    // labelled partial.
+    const capturedTruncated = err.code === "ENOBUFS";
+    const timedOut = !capturedTruncated && (err.code === "ETIMEDOUT" || err.signal === "SIGTERM");
     const code = typeof err.status === "number" ? err.status : -1;
-    return formatOutput(out, code, process.cwd(), timedOut, "backend=subprocess");
+    // Only this backend passes overflowFile: the command ran on this machine,
+    // so a host tmp path is one the model can actually read back.
+    return formatOutput(out, code, process.cwd(), timedOut, "backend=subprocess", {
+      overflowFile: true,
+      captureTruncated: capturedTruncated,
+    });
   }
 }
 
@@ -44,21 +55,16 @@ async function execTmuxProxy(
   timeoutSec: number,
   sessionId: string,
 ): Promise<string> {
-  const payload = {
-    op: "run",
-    session_id: sessionId,
-    command,
-    timeout: timeoutSec,
-  };
-  // Use ctx.ui.input as a generic data-carrying channel. The Python TB adapter
-  // intercepts extension_ui_request with title prefix __LC_TB_SHELL__ and
-  // responds with the formatted tool output string.
-  const title = TB_PROXY_PREFIX + JSON.stringify(payload);
-  const response = await ctx.ui.input(title, "");
-  if (typeof response === "string") return response;
+  const response = await tbProxyRun(ctx, command, timeoutSec, sessionId);
+  if (response !== null) return response;
+  // Nothing was killed here -- no usable response came back over the
+  // ui.input channel, so the command's actual state (still running,
+  // finished, crashed) is unknown from this side. See
+  // UNKNOWN_TIMED_OUT_WARNING in helpers.ts.
   return formatOutput(
     "Error: tmux proxy returned no response",
     -1, "?", true, "backend=tmux-proxy",
+    { timedOutKind: "unknown" },
   );
 }
 
@@ -75,14 +81,19 @@ export default function (pi: ExtensionAPI) {
     description: inTbMode()
       ? "Run a command in a persistent bash session. cd, env vars, and shell state " +
         "persist across calls. One command per turn. Default timeout 30s (increase to " +
-        "120-300 for installs/builds). Output is line-capped with head/tail truncation " +
-        "and a trailing [exit=N cwd=… timed_out=…] footer."
+        "120-300 for installs/builds). Output is capped at 200 lines or ~48KB of " +
+        "retained content (whichever is hit first) with head/tail truncation, plus a " +
+        "short trailing [exit=N cwd=… timed_out=…] footer."
       : "Run a shell command. NOTE: each call runs in its own process — cd, env vars, " +
         "and shell state do NOT persist between calls, so use absolute paths and set " +
         "variables inline. Blocks until the command exits: for anything long-running " +
         "(training, builds, servers) use ShellStart instead. Default timeout 30s " +
-        "(increase to 120-300 for installs/builds). Output is line-capped with " +
-        "head/tail truncation and a trailing [exit=N cwd=… timed_out=…] footer.",
+        "(increase to 120-300 for installs/builds). Output is capped at 200 lines or " +
+        "~48KB of retained content (whichever is hit first) with head/tail truncation, " +
+        "plus a short trailing [exit=N cwd=… timed_out=…] footer; when the byte cap is " +
+        "hit, the captured output is saved to a temp file named in a 'Full output:' " +
+        "line. Capture itself stops at ~10MB, past which the file is a prefix and says " +
+        "'Partial output' instead — redirect to a file for anything bigger.",
     parameters: Type.Object({
       command: Type.String({ description: "Shell command to run" }),
       timeout: Type.Optional(Type.Integer({ description: "Seconds (default 30, max 600)" })),
