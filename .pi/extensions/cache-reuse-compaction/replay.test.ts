@@ -231,6 +231,17 @@ const history =
   "## Key Decisions\n- **x**: y\n\n## Next Steps\n1. b\n\n## Critical Context\n- (none)";
 const prefix = "## Original Request\nFix the build\n\n## Early Progress\n- ran ls\n\n## Context for Suffix\n- make next";
 
+/** `text` with the section under `heading` (the heading and its body) deleted. */
+function without(text: string, heading: string): string {
+  const i = text.indexOf(heading);
+  if (i === -1) throw new Error(`no ${heading}`);
+  const j = text.indexOf("\n\n## ", i + 1);
+  return j === -1 ? text.slice(0, i).trimEnd() : text.slice(0, i) + text.slice(j + 2);
+}
+
+const both = (h: string, p: string) =>
+  `<history-summary>\n${h}\n</history-summary>\n<turn-prefix-summary>\n${p}\n</turn-prefix-summary>`;
+
 describe("parseSummaryOutput", () => {
   it("extracts both tagged sections", () => {
     const out = `<history-summary>\n${history}\n</history-summary>\n\n<turn-prefix-summary>\n${prefix}\n</turn-prefix-summary>`;
@@ -243,14 +254,48 @@ describe("parseSummaryOutput", () => {
     });
   });
 
-  it("rejects a history summary missing any of pi's sections", () => {
-    for (const heading of ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
-      expect(parseSummaryOutput(history.replace(heading, "## Other"), { history: true, prefix: false })).toEqual({ error: "garbage" });
+  it("accepts a history summary that leaves out only ## Next Steps", () => {
+    const h = without(history, "## Next Steps");
+    expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ history: h });
+    expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ history: h, prefix });
+  });
+
+  it("rejects a summary missing a required section", () => {
+    for (const heading of ["## Goal", "## Constraints & Preferences", "## Progress", "## Key Decisions", "## Critical Context"]) {
+      const h = without(history, heading);
+      expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ error: "garbage" });
+      expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ error: "garbage" });
     }
     for (const heading of ["## Original Request", "## Early Progress", "## Context for Suffix"]) {
-      const out = `<history-summary>\n${history}\n</history-summary>\n<turn-prefix-summary>\n${prefix.replace(heading, "## X")}\n</turn-prefix-summary>`;
-      expect(parseSummaryOutput(out, { history: true, prefix: true })).toEqual({ error: "garbage" });
+      expect(parseSummaryOutput(both(history, without(prefix, heading)), { history: true, prefix: true })).toEqual({
+        error: "garbage",
+      });
     }
+  });
+
+  it("rejects a required heading with an empty body", () => {
+    const emptyGoal = history.replace("## Goal\nShip it\n", "## Goal\n");
+    expect(parseSummaryOutput(both(emptyGoal, prefix), { history: true, prefix: true })).toEqual({ error: "garbage" });
+    const emptyLast = history.replace("## Critical Context\n- (none)", "## Critical Context\n  \n");
+    expect(parseSummaryOutput(emptyLast, { history: true, prefix: false })).toEqual({ error: "garbage" });
+    const emptyRequest = prefix.replace("## Original Request\nFix the build\n", "## Original Request\n");
+    expect(parseSummaryOutput(both(history, emptyRequest), { history: true, prefix: true })).toEqual({ error: "garbage" });
+    const headingsOnly = "## Goal\n## Constraints & Preferences\n## Progress\n## Key Decisions\n## Critical Context\n";
+    expect(parseSummaryOutput(headingsOnly, { history: true, prefix: false })).toEqual({ error: "garbage" });
+  });
+
+  it("counts a `- (none)` body and ### subheadings as section content", () => {
+    const h = "## Goal\n- (none)\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] a\n\n" +
+      "## Key Decisions\n- (none)\n\n## Critical Context\n- (none)";
+    expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ history: h });
+    const subOnly = h.replace("### Done\n- [x] a", "### Done\n### In Progress\n- [ ] b");
+    expect(parseSummaryOutput(subOnly, { history: true, prefix: false })).toEqual({ history: subOnly });
+  });
+
+  it("rejects a history summary the model stopped after ## Progress", () => {
+    const h = "## Goal\nShip it\n\n## Progress\n### Done\n- [x] a";
+    expect(parseSummaryOutput(h, { history: true, prefix: false })).toEqual({ error: "garbage" });
+    expect(parseSummaryOutput(both(h, prefix), { history: true, prefix: true })).toEqual({ error: "garbage" });
   });
 
   it("rejects empty, unstructured or truncated output", () => {
