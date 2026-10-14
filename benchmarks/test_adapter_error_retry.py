@@ -842,6 +842,67 @@ def test_pending_tool_results_count_toward_the_trigger():
     assert len(rpc.compact_requests) == 1
 
 
+def _turn_without_usage(tool_result_chars=0):
+    """A turn_end whose usage is absent, carrying one tool result."""
+    ev = _turn(0, tool_result_chars=tool_result_chars)
+    del ev["message"]["usage"]
+    return ev
+
+
+def test_a_turn_without_usage_still_counts_its_tool_results():
+    """A missing usage block must not hide the tool result the same turn_end
+    carries: the last measured context stands in for this turn's."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000), _turn_without_usage(tool_result_chars=60_000 * 4)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_usage_less_turns_accumulate_their_tool_results():
+    """Two usage-less turns in a row: the first one's result is in context
+    by the time the second is measured, so both count."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000),
+           _turn_without_usage(tool_result_chars=30_000 * 4),
+           _turn_without_usage(tool_result_chars=30_000 * 4)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_a_usage_less_turn_with_no_prior_usage_does_not_compact():
+    """Nothing measured yet means no baseline to add the result to."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn_without_usage(tool_result_chars=250_000 * 4)], _ok())], clock,
+    )
+    _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []
+
+
+def test_a_usage_less_turn_after_a_compaction_does_not_reuse_the_old_baseline():
+    """The pre-compaction context is gone once a compaction re-arms the
+    trigger; adding a result to it would compact again at once."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn_without_usage(tool_result_chars=4_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
 def test_small_tool_results_do_not_trigger_early():
     clock = _Clock()
     rpc = _CycleRpc([([_turn(190_000, tool_result_chars=4_000)], _ok())], clock)

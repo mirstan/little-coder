@@ -1781,6 +1781,10 @@ class _CompactionTrigger:
         self.threshold: Optional[int] = threshold if threshold else None
         self._armed = self.threshold is not None
         self.pending_rid: Optional[str] = None
+        # The context the next request will carry, as of the last turn_end:
+        # measured usage plus that turn's pending tool results. None until a
+        # turn reports usable usage.
+        self._projected_tokens: Optional[int] = None
 
     def __call__(self, event: dict) -> None:
         # The caller's logging runs first and unguarded: an exception out of
@@ -1791,8 +1795,16 @@ class _CompactionTrigger:
             return
         tokens = _turn_context_tokens(event)
         if tokens is None:
-            return
+            # No usable usage: the last projection stands in for this turn's
+            # measurement, so the results this turn_end carries still count.
+            # The sum becomes the new projection because the earlier results
+            # are already in context; the next turn's real usage replaces it,
+            # so nothing is counted twice.
+            if self._projected_tokens is None:
+                return
+            tokens = self._projected_tokens
         tokens += _pending_tool_result_tokens(event)
+        self._projected_tokens = tokens
         if not self._armed or self.pending_rid is not None:
             return
         if tokens < self.threshold:
@@ -1823,6 +1835,8 @@ class _CompactionTrigger:
         return rid
 
     def rearm(self) -> None:
+        # The projection measured the context the compaction just replaced.
+        self._projected_tokens = None
         if self.threshold is not None:
             self._armed = True
 
