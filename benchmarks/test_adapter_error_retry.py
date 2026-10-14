@@ -1101,13 +1101,13 @@ def test_the_regain_floor_stays_satisfiable_on_a_small_window():
 
 def test_a_big_window_keeps_the_flat_regain_floor():
     """The clamp binds only below ~71k; the tuned big-window bound is the
-    flat 30k, and a compaction that left 215k of a 220k threshold still has
+    flat 30k, and a compaction that left 185k of a 200k threshold still has
     to disarm."""
     clock = _Clock()
     rpc = _CycleRpc(
         [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
         clock,
-        compact_results=[{"estimatedTokensAfter": 215_000}],
+        compact_results=[{"estimatedTokensAfter": 185_000}],
     )
     _run_compaction(rpc, clock, context_window=262_144)
     assert len(rpc.compact_requests) == 1
@@ -1701,3 +1701,16 @@ def test_the_skipped_post_compaction_wait_applies_only_to_the_late_cycle():
     outcome = _run_compaction(rpc, clock, timeout=36_000.0)
     assert len(rpc.calls) == 3
     assert "PiBusyError" not in (outcome.retry_exception or "")
+
+
+@pytest.mark.parametrize("stop", ["error", "aborted"])
+def test_an_error_or_aborted_turn_never_triggers_compaction(stop):
+    """pi drops these turns from the next request, and the error retry
+    resends right after one; a compaction requested here would race it."""
+    clock = _Clock()
+    ev = _turn(0)
+    ev["message"]["stopReason"] = stop
+    ev["message"]["content"] = [{"type": "thinking", "thinking": "x" * 300_000}]
+    rpc = _CycleRpc([([_turn(190_000), ev], _ok())], clock)
+    _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []

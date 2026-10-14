@@ -1275,7 +1275,7 @@ PI_IDLE_WAIT_CAP_SEC = 1800.0
 #: The one extra wait after a harness compaction's response outlasts
 #: PI_IDLE_WAIT_CAP_SEC, for pi to finish and go idle so the late response
 #: can be picked up (prompt_with_mid_run_compaction). 1800 + 2700 = 4500 s in
-#: all. Worst legitimate case at the 220K trigger: a cache-reuse-compaction
+#: all. Worst legitimate case at a 220K context: a cache-reuse-compaction
 #: attempt that hands back late (240 s first-token timeout, or a first token
 #: plus its 2 x 600 s decode backstop: 1,440 s), then pi's own summary
 #: (TTFT ~960-1,600 s extrapolated from 820-955 s measured at 190-200k, plus
@@ -1615,6 +1615,7 @@ def prompt_with_error_retry(
 #: Context-token estimate at which the harness asks pi to compact. Below the
 #: 262 144-token window the real TB2.0 `train-fasttext` trial overflowed, with
 #: room for one more turn to land and a prefix-cache summary to fit after it.
+#: .pi/extensions/shell-retention/retention.ts mirrors this value.
 #: At 220_000, make-doom-for-mips grew 43K tokens in one turn and compacted at
 #: 259K, too late for prefix-cache compaction's minimum summary budget.
 COMPACT_TRIGGER_TOKENS = 200_000
@@ -1750,7 +1751,7 @@ def _pending_tool_result_tokens(event: dict) -> int:
 def _turn_output_tokens(event: dict) -> int:
     """Estimated tokens of the assistant output a `turn_end` carries.
 
-    Text, thinking and tool-call arguments, all of which pi sends back with
+    Text, thinking and tool-call arguments, which pi sends back with
     the next request. Only needed when the turn reported no usage, whose
     output count would otherwise cover them. Malformed blocks count as
     zero, for the reason _turn_context_tokens gives.
@@ -1834,6 +1835,11 @@ class _CompactionTrigger:
         if self._inner is not None:
             self._inner(event)
         if event.get("type") != "turn_end":
+            return
+        message = event.get("message")
+        # pi drops error and aborted turns from the next request, and the
+        # error retry resends right after one: compacting here would race it.
+        if isinstance(message, dict) and message.get("stopReason") in ("error", "aborted"):
             return
         tokens = _turn_context_tokens(event)
         if tokens is None:
@@ -2194,7 +2200,7 @@ def prompt_with_mid_run_compaction(
             )
         except TimeoutError as exc:
             # pi may still be compacting, not wedged: a cache-reuse attempt
-            # that falls back late, or pi's own summary of a ~220K context,
+            # that falls back late, or pi's own summary of a ~200K+ context,
             # can outlast the wait. Wait once more (bounded) for pi to go
             # idle, then re-await once: pi writes the compact response in the
             # same step that clears its compacting state, so after an idle
@@ -2245,8 +2251,8 @@ def prompt_with_mid_run_compaction(
             # flat trigger: on a window smaller than trigger_tokens the two
             # differ, and a bound that never fires cannot say whether this
             # compaction bought anything. A 100k-window model triggers at
-            # 84k, so a drop to 83k reads as 137k of headroom against the
-            # flat 220k -- enough to re-arm and compact again one turn
+            # 84k, so a drop to 83k reads as 117k of headroom against the
+            # flat 200k -- enough to re-arm and compact again one turn
             # later, spending every remaining compaction the cap allows on
             # summarizations that free nothing.
             regain_floor = min(
