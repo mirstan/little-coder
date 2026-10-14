@@ -1673,10 +1673,13 @@ class _HarborShellProxy:
 # benchmark canary and were not there at trial start. A baseline is taken
 # because some task images ship files carrying the canary that the model may
 # legitimately edit. Misses files deleted before the trial ends, files at or
-# over the size cap (-size -10M), and paths on other filesystems (-xdev). /tmp/.lc* holds
-# the harness's own copies of task files and model output, so it is pruned.
+# over the 10MiB size cap, and paths on other filesystems (-xdev). /tmp/.lc*
+# holds the harness's own copies of task files and model output, so it is
+# pruned.
 CANARY_STRING = "terminal-bench-canary"
 _CANARY_SCAN_TIMEOUT_SEC = 60
+# Under 10MiB, in POSIX 512-byte blocks: BusyBox find rejects the "M" suffix.
+_CANARY_SCAN_SIZE_BLOCKS = "-20480"
 # Kept under _format_output's MAX_LINES, so a full list is never truncated.
 _CANARY_SCAN_MAX_PATHS = 50
 _CANARY_REPORTED_PATHS_MAX = 20
@@ -1690,19 +1693,28 @@ def _build_canary_scan_command(newer_than: str | None) -> str:
 
     The status token is printed last, after the search completes, so a scan
     killed by its timeout reads as missing a token, never as an empty list.
+    The search's own errors are silenced, so a probe of the same find
+    predicates, grep and head first turns a missing or incompatible tool into
+    an "error" token instead of an empty "ok".
     """
     newer = f" -newer {newer_than}" if newer_than else ""
+    probe = (
+        f"find / -maxdepth 0 -xdev -type d -size {_CANARY_SCAN_SIZE_BLOCKS}{newer} -exec true {{}} + >/dev/null 2>&1"
+        f" && {{ grep -lF -- {CANARY_STRING} /dev/null >/dev/null 2>&1; [ $? -le 1 ]; }}"
+        " && command -v head >/dev/null 2>&1"
+    )
     scan = (
         f"timeout {_CANARY_SCAN_TIMEOUT_SEC} sh -c \""
         "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path '/tmp/.lc*' \\) -prune"
-        f" -o -type f -size -10M{newer} -exec grep -lF -- {CANARY_STRING} {{}} + 2>/dev/null"
+        f" -o -type f -size {_CANARY_SCAN_SIZE_BLOCKS}{newer} -exec grep -lF -- {CANARY_STRING} {{}} + 2>/dev/null"
         f" | head -n {_CANARY_SCAN_MAX_PATHS + 1};"
         f" echo {_CANARY_SCAN_STATUS_PREFIX}ok\""
     )
+    checked = f"if {probe}; then {scan}; else echo {_CANARY_SCAN_STATUS_PREFIX}error; fi"
     if newer_than is None:
-        return scan
+        return checked
     return (
-        f"if [ -e {newer_than} ]; then {scan}; "
+        f"if [ -e {newer_than} ]; then {checked}; "
         f"else echo {_CANARY_SCAN_STATUS_PREFIX}skipped; fi"
     )
 

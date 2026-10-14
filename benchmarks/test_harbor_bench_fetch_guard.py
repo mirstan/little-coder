@@ -184,7 +184,16 @@ def test_canary_scan_command_parses_and_prunes_harness_copies():
         subprocess.run(["sh", "-n", "-c", lca._wrap_command(cmd, None, "__S__")], check=True)
         assert "-xdev" in cmd and "/tmp/.lc*" in cmd and lca.CANARY_STRING in cmd
         assert f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}" in cmd
-        assert (f"-newer {newer}" in cmd) == (newer is not None)
+        assert cmd.count(f"-newer {newer}") == (2 if newer else 0)
+        # The probe, ahead of the silenced search, is what keeps a missing
+        # tool from reading as an empty "ok".
+        assert cmd.index("-maxdepth 0") < cmd.index(f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}")
+        assert f"echo {lca._CANARY_SCAN_STATUS_PREFIX}error" in cmd
+
+
+def test_parse_error_token_is_error():
+    out = _harness_out(f"{lca._CANARY_SCAN_STATUS_PREFIX}error")
+    assert lca._parse_canary_scan(out) == ("error", [])
 
 
 def test_parse_ok_lists_paths():
