@@ -1614,8 +1614,13 @@ def prompt_with_error_retry(
 
 #: Context-token estimate at which the harness asks pi to compact. Below the
 #: 262 144-token window the real TB2.0 `train-fasttext` trial overflowed, with
-#: enough slack for the turn already in flight to land.
-COMPACT_TRIGGER_TOKENS = 220_000
+#: room for one more turn to land and a prefix-cache summary to fit after it.
+#: At 220_000, make-doom-for-mips grew 43K tokens in one turn and compacted at
+#: 259K, too late for prefix-cache compaction's minimum summary budget.
+COMPACT_TRIGGER_TOKENS = 200_000
+#: Characters per token used to estimate tool results that have not been
+#: tokenized yet. Low on purpose: overestimating only compacts a turn early.
+TOOL_RESULT_CHARS_PER_TOKEN = 3
 #: A compaction that freed less than this much is not worth repeating: the
 #: transcript is dominated by whatever compaction cannot summarize away, so
 #: the next trigger would just spend another summarization on nothing.
@@ -1710,6 +1715,27 @@ def _turn_context_tokens(event: dict) -> Optional[int]:
     return int(total)
 
 
+def _pending_tool_result_tokens(event: dict) -> int:
+    """Estimated tokens of the tool results a `turn_end` carries.
+
+    They are not in the turn's usage yet: they enter context with the next
+    request. Malformed entries count as zero, for the reason
+    _turn_context_tokens gives.
+    """
+    results = event.get("toolResults")
+    if not isinstance(results, list):
+        return 0
+    chars = 0
+    for result in results:
+        content = result.get("content") if isinstance(result, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chars += len(block["text"])
+    return chars // TOOL_RESULT_CHARS_PER_TOKEN
+
+
 class _CompactionTrigger:
     """A caller's `on_event`, wrapped to watch context growth on `turn_end`.
 
@@ -1766,6 +1792,7 @@ class _CompactionTrigger:
         tokens = _turn_context_tokens(event)
         if tokens is None:
             return
+        tokens += _pending_tool_result_tokens(event)
         if not self._armed or self.pending_rid is not None:
             return
         if tokens < self.threshold:

@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
 from rpc_client import (  # noqa: E402
     COMPACTION_CONTINUE_PROMPT,
+    COMPACT_TRIGGER_TOKENS,
+    _pending_tool_result_tokens,
     ERROR_RETRY_PROMPT,
     PiBusyError,
     PiProcessExited,
@@ -591,11 +593,15 @@ def test_a_dead_pi_is_not_waited_on():
 # ── deliberate mid-run compaction ────────────────────────────────────────
 
 
-def _turn(tokens):
-    """A turn_end carrying `tokens` of context, in pi's own usage shape."""
+def _turn(tokens, tool_result_chars=0):
+    """A turn_end carrying `tokens` of context, in pi's own usage shape, and
+    optionally one tool result of `tool_result_chars` characters."""
+    results = []
+    if tool_result_chars:
+        results = [{"role": "toolResult", "content": [{"type": "text", "text": "x" * tool_result_chars}]}]
     return {"type": "turn_end", "message": {"usage": {
         "input": tokens, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-    }}}
+    }}, "toolResults": results}
 
 
 class _CycleRpc:
@@ -815,6 +821,41 @@ def test_crossing_the_threshold_compacts_and_continues_the_same_session():
     assert "finished" in outcome.result.assistant_text
 
 
+def test_the_default_trigger_leaves_room_for_a_prefix_cache_summary():
+    """make-doom-for-mips (2026-10-10) grew 43K tokens in one turn; at 220K
+    that put the compaction at 259K, past what prefix-cache compaction can
+    summarize in a 262K window."""
+    assert COMPACT_TRIGGER_TOKENS <= 200_000
+
+
+def test_pending_tool_results_count_toward_the_trigger():
+    """A turn that ends under the threshold but carries a large tool result
+    compacts now: that result lands in context before the next turn can be
+    measured."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(190_000, tool_result_chars=31_000 * 4)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_small_tool_results_do_not_trigger_early():
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(190_000, tool_result_chars=4_000)], _ok())], clock)
+    _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []
+
+
+@pytest.mark.parametrize("results", ["nope", [None], [{"content": "text"}], [{"content": [{"type": "image"}]}]])
+def test_malformed_tool_results_count_as_zero(results):
+    ev = _turn(1_000)
+    ev["toolResults"] = results
+    assert _pending_tool_result_tokens(ev) == 0
+
+
 def test_the_threshold_follows_a_smaller_context_window():
     """min(flat trigger, 84% of the window): a model with a window under the
     flat trigger would otherwise never compact before overflowing."""
@@ -859,8 +900,8 @@ def test_a_compaction_that_regained_too_little_disarms_the_trigger():
 def test_the_regain_floor_follows_the_smaller_window_too():
     """The threshold moves with the window, so the regain check has to.
 
-    Measured against the flat 220k trigger, a 100k-window trial that
-    compacted 84k down to 83k would read as having regained 137k, re-arm,
+    Measured against the flat 200k trigger, a 100k-window trial that
+    compacted 84k down to 83k would read as having regained 117k, re-arm,
     and compact again on the very next turn -- a summarization per turn for
     the rest of the trial.
     """
