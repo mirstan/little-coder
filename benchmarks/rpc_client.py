@@ -1275,7 +1275,7 @@ PI_IDLE_WAIT_CAP_SEC = 1800.0
 #: The one extra wait after a harness compaction's response outlasts
 #: PI_IDLE_WAIT_CAP_SEC, for pi to finish and go idle so the late response
 #: can be picked up (prompt_with_mid_run_compaction). 1800 + 2700 = 4500 s in
-#: all. Worst legitimate case at the 220K trigger: a cache-reuse-compaction
+#: all. Worst legitimate case at a 220K context: a cache-reuse-compaction
 #: attempt that hands back late (240 s first-token timeout, or a first token
 #: plus its 2 x 600 s decode backstop: 1,440 s), then pi's own summary
 #: (TTFT ~960-1,600 s extrapolated from 820-955 s measured at 190-200k, plus
@@ -1614,8 +1614,14 @@ def prompt_with_error_retry(
 
 #: Context-token estimate at which the harness asks pi to compact. Below the
 #: 262 144-token window the real TB2.0 `train-fasttext` trial overflowed, with
-#: enough slack for the turn already in flight to land.
-COMPACT_TRIGGER_TOKENS = 220_000
+#: room for one more turn to land and a prefix-cache summary to fit after it.
+#: .pi/extensions/shell-retention/retention.ts mirrors this value.
+#: At 220_000, make-doom-for-mips grew 43K tokens in one turn and compacted at
+#: 259K, too late for prefix-cache compaction's minimum summary budget.
+COMPACT_TRIGGER_TOKENS = 200_000
+#: Characters per token used to estimate tool results that have not been
+#: tokenized yet. Low on purpose: overestimating only compacts a turn early.
+TOOL_RESULT_CHARS_PER_TOKEN = 3
 #: A compaction that freed less than this much is not worth repeating: the
 #: transcript is dominated by whatever compaction cannot summarize away, so
 #: the next trigger would just spend another summarization on nothing.
@@ -1697,17 +1703,78 @@ def _turn_context_tokens(event: dict) -> Optional[int]:
     own usage aggregation does -- same defensive .get/isinstance handling,
     because this is untrusted wire data from a pi build we don't control and
     a malformed field here must not crash a trial over token accounting.
+
+    None also when the prompt part sums to zero: pi-ai initialises every
+    assistant message's usage to zeros and overwrites it only when the
+    server sends usage, so a provider that reported nothing arrives as
+    zeros, not as a missing key (turn_ledger's usage_reported reads it the
+    same way).
     """
     message = event.get("message")
     usage = message.get("usage") if isinstance(message, dict) else None
     if not isinstance(usage, dict):
         return None
     total = 0
+    prompt = 0
     for src in ("input", "output", "cacheRead", "cacheWrite"):
         val = usage.get(src, 0)
         if isinstance(val, (int, float)):
             total += val
+            if src != "output":
+                prompt += val
+    if prompt <= 0:
+        return None
     return int(total)
+
+
+def _pending_tool_result_tokens(event: dict) -> int:
+    """Estimated tokens of the tool results a `turn_end` carries.
+
+    They are not in the turn's usage yet: they enter context with the next
+    request. Malformed entries count as zero, for the reason
+    _turn_context_tokens gives.
+    """
+    results = event.get("toolResults")
+    if not isinstance(results, list):
+        return 0
+    chars = 0
+    for result in results:
+        content = result.get("content") if isinstance(result, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chars += len(block["text"])
+    return chars // TOOL_RESULT_CHARS_PER_TOKEN
+
+
+def _turn_output_tokens(event: dict) -> int:
+    """Estimated tokens of the assistant output a `turn_end` carries.
+
+    Text, thinking and tool-call arguments, which pi sends back with
+    the next request. Only needed when the turn reported no usage, whose
+    output count would otherwise cover them. Malformed blocks count as
+    zero, for the reason _turn_context_tokens gives.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return 0
+    chars = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text" and isinstance(block.get("text"), str):
+            chars += len(block["text"])
+        elif kind == "thinking" and isinstance(block.get("thinking"), str):
+            chars += len(block["thinking"])
+        elif kind == "toolCall" and block.get("arguments") is not None:
+            try:
+                chars += len(json.dumps(block["arguments"]))
+            except (TypeError, ValueError):
+                continue
+    return chars // TOOL_RESULT_CHARS_PER_TOKEN
 
 
 class _CompactionTrigger:
@@ -1755,6 +1822,12 @@ class _CompactionTrigger:
         self.threshold: Optional[int] = threshold if threshold else None
         self._armed = self.threshold is not None
         self.pending_rid: Optional[str] = None
+        # The context the next request will carry, as of the last turn_end:
+        # measured usage plus that turn's pending tool results, or an
+        # estimate when the turn reported no usage. None until the first
+        # turn_end, or after a compaction with no usable estimate; either
+        # reads as a zero baseline.
+        self._projected_tokens: Optional[int] = None
 
     def __call__(self, event: dict) -> None:
         # The caller's logging runs first and unguarded: an exception out of
@@ -1763,9 +1836,24 @@ class _CompactionTrigger:
             self._inner(event)
         if event.get("type") != "turn_end":
             return
+        message = event.get("message")
+        # pi drops error and aborted turns from the next request, and the
+        # error retry resends right after one: compacting here would race it.
+        if isinstance(message, dict) and message.get("stopReason") in ("error", "aborted"):
+            return
         tokens = _turn_context_tokens(event)
         if tokens is None:
-            return
+            # No usable usage: the last projection stands in for this turn's
+            # measurement, plus an estimate of the turn's own output, so the
+            # output and results this turn_end carries still count. With no
+            # projection yet the baseline is zero rather than a skip: the
+            # results reach the next request either way. The sum becomes the
+            # new projection because the earlier results are already in
+            # context; the next turn's real usage replaces it, so nothing is
+            # counted twice.
+            tokens = (self._projected_tokens or 0) + _turn_output_tokens(event)
+        tokens += _pending_tool_result_tokens(event)
+        self._projected_tokens = tokens
         if not self._armed or self.pending_rid is not None:
             return
         if tokens < self.threshold:
@@ -1795,7 +1883,17 @@ class _CompactionTrigger:
         rid, self.pending_rid = self.pending_rid, None
         return rid
 
-    def rearm(self) -> None:
+    def rearm(self, estimated_tokens_after: Optional[float] = None) -> None:
+        # The projection measured the context the compaction just replaced;
+        # the compaction's own estimate of what is left, when it gave one,
+        # is the baseline until a turn reports usage.
+        self._projected_tokens = (
+            int(estimated_tokens_after)
+            if isinstance(estimated_tokens_after, (int, float))
+            and not isinstance(estimated_tokens_after, bool)
+            and 0 < estimated_tokens_after < float("inf")
+            else None
+        )
         if self.threshold is not None:
             self._armed = True
 
@@ -2102,7 +2200,7 @@ def prompt_with_mid_run_compaction(
             )
         except TimeoutError as exc:
             # pi may still be compacting, not wedged: a cache-reuse attempt
-            # that falls back late, or pi's own summary of a ~220K context,
+            # that falls back late, or pi's own summary of a ~200K+ context,
             # can outlast the wait. Wait once more (bounded) for pi to go
             # idle, then re-await once: pi writes the compact response in the
             # same step that clears its compacting state, so after an idle
@@ -2153,8 +2251,8 @@ def prompt_with_mid_run_compaction(
             # flat trigger: on a window smaller than trigger_tokens the two
             # differ, and a bound that never fires cannot say whether this
             # compaction bought anything. A 100k-window model triggers at
-            # 84k, so a drop to 83k reads as 137k of headroom against the
-            # flat 220k -- enough to re-arm and compact again one turn
+            # 84k, so a drop to 83k reads as 117k of headroom against the
+            # flat 200k -- enough to re-arm and compact again one turn
             # later, spending every remaining compaction the cap allows on
             # summarizations that free nothing.
             regain_floor = min(
@@ -2167,7 +2265,7 @@ def prompt_with_mid_run_compaction(
                 and after <= trigger.threshold - regain_floor
             )
             if regained_enough:
-                trigger.rearm()
+                trigger.rearm(after)
                 _log(f"compaction left ~{int(after)} context tokens")
             else:
                 # Also the branch an absent estimatedTokensAfter (pi marks it

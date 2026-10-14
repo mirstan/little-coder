@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpc_client  # noqa: E402
 from rpc_client import (  # noqa: E402
     COMPACTION_CONTINUE_PROMPT,
+    COMPACT_TRIGGER_TOKENS,
+    _pending_tool_result_tokens,
     ERROR_RETRY_PROMPT,
     PiBusyError,
     PiProcessExited,
@@ -591,11 +593,15 @@ def test_a_dead_pi_is_not_waited_on():
 # ── deliberate mid-run compaction ────────────────────────────────────────
 
 
-def _turn(tokens):
-    """A turn_end carrying `tokens` of context, in pi's own usage shape."""
+def _turn(tokens, tool_result_chars=0):
+    """A turn_end carrying `tokens` of context, in pi's own usage shape, and
+    optionally one tool result of `tool_result_chars` characters."""
+    results = []
+    if tool_result_chars:
+        results = [{"role": "toolResult", "content": [{"type": "text", "text": "x" * tool_result_chars}]}]
     return {"type": "turn_end", "message": {"usage": {
         "input": tokens, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-    }}}
+    }}, "toolResults": results}
 
 
 class _CycleRpc:
@@ -815,6 +821,191 @@ def test_crossing_the_threshold_compacts_and_continues_the_same_session():
     assert "finished" in outcome.result.assistant_text
 
 
+def test_the_default_trigger_leaves_room_for_a_prefix_cache_summary():
+    """make-doom-for-mips (2026-10-10) grew 43K tokens in one turn; at 220K
+    that put the compaction at 259K, past what prefix-cache compaction can
+    summarize in a 262K window."""
+    assert COMPACT_TRIGGER_TOKENS <= 200_000
+
+
+def test_pending_tool_results_count_toward_the_trigger():
+    """A turn that ends under the threshold but carries a large tool result
+    compacts now: that result lands in context before the next turn can be
+    measured."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(190_000, tool_result_chars=31_000 * 4)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def _turn_without_usage(tool_result_chars=0):
+    """A turn_end whose usage is absent, carrying one tool result."""
+    ev = _turn(0, tool_result_chars=tool_result_chars)
+    del ev["message"]["usage"]
+    return ev
+
+
+def test_a_turn_without_usage_still_counts_its_tool_results():
+    """A missing usage block must not hide the tool result the same turn_end
+    carries: the last measured context stands in for this turn's."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000), _turn_without_usage(tool_result_chars=60_000 * 4)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_usage_less_turns_accumulate_their_tool_results():
+    """Two usage-less turns in a row: the first one's result is in context
+    by the time the second is measured, so both count."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000),
+           _turn_without_usage(tool_result_chars=30_000 * 4),
+           _turn_without_usage(tool_result_chars=30_000 * 4)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def _turn_with_zero_usage(tool_result_chars=0):
+    """A turn_end whose provider reported no usage, as it reaches the wire.
+
+    pi-ai initialises every assistant message's usage to zeros and only
+    overwrites it when the server sends a usage chunk, so "nothing reported"
+    arrives as a present usage block of zeros, not as a missing key.
+    """
+    return _turn(0, tool_result_chars=tool_result_chars)
+
+
+_USAGE_LESS_SHAPES = [
+    pytest.param(_turn_without_usage, id="usage-deleted"),
+    pytest.param(_turn_with_zero_usage, id="usage-zeros"),
+]
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+def test_a_zero_usage_turn_keeps_the_measured_baseline(usage_less):
+    """All-zero usage is no measurement: it must not reset the 150K already in
+    context to zero before the turn's own result is added."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000), usage_less(tool_result_chars=60_000 * 3)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+def test_a_first_usage_less_turn_still_counts_its_tool_results(usage_less):
+    """No measurement yet is a zero baseline, not a reason to skip the result:
+    a result over the threshold reaches the next request either way."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([usage_less(tool_result_chars=250_000 * 3)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def _with_output(ev, block):
+    ev["message"]["content"] = [block]
+    return ev
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+@pytest.mark.parametrize("block", [
+    pytest.param({"type": "text", "text": "x" * 60_000 * 3}, id="text"),
+    pytest.param({"type": "thinking", "thinking": "x" * 60_000 * 3}, id="thinking"),
+    pytest.param({"type": "toolCall", "id": "c1", "name": "write",
+                  "arguments": {"content": "x" * 60_000 * 3}}, id="tool-call-arguments"),
+])
+def test_a_usage_less_turn_counts_its_own_assistant_output(usage_less, block):
+    """pi sends the assistant's text, thinking and tool-call arguments back
+    with the next request, so they count even with no tool result."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000), _with_output(usage_less(), block)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+@pytest.mark.parametrize("result_tokens,expected", [(150_000, 2), (1_000, 1)])
+def test_a_usage_less_turn_after_a_compaction_starts_from_its_estimate(
+        usage_less, result_tokens, expected):
+    """The compaction's estimatedTokensAfter is the best baseline there is
+    until a turn reports usage: 60K + a 150K result crosses 200K, 60K + 1K
+    does not."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([usage_less(tool_result_chars=result_tokens * 3)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 60_000}, {"estimatedTokensAfter": 60_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == expected
+
+
+@pytest.mark.parametrize("content", [
+    "nope", [None], [{"type": "text", "text": 5}], [{"type": "thinking"}],
+    [{"type": "toolCall", "arguments": object()}], [{"type": "image", "data": "x" * 999}],
+])
+def test_malformed_assistant_output_counts_as_zero(content):
+    ev = _turn_without_usage()
+    ev["message"]["content"] = content
+    assert rpc_client._turn_output_tokens(ev) == 0
+
+
+def test_a_usage_less_turn_after_a_compaction_does_not_reuse_the_old_baseline():
+    """The pre-compaction context is gone once a compaction re-arms the
+    trigger; adding a result to it would compact again at once."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn_without_usage(tool_result_chars=4_000)], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def test_small_tool_results_do_not_trigger_early():
+    clock = _Clock()
+    rpc = _CycleRpc([([_turn(190_000, tool_result_chars=4_000)], _ok())], clock)
+    _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []
+
+
+@pytest.mark.parametrize("results", ["nope", [None], [{"content": "text"}], [{"content": [{"type": "image"}]}]])
+def test_malformed_tool_results_count_as_zero(results):
+    ev = _turn(1_000)
+    ev["toolResults"] = results
+    assert _pending_tool_result_tokens(ev) == 0
+
+
 def test_the_threshold_follows_a_smaller_context_window():
     """min(flat trigger, 84% of the window): a model with a window under the
     flat trigger would otherwise never compact before overflowing."""
@@ -859,8 +1050,8 @@ def test_a_compaction_that_regained_too_little_disarms_the_trigger():
 def test_the_regain_floor_follows_the_smaller_window_too():
     """The threshold moves with the window, so the regain check has to.
 
-    Measured against the flat 220k trigger, a 100k-window trial that
-    compacted 84k down to 83k would read as having regained 137k, re-arm,
+    Measured against the flat 200k trigger, a 100k-window trial that
+    compacted 84k down to 83k would read as having regained 117k, re-arm,
     and compact again on the very next turn -- a summarization per turn for
     the rest of the trial.
     """
@@ -910,13 +1101,13 @@ def test_the_regain_floor_stays_satisfiable_on_a_small_window():
 
 def test_a_big_window_keeps_the_flat_regain_floor():
     """The clamp binds only below ~71k; the tuned big-window bound is the
-    flat 30k, and a compaction that left 215k of a 220k threshold still has
+    flat 30k, and a compaction that left 185k of a 200k threshold still has
     to disarm."""
     clock = _Clock()
     rpc = _CycleRpc(
         [([_turn(230_000)], _ok()), ([_turn(240_000)], _ok())],
         clock,
-        compact_results=[{"estimatedTokensAfter": 215_000}],
+        compact_results=[{"estimatedTokensAfter": 185_000}],
     )
     _run_compaction(rpc, clock, context_window=262_144)
     assert len(rpc.compact_requests) == 1
@@ -1510,3 +1701,16 @@ def test_the_skipped_post_compaction_wait_applies_only_to_the_late_cycle():
     outcome = _run_compaction(rpc, clock, timeout=36_000.0)
     assert len(rpc.calls) == 3
     assert "PiBusyError" not in (outcome.retry_exception or "")
+
+
+@pytest.mark.parametrize("stop", ["error", "aborted"])
+def test_an_error_or_aborted_turn_never_triggers_compaction(stop):
+    """pi drops these turns from the next request, and the error retry
+    resends right after one; a compaction requested here would race it."""
+    clock = _Clock()
+    ev = _turn(0)
+    ev["message"]["stopReason"] = stop
+    ev["message"]["content"] = [{"type": "thinking", "thinking": "x" * 300_000}]
+    rpc = _CycleRpc([([_turn(190_000), ev], _ok())], clock)
+    _run_compaction(rpc, clock)
+    assert rpc.compact_requests == []

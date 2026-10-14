@@ -154,17 +154,17 @@ export const DEFAULT_DEMOTE_MIN_TOKENS_PER_SECOND = 38;
 /**
  * <= 0 disables the near-compaction clause. Measured from context-watchdog's
  * threshold (80% = 209.7K of a 262K window); the Harbor harness compacts at
- * 220K, about 50K past the clause. In the replay (harness at 220K) margins of
+ * 200K or earlier. In the replay (harness at 220K) margins of
  * 30-60K score the same, 80K costs a compaction; under +-20% noise on the
  * estimates, minTokensPerSecond 30-40 and margins 40-60K all keep 16.
  */
 export const DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS = 40000;
 /**
  * With context-watchdog off, the only mid-run compaction in an autonomous run is
- * the RPC harness's, at min(220K, 84% of the window) (benchmarks/rpc_client.py);
+ * the RPC harness's, at min(200K, 84% of the window) (benchmarks/rpc_client.py);
  * pi's own threshold check runs only between prompts.
  */
-const HARNESS_COMPACT_TOKENS = 220000;
+const HARNESS_COMPACT_TOKENS = 200000;
 const HARNESS_COMPACT_FRACTION = 0.84;
 /** Seconds per prefilled token at depth 0. */
 export const DEFAULT_PREFILL_LINEAR_SECONDS = 1.05e-3;

@@ -592,8 +592,8 @@ describe("re-prefill ceiling", () => {
     expect(demotionVeto(over, GATE)).toBe("near");
     expect(demotionVeto({ ...over, contextTokens: at - 1 }, GATE)).toBe("ceiling");
     expect(demotionVeto({ ...over, contextTokens: at - 1, estSaveTokens: 1e9 }, GATE)).toBeNull();
-    // Watchdog off: the RPC harness compacts at min(220K, 84% of the window).
-    const piAt = 220_000 - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS;
+    // Watchdog off: the RPC harness compacts at min(200K, 84% of the window).
+    const piAt = 200_000 - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS;
     expect(demotionVeto({ ...over, contextWindow: 200_000, contextTokens: 168_000 - DEFAULT_DEMOTE_NEAR_COMPACT_TOKENS, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: null })).toBe("near");
     expect(demotionVeto({ ...over, contextTokens: piAt - 1, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: null })).toBeNull();
     expect(demotionVeto({ ...over, contextTokens: piAt, estSaveTokens: 1e9 }, { ...GATE, compactAtPercent: null })).toBe("near");
