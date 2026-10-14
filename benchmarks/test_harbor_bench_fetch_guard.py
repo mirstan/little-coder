@@ -177,18 +177,41 @@ def _harness_out(body: str, code: int = 0, timed_out: bool = False) -> str:
     return lca._format_output(body, "", code, "/app", timed_out)
 
 
+def _scan_out(*paths: str, rc: int = 1) -> str:
+    """A completed scan's output: the paths, then find's exit status. A clean
+    walk exits 1 here because grep -l exits 1 on a batch with no match."""
+    lines = [*paths, f"{lca._CANARY_SCAN_RC_PREFIX}{rc}"]
+    return _harness_out("\n".join(lines))
+
+
 def test_canary_scan_command_parses_and_prunes_harness_copies():
     import subprocess
-    for newer in (None, lca.SNAPSHOT_START_MARKER):
-        cmd = lca._build_canary_scan_command(newer)
-        subprocess.run(["sh", "-n", "-c", lca._wrap_command(cmd, None, "__S__")], check=True)
-        assert "-xdev" in cmd and "/tmp/.lc*" in cmd and lca.CANARY_STRING in cmd
-        assert f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}" in cmd
-        assert cmd.count(f"-newer {newer}") == (2 if newer else 0)
-        # The probe, ahead of the silenced search, is what keeps a missing
-        # tool from reading as an empty "ok".
-        assert cmd.index("-maxdepth 0") < cmd.index(f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}")
-        assert f"echo {lca._CANARY_SCAN_STATUS_PREFIX}error" in cmd
+    cmd = lca._build_canary_scan_command()
+    subprocess.run(["sh", "-n", "-c", lca._wrap_command(cmd, None, "__S__")], check=True)
+    assert "-xdev" in cmd and "/tmp/.lc*" in cmd and lca.CANARY_STRING in cmd
+    assert f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}" in cmd
+    # The probe, ahead of the silenced search, is what keeps a missing
+    # tool from reading as an empty "ok".
+    assert cmd.index("-maxdepth 0") < cmd.index(f"timeout {lca._CANARY_SCAN_TIMEOUT_SEC}")
+    assert f"echo {lca._CANARY_SCAN_STATUS_PREFIX}error" in cmd
+    assert "command -v awk" in cmd
+
+
+def test_canary_scan_has_no_time_filter_or_marker_gate():
+    # tar, unzip, cp -p, rsync -a and curl -R restore old mtimes, so a
+    # time filter misses extracted files; the baseline diff does that job.
+    cmd = lca._build_canary_scan_command()
+    assert "-newer" not in cmd and "-cnewer" not in cmd and "-mmin" not in cmd
+    assert lca.SNAPSHOT_START_MARKER not in cmd
+    assert "skipped" not in cmd
+
+
+def test_canary_scan_reports_find_exit_status_past_the_path_cap():
+    cmd = lca._build_canary_scan_command()
+    # Escaped for the outer shell, so the inner sh -c expands it after find.
+    assert f"echo {lca._CANARY_SCAN_RC_PREFIX}\\$?" in cmd
+    # A head that exits early would SIGPIPE find and drop the status line.
+    assert "| head" not in cmd
 
 
 def test_parse_error_token_is_error():
@@ -197,13 +220,20 @@ def test_parse_error_token_is_error():
 
 
 def test_parse_ok_lists_paths():
-    out = _harness_out(f"/app/user.cpp\n/tmp/solve.sh\n{lca._CANARY_SCAN_STATUS_PREFIX}ok")
+    out = _scan_out("/app/user.cpp", "/tmp/solve.sh")
     assert lca._parse_canary_scan(out) == ("ok", ["/app/user.cpp", "/tmp/solve.sh"])
+    assert lca._parse_canary_scan(_scan_out("/app/user.cpp", rc=0)) == ("ok", ["/app/user.cpp"])
 
 
-def test_parse_missing_marker_is_skipped():
+def test_parse_walk_that_did_not_complete_is_error():
+    # find killed by a signal (128+n) or failing outright never reads as ok.
+    assert lca._parse_canary_scan(_scan_out("/app/a", rc=137)) == ("error", [])
+    assert lca._parse_canary_scan(_scan_out(rc=2)) == ("error", [])
+
+
+def test_parse_skipped_token_is_no_longer_a_status():
     out = _harness_out(f"{lca._CANARY_SCAN_STATUS_PREFIX}skipped")
-    assert lca._parse_canary_scan(out) == ("skipped", [])
+    assert lca._parse_canary_scan(out) == ("error", [])
 
 
 def test_parse_timeout_without_status_token():
@@ -213,14 +243,16 @@ def test_parse_timeout_without_status_token():
 
 def test_parse_error_never_reads_as_clean():
     assert lca._parse_canary_scan(_harness_out("", code=0)) == ("error", [])
+    assert lca._parse_canary_scan(_harness_out("/app/a", code=0)) == ("error", [])
     assert lca._parse_canary_scan(_harness_out("sh: find: not found", code=127))[0] == "error"
     assert lca._parse_canary_scan(None)[0] == "error"
 
 
-def test_parse_over_cap_is_error():
-    paths = "\n".join(f"/app/f{i}" for i in range(lca._CANARY_SCAN_MAX_PATHS + 1))
-    out = _harness_out(f"{paths}\n{lca._CANARY_SCAN_STATUS_PREFIX}ok")
-    assert lca._parse_canary_scan(out)[0] == "error"
+def test_parse_over_cap_keeps_the_capped_paths():
+    paths = [f"/app/f{i}" for i in range(lca._CANARY_SCAN_MAX_PATHS + 1)]
+    status, kept = lca._parse_canary_scan(_scan_out(*paths))
+    assert status == "over_cap"
+    assert kept == paths[: lca._CANARY_SCAN_MAX_PATHS]
 
 
 def test_result_reports_only_paths_not_in_baseline():
@@ -238,9 +270,49 @@ def test_result_status_fails_closed_on_either_scan():
     r = lca._canary_scan_result(("timeout", []), ("ok", ["/app/user.cpp"]))
     assert r["canary_scan_status"] == "timeout"
     # No usable baseline: every hit is reported rather than dropped.
-    assert r["canary_new_paths"] == ["/app/user.cpp"] and r["contamination_suspected"]
+    assert r["canary_new_paths"] == ["/app/user.cpp"] and r["contamination_suspected"] is True
     assert lca._canary_scan_result(None, ("ok", []))["canary_scan_status"] == "error"
-    assert lca._canary_scan_result(("ok", []), ("skipped", []))["canary_scan_status"] == "skipped"
+
+
+def test_result_incomplete_end_scan_is_never_false():
+    for end_status in ("timeout", "error"):
+        for base in (("ok", []), ("ok", ["/app/x"]), ("error", []), None):
+            r = lca._canary_scan_result(base, (end_status, []))
+            assert r["contamination_suspected"] is None, (base, end_status)
+            assert r["canary_scan_status"] != "ok"
+
+
+def test_result_end_over_cap_is_contamination():
+    # A whole-repo clone: more new canary files than the cap.
+    end = ("over_cap", [f"/app/repo/f{i}" for i in range(lca._CANARY_SCAN_MAX_PATHS)])
+    r = lca._canary_scan_result(("ok", ["/app/user.cpp"]), end)
+    assert r["canary_scan_status"] == "over_cap"
+    assert r["contamination_suspected"] is True
+    assert len(r["canary_new_paths"]) == lca._CANARY_REPORTED_PATHS_MAX
+    # Even when every listed path was in the baseline: the end set is larger
+    # than a baseline that fit under the cap, so something is new.
+    known = [f"/app/k{i}" for i in range(lca._CANARY_SCAN_MAX_PATHS)]
+    r = lca._canary_scan_result(("ok", known[:10]), ("over_cap", known))
+    assert r["contamination_suspected"] is True
+    r = lca._canary_scan_result(("error", []), end)
+    assert r["canary_scan_status"] == "error" and r["contamination_suspected"] is True
+
+
+def test_result_baseline_over_cap_is_unknown_unless_end_is_all_known():
+    known = [f"/opt/img/f{i}" for i in range(lca._CANARY_SCAN_MAX_PATHS)]
+    base = ("over_cap", known)
+    # New-path detection is unreliable: an unlisted path may be a 51st+
+    # baseline file, so it is not flagged either way.
+    for end in (("over_cap", known), ("ok", known[:5] + ["/tmp/sol.sh"])):
+        r = lca._canary_scan_result(base, end)
+        assert r["canary_scan_status"] == "over_cap"
+        assert r["contamination_suspected"] is None, end
+    r = lca._canary_scan_result(base, ("ok", ["/tmp/sol.sh"]))
+    assert r["canary_new_paths"] == ["/tmp/sol.sh"]
+    # A complete end list whose every path was listed at the start has
+    # nothing new, whatever the baseline missed.
+    r = lca._canary_scan_result(base, ("ok", known[:5]))
+    assert r["contamination_suspected"] is False and r["canary_new_paths"] == []
 
 
 def test_result_caps_reported_paths():
@@ -269,6 +341,14 @@ def test_record_guard_metadata_creates_dict_on_cancel_path():
     assert GUARD_KEYS <= set(ctx.metadata)
     assert ctx.metadata["n_blocked_benchmark_fetches"] == 2
     assert ctx.metadata["canary_scan_status"] == "error"
+    assert ctx.metadata["contamination_suspected"] is None
+
+
+def test_record_guard_metadata_defaults_never_read_clean():
+    ctx = types.SimpleNamespace(metadata=None)
+    lca._record_guard_metadata(ctx, _proxy_with_counts(), {}, logging.getLogger("t"))
+    assert ctx.metadata["canary_scan_status"] == "error"
+    assert ctx.metadata["contamination_suspected"] is None
 
 
 def test_record_guard_metadata_merges_into_success_dict():
@@ -296,19 +376,19 @@ def test_run_canary_scan_goes_through_run_harness_and_maps_failures():
     class _P:
         async def run_harness(self, command, timeout):
             calls.append(command)
-            return _harness_out(f"/tmp/x\n{lca._CANARY_SCAN_STATUS_PREFIX}ok")
+            return _scan_out("/tmp/x")
 
         def run(self, *a, **kw):
             raise AssertionError("the scan must never use proxy.run()")
 
-    assert asyncio.run(lca._run_canary_scan(_P(), None, logging.getLogger("t"))) == ("ok", ["/tmp/x"])
+    assert asyncio.run(lca._run_canary_scan(_P(), logging.getLogger("t"))) == ("ok", ["/tmp/x"])
     assert len(calls) == 1
 
     class _Boom:
         async def run_harness(self, command, timeout):
             raise RuntimeError("container gone")
 
-    assert asyncio.run(lca._run_canary_scan(_Boom(), None, logging.getLogger("t"))) == ("error", [])
+    assert asyncio.run(lca._run_canary_scan(_Boom(), logging.getLogger("t"))) == ("error", [])
 
 
 def test_run_canary_scan_does_not_swallow_cancellation():
@@ -317,7 +397,7 @@ def test_run_canary_scan_does_not_swallow_cancellation():
             await asyncio.sleep(10)
 
     async def main():
-        task = asyncio.create_task(lca._run_canary_scan(_Slow(), None, logging.getLogger("t")))
+        task = asyncio.create_task(lca._run_canary_scan(_Slow(), logging.getLogger("t")))
         await asyncio.sleep(0.01)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
