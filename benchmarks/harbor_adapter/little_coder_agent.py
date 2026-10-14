@@ -1374,6 +1374,30 @@ _BRIDGE_TIMEOUT_WARNING = (
 )
 
 
+# Every TB2.1 task sets allow_internet = true, and the benchmark repo shares
+# github.com / raw.githubusercontent.com / api.github.com with legitimate
+# source downloads, so harbor's hostname allowlist cannot separate them. This
+# string match catches the fetches seen so far (the agent names the repo);
+# encoded or assembled URLs get past it, so the post-run scan stays the check.
+_BENCH_REPO_OWNER_RE = re.compile(r"laude-institute", re.I)
+_BENCH_NAME_RE = re.compile(r"terminal-bench", re.I)
+# Bare "terminal-bench" is legitimate: mteb-retrieve's corpus contains it.
+_BENCH_HOST_RE = re.compile(r"github\.com|githubusercontent\.com|huggingface\.co", re.I)
+_BENCH_CANARY_RE = re.compile(r"terminal-bench-canary", re.I)
+
+_BENCH_FETCH_REFUSAL = (
+    "Blocked: this command references the benchmark's own repository. Fetching "
+    "the task's tests or reference solution is not permitted and will be blocked "
+    "every time. Solve the task from the instructions and the container."
+)
+
+
+def _is_benchmark_repo_fetch(command: str) -> bool:
+    if _BENCH_REPO_OWNER_RE.search(command):
+        return True
+    return bool(_BENCH_NAME_RE.search(command) and _BENCH_HOST_RE.search(command))
+
+
 class _HarborShellProxy:
     """Stateful shell proxy over harbor's BaseEnvironment.exec().
 
@@ -1413,6 +1437,10 @@ class _HarborShellProxy:
         # the 0644 files inside it are still unreachable to other users of a
         # shared harness machine.
         self._host_stage_dir: str | None = None
+        self.n_blocked_benchmark_fetches = 0
+        # Some task images ship files carrying the canary, so this is logged
+        # for the post-run scan, never blocked.
+        self.n_canary_outputs = 0
 
     async def _capture_overflow(self, cleaned: str) -> str | None:
         """Upload the full untruncated output into the container so a later
@@ -1546,9 +1574,17 @@ class _HarborShellProxy:
 
     def run(self, command: str, timeout: int) -> str:
         """Sync entry point called by PiRpc's reader thread."""
+        if _is_benchmark_repo_fetch(command):
+            self.n_blocked_benchmark_fetches += 1
+            self.logger.warning(f"blocked benchmark-repo fetch: {command[:300]!r}")
+            return _format_output("", _BENCH_FETCH_REFUSAL, 1, self.cwd, False)
         fut = asyncio.run_coroutine_threadsafe(self._exec_async(command, timeout), self.loop)
         try:
-            return fut.result(timeout=timeout + 30)
+            result = fut.result(timeout=timeout + 30)
+            if _BENCH_CANARY_RE.search(result):
+                self.n_canary_outputs += 1
+                self.logger.warning(f"benchmark canary in output of: {command[:300]!r}")
+            return result
         except concurrent.futures.TimeoutError as e:
             warning = _BRIDGE_TIMEOUT_WARNING.format(N=timeout)
             return _format_output("", f"shell proxy error: {e}\n{warning}", -1, self.cwd, True)
@@ -2245,6 +2281,8 @@ class LittleCoderAgent(BaseAgent):
                     # Peak context, max output, stopReason histogram, demotion,
                     # guard and stub counts (turn_ledger.summarize).
                     "turn_ledger": sink_metadata(ledger),
+                    "n_blocked_benchmark_fetches": proxy.n_blocked_benchmark_fetches,
+                    "n_canary_outputs": proxy.n_canary_outputs,
                 }
             finally:
                 await asyncio.to_thread(rpc.close, 3)
