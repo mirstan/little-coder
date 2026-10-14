@@ -879,14 +879,103 @@ def test_usage_less_turns_accumulate_their_tool_results():
     assert len(rpc.compact_requests) == 1
 
 
-def test_a_usage_less_turn_with_no_prior_usage_does_not_compact():
-    """Nothing measured yet means no baseline to add the result to."""
+def _turn_with_zero_usage(tool_result_chars=0):
+    """A turn_end whose provider reported no usage, as it reaches the wire.
+
+    pi-ai initialises every assistant message's usage to zeros and only
+    overwrites it when the server sends a usage chunk, so "nothing reported"
+    arrives as a present usage block of zeros, not as a missing key.
+    """
+    return _turn(0, tool_result_chars=tool_result_chars)
+
+
+_USAGE_LESS_SHAPES = [
+    pytest.param(_turn_without_usage, id="usage-deleted"),
+    pytest.param(_turn_with_zero_usage, id="usage-zeros"),
+]
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+def test_a_zero_usage_turn_keeps_the_measured_baseline(usage_less):
+    """All-zero usage is no measurement: it must not reset the 150K already in
+    context to zero before the turn's own result is added."""
     clock = _Clock()
     rpc = _CycleRpc(
-        [([_turn_without_usage(tool_result_chars=250_000 * 4)], _ok())], clock,
+        [([_turn(150_000), usage_less(tool_result_chars=60_000 * 3)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
     )
     _run_compaction(rpc, clock)
-    assert rpc.compact_requests == []
+    assert len(rpc.compact_requests) == 1
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+def test_a_first_usage_less_turn_still_counts_its_tool_results(usage_less):
+    """No measurement yet is a zero baseline, not a reason to skip the result:
+    a result over the threshold reaches the next request either way."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([usage_less(tool_result_chars=250_000 * 3)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+def _with_output(ev, block):
+    ev["message"]["content"] = [block]
+    return ev
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+@pytest.mark.parametrize("block", [
+    pytest.param({"type": "text", "text": "x" * 60_000 * 3}, id="text"),
+    pytest.param({"type": "thinking", "thinking": "x" * 60_000 * 3}, id="thinking"),
+    pytest.param({"type": "toolCall", "id": "c1", "name": "write",
+                  "arguments": {"content": "x" * 60_000 * 3}}, id="tool-call-arguments"),
+])
+def test_a_usage_less_turn_counts_its_own_assistant_output(usage_less, block):
+    """pi sends the assistant's text, thinking and tool-call arguments back
+    with the next request, so they count even with no tool result."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(150_000), _with_output(usage_less(), block)], _ok()), ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 20_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == 1
+
+
+@pytest.mark.parametrize("usage_less", _USAGE_LESS_SHAPES)
+@pytest.mark.parametrize("result_tokens,expected", [(150_000, 2), (1_000, 1)])
+def test_a_usage_less_turn_after_a_compaction_starts_from_its_estimate(
+        usage_less, result_tokens, expected):
+    """The compaction's estimatedTokensAfter is the best baseline there is
+    until a turn reports usage: 60K + a 150K result crosses 200K, 60K + 1K
+    does not."""
+    clock = _Clock()
+    rpc = _CycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([usage_less(tool_result_chars=result_tokens * 3)], _ok()),
+         ([], _ok())],
+        clock,
+        compact_results=[{"estimatedTokensAfter": 60_000}, {"estimatedTokensAfter": 60_000}],
+    )
+    _run_compaction(rpc, clock)
+    assert len(rpc.compact_requests) == expected
+
+
+@pytest.mark.parametrize("content", [
+    "nope", [None], [{"type": "text", "text": 5}], [{"type": "thinking"}],
+    [{"type": "toolCall", "arguments": object()}], [{"type": "image", "data": "x" * 999}],
+])
+def test_malformed_assistant_output_counts_as_zero(content):
+    ev = _turn_without_usage()
+    ev["message"]["content"] = content
+    assert rpc_client._turn_output_tokens(ev) == 0
 
 
 def test_a_usage_less_turn_after_a_compaction_does_not_reuse_the_old_baseline():

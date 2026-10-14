@@ -1702,16 +1702,27 @@ def _turn_context_tokens(event: dict) -> Optional[int]:
     own usage aggregation does -- same defensive .get/isinstance handling,
     because this is untrusted wire data from a pi build we don't control and
     a malformed field here must not crash a trial over token accounting.
+
+    None also when the prompt part sums to zero: pi-ai initialises every
+    assistant message's usage to zeros and overwrites it only when the
+    server sends usage, so a provider that reported nothing arrives as
+    zeros, not as a missing key (turn_ledger's usage_reported reads it the
+    same way).
     """
     message = event.get("message")
     usage = message.get("usage") if isinstance(message, dict) else None
     if not isinstance(usage, dict):
         return None
     total = 0
+    prompt = 0
     for src in ("input", "output", "cacheRead", "cacheWrite"):
         val = usage.get(src, 0)
         if isinstance(val, (int, float)):
             total += val
+            if src != "output":
+                prompt += val
+    if prompt <= 0:
+        return None
     return int(total)
 
 
@@ -1733,6 +1744,35 @@ def _pending_tool_result_tokens(event: dict) -> int:
         for block in content:
             if isinstance(block, dict) and isinstance(block.get("text"), str):
                 chars += len(block["text"])
+    return chars // TOOL_RESULT_CHARS_PER_TOKEN
+
+
+def _turn_output_tokens(event: dict) -> int:
+    """Estimated tokens of the assistant output a `turn_end` carries.
+
+    Text, thinking and tool-call arguments, all of which pi sends back with
+    the next request. Only needed when the turn reported no usage, whose
+    output count would otherwise cover them. Malformed blocks count as
+    zero, for the reason _turn_context_tokens gives.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return 0
+    chars = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text" and isinstance(block.get("text"), str):
+            chars += len(block["text"])
+        elif kind == "thinking" and isinstance(block.get("thinking"), str):
+            chars += len(block["thinking"])
+        elif kind == "toolCall" and block.get("arguments") is not None:
+            try:
+                chars += len(json.dumps(block["arguments"]))
+            except (TypeError, ValueError):
+                continue
     return chars // TOOL_RESULT_CHARS_PER_TOKEN
 
 
@@ -1782,8 +1822,10 @@ class _CompactionTrigger:
         self._armed = self.threshold is not None
         self.pending_rid: Optional[str] = None
         # The context the next request will carry, as of the last turn_end:
-        # measured usage plus that turn's pending tool results. None until a
-        # turn reports usable usage.
+        # measured usage plus that turn's pending tool results, or an
+        # estimate when the turn reported no usage. None until the first
+        # turn_end, or after a compaction with no usable estimate; either
+        # reads as a zero baseline.
         self._projected_tokens: Optional[int] = None
 
     def __call__(self, event: dict) -> None:
@@ -1796,13 +1838,14 @@ class _CompactionTrigger:
         tokens = _turn_context_tokens(event)
         if tokens is None:
             # No usable usage: the last projection stands in for this turn's
-            # measurement, so the results this turn_end carries still count.
-            # The sum becomes the new projection because the earlier results
-            # are already in context; the next turn's real usage replaces it,
-            # so nothing is counted twice.
-            if self._projected_tokens is None:
-                return
-            tokens = self._projected_tokens
+            # measurement, plus an estimate of the turn's own output, so the
+            # output and results this turn_end carries still count. With no
+            # projection yet the baseline is zero rather than a skip: the
+            # results reach the next request either way. The sum becomes the
+            # new projection because the earlier results are already in
+            # context; the next turn's real usage replaces it, so nothing is
+            # counted twice.
+            tokens = (self._projected_tokens or 0) + _turn_output_tokens(event)
         tokens += _pending_tool_result_tokens(event)
         self._projected_tokens = tokens
         if not self._armed or self.pending_rid is not None:
@@ -1834,9 +1877,17 @@ class _CompactionTrigger:
         rid, self.pending_rid = self.pending_rid, None
         return rid
 
-    def rearm(self) -> None:
-        # The projection measured the context the compaction just replaced.
-        self._projected_tokens = None
+    def rearm(self, estimated_tokens_after: Optional[float] = None) -> None:
+        # The projection measured the context the compaction just replaced;
+        # the compaction's own estimate of what is left, when it gave one,
+        # is the baseline until a turn reports usage.
+        self._projected_tokens = (
+            int(estimated_tokens_after)
+            if isinstance(estimated_tokens_after, (int, float))
+            and not isinstance(estimated_tokens_after, bool)
+            and 0 < estimated_tokens_after < float("inf")
+            else None
+        )
         if self.threshold is not None:
             self._armed = True
 
@@ -2208,7 +2259,7 @@ def prompt_with_mid_run_compaction(
                 and after <= trigger.threshold - regain_floor
             )
             if regained_enough:
-                trigger.rearm()
+                trigger.rearm(after)
                 _log(f"compaction left ~{int(after)} context tokens")
             else:
                 # Also the branch an absent estimatedTokensAfter (pi marks it
