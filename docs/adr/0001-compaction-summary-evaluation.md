@@ -21,22 +21,29 @@ paired continuations from the same state.
 1. Score each summary on its own, never pairwise, with the arm hidden. The primary number is
    vital recall over a frozen vital-fact list. Precision over the summary's own claims and the
    fixed R/P/A checklist are reported beside it. Two judge families (Claude, GPT) each run 3 samples.
-   Items where the families agree below α ≈ 0.4 are dropped.
+   Per-item agreement between the families is reported and low items are flagged, not dropped
+   automatically, because alpha on 8 summaries is too noisy to act on alone.
 2. Claude and GPT draft vital facts from the pre-compaction transcript only. A human resolves only
    the facts where they disagree. The post-compaction window stays hidden from drafting, so the
    validity test cannot pass circularly.
 3. Validate the judge against rediscovery in the first 20 post-compaction actions, labelled per fact
    by an LLM that cites the action.
-4. The offline result decides only when the judge is valid (OR ≥ 2, Fisher p < 0.05) **and** one arm
-   wins vital recall in all 4 within-task pairs without losing more than 10 points of precision.
-   Otherwise, run paired reruns. Rebuild each compaction point by replaying its recorded commands in
+4. A compaction point is excluded when its pre-compaction transcript was not fully saved to disk.
+   Trial 6 of r3 is excluded: its compaction hung, its saved messages stop 54 minutes before the
+   compaction, and only 2 actions follow it. That leaves 7 points: doom 2 v 2, gcode 1
+   prefix-cache v 2 blackhole.
+5. The r3 trials ran independently, so the offline arm comparison is unpaired and descriptive. It
+   decides only when the judge is valid (OR ≥ 2, Fisher p < 0.05) **and**, in both tasks, the winning
+   arm's lowest vital recall is above the losing arm's highest, without losing more than 10 points of
+   precision. Otherwise, run paired reruns. Rebuild each compaction point by replaying its recorded commands in
    a fresh container. Continue it under full history, each arm's summary, and CliffCompaction, for
    20 actions × 3 seeds, and compare burden.
 
 ## Consequences
 
-- The offline pass needs no GPU and about 1 hour of human review. With 4 pairs, its arm verdict
-  describes a pattern and is not statistically significant. Only the per-fact validity test can be.
+- The offline pass needs no GPU and about 1 hour of human review. With 7 unpaired points, its arm
+  verdict describes a pattern and is not statistically significant. Only the per-fact validity test
+  can be. A paired sign test applies only to reruns.
 - Reruns need a new harness entry point that starts pi from a supplied summary, plus a replay step
   that checks the rebuilt file state. Commands that are not deterministic, such as downloads,
   timestamps or long builds, may stop a compaction point from being rebuilt. That point is then

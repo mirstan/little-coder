@@ -18,7 +18,7 @@ they label differently, goes to a human. The list is frozen before any summary i
 facts*, which are scored separately and never count toward recall.
 
 ## Post-compaction window
-The first 20 agent actions after a compaction point. Rediscovery is only counted inside it.
+The first 20 agent actions after a compaction point, or fewer if the trial ends first. Rediscovery is only counted inside it.
 
 ## Rediscovery
 An action in the post-compaction window that re-establishes a vital fact the agent already had
