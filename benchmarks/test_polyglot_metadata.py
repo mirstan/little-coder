@@ -434,3 +434,52 @@ def test_successful_but_empty_get_state_records_an_error_not_silence(tmp_path, m
     assert snap["thinking"]["confirmed_live"] is None
     confirm_errors = [e for e in snap["errors"] if e["source"] == "confirmed_thinking"]
     assert len(confirm_errors) == 1, "empty thinkingLevel must be recorded as a breadcrumb, not silence"
+
+
+class _UsageRpc(_CountingRpc):
+    """Fake agent whose attempts report distinct rpc_client-shaped usage."""
+    usages = [
+        {"input": 100, "output": 20, "cache_read": 30, "cache_write": 5, "cost": 0.0},
+        {"input": 50, "output": 7, "cache_read": 200, "cache_write": 0, "cost": 0.0},
+    ]
+
+    def prompt_and_collect(self, message, timeout=900):
+        r = super().prompt_and_collect(message, timeout)
+        r.usage = _UsageRpc.usages[self.n]
+        return r
+
+
+def _always_failing_faker(tmp_path, monkeypatch, rpc_cls):
+    src = tmp_path / "practice" / "ex"
+    src.mkdir(parents=True)
+    (src / "ex.py").write_text("stub")
+    monkeypatch.setitem(AP.LANG_DESCRIPTORS, "faker", {
+        "practice_dir": tmp_path / "practice",
+        "prepare": lambda s, w: (AP._copy_exercise(s, w), ([w / "ex.py"], []))[1],
+        "run_tests": lambda where, timeout: (False, "nope"),
+        "syntax_hint": "",
+        "timeout_s": 5,
+    })
+    monkeypatch.setattr(AP, "PiRpc", rpc_cls)
+    monkeypatch.setattr(AP, "LOG_ROOT", tmp_path / "logs")
+
+
+def test_token_usage_is_recorded_per_attempt_and_summed(tmp_path, monkeypatch):
+    """input_tokens is the whole prompt pi sent (uncached input + cache
+    read + cache write), the same convention as the Harbor adapter's
+    n_input_tokens, so cache_read_tokens / input_tokens is the cache ratio."""
+    _always_failing_faker(tmp_path, monkeypatch, _UsageRpc)
+    rec = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    assert rec["attempt_usage"] == [
+        {"input_tokens": 135, "cache_read_tokens": 30, "output_tokens": 20},
+        {"input_tokens": 250, "cache_read_tokens": 200, "output_tokens": 7},
+    ]
+    assert rec["usage"] == {"input_tokens": 385, "cache_read_tokens": 230, "output_tokens": 27}
+
+
+def test_token_usage_is_zero_when_the_agent_reports_none(tmp_path, monkeypatch):
+    _always_failing_faker(tmp_path, monkeypatch, _CountingRpc)
+    rec = AP._run_exercise("faker", "ex", "fake/model", agent="pi", verbose=False, retry=True)
+    zero = {"input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0}
+    assert rec["attempt_usage"] == [zero, zero]
+    assert rec["usage"] == zero

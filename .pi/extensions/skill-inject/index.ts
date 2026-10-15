@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { skillPackDir } from "../_shared/skills-root.ts";
 import { parseSkillFile } from "./frontmatter.ts";
-import { injectionResult, makeDedupe } from "../_shared/inject.ts";
+import { contentHash, injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
 import { SHELL_TOOLS } from "../_shared/shell-write.ts";
 
@@ -815,13 +815,28 @@ export default function (pi: ExtensionAPI) {
     try {
       const parts: string[] = [];
       if (selected.length > 0) {
-        parts.push(`+${selected.length} [${selected.map((s) => s.targetTool).join(",")}]`);
+        // JSON-encoded for the same reason knowledge-inject's notify is --
+        // see that extension's own comment. targetTool names are unlikely
+        // to contain a comma in practice, but the ingest-side parser
+        // handles both sources identically, so both emitters stay
+        // consistent with each other.
+        parts.push(`+${selected.length} ${JSON.stringify(selected.map((s) => s.targetTool))}`);
       }
       if (researchTask) parts.push("+research-directive");
       if (temporalTask) parts.push("+temporal-directive");
       if (gpt2CheckpointTask) parts.push("+gpt2-checkpoint-directive");
       if (ramanFittingTask) parts.push("+raman-fitting-directive");
       ctx.ui.notify(`skill-inject: ${parts.join(" ")}`, "info");
+      if (selected.length > 0) {
+        // Content hashes on a separate line, so the usage line above stays
+        // byte-identical for every existing reader (ingest regex, tb_status.sh,
+        // gaia_status.sh). Hashed over the body exactly as buildBlock renders
+        // it: the gated-line stripping changes the text the model sees.
+        const hashes = Object.fromEntries(
+          selected.map((s) => [s.targetTool, contentHash(stripGatedLines(s.body, allowed))]),
+        );
+        ctx.ui.notify(`skill-inject-hashes: ${JSON.stringify(hashes)}`, "info");
+      }
     } catch {
       // UI unavailable in some run modes — silent best-effort
     }

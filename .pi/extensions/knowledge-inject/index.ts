@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { skillPackDir } from "../_shared/skills-root.ts";
 import { parseSkillFile } from "../skill-inject/frontmatter.ts";
-import { injectionResult, makeDedupe } from "../_shared/inject.ts";
+import { contentHash, injectionResult, makeDedupe } from "../_shared/inject.ts";
 import { allowedToolSet, toolsAvailable } from "../_shared/allowed-tools.ts";
 
 // ── Knowledge-entry registry ────────────────────────────────────────────
@@ -158,10 +158,21 @@ export default function (pi: ExtensionAPI) {
     if (!shouldInject(block)) return;
 
     try {
+      // JSON-encoded, not comma-joined: `topic` is arbitrary human
+      // frontmatter text (e.g. "Error handling, retries, and backoff") and
+      // a bare comma-join is ambiguous whenever a topic contains a literal
+      // comma. The ingest-side parser (benchmarks/self_improve/ingest/
+      // common.py::_parse_notification_payload) tries JSON first and falls
+      // back to the old comma-split only for historical trajectory data
+      // predating this fix.
       ctx.ui.notify(
-        `knowledge-inject: +${selected.length} [${selected.map((e) => e.topic).join(",")}]`,
+        `knowledge-inject: +${selected.length} ${JSON.stringify(selected.map((e) => e.topic))}`,
         "info",
       );
+      // Per-entry content hashes on their own line so the one above stays
+      // byte-identical for existing readers; see skill-inject's twin.
+      const hashes = Object.fromEntries(selected.map((e) => [e.topic, contentHash(e.body)]));
+      ctx.ui.notify(`knowledge-inject-hashes: ${JSON.stringify(hashes)}`, "info");
     } catch {
       // best-effort
     }
