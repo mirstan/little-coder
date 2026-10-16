@@ -68,3 +68,8 @@ paired continuations from the same state.
 - Gate outcome: not decisive. On gcode, prefix-cache's vital recall (0.73) beats both blackhole
   points (0.29, 0.51). On doom, the ranges overlap (0.37 to 0.58 vs 0.26 to 0.40). Prefix-cache's
   precision is 11 to 21 points lower on both tasks. Judge validity is still untested.
+- Judge validity (step 4) was not established. Claude and GPT both labelled rediscovery in the first
+  20 post-compaction actions (kappa 0.63). Facts both labellers counted as rediscovered gave OR 2.03,
+  Fisher p = 0.073. The Claude labeller alone gives OR 2.42, p = 0.023, and the GPT labeller alone
+  gives OR 0.82. The ADR named no rule for combining labellers, which should have been fixed in
+  advance. With validity and the arm sweep both failing, the gate calls for paired reruns.
