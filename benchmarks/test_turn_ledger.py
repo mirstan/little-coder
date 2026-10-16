@@ -60,7 +60,7 @@ def test_an_empty_ledger_summarizes_to_zeros():
         "max_ttft_s": None, "stop_reasons": {}, "telemetry_seen": False,
         "max_large_pairs": 0, "max_demoted": 0, "demoted_new_total": 0,
         "max_bytes_saved": 0, "max_signed": 0, "stubbed_new_total": 0,
-        "guard_fires": {}, "compactions": {"pi": 0, "harness": 0, "harness_failed": 0},
+        "guard_fires": {}, "compactions": {"pi": 0, "harness": 0, "harness_failed": 0, "harness_reaborts": 0},
     }
 
 
@@ -158,7 +158,8 @@ def test_compactions_attach_to_the_next_turn_and_are_counted_by_source():
         (2, {"type": "compaction_start", "reason": "threshold"}),
         (3, {"type": "compaction_end", "reason": "threshold", "aborted": False, "willRetry": False,
              "result": {"summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 230000, "estimatedTokensAfter": 41000}}),
-        (4, {"type": "lc_harness_compaction", "n": 1, "ok": True, "tokens_before": 221000, "tokens_after": 38000, "error": None}),
+        (4, {"type": "lc_harness_compaction", "n": 1, "ok": True, "tokens_before": 221000, "tokens_after": 38000, "error": None,
+             "reaborts": 2}),
         (5, {"type": "lc_harness_compaction", "n": 2, "ok": False, "tokens_before": None, "tokens_after": None,
              "error": "RuntimeError: pi rejected compact: Already compacted"}),
         (6, {"type": "compaction_end", "reason": "manual", "result": None, "aborted": True, "willRetry": False}),
@@ -167,12 +168,13 @@ def test_compactions_attach_to_the_next_turn_and_are_counted_by_source():
     assert recs[0]["compactions"] == []
     assert recs[1]["compactions"] == [
         {"source": "pi", "reason": "threshold", "ok": True, "tokens_before": 230000, "tokens_after": 41000, "error": None},
-        {"source": "harness", "reason": "manual", "ok": True, "tokens_before": 221000, "tokens_after": 38000, "error": None},
+        {"source": "harness", "reason": "manual", "ok": True, "tokens_before": 221000, "tokens_after": 38000, "error": None,
+         "reaborts": 2},
         {"source": "harness", "reason": "manual", "ok": False, "tokens_before": None, "tokens_after": None,
-         "error": "RuntimeError: pi rejected compact: Already compacted"},
+         "error": "RuntimeError: pi rejected compact: Already compacted", "reaborts": 0},
         {"source": "pi", "reason": "manual", "ok": False, "tokens_before": None, "tokens_after": None, "error": None},
     ]
-    assert L.summarize(st)["compactions"] == {"pi": 1, "harness": 1, "harness_failed": 1}
+    assert L.summarize(st)["compactions"] == {"pi": 1, "harness": 1, "harness_failed": 1, "harness_reaborts": 2}
 
 
 def test_an_aborted_turn_without_usage_is_marked_unreported():
