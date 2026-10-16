@@ -34,7 +34,7 @@ TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 # pi's compact() aborts the active run, but a message an extension queued
 # makes pi continue in a fresh run that abort never reached; compaction then
 # waits for that run to end on its own. Abort is re-sent at this interval
-# until compaction starts.
+# until the requested compaction starts; see request_compact.
 COMPACT_REABORT_INTERVAL_SEC = 20.0
 
 # capture_environment_snapshot()'s config sources -- module-level constants
@@ -346,7 +346,8 @@ class PiRpc:
 
         # Demultiplexer state
         self._responses: dict[str, dict] = {}
-        self._compaction_moving = threading.Event()
+        #: compact request id -> its re-abort watchdog's stop event; see request_compact.
+        self._compact_watches: dict[str, threading.Event] = {}
         #: aborts re-sent because a requested compaction had not started
         self.n_compact_reaborts = 0
         self._event_q: list[dict] = []
@@ -411,11 +412,17 @@ class PiRpc:
                     # prompt_and_collect()'s readiness-retry handling.
                     msg["_event_q_watermark"] = len(self._event_q)
                     self._responses[msg["id"]] = msg
-                    if msg.get("command") == "compact":
-                        self._compaction_moving.set()
+                    watch = self._compact_watches.pop(msg["id"], None)
+                    if watch is not None:
+                        watch.set()
                 else:
-                    if msg.get("type") == "compaction_start":
-                        self._compaction_moving.set()
+                    # Only pi's manual compact() emits reason "manual"; a
+                    # threshold/overflow auto-compaction says nothing about
+                    # whether the requested one has started.
+                    if msg.get("type") == "compaction_start" and msg.get("reason") == "manual":
+                        for watch in self._compact_watches.values():
+                            watch.set()
+                        self._compact_watches.clear()
                     self._event_q.append(msg)
                 self._cv.notify_all()
 
@@ -1092,17 +1099,35 @@ class PiRpc:
         finished".
         """
         rid = str(uuid.uuid4())
-        self._compaction_moving.clear()
-        self._send({"id": rid, "type": "compact"})
-        threading.Thread(target=self._reabort_until_compaction_starts, args=(rid,), daemon=True).start()
+        stop = threading.Event()
+        with self._cv:
+            self._compact_watches[rid] = stop
+        try:
+            self._send({"id": rid, "type": "compact"})
+        except BaseException:
+            self.cancel_compact_watch(rid)
+            raise
+        threading.Thread(target=self._reabort_until_compaction_starts, args=(stop,), daemon=True).start()
         return rid
 
-    def _reabort_until_compaction_starts(self, rid: str) -> None:
+    def cancel_compact_watch(self, rid: str) -> None:
+        """Stop re-sending abort for the request_compact() `rid`.
+
+        For when the caller gives up on that compaction for good; otherwise
+        the watchdog would keep aborting every later run. A no-op once the
+        compaction started, its response arrived, or for an unknown `rid`.
+        """
+        with self._cv:
+            stop = self._compact_watches.pop(rid, None)
+        if stop is not None:
+            stop.set()
+
+    def _reabort_until_compaction_starts(self, stop: threading.Event) -> None:
         # An abort while pi is already summarizing is harmless: session.abort()
         # stops the agent run and retries, never the compaction itself.
-        while not self._compaction_moving.wait(COMPACT_REABORT_INTERVAL_SEC):
+        while not stop.wait(COMPACT_REABORT_INTERVAL_SEC):
             with self._cv:
-                if self._eof:
+                if self._eof or stop.is_set():
                     return
             try:
                 self._send({"id": str(uuid.uuid4()), "type": "abort"})
@@ -1224,6 +1249,10 @@ class PiRpc:
         if self._closed:
             return
         self._closed = True
+        with self._cv:
+            watches = list(self._compact_watches)
+        for rid in watches:
+            self.cancel_compact_watch(rid)
         try:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
@@ -2257,6 +2286,11 @@ def prompt_with_mid_run_compaction(
             failure = exc
         if failure is not None:
             exc = failure
+            # Given up for good: stop re-aborting, or every later run of the
+            # trial is aborted too. getattr: test doubles may not define it.
+            cancel_watch = getattr(rpc, "cancel_compact_watch", None)
+            if cancel_watch is not None:
+                cancel_watch(rid)
             _drain_compaction_events(rpc, trigger, _log)
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")

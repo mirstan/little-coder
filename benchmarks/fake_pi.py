@@ -184,10 +184,12 @@ def main():
                 emit({"type": "response", "id": req.get("id"), "success": True, "data": {}})
         return
 
-    if mode == "compact_wedged":
+    if mode in ("compact_wedged", "compact_wedged_after_threshold"):
         # Real pi's hang (r3 trial 6): compact() aborts the run, but a steer an
         # extension had queued makes pi continue in a fresh run that abort
         # never reached, so nothing happens until a later abort ends that run.
+        # The _after_threshold variant also runs pi's own threshold
+        # auto-compaction during that wait, as _handlePostAgentRun can.
         deadline = time.time() + 30
         compact_id, aborts = None, 0
         while time.time() < deadline:
@@ -200,6 +202,9 @@ def main():
                 continue
             if req.get("type") == "compact":
                 compact_id = req.get("id")
+                if mode == "compact_wedged_after_threshold":
+                    emit({"type": "compaction_start", "reason": "threshold"})
+                    emit({"type": "compaction_end", "reason": "threshold", "aborted": False})
                 continue
             if req.get("type") == "abort":
                 aborts += 1

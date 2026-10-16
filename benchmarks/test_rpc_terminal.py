@@ -582,6 +582,8 @@ def test_close_warns_if_reader_thread_never_finishes(capsys):
     rpc = object.__new__(PiRpc)
     rpc._closed = False
     rpc._session_id = "wedged-session"
+    rpc._cv = threading.Condition()
+    rpc._compact_watches = {}
     rpc._proc = _AlreadyExitedProc()
     rpc._reader = _NeverFinishingThread(alive=True)
     rpc._stderr_reader = _NeverFinishingThread(alive=False)
@@ -598,6 +600,8 @@ def test_close_silent_when_reader_threads_finish_in_time(capsys):
     rpc = object.__new__(PiRpc)
     rpc._closed = False
     rpc._session_id = "clean-session"
+    rpc._cv = threading.Condition()
+    rpc._compact_watches = {}
     rpc._proc = _AlreadyExitedProc()
     rpc._reader = _NeverFinishingThread(alive=False)
     rpc._stderr_reader = _NeverFinishingThread(alive=False)
@@ -712,6 +716,32 @@ def test_a_compaction_wedged_behind_a_continued_run_is_unstuck(fake_pi, tmp_path
         data = rpc.await_compact(rid, timeout=10)
     assert data["aborts_seen"] >= 1
     assert rpc.n_compact_reaborts >= 1
+
+
+def test_an_auto_compaction_does_not_stop_the_re_abort_for_a_manual_one(fake_pi, tmp_path, monkeypatch):
+    """pi's threshold auto-compaction can start while the manual compact is
+    still waiting behind a continued run. Its compaction_start says nothing
+    about the requested compaction, so re-aborting must go on."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.5)
+    with fake_pi("compact_wedged_after_threshold", tmp_path) as rpc:
+        # A round trip first, so the threshold event lands well inside the
+        # first interval rather than racing the fake's own startup.
+        rpc.get_state()
+        rid = rpc.request_compact()
+        data = rpc.await_compact(rid, timeout=10)
+    assert data["aborts_seen"] >= 1
+    assert rpc.n_compact_reaborts >= 1
+
+
+def test_a_cancelled_compaction_watch_sends_no_further_abort(fake_pi, tmp_path, monkeypatch):
+    """Once the harness gives up on a compaction, a live watchdog would abort
+    every later run of the trial."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.1)
+    with fake_pi("compact_wedged", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        rpc.cancel_compact_watch(rid)
+        time.sleep(0.5)
+        assert rpc.n_compact_reaborts == 0
 
 
 def test_a_prompt_compaction_sends_no_extra_abort(fake_pi, tmp_path, monkeypatch):
