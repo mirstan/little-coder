@@ -1269,9 +1269,10 @@ class PiRpc:
         if self._closed:
             return
         self._closed = True
-        # Not cancel_compact_watch: it waits for `_send_lock`, which a write
-        # stuck on a full pipe never releases. Once stdin is closed below, a
-        # late abort write fails and its watchdog returns.
+        # Not cancel_compact_watch: it waits for `_send_lock`. That avoids one
+        # wait, not all: stdin.close() below still blocks behind a write
+        # already stuck on a full pipe. An abort write that starts after the
+        # close fails, and its watchdog returns.
         with self._cv:
             watches = list(self._compact_watches.values())
             self._compact_watches.clear()
