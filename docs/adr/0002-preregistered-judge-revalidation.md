@@ -62,3 +62,10 @@ needs a new ADR, written before the data it applies to is analysed.
 - **Code.** Branch `exp/compaction-ab-r4`. It is r3's experiment code merged with `dev` at `d2d8936`,
   which includes the compaction-hang watchdog (PR #90). The driver checks that HEAD is the frozen SHA
   before every trial.
+- **Known deviation, found during trial 0 and left in place.** When the run that a harness
+  compaction aborts comes back as a provider error, for example "Model output contains an
+  unrecoverable tool call", `prompt_with_error_retry` retries inside the same cycle. The harness
+  never collects that compaction's response, so its trigger stays disarmed for the rest of the
+  trial. pi still compacts on its own threshold at about 246K, and those points count. The frozen
+  code is not changed mid-run. Each trial's report counts how often this happened, and the fix
+  goes to `dev` with a test after the run.
