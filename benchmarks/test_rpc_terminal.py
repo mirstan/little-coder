@@ -702,6 +702,26 @@ def test_request_compact_does_not_wait_for_the_response(fake_pi, tmp_path):
         assert rpc.await_compact(rid, timeout=20)["summary"] == "so far..."
 
 
+def test_a_compaction_wedged_behind_a_continued_run_is_unstuck(fake_pi, tmp_path, monkeypatch):
+    """pi's compact() aborts the active run, but a steer queued by an
+    extension makes pi start a fresh run the abort never reached (r3 trial 6
+    looped 54 min). Re-sending abort until compaction starts ends that run."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.2)
+    with fake_pi("compact_wedged", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        data = rpc.await_compact(rid, timeout=10)
+    assert data["aborts_seen"] >= 1
+    assert rpc.n_compact_reaborts >= 1
+
+
+def test_a_prompt_compaction_sends_no_extra_abort(fake_pi, tmp_path, monkeypatch):
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.1)
+    with fake_pi("compact_ok", tmp_path) as rpc:
+        rpc.await_compact(rpc.request_compact(), timeout=20)
+        time.sleep(0.5)
+        assert rpc.n_compact_reaborts == 0
+
+
 def test_a_refused_compaction_surfaces_pis_own_error_text(fake_pi, tmp_path):
     """pi has several refusal reasons and picks its own wording; matching on
     the strings here would go stale the next time it rephrases one."""

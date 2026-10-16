@@ -31,6 +31,12 @@ REPO_ROOT = Path(__file__).parent.parent
 PI_BIN = REPO_ROOT / "node_modules" / ".bin" / "pi"
 TB_SHELL_PREFIX = "__LC_TB_SHELL__:"
 
+# pi's compact() aborts the active run, but a message an extension queued
+# makes pi continue in a fresh run that abort never reached; compaction then
+# waits for that run to end on its own. Abort is re-sent at this interval
+# until compaction starts.
+COMPACT_REABORT_INTERVAL_SEC = 20.0
+
 # capture_environment_snapshot()'s config sources -- module-level constants
 # (not inlined) so tests can monkeypatch each one independently, matching how
 # REPO_ROOT/PI_BIN are already overridden in tests.
@@ -340,6 +346,9 @@ class PiRpc:
 
         # Demultiplexer state
         self._responses: dict[str, dict] = {}
+        self._compaction_moving = threading.Event()
+        #: aborts re-sent because a requested compaction had not started
+        self.n_compact_reaborts = 0
         self._event_q: list[dict] = []
         #: _event_q_watermark of the last compact response; see drain_compaction_events.
         self._compact_watermark = 0
@@ -402,7 +411,11 @@ class PiRpc:
                     # prompt_and_collect()'s readiness-retry handling.
                     msg["_event_q_watermark"] = len(self._event_q)
                     self._responses[msg["id"]] = msg
+                    if msg.get("command") == "compact":
+                        self._compaction_moving.set()
                 else:
+                    if msg.get("type") == "compaction_start":
+                        self._compaction_moving.set()
                     self._event_q.append(msg)
                 self._cv.notify_all()
 
@@ -1079,8 +1092,23 @@ class PiRpc:
         finished".
         """
         rid = str(uuid.uuid4())
+        self._compaction_moving.clear()
         self._send({"id": rid, "type": "compact"})
+        threading.Thread(target=self._reabort_until_compaction_starts, args=(rid,), daemon=True).start()
         return rid
+
+    def _reabort_until_compaction_starts(self, rid: str) -> None:
+        # An abort while pi is already summarizing is harmless: session.abort()
+        # stops the agent run and retries, never the compaction itself.
+        while not self._compaction_moving.wait(COMPACT_REABORT_INTERVAL_SEC):
+            with self._cv:
+                if self._eof:
+                    return
+            try:
+                self._send({"id": str(uuid.uuid4()), "type": "abort"})
+            except Exception:
+                return
+            self.n_compact_reaborts += 1
 
     def await_compact(self, rid: str, timeout: float = 600) -> dict:
         """Collect the response to a request_compact(), or raise.
