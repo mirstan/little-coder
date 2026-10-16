@@ -350,6 +350,8 @@ class PiRpc:
         self._compact_watches: dict[str, threading.Event] = {}
         #: aborts re-sent because a requested compaction had not started
         self.n_compact_reaborts = 0
+        #: compact request id -> aborts its watchdog re-sent; see compact_reaborts.
+        self._compact_reaborts: dict[str, int] = {}
         self._event_q: list[dict] = []
         #: _event_q_watermark of the last compact response; see drain_compaction_events.
         self._compact_watermark = 0
@@ -1111,8 +1113,12 @@ class PiRpc:
         except BaseException:
             self.cancel_compact_watch(rid)
             raise
-        threading.Thread(target=self._reabort_until_compaction_starts, args=(stop,), daemon=True).start()
+        threading.Thread(target=self._reabort_until_compaction_starts, args=(rid, stop), daemon=True).start()
         return rid
+
+    def compact_reaborts(self, rid: str) -> int:
+        """How many aborts the watchdog re-sent for the request_compact() `rid`."""
+        return self._compact_reaborts.get(rid, 0)
 
     def cancel_compact_watch(self, rid: str) -> None:
         """Stop re-sending abort for the request_compact() `rid`.
@@ -1130,7 +1136,7 @@ class PiRpc:
             if stop is not None:
                 stop.set()
 
-    def _reabort_until_compaction_starts(self, stop: threading.Event) -> None:
+    def _reabort_until_compaction_starts(self, rid: str, stop: threading.Event) -> None:
         # An abort while pi is already summarizing is harmless: session.abort()
         # stops the agent run and retries, never the compaction itself.
         while not stop.wait(COMPACT_REABORT_INTERVAL_SEC):
@@ -1147,6 +1153,7 @@ class PiRpc:
                 except Exception:
                     return
                 self.n_compact_reaborts += 1
+                self._compact_reaborts[rid] = self._compact_reaborts.get(rid, 0) + 1
 
     def await_compact(self, rid: str, timeout: float = 600) -> dict:
         """Collect the response to a request_compact(), or raise.
@@ -2308,6 +2315,11 @@ def prompt_with_mid_run_compaction(
             cancel_watch = getattr(rpc, "cancel_compact_watch", None)
             if cancel_watch is not None:
                 cancel_watch(rid)
+        count_reaborts = getattr(rpc, "compact_reaborts", None)
+        reaborts = count_reaborts(rid) if count_reaborts is not None else 0
+        if reaborts:
+            _log(f"compaction {n_compactions}: watchdog re-sent abort {reaborts} time(s)")
+        if failure is not None:
             _drain_compaction_events(rpc, trigger, _log)
             trigger.disarm()
             _log(f"deliberate compaction failed ({type(exc).__name__}: {exc})")
@@ -2315,6 +2327,7 @@ def prompt_with_mid_run_compaction(
                 "n": n_compactions, "ok": False,
                 "tokens_before": None, "tokens_after": None,
                 "error": f"{type(exc).__name__}: {exc}",
+                "reaborts": reaborts,
             }, _log)
         else:
             _drain_compaction_events(rpc, trigger, _log)
@@ -2325,6 +2338,7 @@ def prompt_with_mid_run_compaction(
                 "tokens_before": before if isinstance(before, (int, float)) else None,
                 "tokens_after": after if isinstance(after, (int, float)) else None,
                 "error": None,
+                "reaborts": reaborts,
             }, _log)
             # Measured against the threshold that actually fired, not the
             # flat trigger: on a window smaller than trigger_tokens the two

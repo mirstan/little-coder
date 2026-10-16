@@ -716,6 +716,8 @@ def test_a_compaction_wedged_behind_a_continued_run_is_unstuck(fake_pi, tmp_path
         data = rpc.await_compact(rid, timeout=10)
     assert data["aborts_seen"] >= 1
     assert rpc.n_compact_reaborts >= 1
+    assert rpc.compact_reaborts(rid) == rpc.n_compact_reaborts
+    assert rpc.compact_reaborts("some-other-request") == 0
 
 
 def test_an_auto_compaction_does_not_stop_the_re_abort_for_a_manual_one(fake_pi, tmp_path, monkeypatch):
