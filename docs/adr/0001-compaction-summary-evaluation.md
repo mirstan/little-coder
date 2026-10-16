@@ -51,3 +51,20 @@ paired continuations from the same state.
 - CliffCompaction writes no summary, so it appears only in reruns, and only burden scores it.
 - A fact that only turns out to matter after compaction is missed by design. The rediscovery labels
   show how often that happens.
+
+## Amendments (2026-10-16, during the r3 offline pass)
+
+- The judge scores the whole context after compaction: the summary plus the messages kept verbatim.
+  The arms keep different amounts (prefix-cache 29 to 39 messages, blackhole 8 to 26), so scoring the
+  summary alone would charge prefix-cache for facts its kept messages carry. Precision is still
+  scored on the summary alone, since kept messages are verbatim.
+- Human review was replaced. Local Qwen 3.8 27B broke the drafters' disagreements (130 of 140), and
+  Fable ruled on the 10 whose evidence quote was not found. Qwen confirms truth well but rarely
+  separates vital from okay (4 of 12 agreed-okay facts), so the lists lean vital.
+- Before freezing, Fable checked every fact's origin against the full transcript. 18 of 254 were the
+  drafters' own analysis that the agent never reached, 10 of them agreed by both drafters. They were
+  dropped, because no summary can keep what the agent did not know. 236 facts were frozen.
+- A judge's "yes" counts only if a 24-character stretch of its quote is verbatim in the context.
+- Gate outcome: not decisive. On gcode, prefix-cache's vital recall (0.73) beats both blackhole
+  points (0.29, 0.51). On doom, the ranges overlap (0.37 to 0.58 vs 0.26 to 0.40). Prefix-cache's
+  precision is 11 to 21 points lower on both tasks. Judge validity is still untested.
