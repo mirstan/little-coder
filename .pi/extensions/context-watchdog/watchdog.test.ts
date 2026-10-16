@@ -309,6 +309,34 @@ describe("shouldCompactNow", () => {
     expect(sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("compaction-continuation-idle-wait-gap: RPC mode does not double-resume (the harness drives its own continuation)", async () => {
+    const handlers: Record<string, Function> = {};
+    const sendUserMessage = vi.fn();
+    const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
+    setupWatchdog(pi as any);
+
+    // canCompactMidRun("rpc") is false, so the guard above does not cover
+    // this; see index.ts's session_compact handler for why RPC+manual is
+    // skipped.
+    await handlers.session_compact({ reason: "manual", willRetry: false }, { mode: "rpc" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("compaction-continuation-idle-wait-gap: RPC mode DOES resume pi's own automatic compaction (only manual, harness-requested compaction drives its own continuation)", async () => {
+    const handlers: Record<string, Function> = {};
+    const sendUserMessage = vi.fn();
+    const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
+    setupWatchdog(pi as any);
+
+    // Pi's own threshold/overflow auto-compactions reach RPC mode too, via
+    // _checkCompaction inside _handlePostAgentRun, which runs in every mode --
+    // not only the harness's deliberate manual compaction. Those automatic
+    // compactions have no other continuation driving them (unlike a harness-
+    // requested manual compaction over RPC), so this resume must still fire.
+    await handlers.session_compact({ reason: "threshold", willRetry: false }, { mode: "rpc" });
+    expect(sendUserMessage).toHaveBeenCalledWith(RESUME_MESSAGE, { deliverAs: "followUp" });
+  });
+
   describe("classifyCompactionError", () => {
     it("reads 'Already compacted' as another compaction having landed", () => {
       expect(classifyCompactionError("Already compacted")).toBe("already");

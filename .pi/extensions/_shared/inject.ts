@@ -64,6 +64,9 @@ export function injectionResult(
   return { message: { customType, content: block, display: false } };
 }
 
+/** A `shouldInject` predicate with a way to forget the block it last accepted. */
+export type Dedupe = ((block: string) => boolean) & { reset(): void };
+
 /**
  * Suppress a block that is byte-identical to the one this injector added last.
  *
@@ -75,13 +78,25 @@ export function injectionResult(
  * Returns a `shouldInject` predicate that remembers the last block it accepted.
  * In `system` mode it always returns true: there the block is rebuilt from
  * scratch each turn and skipping it would drop the guidance entirely.
+ *
+ * That "still there" assumption doesn't hold across a mid-run compaction:
+ * pi's `session_compact` event can rebuild/summarize the model's live
+ * conversation and drop the previously-injected block out of it, so a later
+ * turn producing the identical block would otherwise be wrongly suppressed
+ * forever. `reset()` lets a caller (e.g. a `session_compact` handler) clear
+ * the remembered block so the next call re-sends it, without touching the
+ * ordinary same-block-in-a-row suppression above.
  */
-export function makeDedupe(env: NodeJS.ProcessEnv = process.env): (block: string) => boolean {
+export function makeDedupe(env: NodeJS.ProcessEnv = process.env): Dedupe {
   let last: string | null = null;
-  return (block: string): boolean => {
+  const shouldInject = ((block: string): boolean => {
     if (injectMode(env) === "system") return true;
     if (block === last) return false;
     last = block;
     return true;
+  }) as Dedupe;
+  shouldInject.reset = () => {
+    last = null;
   };
+  return shouldInject;
 }

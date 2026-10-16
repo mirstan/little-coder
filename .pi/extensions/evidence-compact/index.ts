@@ -20,9 +20,15 @@ const BRIDGE_TEMPLATE = (n: number): string =>
   `EvidenceList and EvidenceGet.`;
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_compact", async (_event, ctx) => {
+  pi.on("session_compact", async (event, ctx) => {
     const store = getSessionStore();
     if (store.length === 0) return;
+    // little-coder's harness drives its own continuation after a compaction
+    // it requested itself over RPC; queueing this bridge message too races
+    // that continuation. Automatic/threshold/overflow compactions in RPC
+    // mode still need this resume (nothing else drives them), so the guard
+    // checks event.reason, not just ctx.mode.
+    if (ctx.mode === "rpc" && (event as { reason?: string }).reason === "manual") return;
     ctx.ui.notify(
       `evidence-compact: ${store.length} evidence entries preserved across compaction`,
       "info",

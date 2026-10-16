@@ -22,6 +22,11 @@ interface ModelProfile {
   context_limit?: number;
   max_tokens?: number;
   thinking_budget?: number;
+  // off|minimal|low|medium|high|xhigh|max. Applied by the benchmark harness at
+  // pi-launch time (rpc_client.py::resolve_thinking_level -> --thinking), not
+  // from here; declared and republished so this interface stays an honest
+  // superset of what settings.json may contain.
+  thinking_level?: string;
   skill_token_budget?: number;
   knowledge_token_budget?: number;
   system_prompt_budget?: number;
@@ -148,6 +153,7 @@ function toLittleCoderOptions(p: ModelProfile): Record<string, unknown> {
     contextLimit: p.context_limit,
     maxTokens: p.max_tokens,
     thinkingBudget: p.thinking_budget,
+    thinkingLevel: p.thinking_level,
     skillTokenBudget: p.skill_token_budget,
     knowledgeTokenBudget: p.knowledge_token_budget,
     systemPromptBudget: p.system_prompt_budget,
