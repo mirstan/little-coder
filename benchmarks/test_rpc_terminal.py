@@ -744,6 +744,66 @@ def test_a_cancelled_compaction_watch_sends_no_further_abort(fake_pi, tmp_path, 
         assert rpc.n_compact_reaborts == 0
 
 
+class _WatchdogGatedLock:
+    """A `_send_lock` that parks the first other-thread acquire on a gate.
+
+    The parked thread is the watchdog: it has woken from its interval and is
+    about to take the send lock. Every acquire from the thread that built
+    this lock passes straight through, so the test thread can act while the
+    watchdog is held.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owner = threading.get_ident()
+        self._gated = None
+        self.reached = threading.Event()
+        self.release_gate = threading.Event()
+        self.watchdog_done = threading.Event()
+
+    def __enter__(self):
+        if threading.get_ident() != self._owner and self._gated is None:
+            self._gated = threading.get_ident()
+            self.reached.set()
+            self.release_gate.wait(10)
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        if threading.get_ident() == self._gated:
+            self.watchdog_done.set()
+        return False
+
+
+def test_a_watchdog_woken_before_cancel_sends_no_abort_after_it(monkeypatch):
+    """cancel_compact_watch() returning has to mean no abort follows.
+
+    The watchdog is held after its wake-up and before it takes the send
+    lock; cancel runs in that gap. An abort written once the gate opens
+    would land on whatever run the harness started after giving up.
+    """
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.01)
+    rpc = object.__new__(PiRpc)
+    rpc._cv = threading.Condition(threading.Lock())
+    rpc._compact_watches = {}
+    rpc._eof = False
+    rpc.n_compact_reaborts = 0
+    gate = _WatchdogGatedLock()
+    rpc._send_lock = gate
+    rpc._proc = types.SimpleNamespace(stdin=_RecordingStdin())
+
+    rid = rpc.request_compact()
+    assert gate.reached.wait(10), "watchdog never woke"
+    rpc.cancel_compact_watch(rid)
+    gate.release_gate.set()
+    assert gate.watchdog_done.wait(10), "watchdog never left the send lock"
+
+    sent = [json.loads(w)["type"] for w in rpc._proc.stdin.writes]
+    assert sent == ["compact"], f"abort written after cancel returned: {sent}"
+    assert rpc.n_compact_reaborts == 0
+
+
 def test_a_prompt_compaction_sends_no_extra_abort(fake_pi, tmp_path, monkeypatch):
     monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.1)
     with fake_pi("compact_ok", tmp_path) as rpc:

@@ -493,10 +493,14 @@ class PiRpc:
         payload = json.dumps(obj) + "\n"
         try:
             with self._send_lock:
-                self._proc.stdin.write(payload)
-                self._proc.stdin.flush()
+                self._write_locked(payload)
         except (BrokenPipeError, ValueError):
             pass
+
+    def _write_locked(self, payload: str) -> None:
+        """Write and flush one line; the caller holds `_send_lock`."""
+        self._proc.stdin.write(payload)
+        self._proc.stdin.flush()
 
     def _await_response(self, rid: str, timeout: float = 600) -> dict:
         start = time.time()
@@ -1116,24 +1120,33 @@ class PiRpc:
         For when the caller gives up on that compaction for good; otherwise
         the watchdog would keep aborting every later run. A no-op once the
         compaction started, its response arrived, or for an unknown `rid`.
+
+        Sets the stop event under `_send_lock`, so an abort the watchdog is
+        writing finishes first and none is written once this returns.
         """
-        with self._cv:
-            stop = self._compact_watches.pop(rid, None)
-        if stop is not None:
-            stop.set()
+        with self._send_lock:
+            with self._cv:
+                stop = self._compact_watches.pop(rid, None)
+            if stop is not None:
+                stop.set()
 
     def _reabort_until_compaction_starts(self, stop: threading.Event) -> None:
         # An abort while pi is already summarizing is harmless: session.abort()
         # stops the agent run and retries, never the compaction itself.
         while not stop.wait(COMPACT_REABORT_INTERVAL_SEC):
-            with self._cv:
-                if self._eof or stop.is_set():
+            # The stop check and the write share `_send_lock` with
+            # cancel_compact_watch, so a cancel cannot land between them.
+            with self._send_lock:
+                with self._cv:
+                    if self._eof or stop.is_set():
+                        return
+                if self._proc.stdin is None or self._proc.stdin.closed:
                     return
-            try:
-                self._send({"id": str(uuid.uuid4()), "type": "abort"})
-            except Exception:
-                return
-            self.n_compact_reaborts += 1
+                try:
+                    self._write_locked(json.dumps({"id": str(uuid.uuid4()), "type": "abort"}) + "\n")
+                except Exception:
+                    return
+                self.n_compact_reaborts += 1
 
     def await_compact(self, rid: str, timeout: float = 600) -> dict:
         """Collect the response to a request_compact(), or raise.
@@ -1249,10 +1262,14 @@ class PiRpc:
         if self._closed:
             return
         self._closed = True
+        # Not cancel_compact_watch: it waits for `_send_lock`, which a write
+        # stuck on a full pipe never releases. Once stdin is closed below, a
+        # late abort write fails and its watchdog returns.
         with self._cv:
-            watches = list(self._compact_watches)
-        for rid in watches:
-            self.cancel_compact_watch(rid)
+            watches = list(self._compact_watches.values())
+            self._compact_watches.clear()
+        for stop in watches:
+            stop.set()
         try:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
