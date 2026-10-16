@@ -582,6 +582,8 @@ def test_close_warns_if_reader_thread_never_finishes(capsys):
     rpc = object.__new__(PiRpc)
     rpc._closed = False
     rpc._session_id = "wedged-session"
+    rpc._cv = threading.Condition()
+    rpc._compact_watches = {}
     rpc._proc = _AlreadyExitedProc()
     rpc._reader = _NeverFinishingThread(alive=True)
     rpc._stderr_reader = _NeverFinishingThread(alive=False)
@@ -598,6 +600,8 @@ def test_close_silent_when_reader_threads_finish_in_time(capsys):
     rpc = object.__new__(PiRpc)
     rpc._closed = False
     rpc._session_id = "clean-session"
+    rpc._cv = threading.Condition()
+    rpc._compact_watches = {}
     rpc._proc = _AlreadyExitedProc()
     rpc._reader = _NeverFinishingThread(alive=False)
     rpc._stderr_reader = _NeverFinishingThread(alive=False)
@@ -700,6 +704,114 @@ def test_request_compact_does_not_wait_for_the_response(fake_pi, tmp_path):
         rid = rpc.request_compact()
         assert time.time() - started < 1.0
         assert rpc.await_compact(rid, timeout=20)["summary"] == "so far..."
+
+
+def test_a_compaction_wedged_behind_a_continued_run_is_unstuck(fake_pi, tmp_path, monkeypatch):
+    """pi's compact() aborts the active run, but a steer queued by an
+    extension makes pi start a fresh run the abort never reached (r3 trial 6
+    looped 54 min). Re-sending abort until compaction starts ends that run."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.2)
+    with fake_pi("compact_wedged", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        data = rpc.await_compact(rid, timeout=10)
+    assert data["aborts_seen"] >= 1
+    assert rpc.n_compact_reaborts >= 1
+    assert rpc.compact_reaborts(rid) == rpc.n_compact_reaborts
+    assert rpc.compact_reaborts("some-other-request") == 0
+
+
+def test_an_auto_compaction_does_not_stop_the_re_abort_for_a_manual_one(fake_pi, tmp_path, monkeypatch):
+    """pi's threshold auto-compaction can start while the manual compact is
+    still waiting behind a continued run. Its compaction_start says nothing
+    about the requested compaction, so re-aborting must go on."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.5)
+    with fake_pi("compact_wedged_after_threshold", tmp_path) as rpc:
+        # A round trip first, so the threshold event lands well inside the
+        # first interval rather than racing the fake's own startup.
+        rpc.get_state()
+        rid = rpc.request_compact()
+        data = rpc.await_compact(rid, timeout=10)
+    assert data["aborts_seen"] >= 1
+    assert rpc.n_compact_reaborts >= 1
+
+
+def test_a_cancelled_compaction_watch_sends_no_further_abort(fake_pi, tmp_path, monkeypatch):
+    """Once the harness gives up on a compaction, a live watchdog would abort
+    every later run of the trial."""
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.1)
+    with fake_pi("compact_wedged", tmp_path) as rpc:
+        rid = rpc.request_compact()
+        rpc.cancel_compact_watch(rid)
+        time.sleep(0.5)
+        assert rpc.n_compact_reaborts == 0
+
+
+class _WatchdogGatedLock:
+    """A `_send_lock` that parks the first other-thread acquire on a gate.
+
+    The parked thread is the watchdog: it has woken from its interval and is
+    about to take the send lock. Every acquire from the thread that built
+    this lock passes straight through, so the test thread can act while the
+    watchdog is held.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owner = threading.get_ident()
+        self._gated = None
+        self.reached = threading.Event()
+        self.release_gate = threading.Event()
+        self.watchdog_done = threading.Event()
+
+    def __enter__(self):
+        if threading.get_ident() != self._owner and self._gated is None:
+            self._gated = threading.get_ident()
+            self.reached.set()
+            self.release_gate.wait(10)
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        if threading.get_ident() == self._gated:
+            self.watchdog_done.set()
+        return False
+
+
+def test_a_watchdog_woken_before_cancel_sends_no_abort_after_it(monkeypatch):
+    """cancel_compact_watch() returning has to mean no abort follows.
+
+    The watchdog is held after its wake-up and before it takes the send
+    lock; cancel runs in that gap. An abort written once the gate opens
+    would land on whatever run the harness started after giving up.
+    """
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.01)
+    rpc = object.__new__(PiRpc)
+    rpc._cv = threading.Condition(threading.Lock())
+    rpc._compact_watches = {}
+    rpc._eof = False
+    rpc.n_compact_reaborts = 0
+    gate = _WatchdogGatedLock()
+    rpc._send_lock = gate
+    rpc._proc = types.SimpleNamespace(stdin=_RecordingStdin())
+
+    rid = rpc.request_compact()
+    assert gate.reached.wait(10), "watchdog never woke"
+    rpc.cancel_compact_watch(rid)
+    gate.release_gate.set()
+    assert gate.watchdog_done.wait(10), "watchdog never left the send lock"
+
+    sent = [json.loads(w)["type"] for w in rpc._proc.stdin.writes]
+    assert sent == ["compact"], f"abort written after cancel returned: {sent}"
+    assert rpc.n_compact_reaborts == 0
+
+
+def test_a_prompt_compaction_sends_no_extra_abort(fake_pi, tmp_path, monkeypatch):
+    monkeypatch.setattr(rpc_client, "COMPACT_REABORT_INTERVAL_SEC", 0.1)
+    with fake_pi("compact_ok", tmp_path) as rpc:
+        rpc.await_compact(rpc.request_compact(), timeout=20)
+        time.sleep(0.5)
+        assert rpc.n_compact_reaborts == 0
 
 
 def test_a_refused_compaction_surfaces_pis_own_error_text(fake_pi, tmp_path):

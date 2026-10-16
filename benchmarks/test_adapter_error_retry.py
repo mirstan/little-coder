@@ -1255,9 +1255,57 @@ def test_a_deliberate_compaction_is_reported_to_on_event():
     _run_compaction(rpc, clock, on_event=seen.append)
     assert [e for e in seen if e.get("type") == "lc_harness_compaction"] == [
         {"type": "lc_harness_compaction", "n": 1, "ok": True,
-         "tokens_before": 230_000, "tokens_after": 60_000, "error": None},
+         "tokens_before": 230_000, "tokens_after": 60_000, "error": None, "reaborts": 0},
     ]
     assert [e.get("type") for e in seen] == ["turn_end", "lc_harness_compaction", "turn_end"]
+
+
+class _ReabortingCycleRpc(_CycleRpc):
+    """A _CycleRpc whose re-abort watchdog fired `n` times per compaction."""
+
+    def __init__(self, *a, reaborts=0, **kw):
+        super().__init__(*a, **kw)
+        self._n_reaborts = reaborts
+        self.cancelled = []
+
+    def compact_reaborts(self, rid):
+        return self._n_reaborts
+
+    def cancel_compact_watch(self, rid):
+        self.cancelled.append(rid)
+
+
+def test_re_sent_aborts_are_logged_and_reported_with_the_compaction():
+    clock = _Clock()
+    seen, logged = [], []
+    rpc = _ReabortingCycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([_turn(60_000)], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[{"tokensBefore": 230_000, "estimatedTokensAfter": 60_000}],
+        reaborts=3,
+    )
+    _run_compaction(rpc, clock, on_event=seen.append, log=logged.append)
+    [mark] = [e for e in seen if e.get("type") == "lc_harness_compaction"]
+    assert (mark["ok"], mark["reaborts"]) == (True, 3)
+    assert "compaction 1: watchdog re-sent abort 3 time(s)" in logged
+    assert rpc.cancelled == []
+
+
+def test_a_given_up_compaction_cancels_its_watch_and_reports_its_re_aborts():
+    clock = _Clock()
+    seen = []
+    rpc = _ReabortingCycleRpc(
+        [([_turn(230_000)], _ok()),
+         ([], PromptResult(stop_reason="agent_end", assistant_text="finished"))],
+        clock,
+        compact_results=[RuntimeError("pi rejected compact: Already compacted")],
+        reaborts=2,
+    )
+    _run_compaction(rpc, clock, on_event=seen.append)
+    [mark] = [e for e in seen if e.get("type") == "lc_harness_compaction"]
+    assert (mark["ok"], mark["reaborts"]) == (False, 2)
+    assert rpc.cancelled == rpc.compact_requests
 
 
 def test_a_failed_deliberate_compaction_is_reported_with_its_error():
@@ -1272,7 +1320,8 @@ def test_a_failed_deliberate_compaction_is_reported_with_its_error():
     _run_compaction(rpc, clock, on_event=seen.append)
     assert [e for e in seen if e.get("type") == "lc_harness_compaction"] == [
         {"type": "lc_harness_compaction", "n": 1, "ok": False, "tokens_before": None,
-         "tokens_after": None, "error": "RuntimeError: pi rejected compact: Already compacted"},
+         "tokens_after": None, "error": "RuntimeError: pi rejected compact: Already compacted",
+         "reaborts": 0},
     ]
 
 

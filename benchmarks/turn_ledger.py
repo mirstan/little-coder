@@ -67,6 +67,7 @@ class LedgerState:
     compactions_pi: int = 0
     compactions_harness: int = 0
     compactions_harness_failed: int = 0
+    compaction_reaborts: int = 0
 
 
 def new_ledger() -> LedgerState:
@@ -192,7 +193,9 @@ def observe(state: LedgerState, ev: Any, now: float) -> list[dict]:
             "tokens_before": _opt_int(ev.get("tokens_before")),
             "tokens_after": _opt_int(ev.get("tokens_after")),
             "error": ev.get("error") or None,
+            "reaborts": _count(ev.get("reaborts")),
         })
+        state.compaction_reaborts += _count(ev.get("reaborts"))
         if ok:
             state.compactions_harness += 1
         else:
@@ -322,7 +325,8 @@ def summarize(state: LedgerState) -> dict:
         "stubbed_new_total": state.stubbed_new_total,
         "guard_fires": dict(sorted(state.guard_fires.items())),
         "compactions": {"pi": state.compactions_pi, "harness": state.compactions_harness,
-                        "harness_failed": state.compactions_harness_failed},
+                        "harness_failed": state.compactions_harness_failed,
+                        "harness_reaborts": state.compaction_reaborts},
     }
 
 
