@@ -49,3 +49,16 @@ needs a new ADR, written before the data it applies to is analysed.
   analysis runs, the change is reported, and the analysis runs anyway.
 - `validity.py` reproduces the r3 result (OR 2.03, p = 0.073, not valid). That reproduction is a check
   of the script, not evidence for either outcome.
+
+## Amendments (2026-10-16, before the run starts and before any new data exists)
+
+- **Tasks.** The run uses no task from the TB2.1 `test` split, so that split stays held out. In 266
+  earlier trials, only four non-test tasks ever reached the compaction trigger:
+  `schemelike-metacircular-eval` (2 of 3 trials), `extract-moves-from-video` (2 of 3), `mailman` (1 of 2)
+  and `video-processing` (1 of 2). The run uses those four.
+- **Trials.** Each task runs 3 times per arm: 24 trials, 12 per arm, in place of about 7 per arm. At
+  the rates above that gives about 14 compaction points. Each repeat is its own round, and the arm
+  order inside a round is shuffled with seed 20261016 (`make_schedule.py --seed 20261016`).
+- **Code.** Branch `exp/compaction-ab-r4`. It is r3's experiment code merged with `dev` at `d2d8936`,
+  which includes the compaction-hang watchdog (PR #90). The driver checks that HEAD is the frozen SHA
+  before every trial.
