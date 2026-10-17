@@ -69,3 +69,7 @@ needs a new ADR, written before the data it applies to is analysed.
   trial. pi still compacts on its own threshold at about 246K, and those points count. The frozen
   code is not changed mid-run. Each trial's report counts how often this happened, and the fix
   goes to `dev` with a test after the run.
+- **Known false void, left in place.** `trial_check.py` hard-codes `EXPECTED_BUDGET = 12150`, the
+  budget of r1–r3's tasks (810 s × 15). Each r4 task has its own budget (schemelike-metacircular-eval
+  has 32,400 s), so every r4 ledger row has a `budget … != 12150.0` void. The analysis ignores that
+  one void reason. Every other void reason still excludes a trial.
