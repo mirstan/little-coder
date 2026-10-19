@@ -1,4 +1,8 @@
-"""Render each usable r3 compaction point to blinded text files.
+"""Render each usable compaction point to blinded text files.
+
+Usage: extract.py [LEDGER [N_TRIALS]]. Defaults reproduce the r3 pass (ADR 0001). ADR 0003 runs it on
+the r4 ledger with N_TRIALS=10, the trials its stopping rule keeps. Every compaction in a trial is a
+point (ADR 0002 item 1).
 
 points/<ID>/pre.txt   transcript the summariser replaced (drafters see only this)
 points/<ID>/context.txt what the agent had after compaction: summary + kept messages
@@ -7,7 +11,8 @@ key.json              ID -> trial, arm (never shown to judges)
 """
 import json, glob, os, random, sys
 
-LEDGER = os.path.expanduser("~/tb21-runs/compaction-ab-r3/ledger.jsonl")
+LEDGER = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/tb21-runs/compaction-ab-r3/ledger.jsonl")
+N_TRIALS = int(sys.argv[2]) if len(sys.argv) > 2 else None
 EXCLUDE = {"gcode-to-text__MGHczpn"}  # ADR 0001 item 4: transcript not fully saved
 POST_ACTIONS = 20
 
@@ -43,30 +48,55 @@ def render(entries, cap=True):
             out.append("### %s\n%s" % (role, body))
     return "\n\n".join(out)
 
-trials = [json.loads(l) for l in open(LEDGER)]
+trials = [json.loads(l) for l in open(LEDGER)][:N_TRIALS]
 trials = [t for t in trials if os.path.basename(t["trial"]) not in EXCLUDE]
-rng = random.Random(20261015)
-ids = ["P%d" % i for i in range(1, len(trials) + 1)]
-rng.shuffle(ids)
-key = {}
-for pid, t in zip(ids, trials):
+
+
+def entry_index(L, eid):
+    return next(i for i, x in enumerate(L) if x.get("id") == eid)
+
+
+# One record per compaction. The summariser of compaction k saw the previous summary plus the
+# entries from the previous compaction's first kept entry up to k; the window after k stops at
+# the next compaction. A point with no action after it is dropped (ADR 0001 item 4).
+points = []
+for t in trials:
     sess = [f for f in glob.glob(t["trial"] + "/agent/pi-session/*.jsonl") if "observer" not in f][0]
     L = [json.loads(l) for l in open(sess)]
-    ci = next(i for i, x in enumerate(L) if x.get("type") == "compaction")
-    post, n = [], 0
-    for e in L[ci + 1:]:
-        if e.get("type") == "message" and e["message"].get("role") == "assistant":
-            n += sum(1 for b in e["message"].get("content", []) if b.get("type") == "toolCall")
-        post.append(e)
-        if n >= POST_ACTIONS:
-            break
+    comps = [i for i, x in enumerate(L) if x.get("type") == "compaction"]
+    for k, ci in enumerate(comps):
+        end = comps[k + 1] if k + 1 < len(comps) else len(L)
+        post, n = [], 0
+        for e in L[ci + 1:end]:
+            if e.get("type") == "message" and e["message"].get("role") == "assistant":
+                n += sum(1 for b in e["message"].get("content", []) if b.get("type") == "toolCall")
+            post.append(e)
+            if n >= POST_ACTIONS:
+                break
+        if n == 0:
+            continue
+        if k == 0:
+            pre = render(L[:ci])
+        else:
+            prev = L[comps[k - 1]]
+            pre = ("## Earlier summary\n\n" + prev["summary"] + "\n\n"
+                   + render(L[entry_index(L, prev["firstKeptEntryId"]):ci]))
+        ki = entry_index(L, L[ci]["firstKeptEntryId"])
+        context = "## Summary\n\n" + L[ci]["summary"] + "\n\n## Kept messages\n\n" + render(L[ki:ci], cap=False)
+        points.append((t, k + 1, pre, context, render(post)))
+
+rng = random.Random(20261015)
+ids = ["P%d" % i for i in range(1, len(points) + 1)]
+rng.shuffle(ids)
+key = {}
+for pid, (t, n_comp, pre, context, post) in zip(ids, points):
     d = "points/" + pid
     os.makedirs(d, exist_ok=True)
-    open(d + "/pre.txt", "w").write(render(L[:ci]))
-    ki = next(i for i, x in enumerate(L) if x.get("id") == L[ci]["firstKeptEntryId"])
-    open(d + "/context.txt", "w").write("## Summary\n\n" + L[ci]["summary"] + "\n\n## Kept messages\n\n" + render(L[ki:ci], cap=False))
-    open(d + "/post.txt", "w").write(render(post))
-    key[pid] = {"trial": os.path.basename(t["trial"]), "arm": t["arm"], "task": os.path.basename(t["trial"]).split("__")[0]}
+    open(d + "/pre.txt", "w").write(pre)
+    open(d + "/context.txt", "w").write(context)
+    open(d + "/post.txt", "w").write(post)
+    key[pid] = {"trial": os.path.basename(t["trial"]), "arm": t["arm"], "task": os.path.basename(t["trial"]).split("__")[0],
+                "compaction": n_comp}
 json.dump(key, open("key.json", "w"), indent=1)
 for pid in sorted(key):
     s = os.path.getsize("points/%s/pre.txt" % pid)
